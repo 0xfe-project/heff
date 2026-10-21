@@ -250,17 +250,6 @@ instanceMonadM = { pure = pure, bind = bind }
 traverseS : {a b : Type} -> (a -> M b) -> List a -> M (List b)
 traverseS = traverse (mo := instanceMonadM)
 
-fieldsS : (IR.Expr -> M IR.Expr)
-        -> List (Pair String IR.Expr)
-        -> M (List (Pair String IR.Expr))
-fieldsS f fs =
-  traverseS
-    (\p -> case p of
-     MkPair l e -> do
-       e' <- f e
-       pure (MkPair l e'))
-    fs
-
 -- (each expression of a condition, by `f`)
 condS : (IR.Expr -> M IR.Expr) -> IR.Cond -> M IR.Cond
 condS f c = IR.condTraverse (mo := instanceMonadM) f c
@@ -572,47 +561,12 @@ mkApp f argv = EApp f argv
 -- | `x` replaced by `a`, a copy of it for each occurrence
 substCopies : String -> IR.Expr -> IR.Expr -> M IR.Expr
 substCopies x a (EVar y) = if strEq y x then copy a else pure (EVar y)
-substCopies x a (ELam xs b) = do
-  b' <- substCopies x a b
-  pure (ELam xs b')
 substCopies x a (EApp f argv) = do
   f' <- substCopies x a f
   argv' <- traverseS (\q -> substCopies x a q) argv
   pure (mkApp f' argv')
-substCopies x a (ELet y e2 b) = do
-  e2' <- substCopies x a e2
-  b' <- substCopies x a b
-  pure (ELet y e2' b')
-substCopies x a (ERecord fs ts) = do
-  fs' <- fieldsS (\q -> substCopies x a q) fs
-  pure (ERecord fs' ts)
-substCopies x a (EProj e2 l sh t) = do
-  e2' <- substCopies x a e2
-  pure (EProj e2' l sh t)
-substCopies x a (ETag t argv ts) = do
-  argv' <- traverseS (\q -> substCopies x a q) argv
-  pure (ETag t argv' ts)
-substCopies x a (EMatch s arms) = do
-  s' <- substCopies x a s
-  arms' <- armsS (\q -> substCopies x a q) arms
-  pure (EMatch s' arms')
-substCopies x a (EPrimCall p argv) = do
-  argv' <- traverseS (\q -> substCopies x a q) argv
-  pure (EPrimCall p argv')
-substCopies x a (ECall g argv) = do
-  argv' <- traverseS (\q -> substCopies x a q) argv
-  pure (ECall g argv')
-substCopies x a (EBool c) = do
-  c' <- condS (\q -> substCopies x a q) c
-  pure (EBool c')
-substCopies x a (ESet ys e2 b) = do
-  e2' <- substCopies x a e2
-  b' <- substCopies x a b
-  pure (ESet ys e2' b')
-substCopies x a (EValues es) = do
-  es' <- traverseS (\q -> substCopies x a q) es
-  pure (EValues es')
-substCopies x a e = pure e
+substCopies x a e =
+  IR.traversePartsM (mo := instanceMonadM) (\_ q -> substCopies x a q) e
 
 -- | (lambdas in lambdas are one lambda)
 lam : List String -> IR.Expr -> IR.Expr
@@ -1443,15 +1397,9 @@ simpF r (EApp f argv) = do
 simpF r (ELet x a b) = do
   a' <- r.simp a
   letFloat r x a' b
-simpF r (ERecord fs ts) = do
-  fs' <- fieldsS (\a -> r.simp a) fs
-  pure (ERecord fs' ts)
 simpF r (EProj e2 l sh t) = do
   e2' <- r.simp e2
   r.project l sh t e2'
-simpF r (ETag t argv ts) = do
-  argv' <- traverseS (\a -> r.simp a) argv
-  pure (ETag t argv' ts)
 simpF r (EMatch s arms) = do
   s' <- r.simp s
   arms' <- armsS (\a -> r.simp a) arms
@@ -1470,13 +1418,13 @@ simpF r (ESet xs a b) = do
     _ -> do
       b' <- r.simp b
       pure (ESet xs a' b')
-simpF r (EValues es) = do
-  es' <- traverseS (\a -> r.simp a) es
-  pure (EValues es')
 simpF r (EGlobal g) = do
   s <- get
   pure (globalLiteral g (OrdMap.lookup s.defs g))
-simpF r e = pure e
+-- (a variable, the leaf met most, not given to the walk: half what the
+-- walk costs here)
+simpF r e@(EVar _) = pure e
+simpF r e = IR.traversePartsM (mo := instanceMonadM) (\_ a -> r.simp a) e
 
 -- | an argument that tells a body nothing to compute with
 opaque : IR.Expr -> Bool
@@ -3971,47 +3919,8 @@ tieGo : String -> IR.Expr -> IR.Expr -> M IR.Expr
 tieGo h lam1 (EApp (EGlobal g) argv) = do
   as2 <- traverseS (tieGo h lam1) argv
   if strEq g h then inlinedCall h lam1 as2 else pure (EApp (EGlobal g) as2)
-tieGo h lam1 (EApp f argv) = do
-  f2 <- tieGo h lam1 f
-  as2 <- traverseS (tieGo h lam1) argv
-  pure (EApp f2 as2)
-tieGo h lam1 (ELam xs b) = do
-  b2 <- tieGo h lam1 b
-  pure (ELam xs b2)
-tieGo h lam1 (ELet x a b) = do
-  a2 <- tieGo h lam1 a
-  b2 <- tieGo h lam1 b
-  pure (ELet x a2 b2)
-tieGo h lam1 (ERecord fs ts) = do
-  fs2 <- fieldsS (tieGo h lam1) fs
-  pure (ERecord fs2 ts)
-tieGo h lam1 (EProj e l sh t) = do
-  e2 <- tieGo h lam1 e
-  pure (EProj e2 l sh t)
-tieGo h lam1 (ETag t argv ts) = do
-  as2 <- traverseS (tieGo h lam1) argv
-  pure (ETag t as2 ts)
-tieGo h lam1 (EMatch sc arms) = do
-  sc2 <- tieGo h lam1 sc
-  arms2 <- armsS (tieGo h lam1) arms
-  pure (EMatch sc2 arms2)
-tieGo h lam1 (EPrimCall p argv) = do
-  as2 <- traverseS (tieGo h lam1) argv
-  pure (EPrimCall p as2)
-tieGo h lam1 (ECall g argv) = do
-  as2 <- traverseS (tieGo h lam1) argv
-  pure (ECall g as2)
-tieGo h lam1 (EBool c) = do
-  c2 <- condS (tieGo h lam1) c
-  pure (EBool c2)
-tieGo h lam1 (ESet xs a b) = do
-  a2 <- tieGo h lam1 a
-  b2 <- tieGo h lam1 b
-  pure (ESet xs a2 b2)
-tieGo h lam1 (EValues es) = do
-  es2 <- traverseS (tieGo h lam1) es
-  pure (EValues es2)
-tieGo h lam1 e = pure e
+tieGo h lam1 e =
+  IR.traversePartsM (mo := instanceMonadM) (\_ q -> tieGo h lam1 q) e
 
 -- (the copy `h`, made to `hb`, small and not calling itself, put where a
 -- copy it calls calls it back)

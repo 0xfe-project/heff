@@ -388,6 +388,156 @@ traverseParts f (EFix x b) = do
   pure (EFix x b2)
 traverseParts f e = pure e
 
+-- In any monad: a pass whose computations are not `S` gives its own
+-- instance (`IR.traversePartsM (mo := instanceMonadM)`), and a copy is
+-- made for it, calling the instance's `bind` and `pure` themselves.
+
+traverseArmM : {m : Type -> Type}
+             -> {{mo : Monad m}}
+             -> Part (m Expr)
+             -> Arm
+             -> m Arm
+traverseArmM f (MkArm t vs b) =
+  mo.bind (f vs b) (\b2 -> mo.pure (MkArm t vs b2))
+
+traverseFieldM : {m : Type -> Type}
+               -> {{mo : Monad m}}
+               -> Part (m Expr)
+               -> Pair String Expr
+               -> m (Pair String Expr)
+traverseFieldM f (MkPair l e) = mo.bind (f Nil e) (\e2 -> mo.pure (MkPair l e2))
+
+-- (each part of a list, then what is built of them)
+partsThen : {m : Type -> Type}
+          -> {{mo : Monad m}}
+          -> Part (m Expr)
+          -> List Expr
+          -> (List Expr -> Expr)
+          -> m Expr
+partsThen f es k =
+  mo.bind (traverse (mo := mo) (f Nil) es) (\es2 -> mo.pure (k es2))
+
+-- (a part not bound around, then another, `xs` bound around it)
+twoThen : {m : Type -> Type}
+        -> {{mo : Monad m}}
+        -> Part (m Expr)
+        -> Expr
+        -> List String
+        -> Expr
+        -> (Expr -> Expr -> Expr)
+        -> m Expr
+twoThen f a xs b k =
+  mo.bind (f Nil a) (\a2 -> mo.bind (f xs b) (\b2 -> mo.pure (k a2 b2)))
+
+-- | `traverseParts` in the monad `mo`
+-- | >>> traversePartsM (mo := instanceMonadMaybe) (\_ e -> Just (EInt 0)) (EApp (EVar "f") [EVar "x"])
+-- | Just (EApp (EInt 0) (Cons (EInt 0) Nil))
+traversePartsM : {m : Type -> Type}
+               -> {{mo : Monad m}}
+               -> Part (m Expr)
+               -> Expr
+               -> m Expr
+traversePartsM f (ELam xs b) = mo.bind (f xs b) (\b2 -> mo.pure (ELam xs b2))
+traversePartsM f (EApp g args) =
+  mo.bind
+    (f Nil g)
+    (\g2 -> partsThen (mo := mo) f args (\args2 -> EApp g2 args2))
+traversePartsM f (ELet x a b) =
+  twoThen (mo := mo) f a (Cons x Nil) b (\a2 b2 -> ELet x a2 b2)
+traversePartsM f (ERecord fs ts) =
+  mo.bind
+    (traverse (mo := mo) (traverseFieldM (mo := mo) f) fs)
+    (\fs2 -> mo.pure (ERecord fs2 ts))
+traversePartsM f (EProj e l sh t) =
+  mo.bind (f Nil e) (\e2 -> mo.pure (EProj e2 l sh t))
+traversePartsM f (ETag t args ts) =
+  partsThen (mo := mo) f args (\args2 -> ETag t args2 ts)
+traversePartsM f (EMatch s arms) =
+  mo.bind
+    (f Nil s)
+    (\s2 ->
+       mo.bind
+         (traverse (mo := mo) (traverseArmM (mo := mo) f) arms)
+         (\arms2 -> mo.pure (EMatch s2 arms2)))
+traversePartsM f (EPrimCall p args) =
+  partsThen (mo := mo) f args (\args2 -> EPrimCall p args2)
+traversePartsM f (ECall g args) =
+  partsThen (mo := mo) f args (\args2 -> ECall g args2)
+traversePartsM f (EBool c) =
+  mo.bind (condTraverse (mo := mo) (f Nil) c) (\c2 -> mo.pure (EBool c2))
+traversePartsM f (ESet xs a b) =
+  twoThen (mo := mo) f a xs b (\a2 b2 -> ESet xs a2 b2)
+traversePartsM f (EValues es) = partsThen (mo := mo) f es (\es2 -> EValues es2)
+traversePartsM f (EFix x b) =
+  mo.bind (f (Cons x Nil) b) (\b2 -> mo.pure (EFix x b2))
+traversePartsM f e = mo.pure e
+
+-- Folding, the names bound around each part given
+
+foldList : {r : Type} -> Part (r -> r) -> List Expr -> r -> r
+foldList f Nil acc = acc
+foldList f (Cons e es) acc = foldList f es (f Nil e acc)
+
+foldArms : {r : Type} -> Part (r -> r) -> List Arm -> r -> r
+foldArms f Nil acc = acc
+foldArms f (Cons (MkArm _ vs b) arms) acc = foldArms f arms (f vs b acc)
+
+foldFields : {r : Type} -> Part (r -> r) -> List (Pair String Expr) -> r -> r
+foldFields f Nil acc = acc
+foldFields f (Cons (MkPair _ e) fs) acc = foldFields f fs (f Nil e acc)
+
+-- | each part of a node into `acc`, in the order they are written, each
+-- | given the names the node binds around it (as `mapParts` gives them)
+-- | >>> foldParts (\xs e n -> n + List.length xs) (ELet "x" (EInt 1) (EVar "x")) 0
+-- | 1
+foldParts : {r : Type} -> Part (r -> r) -> Expr -> r -> r
+foldParts f (ELam xs b) acc = f xs b acc
+foldParts f (EApp g args) acc = foldList f args (f Nil g acc)
+foldParts f (ELet x a b) acc = f (Cons x Nil) b (f Nil a acc)
+foldParts f (ERecord fs _) acc = foldFields f fs acc
+foldParts f (EProj e _ _ _) acc = f Nil e acc
+foldParts f (ETag _ args _) acc = foldList f args acc
+foldParts f (EMatch s arms) acc = foldArms f arms (f Nil s acc)
+foldParts f (EPrimCall _ args) acc = foldList f args acc
+foldParts f (ECall _ args) acc = foldList f args acc
+foldParts f (EBool c) acc = foldList f (condParts c) acc
+foldParts f (ESet xs a b) acc = f xs b (f Nil a acc)
+foldParts f (EValues es) acc = foldList f es acc
+foldParts f (EFix x b) acc = f (Cons x Nil) b acc
+foldParts f _ acc = acc
+
+allList : Part Bool -> List Expr -> Bool
+allList f Nil = True
+allList f (Cons e es) = f Nil e && allList f es
+
+allArms : Part Bool -> List Arm -> Bool
+allArms f Nil = True
+allArms f (Cons (MkArm _ vs b) arms) = f vs b && allArms f arms
+
+allFields : Part Bool -> List (Pair String Expr) -> Bool
+allFields f Nil = True
+allFields f (Cons (MkPair _ e) fs) = f Nil e && allFields f fs
+
+-- | whether `f` holds of every part of a node, given the names bound
+-- | around it: looked at in order, until one does not
+-- | >>> allParts (\xs e -> not (List.null xs)) (ELet "x" (EInt 1) (EVar "x"))
+-- | False
+allParts : Part Bool -> Expr -> Bool
+allParts f (ELam xs b) = f xs b
+allParts f (EApp g args) = f Nil g && allList f args
+allParts f (ELet x a b) = f Nil a && f (Cons x Nil) b
+allParts f (ERecord fs _) = allFields f fs
+allParts f (EProj e _ _ _) = f Nil e
+allParts f (ETag _ args _) = allList f args
+allParts f (EMatch s arms) = f Nil s && allArms f arms
+allParts f (EPrimCall _ args) = allList f args
+allParts f (ECall _ args) = allList f args
+allParts f (EBool c) = allList f (condParts c)
+allParts f (ESet xs a b) = f Nil a && f xs b
+allParts f (EValues es) = allList f es
+allParts f (EFix x b) = f (Cons x Nil) b
+allParts f _ = True
+
 -- Freshening (a copy with every binder renamed afresh)
 --------------------------------------------------------------------------------
 
