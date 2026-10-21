@@ -18,10 +18,13 @@
 -- there.  Only where it reads two fields or more, one of them not a
 -- number -- what a set may change in place.
 --
--- Not a record updated: one built anew at its shape, a field of it read
--- at its own place (`{ x = p.x + 1, y = p.y }`), is built in its cell
--- (heff.compile.refcount), what is read of it before taken out of it
--- there, so it is held alone as well -- and no cell is made.
+-- A record also used whole, or updated -- built anew at its shape, a
+-- field of it read at its own place (`{ x = p.x + 1, y = p.y }`), built
+-- in its cell (heff.compile.refcount) -- has the numbers read of it after
+-- that read where it is bound, in the arms reading them of a match there:
+-- read after, they would keep it held, and its cell not the one rebuilt
+-- (nbody's `pull`: `b.mass` read after the call the updated `b` is given
+-- to).  Its fields read at their own places stay, for the update.
 --
 -- Only the C backend counts references: this runs on what it is given
 -- (heff.compile.lower), before the monadic form.
@@ -31,6 +34,7 @@ module heff.compile.fields
 import heff.compile.ir as IR
 import heff.compile.repr as Repr
 import heff.compile.supply
+import heff.elab.primitive
 import std.ordmap as OrdMap
 
 elemS : String -> List String -> Bool
@@ -90,19 +94,119 @@ labelsOnce acc (Cons r rs) =
   if List.any (\(q : Read) -> strEq q.l r.l) acc then labelsOnce acc rs
   else labelsOnce (Cons r acc) rs
 
--- (the fields of `v` to read where it is bound: of one shape, two of
--- them or more, one not a number)
+-- (a type whose values a record may keep flat: a number)
+number : IR.FieldTy -> Bool
+number t = not (Repr.isBoxed (Repr.flatOf t))
+
+-- (each label read once, the reads all of one shape)
+oneShape : List Read -> List Read
+oneShape Nil = Nil
+oneShape (Cons r rs) =
+  if List.all (\(q : Read) -> sameLabels q.sh r.sh) rs
+  then labelsOnce Nil (List.reverse (Cons r rs))
+  else Nil
+
+-- (the fields of `v` to read where it is bound, of those it reads: two
+-- or more, one not a number)
 toRead : List Read -> List Read
-toRead Nil = Nil
-toRead (Cons r rs) =
-  let once = labelsOnce Nil (List.reverse (Cons r rs))
-  in if List.all (\(q : Read) -> sameLabels q.sh r.sh) rs
-        && List.length once >= 2
-        && List.any
-          (\(q : Read) -> Repr.isBoxed (Repr.flatOf q.t))
-          once
+toRead rs =
+  let once = oneShape rs
+  in if List.length once >= 2
+        && List.any (\(q : Read) -> not (number q.t)) once
   then once
   else Nil
+
+-- Numbers read after
+--------------------------------------------------------------------------------
+
+-- (the variable an expression reads a number of, at a known shape, onto
+-- `acc`)
+numberOf : IR.Expr -> List String -> List String
+numberOf (EProj (EVar y) _ sh t) acc =
+  if number t && not (List.null sh) && not (elemS y acc) then Cons y acc
+  else acc
+numberOf e acc = acc
+
+-- (... the worklist reads)
+numbersW : List String -> List IR.Expr -> List String
+numbersW acc Nil = acc
+numbersW acc (Cons e rest) = numbersW (numberOf e acc) (IR.partsOnto e rest)
+
+-- | how a variable held for more than its fields is used: the fields
+-- | read of it, those read after it is held -- used whole, updated, or
+-- | read at no shape known -- how often it is so held, and whether it
+-- | is at this point of the walk
+type Uses = { reads : List Read, late : List Read, holds : Int, now : Bool }
+
+heldOf : Uses -> Uses
+heldOf u = { reads = u.reads, late = u.late, holds = u.holds + 1, now = True }
+
+readOf : Read -> Uses -> Uses
+readOf r u =
+  { reads = Cons r u.reads
+  , late = if u.now then Cons r u.late else u.late
+  , holds = u.holds
+  , now = u.now
+  }
+
+nowAs : Bool -> Uses -> Uses
+nowAs b u = { reads = u.reads, late = u.late, holds = u.holds, now = b }
+
+-- (the fields of a record built of the labels `ls`, but those read from
+-- `v`'s at their own places)
+unkept : String -> List String -> List (Pair String IR.Expr) -> List IR.Expr
+unkept v ls fs = List.map snd (List.keepIf (\f -> not (keptOf v ls f)) fs)
+
+-- (how the worklist uses `v`, onto `u`, in the order it is computed; not
+-- under a binding of `v` again.  What a lambda reads is read after: it
+-- would be held by the lambda.  Each arm is walked from where its match
+-- is.)
+usesW : String -> Uses -> List IR.Expr -> Uses
+usesW v u Nil = u
+usesW v u (Cons (EProj (EVar y) l sh t) rest) =
+  if not (strEq y v) then usesW v u rest
+  else if List.null sh then usesW v (heldOf u) rest
+  else usesW v (readOf { l = l, sh = sh, t = t } u) rest
+usesW v u (Cons (EVar y) rest) =
+  usesW v (if strEq y v then heldOf u else u) rest
+usesW v u (Cons (ELam xs b) rest) =
+  if elemS v xs then usesW v u rest
+  else let r : Uses = usesW v (nowAs True u) [b]
+       in usesW v (nowAs (u.now || r.holds > u.holds) r) rest
+usesW v u (Cons (ELet x a b) rest) =
+  usesW v u (Cons a (if strEq x v then rest else Cons b rest))
+usesW v u (Cons (ERecord fs _) rest) =
+  let ls = List.map fst fs
+  in if List.any (keptOf v ls) fs
+  then usesW v (heldOf (usesW v u (unkept v ls fs))) rest
+  else usesW v u (IR.pushFields fs rest)
+usesW v u (Cons (EMatch s arms) rest) =
+  let at : Uses = usesW v u [s]
+  in let after : Uses =
+    List.foldl
+      (\(acc : Uses) arm ->
+         let r : Uses = usesW v (nowAs at.now acc) (armOwn v arm Nil)
+         in nowAs (acc.now || r.now) r)
+      (nowAs False at)
+      arms
+  in usesW v after rest
+usesW v u (Cons (ESet xs a b) rest) =
+  usesW v u (Cons a (if elemS v xs then rest else Cons b rest))
+usesW v u (Cons e rest) = usesW v u (IR.partsOnto e rest)
+
+-- (whether the label is read after the variable is held, and only as a
+-- number)
+lateNumber : Uses -> Read -> Bool
+lateNumber u q =
+  List.all (\(r : Read) -> not (strEq r.l q.l) || number r.t) u.reads
+  && List.any (\(r : Read) -> strEq r.l q.l) u.late
+
+-- (the numbers of `v` to read where it is bound, of those read after it
+-- is held)
+lateRead : Uses -> List Read
+lateRead u =
+  if List.null u.late then Nil
+  else List.keepIf (lateNumber u) (oneShape u.reads)
 
 -- Reads put where it is bound
 --------------------------------------------------------------------------------
@@ -127,6 +231,13 @@ readIn v bs (EProj (EVar y) l sh t) =
     Just x -> EVar x
     Nothing -> EProj (EVar y) l sh t
   else EProj (EVar y) l sh t
+readIn v bs (ERecord fs ts) =
+  let ls = List.map fst fs
+  in ERecord
+    (List.map
+       (\f -> if keptOf v ls f then f else MkPair (fst f) (readIn v bs (snd f)))
+       fs)
+    ts
 readIn v bs e = IR.mapParts (\xs p -> if elemS v xs then p else readIn v bs p) e
 
 -- (the reads, bound in front of `e`)
@@ -135,14 +246,33 @@ letsOf v Nil e = e
 letsOf v (Cons b bs) e =
   ELet b.x (EProj (EVar v) b.r.l b.r.sh b.r.t) (letsOf v bs e)
 
+-- (the reads that `e` makes)
+usedIn : IR.Expr -> List Bound -> List Bound
+usedIn e bs = List.keepIf (\(b : Bound) -> IR.countW b.x 0 [e] > 0) bs
+
+-- (... bound in front of `e`, or where it is a match on neither `v` nor
+-- them, in each arm those it makes: not where the match does not go)
+placed : String -> List Bound -> IR.Expr -> IR.Expr
+placed v bs (EMatch s arms) =
+  if IR.countW v 0 [s] == 0 && List.null (usedIn s bs)
+  then EMatch s (List.map (IR.mapArm (\_ b -> placed v (usedIn b bs) b)) arms)
+  else letsOf v bs (EMatch s arms)
+placed v bs e = letsOf v bs e
+
+-- (`b`, where `v` is bound: the fields `rs` read there, in front of it
+-- -- or, `held`, in the arms reading them of a match there)
+readsBy : Bool -> List Read -> String -> IR.Expr -> S IR.Expr
+readsBy held Nil v b = pure b
+readsBy held rs v b = do
+  bs <- traverseS boundOf rs
+  pure
+      (if held then placed v bs (readIn v bs b)
+       else letsOf v bs (readIn v bs b))
+
 -- (`b`, where `v` is bound: the fields it reads read there, if they are)
 readAt : IR.Expr -> String -> S IR.Expr
-readAt b v = case readsW v Nil (Cons b Nil) of
-  Just rs -> case toRead rs of
-    Nil -> pure b
-    once -> do
-      bs <- traverseS boundOf once
-      pure (letsOf v bs (readIn v bs b))
+readAt b v = case readsW v Nil [b] of
+  Just rs -> readsBy False (toRead rs) v b
   Nothing -> pure b
 
 -- (... where the variables `xs` are bound)
@@ -157,12 +287,45 @@ readsAt (Cons x xs) b = do
 go : IR.Expr -> S IR.Expr
 go e = IR.traverseParts (\xs p -> bind (go p) (readsAt xs)) e
 
+-- (`b`, where `v` is bound, if it is one of `ns`, read as numbers: those
+-- read after it is held read there)
+lateAt : List String -> IR.Expr -> String -> S IR.Expr
+lateAt ns b v =
+  if elemS v ns
+  then readsBy
+      True
+      (lateRead
+         (usesW v { reads = Nil, late = Nil, holds = 0, now = False } [b]))
+      v
+      b
+  else pure b
+
+latesAt : List String -> List String -> IR.Expr -> S IR.Expr
+latesAt ns Nil b = pure b
+latesAt ns (Cons x xs) b = do
+  b2 <- lateAt ns b x
+  latesAt ns xs b2
+
+-- | an expression, the numbers of each of `ns` held for more read where
+-- | it is bound, inner ones first
+goLate : List String -> IR.Expr -> S IR.Expr
+goLate ns e = IR.traverseParts (\xs p -> bind (goLate ns p) (latesAt ns xs)) e
+
+-- (... where numbers are read)
+lateIn : List String -> IR.Expr -> S IR.Expr
+lateIn Nil e = pure e
+lateIn ns e = goLate ns e
+
 defOf : IR.Def -> S IR.Def
 defOf d = do
   b <- go d.body
-  pure (IR.mkDef d.key d.name b)
+  b2 <- lateIn (numbersW Nil [b]) b
+  pure (IR.mkDef d.key d.name b2)
 
 -- | the program, each variable of a record read only field by field read
--- | where it is bound; where fresh names go on from
+-- | where it is bound, and the numbers of one held for more read after;
+-- | where fresh names go on from
+-- | >>> snd (fieldsProgram 0 [IR.mkDef "f" "f" (ELam ["b"] (ELet "c" (ECall "g" [ERecord [MkPair "m" (EProj (EVar "b") "m" ["m"] FtFloat)] [FtFloat]]) (EPrimCall FloatAdd [EVar "c", EProj (EVar "b") "m" ["m"] FtFloat])))])
+-- | 1
 fieldsProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
 fieldsProgram n defs = traverseS defOf defs n
