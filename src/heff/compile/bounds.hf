@@ -16,6 +16,19 @@
 -- reads and sets there are not checked (`arrayIndexIn`,
 -- `arraySetOwnedIn`); if not, round the loop as it was, so an index out
 -- of range fails as it did.
+--
+-- And an array of a fixed-width number (`Int64`, `UInt8`, ...) may keep
+-- its elements flat or as `V`s, so a read of one in range looks at how
+-- it keeps them, each round.  But an array that keeps its length round
+-- the loop keeps them as it did where the loop was entered (a `set`
+-- writes an element as the array keeps them, a copy keeps them as the
+-- array it is of).  So the check also has each array read so keep the
+-- number flat (`arrayKeeps`) -- those read in range here, and those
+-- read where their index was tested (`arrayIndexInAny`,
+-- heff.compile.tested) -- and the copy's reads of them do not look.  An
+-- array held alone where the function is entered (heff.compile.owned,
+-- `arrayOwn` of the number) is flat there already: its reads look
+-- nowhere, in the loop as it was too, with no check.
 
 module heff.compile.bounds
 
@@ -352,10 +365,50 @@ scopedSt go info env s = Nil
 scoped : Info -> List Range -> List RefCount.Statement -> List Scoped
 scoped info env ss = List.concatMap (scopedSt (scoped info) info env) ss
 
--- | the reads and sets known in range in a body
-needsOf : Info -> List RefCount.Statement -> List Need
-needsOf info ss =
-  List.concatMap (\p -> needsIn info (fst p) (snd p)) (scoped info Nil ss)
+-- Flat reads
+--------------------------------------------------------------------------------
+
+-- | a read of an array that may keep its elements flat: the array (one
+-- | of `arrays`), the number read
+type Read = Pair String Repr.Repr
+
+sameRead : Read -> Read -> Bool
+sameRead (MkPair a r) (MkPair b s) = strEq a b && Repr.reprEq r s
+
+isRead : List Read -> Read -> Bool
+isRead rs r = List.any (sameRead r) rs
+
+nubReads : List Read -> List Read -> List Read
+nubReads seen Nil = Nil
+nubReads seen (Cons r rs) =
+  if isRead seen r then nubReads seen rs
+  else Cons r (nubReads (Cons r seen) rs)
+
+baseOfVar : Info -> Maybe String -> Maybe String
+baseOfVar info (Just y) = baseOf info y
+baseOfVar info Nothing = Nothing
+
+-- (a read of a fixed-width number where its index was tested, of one of
+-- `arrays`)
+anyRead : Info -> RefCount.Value -> List Read
+anyRead info (RPrimAt "arrayIndexInAny" r (Cons a _)) =
+  maybe Nil (\b -> Cons (MkPair b r) Nil) (baseOfVar info (varOf a))
+anyRead info e = Nil
+
+-- | such reads in a value (not in a lambda's body)
+readsIn : Info -> RefCount.Value -> List Read
+readsIn info e =
+  List.append (anyRead info e) (List.concatMap (readsIn info) (Owned.kids e))
+
+needRead : Need -> List Read
+needRead n = maybe Nil (\r -> Cons (MkPair n.read r) Nil) n.flat
+
+-- | the arrays held alone where the function is entered, each kept flat
+-- | as the number (heff.compile.owned)
+ownedSt : RefCount.Statement -> List Read
+ownedSt (CSet x (RPrimAt "arrayOwn" r (Cons (RLocal y) Nil))) =
+  if strEq x y then Cons (MkPair x r) Nil else Nil
+ownedSt s = Nil
 
 -- Unchecked
 --------------------------------------------------------------------------------
@@ -403,14 +456,30 @@ renamed : Info -> List Range -> String -> List RefCount.Value -> String
 renamed info env p es =
   maybe p (\_ -> fromMaybe p (uncheckedOf p)) (needAt info env p Nothing es)
 
--- (a read or set made unchecked, where it is known in range)
-unchecked : Info -> List Range -> RefCount.Value -> RefCount.Value
-unchecked info env (RPrim p es) = RPrim (renamed info env p es) es
-unchecked info env (RPrimAt p r es) = RPrimAt (renamed info env p es) r es
-unchecked info env e = e
+-- (a read of an array known flat, one of `flat`, not looking how it
+-- keeps its elements)
+flatName : Info -> List Read -> Repr.Repr -> List RefCount.Value -> String
+flatName info flat r (Cons a _) =
+  if maybe False (\b -> isRead flat (MkPair b r)) (baseOfVar info (varOf a))
+  then "arrayIndexIn"
+  else "arrayIndexInAny"
+flatName info flat r es = "arrayIndexInAny"
 
-fixExp : Info -> List Range -> RefCount.Value -> RefCount.Value
-fixExp info env e = mapExp (unchecked info env) e
+-- (a read or set made unchecked, where it is known in range, and a read
+-- of an array known flat not looking)
+unchecked : Info -> List Read -> List Range -> RefCount.Value -> RefCount.Value
+unchecked info flat env (RPrim p es) = RPrim (renamed info env p es) es
+unchecked info flat env (RPrimAt "arrayIndexInAny" r es) =
+  RPrimAt (flatName info flat r es) r es
+unchecked info flat env (RPrimAt p r es) = RPrimAt (renamed info env p es) r es
+unchecked info flat env e = e
+
+fixExp : Info -> List Read -> List Range -> RefCount.Value -> RefCount.Value
+fixExp info flat env e = mapExp (unchecked info flat env) e
+
+-- (what is known with no index: no read or set in range)
+noIndices : Info -> Info
+noIndices info = { indices = Nil, arrays = info.arrays, defs = info.defs }
 
 -- | where the copy of the loop starts
 label : String
@@ -422,39 +491,51 @@ fixArm : (List RefCount.Statement -> List RefCount.Statement)
 fixArm go (MkCArm t fs fl su pl tk body lv) =
   MkCArm t fs fl su pl tk (go body) lv
 
--- | a statement of the copy of the loop: its reads and sets known in
--- | range unchecked, going round the copy again
+-- (the loop again: round the copy, `toCopy`, or as it was)
+again : Bool -> List String -> List RefCount.Value -> RefCount.Statement
+again True ps es = CLoopTo label ps es
+again False ps es = CLoop ps es
+
+-- | a statement: its reads and sets known in range unchecked, its reads
+-- | of arrays known flat (`flat`) not looking, going round the copy
+-- | again where `toCopy`
 fixSt : (List Range -> List RefCount.Statement -> List RefCount.Statement)
       -> Info
+      -> List Read
+      -> Bool
       -> List Range
       -> RefCount.Statement
       -> RefCount.Statement
-fixSt go info env (CLet x e) = CLet x (fixExp info env e)
-fixSt go info env (CSet x e) = CSet x (fixExp info env e)
-fixSt go info env (CReturn e) = CReturn (fixExp info env e)
-fixSt go info env (CIf c a b) =
+fixSt go info flat toCopy env (CLet x e) = CLet x (fixExp info flat env e)
+fixSt go info flat toCopy env (CSet x e) = CSet x (fixExp info flat env e)
+fixSt go info flat toCopy env (CReturn e) = CReturn (fixExp info flat env e)
+fixSt go info flat toCopy env (CIf c a b) =
   CIf
-    (Owned.mapCond (fixExp info env) c)
+    (Owned.mapCond (fixExp info flat env) c)
     (go (fst (split info env c)) a)
     (go (snd (split info env c)) b)
-fixSt go info env (CSwitch e arms r) =
-  CSwitch (fixExp info env e) (List.map (fixArm (go env)) arms) r
-fixSt go info env (CInPlace f es) =
-  CInPlace (fixExp info env f) (List.map (fixExp info env) es)
-fixSt go info env (CRoomed f es) =
-  CRoomed (fixExp info env f) (List.map (fixExp info env) es)
-fixSt go info env (CTail f es) =
-  CTail (fixExp info env f) (List.map (fixExp info env) es)
-fixSt go info env (CLoop ps es) =
-  CLoopTo label ps (List.map (fixExp info env) es)
-fixSt go info env (CJump g w es) = CJump g w (List.map (fixExp info env) es)
-fixSt go info env s = s
+fixSt go info flat toCopy env (CSwitch e arms r) =
+  CSwitch (fixExp info flat env e) (List.map (fixArm (go env)) arms) r
+fixSt go info flat toCopy env (CInPlace f es) =
+  CInPlace (fixExp info flat env f) (List.map (fixExp info flat env) es)
+fixSt go info flat toCopy env (CRoomed f es) =
+  CRoomed (fixExp info flat env f) (List.map (fixExp info flat env) es)
+fixSt go info flat toCopy env (CTail f es) =
+  CTail (fixExp info flat env f) (List.map (fixExp info flat env) es)
+fixSt go info flat toCopy env (CLoop ps es) =
+  again toCopy ps (List.map (fixExp info flat env) es)
+fixSt go info flat toCopy env (CJump g w es) =
+  CJump g w (List.map (fixExp info flat env) es)
+fixSt go info flat toCopy env s = s
 
 fixStmts : Info
+         -> List Read
+         -> Bool
          -> List Range
          -> List RefCount.Statement
          -> List RefCount.Statement
-fixStmts info env ss = List.map (fixSt (fixStmts info) info env) ss
+fixStmts info flat toCopy env ss =
+  List.map (fixSt (fixStmts info flat toCopy) info flat toCopy env) ss
 
 -- The check
 --------------------------------------------------------------------------------
@@ -473,13 +554,8 @@ longEnough n =
   else Cons (CondRelU "wordLe" [lengthWord n.tested, lengthWord n.read]) Nil
 
 -- (the array read kept flat, of the number it is read as)
-keptFlat : Need -> List RefCount.Test
-keptFlat n =
-  maybe
-    Nil
-    (\r ->
-       Cons (CondBool (RPrimAt "arrayKeeps" r (Cons (RDup n.read) Nil))) Nil)
-    n.flat
+keepsFlat : Read -> RefCount.Test
+keepsFlat (MkPair b r) = CondBool (RPrimAt "arrayKeeps" r (Cons (RDup b) Nil))
 
 needIndex : Need -> String
 needIndex n = n.index
@@ -492,14 +568,11 @@ nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
 pairKey : Need -> String
 pairKey n = n.tested ^ " " ^ n.read
 
-flatKey : Need -> String
-flatKey n = n.read ^ " " ^ maybe "" Repr.reprName n.flat
-
-nubNeeds : (Need -> String) -> List String -> List Need -> List Need
-nubNeeds key seen Nil = Nil
-nubNeeds key seen (Cons n ns) =
-  if elemS (key n) seen then nubNeeds key seen ns
-  else Cons n (nubNeeds key (Cons (key n) seen) ns)
+nubNeeds : List String -> List Need -> List Need
+nubNeeds seen Nil = Nil
+nubNeeds seen (Cons n ns) =
+  if elemS (pairKey n) seen then nubNeeds seen ns
+  else Cons n (nubNeeds (Cons (pairKey n) seen) ns)
 
 allOf : List RefCount.Test -> RefCount.Test
 allOf Nil = CondTrue
@@ -508,37 +581,56 @@ allOf (Cons c cs) = CondIf c (allOf cs) CondFalse
 
 -- | the check, where the function is entered, that every read and set
 -- | known in range is: each index at least 0, each array read at least
--- | as long as the one tested -- and each read as a fixed-width number
--- | kept flat
-checkOf : List Need -> RefCount.Test
-checkOf ns =
+-- | as long as the one tested -- and each array read as a fixed-width
+-- | number, `rs`, kept flat
+checkOf : List Need -> List Read -> RefCount.Test
+checkOf ns rs =
   allOf
     (List.append
        (List.map atLeast0 (nubS Nil (List.map needIndex ns)))
        (List.append
-          (List.concatMap longEnough (nubNeeds pairKey Nil ns))
-          (List.concatMap keptFlat (nubNeeds flatKey Nil ns))))
+          (List.concatMap longEnough (nubNeeds Nil ns))
+          (List.map keepsFlat rs)))
 
 -- The function
 --------------------------------------------------------------------------------
 
--- (the function, a copy of its loop unchecked where `ns`, if any, are)
-checkedWith : RefCount.Fun -> Info -> List Need -> RefCount.Fun
-checkedWith f info Nil = f
-checkedWith f info ns =
+-- (where the function is entered: a copy of its loop, where `ns` and
+-- `checked`, if any, are -- its reads and sets in range unchecked, its
+-- reads of `owned` and `checked` not looking)
+entryWith : RefCount.Fun
+          -> Info
+          -> List Read
+          -> List Need
+          -> List Read
+          -> List RefCount.Statement
+entryWith f info owned Nil Nil = f.entry
+entryWith f info owned ns checked =
+  List.append
+    f.entry
+    (Cons
+       (CIf
+          (checkOf ns checked)
+          (Cons
+             (CLabel label)
+             (fixStmts info (List.append owned checked) True Nil f.body))
+          Nil)
+       Nil)
+
+-- (the function, its reads of `owned` not looking, and a copy of its
+-- loop where `ns` and `checked` are)
+checkedWith : RefCount.Fun
+            -> Info
+            -> List Read
+            -> List Need
+            -> List Read
+            -> RefCount.Fun
+checkedWith f info owned ns checked =
   { key = f.key
   , params = f.params
   , lent = f.lent
-  , entry =
-      List.append
-        f.entry
-        (Cons
-           (CIf
-              (checkOf ns)
-              (Cons (CLabel label) (fixStmts info Nil f.body))
-              Nil)
-           Nil)
-  , body = f.body
+  , entry = entryWith f info owned ns checked
+  , body = fixStmts (noIndices info) owned False Nil f.body
   , reprs = f.reprs
   , ret = f.ret
   , wrapper = f.wrapper
@@ -551,19 +643,27 @@ boundsWith : RefCount.Fun
 boundsWith f ds ags =
   let info : Info =
     { indices = indices f ds ags, arrays = kept f ds ags, defs = ds }
-  in if List.null info.indices then f
-  else checkedWith f info (needsOf info f.body)
+  in let sc = scoped info Nil f.body
+  in let ns = List.concatMap (\p -> needsIn info (fst p) (snd p)) sc
+  in let owned = List.concatMap ownedSt f.entry
+  in let rs =
+    nubReads
+      Nil
+      (List.append
+         (List.concatMap needRead ns)
+         (List.concatMap (\p -> readsIn info (snd p)) sc))
+  in checkedWith f info owned ns (List.keepIf (\r -> not (isRead owned r)) rs)
 
 -- | a function going round a loop, its reads and sets in range checked
--- | once where it is entered, where they may be
+-- | once where it is entered, and its arrays read flat, where they may be
 boundsFun : RefCount.Fun -> RefCount.Fun
 boundsFun f =
   let ags = agains Nil f.body
   in if List.null ags || labelled False f.body then f
   else boundsWith f (Owned.defsOf Nil f.body) ags
 
--- | a definition of the C backend's, its loops' reads and sets in range
--- | checked once where they may be
+-- | a definition of the C backend's, its loops' reads and sets in range,
+-- | and arrays read flat, checked once where they may be
 boundsDef : RefCount.Def -> RefCount.Def
 boundsDef (DFun f) = DFun (boundsFun f)
 boundsDef d = d
