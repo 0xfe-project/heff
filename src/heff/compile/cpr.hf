@@ -76,22 +76,14 @@ tysOf : List IR.Expr -> List IR.FieldTy -> List IR.FieldTy
 tysOf args ts =
   List.map (\i -> Repr.tyIn i ts) (List.range 0 (List.length args - 1))
 
--- (the ways out of the worklist, onto `acc`: through bindings and
--- matches)
-outsW : List Out -> List IR.Expr -> List Out
-outsW acc Nil = acc
-outsW acc (Cons (ELet _ _ b) rest) = outsW acc (Cons b rest)
-outsW acc (Cons (ESet _ _ b) rest) = outsW acc (Cons b rest)
-outsW acc (Cons (EMatch _ arms) rest) = outsW acc (IR.pushArms arms rest)
-outsW acc (Cons (ETag t args ts) rest) =
-  outsW (Cons (OutTag t (tysOf args ts)) acc) rest
-outsW acc (Cons (ERecord fs ts) rest) =
-  outsW
-    (Cons (OutRecord (List.map fst fs) (tysOf (List.map snd fs) ts)) acc)
-    rest
-outsW acc (Cons (ECall g _) rest) = outsW (Cons (OutCall g) acc) rest
-outsW acc (Cons EAbandon rest) = outsW acc rest
-outsW acc (Cons _ rest) = outsW (Cons OutOther acc) rest
+-- (a way out, onto `acc`)
+outOnto : List Out -> IR.Expr -> List Out
+outOnto acc (ETag t args ts) = Cons (OutTag t (tysOf args ts)) acc
+outOnto acc (ERecord fs ts) =
+  Cons (OutRecord (List.map fst fs) (tysOf (List.map snd fs) ts)) acc
+outOnto acc (ECall g _) = Cons (OutCall g) acc
+outOnto acc EAbandon = acc
+outOnto acc _ = Cons OutOther acc
 
 isOther : Out -> Bool
 isOther OutOther = True
@@ -112,7 +104,8 @@ candWith m k os = if List.any isOther os then m else OrdMap.insert m k os
 candOne : OrdMap.OrdMap String (List Out)
         -> IR.Def
         -> OrdMap.OrdMap String (List Out)
-candOne m d@{ body = ELam _ b } = candWith m d.key (outsW Nil (Cons b Nil))
+candOne m d@{ body = ELam _ b } =
+  candWith m d.key (List.foldl outOnto Nil (IR.waysList b))
 candOne m d = m
 
 -- (those whose calls last are each of one of them)
@@ -675,15 +668,6 @@ builtOut lay c es = do
 -- | a worker's way out: a tag or a record built, its tuple; a call last,
 -- | of the other's worker
 outRw : Layout -> IR.Expr -> S IR.Expr
-outRw lay (ELet x a b) = do
-  b2 <- outRw lay b
-  pure (ELet x a b2)
-outRw lay (ESet xs a b) = do
-  b2 <- outRw lay b
-  pure (ESet xs a b2)
-outRw lay (EMatch s arms) = do
-  arms2 <- traverseS (IR.traverseArm (\_ b -> outRw lay b)) arms
-  pure (EMatch s arms2)
 outRw lay (ETag t args _) = builtOut lay (conOf lay t) args
 outRw lay (ERecord fs _) = builtOut lay (conOf lay "") (List.map snd fs)
 outRw lay (ECall g args) = pure (ECall (workerKey g) args)
@@ -727,7 +711,7 @@ mentions k e = List.any (\g -> OrdMap.member k g) (IR.globalsIn e)
 defWith : Know -> IR.Def -> Maybe Layout -> S (List IR.Def)
 defWith k d@{ body = ELam xs b } (Just lay) = do
   b2 <- rw k b
-  b3 <- outRw lay b2
+  b3 <- IR.waysM (mo := instanceMonadS) (outRw lay) b2
   w <- wrapperOf lay d xs
   pure (Cons (IR.mkDef (workerKey d.key) d.name (ELam xs b3)) (Cons w Nil))
 defWith k d m =
