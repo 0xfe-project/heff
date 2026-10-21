@@ -20,18 +20,8 @@ addFree bound x acc =
 
 freeGo : List String -> IR.Expr -> List String -> List String
 freeGo bound (EVar x) acc = addFree bound x acc
-freeGo bound (ELam xs b) acc = freeGo (IR.appendI xs bound) b acc
-freeGo bound (ELet x a b) acc = freeGo (x :: bound) b (freeGo bound a acc)
-freeGo bound (EMatch x arms) acc =
-  List.foldl
-    (\a arm -> freeGo (IR.appendI (IR.armVars arm) bound) (IR.armBody arm) a)
-    (freeGo bound x acc)
-    arms
-freeGo bound (EFix f b) acc = freeGo (f :: bound) b acc
-freeGo bound (ESet xs a b) acc =
-  freeGo (IR.appendI xs bound) b (freeGo bound a acc)
 freeGo bound e acc =
-  List.foldl (\a x -> freeGo bound x a) acc (IR.partsOnto e Nil)
+  IR.foldParts (\xs p a -> freeGo (IR.appendI xs bound) p a) e acc
 
 -- | the variables `e` mentions and does not bind, but `bound`
 freeVars : List String -> IR.Expr -> List String
@@ -53,32 +43,25 @@ type Acc = { out : List IR.Def, n : Int }
 
 type LiftK = { go : IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc }
 
-consLifted : IR.Expr -> Pair (List IR.Expr) Acc -> Pair (List IR.Expr) Acc
-consLifted x (MkPair xs acc) = MkPair (x :: xs) acc
+-- (computations adding globals)
+type L a = Acc -> Pair a Acc
 
--- (each of a list, in order)
-liftMany : LiftK -> IR.Def -> Acc -> List IR.Expr -> Pair (List IR.Expr) Acc
-liftMany k d acc Nil = MkPair Nil acc
-liftMany k d acc (x :: xs) = case k.go d acc x of
-  MkPair x2 acc2 -> consLifted x2 (liftMany k d acc2 xs)
+bindTake : {a b : Type} -> (a -> L b) -> Pair a Acc -> Pair b Acc
+bindTake f (MkPair x acc) = f x acc
 
-liftFields : LiftK
-           -> IR.Def
-           -> Acc
-           -> List (Pair String IR.Expr)
-           -> Pair (List (Pair String IR.Expr)) Acc
-liftFields k d acc fs = case liftMany k d acc (List.map snd fs) of
-  MkPair es acc2 -> MkPair (List.zipWith (\f x -> MkPair (fst f) x) fs es) acc2
+bindL : {a b : Type} -> L a -> (a -> L b) -> L b
+bindL m f = \acc -> bindTake f (m acc)
 
-liftArms : LiftK -> IR.Def -> Acc -> List IR.Arm -> Pair (List IR.Arm) Acc
-liftArms k d acc arms = case liftMany k d acc (List.map IR.armBody arms) of
-  MkPair bs acc2 ->
-    MkPair
-      (List.zipWith
-         (\arm b -> MkArm (IR.armTag arm) (IR.armVars arm) b)
-         arms
-         bs)
-      acc2
+pureL : {a : Type} -> a -> L a
+pureL x = \acc -> MkPair x acc
+
+instance instanceMonadL : Monad L
+instanceMonadL = { pure = pureL, bind = bindL }
+
+-- (each part of it, in order)
+liftParts : LiftK -> IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc
+liftParts k d acc e =
+  IR.traversePartsM (mo := instanceMonadL) (\_ p a -> k.go d a p) e acc
 
 -- | the global a local definition is, given the variables it takes
 calledAs : String -> List String -> IR.Expr
@@ -135,9 +118,7 @@ oneParam (ELam xs b) = case xs of
 oneParam e = Nothing
 
 liftArgs : LiftK -> IR.Def -> Acc -> IR.Expr -> List IR.Expr -> Pair IR.Expr Acc
-liftArgs k d acc f args = case liftMany k d acc (f :: args) of
-  MkPair (f2 :: as2) acc2 -> MkPair (EApp f2 as2) acc2
-  MkPair Nil acc2 -> MkPair (EApp f args) acc2
+liftArgs k d acc f args = liftParts k d acc (EApp f args)
 
 -- (a local definition bound by a beta-redex, as elaboration binds it: its
 -- name is its global, given the variables, wherever it is used -- so that
@@ -163,33 +144,8 @@ liftApp k d acc f args = case oneParam f of
 
 liftGo : LiftK -> IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc
 liftGo k d acc (EFix f b) = liftFix k d acc f b
-liftGo k d acc (ELam xs b) = case k.go d acc b of
-  MkPair b2 acc2 -> MkPair (ELam xs b2) acc2
 liftGo k d acc (EApp f args) = liftApp k d acc f args
-liftGo k d acc e@(ELet x a b) = case liftMany k d acc [a, b] of
-  MkPair (a2 :: b2 :: Nil) acc2 -> MkPair (ELet x a2 b2) acc2
-  MkPair _ acc2 -> MkPair e acc2
-liftGo k d acc (ERecord fs ts) = case liftFields k d acc fs of
-  MkPair fs2 acc2 -> MkPair (ERecord fs2 ts) acc2
-liftGo k d acc (EProj x l sh t) = case k.go d acc x of
-  MkPair x2 acc2 -> MkPair (EProj x2 l sh t) acc2
-liftGo k d acc (ETag t es ts) = case liftMany k d acc es of
-  MkPair es2 acc2 -> MkPair (ETag t es2 ts) acc2
-liftGo k d acc (EMatch x arms) = case k.go d acc x of
-  MkPair x2 acc2 -> case liftArms k d acc2 arms of
-    MkPair arms2 acc3 -> MkPair (EMatch x2 arms2) acc3
-liftGo k d acc (EPrimCall p es) = case liftMany k d acc es of
-  MkPair es2 acc2 -> MkPair (EPrimCall p es2) acc2
-liftGo k d acc (ECall c es) = case liftMany k d acc es of
-  MkPair es2 acc2 -> MkPair (ECall c es2) acc2
-liftGo k d acc e@(ESet xs a b) = case liftMany k d acc [a, b] of
-  MkPair (a2 :: b2 :: Nil) acc2 -> MkPair (ESet xs a2 b2) acc2
-  MkPair _ acc2 -> MkPair e acc2
-liftGo k d acc (EValues es) = case liftMany k d acc es of
-  MkPair es2 acc2 -> MkPair (EValues es2) acc2
-liftGo k d acc (EBool c) = case liftMany k d acc (IR.condParts c) of
-  MkPair es2 acc2 -> MkPair (EBool (IR.condFill c es2)) acc2
-liftGo k d acc e = MkPair e acc
+liftGo k d acc e = liftParts k d acc e
 
 lk : LiftK
 lk = { go = \d acc e -> liftGo lk d acc e }
