@@ -7,10 +7,22 @@
 
 module heff.build.docpages
 
+import co
+import heff.build.commands as Commands
 import heff.build.driver as Driver
 import heff.build.query as Query
+import heff.build.session as Session
+import heff.build.testing as Testing
 import heff.elab.params as Params
+import heff.lsp.report as Report
 import heff.syntax.format as Format
+import heff.util.files as Files
+import heff.util.hostpath as HostPath
+import std.filesystem
+import std.io
+import std.path as Path
+import std.process
+import std.progress as Progress
 
 -- The header comment
 --------------------------------------------------------------------------------
@@ -257,3 +269,149 @@ indexPage cs =
   "---\ntitle: API\nsidebar:\n  label: Modules\n---\n\n"
   ^ "The modules, each a page: what it exposes, with its type and its documentation.\n\n"
   ^ joinWith "" (List.map indexLine (List.sortBy moduleBefore cs))
+
+-- `heff doc`
+--------------------------------------------------------------------------------
+
+-- (the files `heff doc` reads, none given: the `.hf` files under `src/`,
+-- if there is one here)
+docFilesIn : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Maybe (List String)
+           -> Co e (List String)
+docFilesIn (Just _) = Testing.testFilesGo [MkPair True "src"] Nil
+docFilesIn Nothing = do
+  printErr "heff doc: no src/ here: run it at the project's root, or give FILEs"
+  exit 1
+  pure Nil
+
+-- | the files `heff doc` reads: those given, a directory's `.hf` files
+-- | for it; none given, the project's here (those under `src/`)
+docFiles : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List String
+         -> Co e (List String)
+docFiles Nil = do
+  src <- Files.readDirectory "src"
+  docFilesIn src
+docFiles given = Testing.testFilesGo (List.map (\f -> MkPair True f) given) Nil
+
+-- (a file's module, kept if it and what it imports checked)
+docKept : Bool
+        -> Maybe Driver.Checked
+        -> List Driver.Checked
+        -> List Driver.Checked
+docKept False (Just c) acc = Cons c acc
+docKept bad found acc = acc
+
+-- (each file checked, after what it imports: the modules that checked,
+-- in order; each that did not, its diagnostics said.  Each one more of
+-- the task `chk`'s, a task under it meanwhile)
+docChecked : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{rep : Report.report <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Progress.Task
+           -> List String
+           -> List Driver.Checked
+           -> Co e (List Driver.Checked)
+docChecked chk Nil acc = pure (List.reverse acc)
+docChecked chk (Cons f rest) acc = do
+  m <- Progress.start chk f 0
+  l <- Commands.load f
+  badL <- Commands.printErrs "heff" l.errors 0
+  cs <- Session.cachedProgram l
+  if Commands.anyErrors cs then Commands.putFileDiags cs else pure MkUnit
+  Progress.end m
+  docChecked
+      chk
+      rest
+      (docKept (badL > 0 || Commands.anyErrors cs) (Driver.lastChecked cs) acc)
+
+-- (a page written, its directory made first)
+docPageWritten : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> {{sys : process <: e}}
+               -> {{disk : filesystem <: e}}
+               -> String
+               -> String
+               -> Co e Unit
+docPageWritten path text = do
+  st <- Commands.styleNow
+  _ <- Files.makeDirectory (HostPath.dirname st path)
+  ok <- Files.writeFile path text
+  if ok then pure MkUnit
+  else do
+    printErr ("heff doc: cannot write " ^ path)
+    exit 1
+
+-- (each module's page, under the directory: one more of the task `w`'s)
+docPagesWritten : {e : HFunctor}
+                -> {{io : stdio <: e}}
+                -> {{sys : process <: e}}
+                -> {{disk : filesystem <: e}}
+                -> {{prog : Progress.progress <: e}}
+                -> Progress.Task
+                -> String
+                -> List Driver.Checked
+                -> Co e Unit
+docPagesWritten w dir Nil = pure MkUnit
+docPagesWritten w dir (Cons c rest) = do
+  st <- Commands.styleNow
+  docPageWritten
+      (HostPath.join st dir (pagePath c.module))
+      (page c)
+  Progress.complete w
+  docPagesWritten w dir rest
+
+-- (the pages: printed one after another, or written under the directory,
+-- with their index)
+docWritten : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Maybe String
+           -> List Driver.Checked
+           -> Co e Unit
+docWritten Nothing cs = write (joinWith "\n" (List.map page cs))
+docWritten (Just dir) cs = do
+  st <- Commands.styleNow
+  w <- Progress.start Progress.root "writing pages" (List.length cs + 1)
+  docPagesWritten w dir cs
+  docPageWritten (HostPath.join st dir "index.md") (indexPage cs)
+  Progress.end w
+  print
+      ("heff doc: "
+       ^ show (List.length cs)
+       ^ " pages and their index, in "
+       ^ dir)
+
+-- | `heff doc`: a reference page of each module of the files (a
+-- | directory's `.hf` files), else of the project's here (`src/`): its
+-- | header comment, and each definition it exposes, its signature and
+-- | its doc comment; printed, or with `--out DIR`, each written under
+-- | DIR (`std.path` at DIR/std/path.md), with an index of them.  A module
+-- | that does not check has no page, and its errors are said
+docCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{rep : Report.report <: e}}
+       -> {{prog : Progress.progress <: e}}
+       -> Maybe String
+       -> List String
+       -> Co e Unit
+docCmd out given = do
+  files <- docFiles given
+  chk <- Progress.start Progress.root "checking modules" (List.length files)
+  cs <- docChecked chk files Nil
+  Progress.end chk
+  docWritten out cs
+  if List.length cs < List.length files then exit 1 else pure MkUnit

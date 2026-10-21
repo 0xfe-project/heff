@@ -9,7 +9,7 @@ compiler as a library, in a directory each by what they are for:
 - `elab/` elaborates it;
 - `compile/` erases, lowers and emits JavaScript and C;
 - `build/` loads a project, keeps the cache and does each command's
-  work (`heff.build.commands`);
+  work (`heff.build.commands` and the modules beside it);
 - `lsp/` is the language server and how diagnostics and test reports
   are shown;
 - `util/` holds what is of no one of them.
