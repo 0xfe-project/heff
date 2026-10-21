@@ -14,25 +14,7 @@ module heff.compile.early
 
 import heff.compile.ir as IR
 import heff.compile.repr as Repr
-
--- | computations drawing fresh names
-type S a = Int -> Pair a Int
-
-bindTake : {a b : Type} -> (a -> S b) -> Pair a Int -> Pair b Int
-bindTake f (MkPair x n) = f x n
-
--- `do` is this
-bind : {a b : Type} -> S a -> (a -> S b) -> S b
-bind m f = \n -> bindTake f (m n)
-
-pure : {a : Type} -> a -> S a
-pure x = \n -> MkPair x n
-
-instance instanceMonadS : Monad S
-instanceMonadS = { pure = pure, bind = bind }
-
-traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
-traverseS = traverse (mo := instanceMonadS)
+import heff.compile.supply
 
 elemE : String -> List String -> Bool
 elemE x Nil = False
@@ -54,18 +36,7 @@ numberTy t = not (Repr.isBoxed (Repr.flatOf t))
 -- `lams`)
 pushKids : Bool -> IR.Expr -> List IR.Expr -> List IR.Expr
 pushKids lams (ELam _ b) rest = if lams then Cons b rest else rest
-pushKids lams (EApp f args) rest = Cons f (IR.appendI args rest)
-pushKids lams (ELet _ a b) rest = Cons a (Cons b rest)
-pushKids lams (ERecord fs _) rest = IR.pushFields fs rest
-pushKids lams (EProj e _ _ _) rest = Cons e rest
-pushKids lams (ETag _ args _) rest = IR.appendI args rest
-pushKids lams (EMatch s arms) rest = Cons s (IR.pushArms arms rest)
-pushKids lams (EPrimCall _ args) rest = IR.appendI args rest
-pushKids lams (ECall _ args) rest = IR.appendI args rest
-pushKids lams (EBool c) rest = IR.condOnto c rest
-pushKids lams (ESet _ a b) rest = Cons a (Cons b rest)
-pushKids lams (EValues es) rest = IR.appendI es rest
-pushKids lams _ rest = rest
+pushKids lams e rest = IR.partsOnto e rest
 
 isCall : IR.Expr -> Bool
 isCall (EApp _ _) = True
@@ -192,6 +163,7 @@ earlyAt (Cons e es) v l =
 
 -- (... those not of the variables bound again)
 unbound : List String -> List Early -> List Early
+unbound Nil es = es
 unbound xs es = List.keepIf (\(e : Early) -> not (elemE e.r.v xs)) es
 
 projRead : List Early
@@ -205,26 +177,9 @@ projRead es (EVar v) l sh t = case earlyAt es v l of
   Nothing -> EProj (EVar v) l sh t
 projRead es e l sh t = EProj e l sh t
 
--- (an arm, its reads made early but of the variables it binds)
-armRead : (List Early -> IR.Expr -> IR.Expr) -> List Early -> IR.Arm -> IR.Arm
-armRead go es (MkArm t vs b) = MkArm t vs (go (unbound vs es) b)
-
 readGo : List Early -> IR.Expr -> IR.Expr
 readGo es (EProj e l sh t) = projRead es (readGo es e) l sh t
-readGo es (ELam xs b) = ELam xs (readGo (unbound xs es) b)
-readGo es (EApp f args) = EApp (readGo es f) (List.map (readGo es) args)
-readGo es (ELet x a b) = ELet x (readGo es a) (readGo (unbound [x] es) b)
-readGo es (ERecord fs ts) =
-  ERecord (List.map (\p -> MkPair (fst p) (readGo es (snd p))) fs) ts
-readGo es (ETag t args ts) = ETag t (List.map (readGo es) args) ts
-readGo es (EMatch s arms) =
-  EMatch (readGo es s) (List.map (armRead readGo es) arms)
-readGo es (EPrimCall p args) = EPrimCall p (List.map (readGo es) args)
-readGo es (ECall g args) = ECall g (List.map (readGo es) args)
-readGo es (EBool c) = EBool (IR.condMap (readGo es) c)
-readGo es (ESet xs a b) = ESet xs (readGo es a) (readGo (unbound xs es) b)
-readGo es (EValues vs) = EValues (List.map (readGo es) vs)
-readGo es e = e
+readGo es e = IR.mapParts (\xs p -> readGo (unbound xs es) p) e
 
 -- | the reads made early, each the variable it is bound to
 readIn : List Early -> IR.Expr -> IR.Expr
@@ -297,7 +252,13 @@ atMatch before s arms = do
   pure
       (letsEarly
          es
-         (letsOf before (EMatch s (List.map (armRead readIn es) arms))))
+         (letsOf
+            before
+            (EMatch
+               s
+               (List.map
+                  (IR.mapArm (\xs b -> readIn (unbound xs es) b))
+                  arms))))
 
 -- (the spine cut at its first call: the bindings before it, from it on,
 -- and what it comes to)
@@ -326,59 +287,13 @@ readEarly e = case spineOf e of
 -- there, its spine to be cut)
 type Walk = Bool -> IR.Expr -> S IR.Expr
 
-armWith : Walk -> IR.Arm -> S IR.Arm
-armWith go (MkArm t vs b) = do
-  b2 <- go True b
-  pure (MkArm t vs b2)
-
-fieldWith : Walk -> Pair String IR.Expr -> S (Pair String IR.Expr)
-fieldWith go (MkPair l e) = do
-  e2 <- go True e
-  pure (MkPair l e2)
-
 -- (what is in an expression walked: a binding's body on in its spine)
 kidsWith : Walk -> IR.Expr -> S IR.Expr
-kidsWith go (ELam xs b) = do
-  b2 <- go True b
-  pure (ELam xs b2)
-kidsWith go (EApp f args) = do
-  f2 <- go True f
-  as2 <- traverseS (go True) args
-  pure (EApp f2 as2)
 kidsWith go (ELet x a b) = do
   a2 <- go True a
   b2 <- go False b
   pure (ELet x a2 b2)
-kidsWith go (ERecord fs ts) = do
-  fs2 <- traverseS (fieldWith go) fs
-  pure (ERecord fs2 ts)
-kidsWith go (EProj e l sh t) = do
-  e2 <- go True e
-  pure (EProj e2 l sh t)
-kidsWith go (ETag t args ts) = do
-  as2 <- traverseS (go True) args
-  pure (ETag t as2 ts)
-kidsWith go (EMatch s arms) = do
-  s2 <- go True s
-  arms2 <- traverseS (armWith go) arms
-  pure (EMatch s2 arms2)
-kidsWith go (EPrimCall p args) = do
-  as2 <- traverseS (go True) args
-  pure (EPrimCall p as2)
-kidsWith go (ECall g args) = do
-  as2 <- traverseS (go True) args
-  pure (ECall g as2)
-kidsWith go (ESet xs a b) = do
-  a2 <- go True a
-  b2 <- go True b
-  pure (ESet xs a2 b2)
-kidsWith go (EValues es) = do
-  es2 <- traverseS (go True) es
-  pure (EValues es2)
-kidsWith go (EBool c) = do
-  c2 <- IR.condTraverse (mo := instanceMonadS) (go True) c
-  pure (EBool c2)
-kidsWith go e = pure e
+kidsWith go e = IR.traverseParts (\_ p -> go True p) e
 
 -- (a body's spine: bindings, or a match)
 spined : IR.Expr -> Bool

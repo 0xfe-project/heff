@@ -34,30 +34,9 @@ module heff.compile.cpr
 
 import heff.compile.ir as IR
 import heff.compile.repr as Repr
+import heff.compile.supply
 import heff.elab.fixed as Fixed
 import std.ordmap as OrdMap
-
--- | computations drawing fresh names
-type S a = Int -> Pair a Int
-
-bindTake : {a b : Type} -> (a -> S b) -> Pair a Int -> Pair b Int
-bindTake f (MkPair x n) = f x n
-
--- `do` is this
-bind : {a b : Type} -> S a -> (a -> S b) -> S b
-bind m f = \n -> bindTake f (m n)
-
-pure : {a : Type} -> a -> S a
-pure x = \n -> MkPair x n
-
-instance instanceMonadS : Monad S
-instanceMonadS = { pure = pure, bind = bind }
-
-traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
-traverseS = traverse (mo := instanceMonadS)
-
-freshS : String -> S String
-freshS base = \n -> IR.fresh base n
 
 sameLabels : List String -> List String -> Bool
 sameLabels Nil Nil = True
@@ -453,22 +432,7 @@ apartW lay x n (Cons (EMatch s arms) rest) =
     (Cons s (IR.pushArms arms rest))
 apartW lay x n (Cons (EProj e _ _ _) rest) =
   apartW lay x (if isVar x e && lay.record then n + 1 else n) (Cons e rest)
-apartW lay x n (Cons (ELam _ b) rest) = apartW lay x n (Cons b rest)
-apartW lay x n (Cons (EApp f args) rest) =
-  apartW lay x n (Cons f (IR.appendI args rest))
-apartW lay x n (Cons (ELet _ a b) rest) = apartW lay x n (Cons a (Cons b rest))
-apartW lay x n (Cons (ERecord fs _) rest) =
-  apartW lay x n (IR.pushFields fs rest)
-apartW lay x n (Cons (ETag _ args _) rest) =
-  apartW lay x n (IR.appendI args rest)
-apartW lay x n (Cons (EPrimCall _ args) rest) =
-  apartW lay x n (IR.appendI args rest)
-apartW lay x n (Cons (ECall _ args) rest) =
-  apartW lay x n (IR.appendI args rest)
-apartW lay x n (Cons (EBool c) rest) = apartW lay x n (IR.condOnto c rest)
-apartW lay x n (Cons (ESet _ a b) rest) = apartW lay x n (Cons a (Cons b rest))
-apartW lay x n (Cons (EValues es) rest) = apartW lay x n (IR.appendI es rest)
-apartW lay x n (Cons _ rest) = apartW lay x n rest
+apartW lay x n (Cons e rest) = apartW lay x n (IR.partsOnto e rest)
 
 -- | `x`, bound to what a function of the layout gives back, is only
 -- | taken apart in `b`
@@ -503,19 +467,7 @@ sitesW k acc (Cons (ELet x a b) rest) =
   sitesW k (siteLet k acc x a b) (Cons a (Cons b rest))
 sitesW k acc (Cons (EMatch s arms) rest) =
   sitesW k (siteMatch k acc s arms) (Cons s (IR.pushArms arms rest))
-sitesW k acc (Cons (ELam _ b) rest) = sitesW k acc (Cons b rest)
-sitesW k acc (Cons (EApp f args) rest) =
-  sitesW k acc (Cons f (IR.appendI args rest))
-sitesW k acc (Cons (ERecord fs _) rest) = sitesW k acc (IR.pushFields fs rest)
-sitesW k acc (Cons (EProj e _ _ _) rest) = sitesW k acc (Cons e rest)
-sitesW k acc (Cons (ETag _ args _) rest) = sitesW k acc (IR.appendI args rest)
-sitesW k acc (Cons (EPrimCall _ args) rest) =
-  sitesW k acc (IR.appendI args rest)
-sitesW k acc (Cons (ECall _ args) rest) = sitesW k acc (IR.appendI args rest)
-sitesW k acc (Cons (EBool c) rest) = sitesW k acc (IR.condOnto c rest)
-sitesW k acc (Cons (ESet _ a b) rest) = sitesW k acc (Cons a (Cons b rest))
-sitesW k acc (Cons (EValues es) rest) = sitesW k acc (IR.appendI es rest)
-sitesW k acc (Cons _ rest) = sitesW k acc rest
+sitesW k acc (Cons e rest) = sitesW k acc (IR.partsOnto e rest)
 
 sitedIn : OrdMap.OrdMap String Unit -> Know -> Know
 sitedIn groups k =
@@ -582,36 +534,18 @@ dispatch : Layout -> List String -> List IR.Arm -> IR.Expr
 dispatch lay vs arms =
   chosen vs (\c -> armBodyAs lay vs c (armOf c.tag arms)) lay.cons
 
-apartArm : (IR.Expr -> IR.Expr) -> IR.Arm -> IR.Arm
-apartArm go (MkArm t ws b) = MkArm t ws (go b)
-
 -- | `x`, what a worker gave back (`vs`), taken apart in what follows: a
 -- | match on it chooses by the tuple's number, a field of it read is the
 -- | variable of its place
 apart : Layout -> String -> List String -> IR.Expr -> IR.Expr
 apart lay x vs (EMatch s arms) =
-  if isVar x s then dispatch lay vs (List.map (apartArm (apart lay x vs)) arms)
-  else EMatch (apart lay x vs s) (List.map (apartArm (apart lay x vs)) arms)
+  if isVar x s
+  then dispatch lay vs (List.map (IR.mapArm (\_ b -> apart lay x vs b)) arms)
+  else IR.mapParts (\_ p -> apart lay x vs p) (EMatch s arms)
 apart lay x vs (EProj e l sh t) =
   if isVar x e then EVar (placeVar lay vs (labelAt l 0 lay.labels))
   else EProj (apart lay x vs e) l sh t
-apart lay x vs (ELam ys b) = ELam ys (apart lay x vs b)
-apart lay x vs (EApp f args) =
-  EApp (apart lay x vs f) (List.map (apart lay x vs) args)
-apart lay x vs (ELet y a b) = ELet y (apart lay x vs a) (apart lay x vs b)
-apart lay x vs (ERecord fs ts) =
-  ERecord
-    (List.map
-       (\(p : Pair String IR.Expr) -> MkPair (fst p) (apart lay x vs (snd p)))
-       fs)
-    ts
-apart lay x vs (ETag t args ts) = ETag t (List.map (apart lay x vs) args) ts
-apart lay x vs (EPrimCall p args) = EPrimCall p (List.map (apart lay x vs) args)
-apart lay x vs (ECall g args) = ECall g (List.map (apart lay x vs) args)
-apart lay x vs (EBool c) = EBool (IR.condMap (apart lay x vs) c)
-apart lay x vs (ESet ys a b) = ESet ys (apart lay x vs a) (apart lay x vs b)
-apart lay x vs (EValues es) = EValues (List.map (apart lay x vs) es)
-apart lay x vs e = e
+apart lay x vs e = IR.mapParts (\_ p -> apart lay x vs p) e
 
 -- Calls of workers
 --------------------------------------------------------------------------------
@@ -661,62 +595,16 @@ matchRw : Know -> IR.Expr -> List IR.Arm -> S IR.Expr
 matchRw k (ECall g args) arms = matchCallIn g args arms (OrdMap.lookup k g)
 matchRw k s arms = pure (EMatch s arms)
 
-armS : (IR.Expr -> S IR.Expr) -> IR.Arm -> S IR.Arm
-armS go (MkArm t ws b) = do
-  b2 <- go b
-  pure (MkArm t ws b2)
-
-fieldS : (IR.Expr -> S IR.Expr)
-       -> Pair String IR.Expr
-       -> S (Pair String IR.Expr)
-fieldS go (MkPair l e) = do
-  e2 <- go e
-  pure (MkPair l e2)
+-- (a node, its parts rewritten: a binding of a call, a match on one)
+rwNode : Know -> IR.Expr -> S IR.Expr
+rwNode k (ELet x a b) = letRw k x a b
+rwNode k (EMatch s arms) = matchRw k s arms
+rwNode k e = pure e
 
 -- | an expression, each call whose value is taken apart at once calling
 -- | the worker
 rw : Know -> IR.Expr -> S IR.Expr
-rw k (ELam xs b) = do
-  b2 <- rw k b
-  pure (ELam xs b2)
-rw k (EApp f args) = do
-  f2 <- rw k f
-  as2 <- traverseS (rw k) args
-  pure (EApp f2 as2)
-rw k (ELet x a b) = do
-  a2 <- rw k a
-  b2 <- rw k b
-  letRw k x a2 b2
-rw k (EMatch s arms) = do
-  s2 <- rw k s
-  arms2 <- traverseS (armS (rw k)) arms
-  matchRw k s2 arms2
-rw k (ERecord fs ts) = do
-  fs2 <- traverseS (fieldS (rw k)) fs
-  pure (ERecord fs2 ts)
-rw k (EProj e l sh t) = do
-  e2 <- rw k e
-  pure (EProj e2 l sh t)
-rw k (ETag t args ts) = do
-  as2 <- traverseS (rw k) args
-  pure (ETag t as2 ts)
-rw k (EPrimCall p args) = do
-  as2 <- traverseS (rw k) args
-  pure (EPrimCall p as2)
-rw k (ECall g args) = do
-  as2 <- traverseS (rw k) args
-  pure (ECall g as2)
-rw k (ESet xs a b) = do
-  a2 <- rw k a
-  b2 <- rw k b
-  pure (ESet xs a2 b2)
-rw k (EValues es) = do
-  es2 <- traverseS (rw k) es
-  pure (EValues es2)
-rw k (EBool c) = do
-  c2 <- IR.condTraverse (mo := instanceMonadS) (rw k) c
-  pure (EBool c2)
-rw k e = pure e
+rw k e = bind (IR.traverseParts (\_ p -> rw k p) e) (rwNode k)
 
 -- Workers and wrappers
 --------------------------------------------------------------------------------
@@ -794,7 +682,7 @@ outRw lay (ESet xs a b) = do
   b2 <- outRw lay b
   pure (ESet xs a b2)
 outRw lay (EMatch s arms) = do
-  arms2 <- traverseS (armS (outRw lay)) arms
+  arms2 <- traverseS (IR.traverseArm (\_ b -> outRw lay b)) arms
   pure (EMatch s arms2)
 outRw lay (ETag t args _) = builtOut lay (conOf lay t) args
 outRw lay (ERecord fs _) = builtOut lay (conOf lay "") (List.map snd fs)
