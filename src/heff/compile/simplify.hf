@@ -48,12 +48,14 @@ type KeptMade =
   { body : Unit -> Maybe IR.Expr, touched : List (Pair String String) }
 
 -- | a copy asked for, as the cache keeps it: its version (`copyVer`),
--- | what it is known by (`knowing`, read when it is wanted), how deep in
--- | copies of copies it is, whether it is safe (`markCopySafe`) -- and
--- | what it was made to, if it was
+-- | what it is known by (`knowing`, read when it is wanted), the copies
+-- | that calls, each by its name and version, how deep in copies of
+-- | copies it is, whether it is safe (`markCopySafe`) -- and what it was
+-- | made to, if it was
 type KeptCopy =
   { ver : String
   , recipe : Unit -> Maybe IR.Expr
+  , asks : List (Pair String String)
   , depth : Int
   , safe : Bool
   , made : Maybe KeptMade
@@ -2571,38 +2573,77 @@ markSafeAs : Bool -> String -> M Unit
 markSafeAs True h = \s -> MkPair MkUnit (withSafe h (withBase h s))
 markSafeAs False h = pure MkUnit
 
-askKept : String -> KeptCopy -> Maybe IR.Expr -> M Bool
-askKept h kc (Just b) = do
+-- (the copies asked for, each by what it is known by, changed by `f`)
+recipesWith : (Map.Map String IR.Expr -> Map.Map String IR.Expr) -> M Unit
+recipesWith f = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = s.sp.all
+         , kinds = s.sp.kinds
+         , recipes = f s.sp.recipes
+         , depths = s.sp.depths
+         , made = s.sp.made
+         , count = s.sp.count
+         , off = s.sp.off
+         }
+         s)
+
+askedAs : String -> KeptCopy -> IR.Expr -> Bool -> M Bool
+askedAs h kc b True = do
   b1 <- copy b
   u <- askedFor h b1 kc.depth
   u2 <- markSafeAs kc.safe h
   pure True
-askKept h kc Nothing = pure False
+askedAs h kc b False = do
+  u <- recipesWith (\m -> Map.delete m h)
+  pure False
 
--- | the copy `h` asked for as the cache keeps it, if it does
-fromKept : String -> M Bool
-fromKept h = do
+-- (the copies its recipe calls asked for first, by `more`: a recipe
+-- calls copies asked for before it, maybe as another definition was
+-- made, which the cache may no longer keep.  Meanwhile `h` is held as
+-- asked for, so that none of them asks for it again; then asked for,
+-- or not if they could not be)
+askKept : (List (Pair String String) -> M Bool)
+        -> String
+        -> KeptCopy
+        -> Maybe IR.Expr
+        -> M Bool
+askKept more h kc (Just b) = do
+  u <- recipesWith (\m -> Map.insert m h b)
+  ok <- more kc.asks
+  askedAs h kc b ok
+askKept more h kc Nothing = pure False
+
+-- | the copy `h` asked for as the cache keeps it, if it does, and the
+-- | copies its recipe calls (by `more`)
+keptBy : (List (Pair String String) -> M Bool) -> String -> M Bool
+keptBy more h = do
   s <- get
   case keptAt s h of
-    Just kc -> askKept h kc (kc.recipe MkUnit)
+    Just kc -> askKept more h kc (kc.recipe MkUnit)
     Nothing -> pure False
 
 -- | the copy `h`, of version `v`, asked for if it is not yet: as the
 -- | cache keeps it (`False`: it does not)
-keptAsk : String -> String -> M Bool
-keptAsk h v = do
+keptAsk : (List (Pair String String) -> M Bool) -> String -> String -> M Bool
+keptAsk more h v = do
   s <- get
   if Map.member s.sp.recipes h then pure True
   else do
     u <- keepWith (verTo h v)
-    fromKept h
+    keptBy more h
 
 -- | ... each
 allAsked : List (Pair String String) -> M Bool
 allAsked Nil = pure True
 allAsked (Cons (MkPair h v) rest) = do
-  ok <- keptAsk h v
+  ok <- keptAsk allAsked h v
   if ok then allAsked rest else pure False
+
+-- | the copy `h` asked for as the cache keeps it, if it does
+fromKept : String -> M Bool
+fromKept h = keptBy allAsked h
 
 madeKept : KeptMade -> Maybe IR.Expr -> M (Maybe IR.Expr)
 madeKept km (Just b) = do
@@ -4101,12 +4142,14 @@ oneItem (Fresh d) = oneDef d
 oneItem (Kept k redo) = oneKept k redo
 
 -- | a copy asked for or made here, as the cache is to keep it: its
--- | version, what it is known by, how deep, whether safe, and what it was
--- | made to, with the copies it asked for as it was, if it was made here
+-- | version, what it is known by, the copies that calls (with their
+-- | versions), how deep, whether safe, and what it was made to, with the
+-- | copies it asked for as it was, if it was made here
 type CopyDone =
   { name : String
   , ver : String
   , recipe : IR.Expr
+  , asks : List (Pair String String)
   , depth : Int
   , safe : Bool
   , made : Maybe (Pair IR.Expr (List (Pair String String)))
@@ -4138,6 +4181,17 @@ madeOf st bodies h = case Map.lookup st.kp.madeFresh h of
   Just t -> madeWith (touchedVers st.kp.vers t) (Map.lookup bodies h)
   Nothing -> Nothing
 
+-- (the copies the recipe `r` of `h` calls, each once, with its version)
+recipeAsks : St -> String -> IR.Expr -> List (Pair String String)
+recipeAsks st h r =
+  touchedVers
+    st.kp.vers
+    (List.reverse
+       (List.keepIf
+          (\x -> not (strEq x h) && Map.member st.sp.recipes x)
+          (IR.globalsIn r)))
+
+-- (kept if it has a version, and so has each copy its recipe calls)
 copyWith : St
          -> Map.Map String IR.Expr
          -> String
@@ -4145,11 +4199,12 @@ copyWith : St
          -> IR.Expr
          -> Maybe CopyDone
 copyWith st bodies h v r =
-  if strEq v "" then Nothing
+  if strEq v "" || not (allVersKnown (recipeAsks st h r)) then Nothing
   else Just
       { name = h
       , ver = v
       , recipe = r
+      , asks = recipeAsks st h r
       , depth = fromMaybe 0 (Map.lookup st.sp.depths h)
       , safe = Map.member st.base h
       , made = madeOf st bodies h
