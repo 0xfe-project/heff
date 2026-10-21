@@ -4,6 +4,7 @@
 
 module heff.compile.ir
 
+import heff.compile.supply
 import heff.elab.fixed
 import std.ordmap as OrdMap
 
@@ -224,7 +225,7 @@ mkDef key name body = { key = key, name = name, body = body }
 type Supply = Int
 
 fresh : String -> Supply -> Pair String Supply
-fresh base n = MkPair (base ^ "$" ^ show n) (n + 1)
+fresh base n = freshS base n
 
 baseGo : String -> Int -> String
 baseGo x i =
@@ -247,6 +248,145 @@ concatMapI f (Cons x xs) = appendI (f x) (concatMapI f xs)
 nubI : List String -> List String
 nubI Nil = Nil
 nubI (Cons x xs) = Cons x (nubI (List.keepIf (\y -> not (strEq y x)) xs))
+
+-- One level
+--------------------------------------------------------------------------------
+
+-- A pass walks an expression by these: it writes an equation for each
+-- node it changes or looks into, and leaves the others to `mapParts`
+-- (`traverseParts`, drawing fresh names) with its own walk, or, folding,
+-- to `partsOnto` -- so a node `Expr` gains is walked by every pass that
+-- does not ask for it.  Each part is given with the names the node binds
+-- around it: a lambda's parameters for its body, a binding's name for
+-- what follows it, an arm's variables for its body, an `ESet`'s for what
+-- follows it, an `EFix`'s name for its body; none for any other: a pass
+-- that keeps something of a variable forgets it there.
+--
+-- The walks after these -- freshening, substitution, occurrences, size
+-- -- are written out in full: the simplifier runs them for each copy it
+-- weighs, and through these, a closure called at each node and no cell
+-- of the worklist used again, the compiler compiling itself took a
+-- twentieth more instructions.
+
+pairSndI : Pair String Expr -> Expr
+pairSndI (MkPair _ e2) = e2
+
+-- (worklists: an expression's parts before the rest -- a walk that
+-- needs no list of its own for each node)
+pushArms : List Arm -> List Expr -> List Expr
+pushArms Nil rest = rest
+pushArms (Cons a args) rest = Cons (armBody a) (pushArms args rest)
+
+pushFields : List (Pair String Expr) -> List Expr -> List Expr
+pushFields Nil rest = rest
+pushFields (Cons p fs) rest = Cons (pairSndI p) (pushFields fs rest)
+
+-- | an expression's parts onto the worklist, before the rest, in the
+-- | order they are written: what a fold walks below a node
+-- | >>> partsOnto (ELet "x" (EInt 1) (EVar "x")) [EInt 2]
+-- | [EInt 1, EVar "x", EInt 2]
+partsOnto : Expr -> List Expr -> List Expr
+partsOnto (ELam _ b) rest = Cons b rest
+partsOnto (EApp f args) rest = Cons f (appendI args rest)
+partsOnto (ELet _ a b) rest = Cons a (Cons b rest)
+partsOnto (ERecord fs _) rest = pushFields fs rest
+partsOnto (EProj e _ _ _) rest = Cons e rest
+partsOnto (ETag _ args _) rest = appendI args rest
+partsOnto (EMatch s arms) rest = Cons s (pushArms arms rest)
+partsOnto (EPrimCall _ args) rest = appendI args rest
+partsOnto (ECall _ args) rest = appendI args rest
+partsOnto (EBool c) rest = condOnto c rest
+partsOnto (ESet _ a b) rest = Cons a (Cons b rest)
+partsOnto (EValues es) rest = appendI es rest
+partsOnto (EFix _ b) rest = Cons b rest
+partsOnto _ rest = rest
+
+-- | what a pass does to a part of a node: given the names the node binds
+-- | around it
+type Part r = List String -> Expr -> r
+
+mapArm : Part Expr -> Arm -> Arm
+mapArm f (MkArm t vs b) = MkArm t vs (f vs b)
+
+mapField : Part Expr -> Pair String Expr -> Pair String Expr
+mapField f (MkPair l e) = MkPair l (f Nil e)
+
+-- | each part of a node by `f` (a pass's own walk): one level, the node
+-- | kept
+-- | >>> mapParts (\xs e -> if List.null xs then EInt 0 else e) (ELet "x" (EVar "y") (EVar "x"))
+-- | ELet "x" (EInt 0) (EVar "x")
+mapParts : Part Expr -> Expr -> Expr
+mapParts f (ELam xs b) = ELam xs (f xs b)
+mapParts f (EApp g args) = EApp (f Nil g) (List.map (f Nil) args)
+mapParts f (ELet x a b) = ELet x (f Nil a) (f (Cons x Nil) b)
+mapParts f (ERecord fs ts) = ERecord (List.map (mapField f) fs) ts
+mapParts f (EProj e l sh t) = EProj (f Nil e) l sh t
+mapParts f (ETag t args ts) = ETag t (List.map (f Nil) args) ts
+mapParts f (EMatch s arms) = EMatch (f Nil s) (List.map (mapArm f) arms)
+mapParts f (EPrimCall p args) = EPrimCall p (List.map (f Nil) args)
+mapParts f (ECall g args) = ECall g (List.map (f Nil) args)
+mapParts f (EBool c) = EBool (condMap (f Nil) c)
+mapParts f (ESet xs a b) = ESet xs (f Nil a) (f xs b)
+mapParts f (EValues es) = EValues (List.map (f Nil) es)
+mapParts f (EFix x b) = EFix x (f (Cons x Nil) b)
+mapParts f e = e
+
+traverseArm : Part (S Expr) -> Arm -> S Arm
+traverseArm f (MkArm t vs b) = do
+  b2 <- f vs b
+  pure (MkArm t vs b2)
+
+traverseField : Part (S Expr) -> Pair String Expr -> S (Pair String Expr)
+traverseField f (MkPair l e) = do
+  e2 <- f Nil e
+  pure (MkPair l e2)
+
+-- | ... drawing fresh names: the parts in the order they are written
+traverseParts : Part (S Expr) -> Expr -> S Expr
+traverseParts f (ELam xs b) = do
+  b2 <- f xs b
+  pure (ELam xs b2)
+traverseParts f (EApp g args) = do
+  g2 <- f Nil g
+  args2 <- traverseS (f Nil) args
+  pure (EApp g2 args2)
+traverseParts f (ELet x a b) = do
+  a2 <- f Nil a
+  b2 <- f (Cons x Nil) b
+  pure (ELet x a2 b2)
+traverseParts f (ERecord fs ts) = do
+  fs2 <- traverseS (traverseField f) fs
+  pure (ERecord fs2 ts)
+traverseParts f (EProj e l sh t) = do
+  e2 <- f Nil e
+  pure (EProj e2 l sh t)
+traverseParts f (ETag t args ts) = do
+  args2 <- traverseS (f Nil) args
+  pure (ETag t args2 ts)
+traverseParts f (EMatch s arms) = do
+  s2 <- f Nil s
+  arms2 <- traverseS (traverseArm f) arms
+  pure (EMatch s2 arms2)
+traverseParts f (EPrimCall p args) = do
+  args2 <- traverseS (f Nil) args
+  pure (EPrimCall p args2)
+traverseParts f (ECall g args) = do
+  args2 <- traverseS (f Nil) args
+  pure (ECall g args2)
+traverseParts f (EBool c) = do
+  c2 <- condTraverse (mo := instanceMonadS) (f Nil) c
+  pure (EBool c2)
+traverseParts f (ESet xs a b) = do
+  a2 <- f Nil a
+  b2 <- f xs b
+  pure (ESet xs a2 b2)
+traverseParts f (EValues es) = do
+  es2 <- traverseS (f Nil) es
+  pure (EValues es2)
+traverseParts f (EFix x b) = do
+  b2 <- f (Cons x Nil) b
+  pure (EFix x b2)
+traverseParts f e = pure e
 
 -- Freshening (a copy with every binder renamed afresh)
 --------------------------------------------------------------------------------
@@ -410,20 +550,7 @@ subst m e = if OrdMap.size m == 0 then e else substGo m e
 -- Occurrences, size, globals, values
 --------------------------------------------------------------------------------
 
-pairSndI : Pair String Expr -> Expr
-pairSndI (MkPair _ e2) = e2
-
 type Occ = { count : Int, underLam : Bool }
-
--- (worklists: an expression's parts before the rest -- a walk that
--- needs no list of its own for each node)
-pushArms : List Arm -> List Expr -> List Expr
-pushArms Nil rest = rest
-pushArms (Cons a args) rest = Cons (armBody a) (pushArms args rest)
-
-pushFields : List (Pair String Expr) -> List Expr -> List Expr
-pushFields Nil rest = rest
-pushFields (Cons p fs) rest = Cons (pairSndI p) (pushFields fs rest)
 
 -- (how often `x` occurs in the worklist, `n` counted so far)
 countW : String -> Int -> List Expr -> Int
@@ -469,23 +596,6 @@ lamW x (Cons _ rest) = lamW x rest
 occurrences : String -> Expr -> Occ
 occurrences x e =
   { count = countW x 0 (Cons e Nil), underLam = lamW x (Cons e Nil) }
-
--- | an expression's parts onto the worklist, before the rest: what
--- | `size` counts below a node
-partsOnto : Expr -> List Expr -> List Expr
-partsOnto (ELam _ b) rest = Cons b rest
-partsOnto (EApp f args) rest = Cons f (appendI args rest)
-partsOnto (ELet _ a b) rest = Cons a (Cons b rest)
-partsOnto (ERecord fs _) rest = pushFields fs rest
-partsOnto (EProj e _ _ _) rest = Cons e rest
-partsOnto (ETag _ args _) rest = appendI args rest
-partsOnto (EMatch s arms) rest = Cons s (pushArms arms rest)
-partsOnto (EPrimCall _ args) rest = appendI args rest
-partsOnto (ECall _ args) rest = appendI args rest
-partsOnto (EBool c) rest = condOnto c rest
-partsOnto (ESet _ a b) rest = Cons a (Cons b rest)
-partsOnto (EValues es) rest = appendI es rest
-partsOnto _ rest = rest
 
 -- (the nodes in the worklist, `n` counted so far)
 sizeW : Int -> List Expr -> Int
