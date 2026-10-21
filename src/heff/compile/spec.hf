@@ -10,42 +10,22 @@ import heff.elab.fixed as Fixed
 import heff.compile.ir as IR
 import std.ordmap as OrdMap
 
-elemS : String -> List String -> Bool
-elemS x Nil = False
-elemS x (Cons y ys) = strEq x y || elemS x ys
-
-appendS : {a : Type} -> List a -> List a -> List a
-appendS Nil ys = ys
-appendS (Cons x xs) ys = Cons x (appendS xs ys)
-
-allS : {a : Type} -> (a -> Bool) -> List a -> Bool
-allS p Nil = True
-allS p (Cons x xs) = p x && allS p xs
-
 -- (an arm's body, its variables bound)
 armClosed : (List String -> IR.Expr -> Bool) -> List String -> IR.Arm -> Bool
-armClosed go env (MkArm _ vs b) = go (appendS vs env) b
+armClosed go env (MkArm _ vs b) = go (List.append vs env) b
 
 -- | whether every variable it mentions is bound in it or in `env`
 -- | >>> closedIn Nil (ELam ["x"] (EVar "y"))
 -- | False
 closedIn : List String -> IR.Expr -> Bool
-closedIn env (EVar x) = elemS x env
-closedIn env (ELam xs b) = closedIn (appendS xs env) b
-closedIn env (EApp f args) = closedIn env f && allS (closedIn env) args
+closedIn env (EVar x) = List.elemBy strEq x env
+closedIn env (ELam xs b) = closedIn (List.append xs env) b
 closedIn env (ELet x a b) = closedIn env a && closedIn (Cons x env) b
-closedIn env (ERecord fs _) = allS (closedIn env) (List.map snd fs)
-closedIn env (EProj e _ _ _) = closedIn env e
-closedIn env (ETag _ args _) = allS (closedIn env) args
 closedIn env (EMatch s arms) =
-  closedIn env s && allS (armClosed closedIn env) arms
-closedIn env (EPrimCall _ args) = allS (closedIn env) args
-closedIn env (ECall _ args) = allS (closedIn env) args
-closedIn env (EBool c) = allS (closedIn env) (IR.condParts c)
-closedIn env (ESet xs a b) = closedIn env a && closedIn (appendS xs env) b
-closedIn env (EValues es) = allS (closedIn env) es
+  closedIn env s && List.all (armClosed closedIn env) arms
+closedIn env (ESet xs a b) = closedIn env a && closedIn (List.append xs env) b
 closedIn env (EFix _ _) = False
-closedIn env _ = True
+closedIn env e = List.all (closedIn env) (IR.partsOnto e Nil)
 
 -- | whether it computes without calling anything -- primitives, fields,
 -- | tags, matches -- and so is little more than the call of its closure
@@ -56,21 +36,10 @@ closedIn env _ = True
 -- | >>> callsNothing (ELam ["x"] (EApp (EVar "f") [EVar "x"]))
 -- | False
 callsNothing : IR.Expr -> Bool
-callsNothing (ELam _ b) = callsNothing b
-callsNothing (ELet _ a b) = callsNothing a && callsNothing b
-callsNothing (ERecord fs _) = allS callsNothing (List.map snd fs)
-callsNothing (EProj e _ _ _) = callsNothing e
-callsNothing (ETag _ args _) = allS callsNothing args
-callsNothing (EMatch s arms) =
-  callsNothing s && allS callsNothing (List.map IR.armBody arms)
-callsNothing (EPrimCall _ args) = allS callsNothing args
-callsNothing (EBool c) = allS callsNothing (IR.condParts c)
-callsNothing (ESet _ a b) = callsNothing a && callsNothing b
-callsNothing (EValues es) = allS callsNothing es
 callsNothing (EApp _ _) = False
 callsNothing (ECall _ _) = False
 callsNothing (EFix _ _) = False
-callsNothing _ = True
+callsNothing e = List.all callsNothing (IR.partsOnto e Nil)
 
 -- | ... or calls a global once, at its end, given what calls nothing: a
 -- | partial application made a lambda (`\x -> scale t x`), which costs
@@ -81,7 +50,7 @@ callsNothing _ = True
 -- | False
 callsOnce : IR.Expr -> Bool
 callsOnce (ELam _ b) = callsOnce b
-callsOnce (EApp (EGlobal _) args) = allS callsNothing args
+callsOnce (EApp (EGlobal _) args) = List.all callsNothing args
 callsOnce _ = False
 
 posGo : String -> List String -> Int -> Int
@@ -100,7 +69,7 @@ armKey go env (MkArm t vs b) =
   ^ t
   ^ show (List.length vs)
   ^ ":"
-  ^ go (appendS (List.reverse vs) env) b
+  ^ go (List.append (List.reverse vs) env) b
 
 -- (a condition's key, of its expressions' keys)
 condKey : (IR.Expr -> String) -> IR.Cond -> String
@@ -120,7 +89,7 @@ keyGo env (ELam xs b) =
   "L"
   ^ show (List.length xs)
   ^ "("
-  ^ keyGo (appendS (List.reverse xs) env) b
+  ^ keyGo (List.append (List.reverse xs) env) b
   ^ ")"
 keyGo env (EApp f args) =
   "A(" ^ keyGo env f ^ ":" ^ keysBy (keyGo env) args ^ ")"
@@ -162,7 +131,7 @@ keyGo env (ESet xs a b) =
   ^ "("
   ^ keyGo env a
   ^ ":"
-  ^ keyGo (appendS (List.reverse xs) env) b
+  ^ keyGo (List.append (List.reverse xs) env) b
   ^ ")"
 keyGo env (EValues es) = "W(" ^ keysBy (keyGo env) es ^ ")"
 
@@ -499,23 +468,12 @@ headUses go f = go f
 usesOf : String -> IR.Expr -> List Use
 usesOf g (EGlobal h) = if strEq h g then Cons Nothing Nil else Nil
 usesOf g (EApp f args) =
-  appendS
+  List.append
     (callUse g f args)
-    (appendS (headUses (usesOf g) f) (List.concatMap (usesOf g) args))
-usesOf g (ELam _ b) = usesOf g b
-usesOf g (ELet _ a b) = appendS (usesOf g a) (usesOf g b)
-usesOf g (ERecord fs _) = List.concatMap (usesOf g) (List.map snd fs)
-usesOf g (EProj e _ _ _) = usesOf g e
-usesOf g (ETag _ args _) = List.concatMap (usesOf g) args
-usesOf g (EMatch s arms) =
-  appendS (usesOf g s) (List.concatMap (usesOf g) (List.map IR.armBody arms))
-usesOf g (EPrimCall _ args) = List.concatMap (usesOf g) args
-usesOf g (EBool c) = List.concatMap (usesOf g) (IR.condParts c)
-usesOf g (ESet _ a b) = appendS (usesOf g a) (usesOf g b)
-usesOf g (EValues es) = List.concatMap (usesOf g) es
+    (List.append (headUses (usesOf g) f) (List.concatMap (usesOf g) args))
 usesOf g (ECall h args) =
-  appendS (callUse g (EGlobal h) args) (List.concatMap (usesOf g) args)
-usesOf g _ = Nil
+  List.append (callUse g (EGlobal h) args) (List.concatMap (usesOf g) args)
+usesOf g e = List.concatMap (usesOf g) (IR.partsOnto e Nil)
 
 nthS : {a : Type} -> Int -> List a -> Maybe a
 nthS i Nil = Nothing
@@ -532,7 +490,7 @@ handsOn x i Nothing = False
 staticGo : List Use -> List String -> Int -> List Bool
 staticGo uses Nil i = Nil
 staticGo uses (Cons x xs) i =
-  Cons (allS (handsOn x i) uses) (staticGo uses xs (i + 1))
+  Cons (List.all (handsOn x i) uses) (staticGo uses xs (i + 1))
 
 -- | for each parameter of `g` (`\xs -> b`), whether every call of itself
 -- | hands it on as it is: a copy for a known argument there is a copy
@@ -563,14 +521,8 @@ selfArgs : String
          -> List IR.Expr
          -> List IR.Expr
 selfArgs g pre ds (EGlobal k) args =
-  if strEq k g then appendS pre (dropAt ds args) else args
+  if strEq k g then List.append pre (dropAt ds args) else args
 selfArgs g pre ds f args = args
-
-selfField : (IR.Expr -> IR.Expr) -> Pair String IR.Expr -> Pair String IR.Expr
-selfField go (MkPair l v) = MkPair l (go v)
-
-selfArm : (IR.Expr -> IR.Expr) -> IR.Arm -> IR.Arm
-selfArm go (MkArm t vs b) = MkArm t vs (go b)
 
 -- | the calls of `g` as calls of `h`, the marked arguments left out
 -- | and `pre` given first (the literals of a copy's known arguments)
@@ -581,24 +533,7 @@ selfTo g h pre ds (EApp f args) =
   EApp
     (selfHead (selfTo g h pre ds) g h f)
     (List.map (selfTo g h pre ds) (selfArgs g pre ds f args))
-selfTo g h pre ds (ELam xs b) = ELam xs (selfTo g h pre ds b)
-selfTo g h pre ds (ELet x a b) =
-  ELet x (selfTo g h pre ds a) (selfTo g h pre ds b)
-selfTo g h pre ds (ERecord fs ts) =
-  ERecord (List.map (selfField (selfTo g h pre ds)) fs) ts
-selfTo g h pre ds (EProj e l sh t) = EProj (selfTo g h pre ds e) l sh t
-selfTo g h pre ds (ETag t args ts) =
-  ETag t (List.map (selfTo g h pre ds) args) ts
-selfTo g h pre ds (EMatch s arms) =
-  EMatch (selfTo g h pre ds s) (List.map (selfArm (selfTo g h pre ds)) arms)
-selfTo g h pre ds (EPrimCall p args) =
-  EPrimCall p (List.map (selfTo g h pre ds) args)
-selfTo g h pre ds (ECall k args) = ECall k (List.map (selfTo g h pre ds) args)
-selfTo g h pre ds (EBool c) = EBool (IR.condMap (selfTo g h pre ds) c)
-selfTo g h pre ds (ESet xs a b) =
-  ESet xs (selfTo g h pre ds a) (selfTo g h pre ds b)
-selfTo g h pre ds (EValues es) = EValues (List.map (selfTo g h pre ds) es)
-selfTo g h pre ds e = e
+selfTo g h pre ds e = IR.mapParts (\_ p -> selfTo g h pre ds p) e
 
 -- Dictionaries held by a global
 --------------------------------------------------------------------------------
