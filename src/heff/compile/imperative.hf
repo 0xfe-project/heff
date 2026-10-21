@@ -85,9 +85,12 @@ data Pred b
 data Arm a = MkArm String (List String) a
 
 -- | a statement: `SLet`, a name bound to what is computed; `SDecl`, a name
--- | that statements after it set (`SSet`), each where it is reached
+-- | that statements after it set (`SSet`), each where it is reached;
+-- | `SOnce`, a name computed where it is used, its one use being in what
+-- | is computed first after it (for JavaScript: `onceInlined`)
 data Stmt b
   = SLet String (Op (Pred b) b)
+  | SOnce String (Op (Pred b) b)
   | SDecl String
   | SSet String (Op (Pred b) b)
   | SIf (Pred b) (List (Stmt b)) (List (Stmt b))
@@ -762,6 +765,7 @@ partsCond r _ acc = acc
 
 partsSt : PK -> St -> List Part -> List Part
 partsSt r (SLet _ o) acc = r.op o acc
+partsSt r (SOnce _ o) acc = r.op o acc
 partsSt r (SSet _ o) acc = r.op o acc
 partsSt r (SIf c ts fs) acc = r.cond c (r.sts ts (r.sts fs acc))
 partsSt r (SCase v arms) acc =
@@ -848,6 +852,7 @@ opNamesTop o = Nil
 -- | computed instead -- the same, in the same order
 firstNames : St -> List String
 firstNames (SLet _ o) = opNamesTop o
+firstNames (SOnce _ o) = opNamesTop o
 firstNames (SSet _ o) = opNamesTop o
 firstNames (SCase v _) = valNamesTop v Nil
 firstNames st = Nil
@@ -876,3 +881,108 @@ timesIn x ps =
 usedOnceNext : String -> List String -> List Part -> Bool
 usedOnceNext x next rest =
   List.length (List.keepIf (\y -> strEq x y) next) == 1 && timesIn x rest == 1
+
+-- Bindings used once
+--------------------------------------------------------------------------------
+
+-- In JavaScript a value a `const` holds is held to the end of its block
+-- -- in a loop, a round -- however soon it is used, so a long list one
+-- step makes and the next takes apart would be held while the steps
+-- after go on, where a call made in place lets it go once it is taken
+-- apart: a name whose one use, in what follows it, computes it instead
+-- is `SOnce`.
+
+-- (whether a binding computes its one use instead: not a condition's
+-- `Bool`, whose names are declared before)
+inlinable : String -> Comp -> List St -> Maybe Tl -> Bool
+inlinable x (OBool _) rest after = False
+inlinable x o rest after =
+  usedOnceNext
+    x
+    (case rest of
+     Cons st _ -> firstNames st
+     Nil -> case after of
+       Just t -> firstNamesTl t
+       Nothing -> Nil)
+    (List.append (stmtsParts rest) (case after of
+     Just t -> tailParts t
+     Nothing -> Nil))
+
+-- (the walk, knotted: statements are given what follows them, `after`)
+type OnceK =
+  { val : Val -> Val
+  , op : Comp -> Comp
+  , cond : Cond -> Cond
+  , sts : List St -> Maybe Tl -> List St
+  , tl : Tl -> Tl
+  }
+
+onceVal : OnceK -> Val -> Val
+onceVal k (SLam xs (MkBlock t)) = SLam xs (MkBlock (k.tl t))
+onceVal k (STag tag args ts) = STag tag (List.map k.val args) ts
+onceVal k (SRec fs ts) =
+  SRec (List.map (\f -> MkPair (fst f) (k.val (snd f))) fs) ts
+onceVal k (SProj v l ls t) = SProj (k.val v) l ls t
+onceVal k (SPrim p args) = SPrim p (List.map k.val args)
+onceVal k v = v
+
+onceOp : OnceK -> Comp -> Comp
+onceOp k (OSimple v) = OSimple (k.val v)
+onceOp k (OCall g args) = OCall g (List.map k.val args)
+onceOp k (OApply f args) = OApply (k.val f) (List.map k.val args)
+onceOp k (OPrim p args) = OPrim p (List.map k.val args)
+onceOp k (OBool c) = OBool (k.cond c)
+onceOp k o = o
+
+onceCond : OnceK -> Cond -> Cond
+onceCond k (PRel p a b) = PRel p (k.val a) (k.val b)
+onceCond k (PBool v) = PBool (k.val v)
+onceCond k (PNot c) = PNot (k.cond c)
+onceCond k (PIf a b c) = PIf (k.cond a) (k.cond b) (k.cond c)
+onceCond k (PLet x o c) = PLet x (k.op o) (k.cond c)
+onceCond k c = c
+
+onceArm : {a : Type} -> (a -> a) -> Arm a -> Arm a
+onceArm f (MkArm tag vs b) = MkArm tag vs (f b)
+
+onceSt : OnceK -> St -> St
+onceSt k (SLet x o) = SLet x (k.op o)
+onceSt k (SOnce x o) = SOnce x (k.op o)
+onceSt k (SSet x o) = SSet x (k.op o)
+onceSt k (SIf c ts fs) = SIf (k.cond c) (k.sts ts Nothing) (k.sts fs Nothing)
+onceSt k (SCase v arms) =
+  SCase (k.val v) (List.map (onceArm (\ss -> k.sts ss Nothing)) arms)
+onceSt k st = st
+
+onceSts : OnceK -> List St -> Maybe Tl -> List St
+onceSts k Nil after = Nil
+onceSts k (Cons (SLet x o) rest) after =
+  Cons
+    (if inlinable x o rest after then SOnce x (k.op o) else SLet x (k.op o))
+    (k.sts rest after)
+onceSts k (Cons st rest) after = Cons (onceSt k st) (k.sts rest after)
+
+onceTl : OnceK -> Tl -> Tl
+onceTl k (TSeq ss t) = TSeq (k.sts ss (Just t)) (k.tl t)
+onceTl k (TReturn o) = TReturn (k.op o)
+onceTl k (TLoop vs) = TLoop (List.map k.val vs)
+onceTl k (TIf c t e) = TIf (k.cond c) (k.tl t) (k.tl e)
+onceTl k (TCase v arms) = TCase (k.val v) (List.map (onceArm k.tl) arms)
+
+onceK : OnceK
+onceK =
+  { val = \v -> onceVal onceK v
+  , op = \o -> onceOp onceK o
+  , cond = \c -> onceCond onceK c
+  , sts = \ss after -> onceSts onceK ss after
+  , tl = \t -> onceTl onceK t
+  }
+
+onceBody : Body -> Body
+onceBody (DefFun xs (MkBlock t)) = DefFun xs (MkBlock (onceK.tl t))
+onceBody (DefVal (MkBlock t)) = DefVal (MkBlock (onceK.tl t))
+
+-- | each binding whose one use, in what follows it, may compute it
+-- | instead, `SOnce`: computed there
+onceInlined : Def -> Def
+onceInlined (MkDef key name b) = MkDef key name (onceBody b)
