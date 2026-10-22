@@ -54,7 +54,10 @@ What is done with them is in the library:
   [`ofRunes`](../../api/prelude.md#ofRunes) and
   [`split`](../../api/prelude.md#split); `^` joins two, and groups to
   the left: `s ^ a ^ b` is `(s ^ a) ^ b`, so a string that nothing else
-  holds is grown in place;
+  holds is grown in place; [`mapBytes`](../../api/prelude.md#mapBytes),
+  [`mapRunes`](../../api/prelude.md#mapRunes) and
+  [`foldBytes`](../../api/prelude.md#foldBytes) go through a string
+  byte by byte or rune by rune without making a list of them;
 - runes: [`rune`](../../api/rune.md), imported as `import rune as Rune`.
 
 JavaScript's own UTF-16 text is another type, `JSString`: see
