@@ -2253,7 +2253,7 @@ HEFF_FN double heff_double_of_int(V v) {
 
 HEFF_FN Str *heff_str_new(int64_t len) {
   Str *s = heff_obj_alloc(sizeof(Str) + len);
-  s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = len;
+  s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = (len + 7) & ~(int64_t)7;
   s->p = s->s;
   return s;
 }
@@ -2298,10 +2298,48 @@ HEFF_FN V heff_str_valid(const void *c, int64_t n) {
   return (V)s;
 }
 
+// A string's room.  One made has room for its bytes, and no more than
+// the allocator's rounding to 8 gives it: what is made once and kept --
+// a map's key, a field -- takes what it needs.  Only a string grown in
+// place, its last reference appended to, is given more, and only where
+// that is cheap: while it is a small object (`SMALL_MAX`), it grows to
+// what it needs, rounded so, each time a copy of at most so many bytes;
+// beyond, to twice its room (or what it needs, if more), by `realloc`,
+// which extends it where it is where it can -- so a string built a piece
+// at a time is copied a logarithmic number of times, not once a piece,
+// and the room not yet written in a large block is the system's pages
+// not yet touched, not memory.
+
+// (the string `x`, its last reference and not a view, room for `n` bytes
+// made in it: the string, moved where it must be)
+HEFF_FN Str *heff_str_grow(Str *x, int64_t n) {
+  size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
+  size_t room = (sizeof(Str) + n + 7) / 8 * 8;
+  Str *g;
+  if (room > SMALL_MAX) {
+    size_t twice = (sizeof(Str) + 2 * x->cap + 7) / 8 * 8;
+    if (twice > room) room = twice;
+  }
+  if (was > SMALL_MAX) {
+    // (from `malloc`, the allocator's own beyond `SMALL_MAX`)
+    HEFF_COUNTED(room / 8);
+    g = realloc(x, room);
+    if (!g) heff_fail("out of memory");
+  } else {
+    // (from the allocator objects are given back to, rounded as it
+    // rounds: a block it frees to a free list must be the whole of
+    // that list's size)
+    g = heff_obj_alloc(room);
+    memcpy(g, x, sizeof(Str) + x->len);
+    heff_obj_free(x, was);
+  }
+  g->cap = (int64_t)(room - sizeof(Str));
+  g->p = g->s;
+  return g;
+}
+
 // (the first string, its last reference and not a view, grown in place,
-// room made for twice what it needs -- a string built a piece at a time
-// copied a logarithmic number of times, not once a piece; `Bytes` too, a
-// new one of the kind `kind`)
+// as above; `Bytes` too, a new one of the kind `kind`)
 HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
@@ -2310,17 +2348,7 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   if (heff_alone(&x->h) && (n <= x->cap || !HEFF_STR_VIEW(x))) {
     if (n > x->cap) {
       if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
-      int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
-      size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
-      // (from the allocator objects are given back to, rounded as it
-      // rounds: a block it frees to a free list must be the whole of
-      // that list's size)
-      Str *g = heff_obj_alloc(sizeof(Str) + cap);
-      memcpy(g, x, sizeof(Str) + x->len);
-      heff_obj_free(x, was);
-      g->cap = (int32_t)cap;
-      g->p = g->s;
-      x = g;
+      x = heff_str_grow(x, n);
     }
     memcpy(x->s + x->len, y->p, (size_t)y->len);
     x->len = n;
