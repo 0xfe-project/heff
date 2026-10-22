@@ -122,3 +122,115 @@ cachedProgram : {e : HFunctor}
 cachedProgram l = do
   acc <- cachedAcc l
   pure acc.done
+
+-- | a module elaborated, kept to be used again: and the cache's text of
+-- | it, which tells whether what it is made of is still what it was
+type Kept = { checked : Driver.Checked, frozen : String }
+
+-- | a program elaborated as `cachedWhere` does: its modules, and the
+-- | modules elaborated in it that can be kept, by path
+type Elaborated =
+  { program : List Driver.Checked, kept : OrdMap.OrdMap String Kept }
+
+-- (the program so far, and the modules elaborated anew in it)
+type WhereAcc =
+  { acc : CacheAcc, fresh : List (Pair Driver.Source Driver.Checked) }
+
+whereAdded : WhereAcc -> Driver.Source -> Driver.Checked -> WhereAcc
+whereAdded w s c =
+  { acc = cacheKeep w.acc Nothing c, fresh = Cons (MkPair s c) w.fresh }
+
+-- (a module elaborated anew, made lean)
+whereFresh : WhereAcc -> Driver.Source -> WhereAcc
+whereFresh w s =
+  whereAdded w s (Driver.lean (Driver.elabNext w.acc.done s Nothing))
+
+-- (a module the cache had, or kept, as it was)
+whereKept : WhereAcc -> Driver.Thawed -> Driver.Checked -> WhereAcc
+whereKept w th c = { acc = cacheKeep w.acc (Just th) c, fresh = w.fresh }
+
+-- (a module `full` takes: the one kept, if its text and what it is made
+-- of are as they were, else elaborated anew)
+whereFull : OrdMap.OrdMap String Kept -> WhereAcc -> Driver.Source -> WhereAcc
+whereFull kept w s = case OrdMap.lookup kept s.path of
+  Just k ->
+    if strEq k.checked.source s.source
+    then case Cache.melt w.acc.hashes w.acc.done s k.frozen of
+      Just th -> whereKept w th k.checked
+      Nothing -> whereFresh w s
+    else whereFresh w s
+  Nothing -> whereFresh w s
+
+-- (a module `full` does not take: thawed from the cache, if it can be)
+whereThawed : WhereAcc -> Driver.Source -> Maybe Driver.Thawed -> WhereAcc
+whereThawed w s (Just th) =
+  whereKept w th (Driver.elabNext w.acc.done s (Just th))
+whereThawed w s Nothing = whereFresh w s
+
+cachedWhereGo : {e : HFunctor}
+              -> {{ev : filesystem <: e}}
+              -> (Driver.Source -> Bool)
+              -> OrdMap.OrdMap String Kept
+              -> Load.Paths
+              -> List Driver.Source
+              -> WhereAcc
+              -> Co e WhereAcc
+cachedWhereGo full kept ps Nil w = pure w
+cachedWhereGo full kept ps (Cons s rest) w =
+  if full s then cachedWhereGo full kept ps rest (whereFull kept w s)
+  else do
+    th <- thawTry ps s w.acc
+    cachedWhereGo full kept ps rest (whereThawed w s th)
+
+-- (the modules elaborated anew, frozen: those `full` takes kept, the
+-- others into the cache -- a text `full` takes may be one not on disk,
+-- a renaming tried)
+keepFresh : {e : HFunctor}
+          -> {{ev : filesystem <: e}}
+          -> (Driver.Source -> Bool)
+          -> Load.Paths
+          -> CacheAcc
+          -> OrdMap.OrdMap String Kept
+          -> List (Pair Driver.Source Driver.Checked)
+          -> Co e (OrdMap.OrdMap String Kept)
+keepFresh full ps acc kept Nil = pure kept
+keepFresh full ps acc kept (Cons (MkPair s c) rest) =
+  if not (List.null c.diags) then keepFresh full ps acc kept rest
+  else case Cache.freeze acc.hashes acc.done s c of
+    Just out ->
+      if full s
+      then keepFresh
+          full
+          ps
+          acc
+          (OrdMap.insert kept s.path { checked = c, frozen = out })
+          rest
+      else do
+        ok <- Files.writeFile (cachePath ps c.module) out
+        keepFresh full ps acc kept rest
+    Nothing -> keepFresh full ps acc kept rest
+
+-- | the program, the modules `full` takes elaborated (their names, and
+-- | where each is written, wanted) -- or, where their text and what they
+-- | are made of are as they were, those `kept` --, the others thawed
+-- | from the cache where they can be; every module made lean.  Those
+-- | elaborated anew are frozen: those `full` takes kept, the others back
+-- | into the cache.
+cachedWhere : {e : HFunctor}
+            -> {{ev : filesystem <: e}}
+            -> (Driver.Source -> Bool)
+            -> OrdMap.OrdMap String Kept
+            -> Load.Paths
+            -> List Driver.Source
+            -> Co e Elaborated
+cachedWhere full kept ps sources = do
+  w <-
+    cachedWhereGo
+      full
+      kept
+      ps
+      sources
+      { acc = { done = Nil, hashes = OrdMap.empty }, fresh = Nil }
+  ok <- Files.makeDirectory (cacheDir ps)
+  more <- keepFresh full ps w.acc kept (List.reverse w.fresh)
+  pure { program = w.acc.done, kept = more }

@@ -125,8 +125,19 @@ corners =
 ## The language server
 
 `heff lsp` gives diagnostics as you type, hover, go to definition,
-completion, formatting, an outline, references, renaming and symbols
-across the project.
+completion, formatting, an outline, the occurrences of a name in the
+file (highlighted), references, renaming and symbols across the project.
+
+Go to definition and references work for locals as well as globals: a
+local's definition is its binder (a parameter, a `let`, a pattern, a
+lambda's, `<-`, `let mut`, `for`, a `where` definition), and its
+references are the uses of that binder alone, not of a name it shadows
+or one that shadows it.  A global's references are found across the
+project: qualified and aliased uses, operators and their fixity
+declarations, tags, record and theory fields, the module claim's entry,
+and names in doc tests.  Only the files whose text has the name are
+elaborated for that, the rest read from the cache, so a project of
+hundreds of files answers in about a second.
 
 A code action splits a variable of an equation into cases: the
 equation is written again for each tag of the variable's type.

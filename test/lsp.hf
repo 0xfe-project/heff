@@ -349,15 +349,15 @@ response : {e : HFunctor}
 response srv l id what = do
   m <- receive srv l what
   if isResponse id m then pure { lsp = l, msg = m }
-    else response
-        srv
-        { notes = List.append l.notes [m]
-        , next = l.next
-        , checks = l.checks
-        , failed = l.failed
-        }
-        id
-        what
+  else response
+      srv
+      { notes = List.append l.notes [m]
+      , next = l.next
+      , checks = l.checks
+      , failed = l.failed
+      }
+      id
+      what
 
 -- (the notes, but the first that `p` holds of)
 withoutFirst : (JSON.Json -> Bool) -> List JSON.Json -> List JSON.Json
@@ -386,7 +386,7 @@ awaitNote : {e : HFunctor}
 awaitNote srv l p what = do
   m <- receive srv l what
   if p m then pure { lsp = l, msg = m }
-    else awaitNote srv (withNotes l (List.append l.notes [m])) p what
+  else awaitNote srv (withNotes l (List.append l.notes [m])) p what
 
 -- (the first note that `p` holds of: one kept, else the next)
 noted : {e : HFunctor}
@@ -728,6 +728,7 @@ initialized rootUri =
           && intAt ["result", "capabilities", "textDocumentSync", "change"] m
           == 1
           && truthyAt ["result", "capabilities", "referencesProvider"] m
+          && truthyAt ["result", "capabilities", "documentHighlightProvider"] m
           && truthyAt
             ["result", "capabilities", "renameProvider", "prepareProvider"]
             m
@@ -811,6 +812,112 @@ refsOf a diskA watched name ok =
        name
        (\m ->
           ok (List.any (\r -> strEq (textAt ["uri"] r) watched) (results m))))
+
+-- (the results are at just these places: each a file's URI, and a
+-- position in it)
+locatedAt : List (Pair String Pos) -> JSON.Json -> Bool
+locatedAt ps m =
+  List.length (results m) == List.length ps
+  && List.all
+    (\(q : Pair String Pos) ->
+       List.any
+         (\r -> strEq (textAt ["uri"] r) (fst q) && samePos (startOf r) (snd q))
+         (results m))
+    ps
+
+-- | across modules, of a module whose claim lists what it exposes: an
+-- | operator's references (the claim's entry, its signature and
+-- | equation, its fixity, a use); a tag's; a theory's field's (declared,
+-- | set in instances, projected); a global's, the claim's entry among
+-- | them, which a rename renames too; a use added in the editor, found
+acrossSteps : (String -> String) -> (String -> String) -> List Step
+acrossSteps u disk =
+  let ex = u "exposing.hf"
+  in let exT = disk "exposing.hf"
+  in let sealedU = u "src/sealed.hf"
+  in let sealed = disk "src/sealed.hf"
+  in let hiddenU = u "exposing-hidden.hf"
+  in let hidden = disk "exposing-hidden.hf"
+  in let countAt = pos exT "count (bump"
+  in let added = exT ^ "\nmore : Int\nmore = count counter\n"
+  in let countsIn : String -> List (Pair String Pos) = \text ->
+      [ MkPair sealedU (past 2 (pos sealed ", count\n"))
+      , MkPair sealedU (pos sealed "count :")
+      , MkPair sealedU (pos sealed "count (MkCounter")
+      , MkPair sealedU (past 2 (pos sealed "= count }"))
+      , MkPair ex (pos text "count (bump")
+      ]
+  in [ Open ex exT
+     , Diagnostics
+       ex
+       (check1 "a module of another's claim: no diagnostics" clean)
+     , references
+       ex
+       (pos exT "<#>")
+       True
+       (check1
+          "references of an operator across modules"
+          (locatedAt
+             [ MkPair sealedU (past 3 (pos sealed ", (<#>)"))
+             , MkPair sealedU (past 1 (pos sealed "(<#>) :"))
+             , MkPair sealedU (past 1 (pos sealed "(<#>) x"))
+             , MkPair sealedU (past 7 (pos sealed "infixl <#>"))
+             , MkPair ex (pos exT "<#>")
+             ]))
+     , references
+       ex
+       (pos exT "Line 3")
+       True
+       (check1
+          "references of a tag across modules"
+          (locatedAt
+             [ MkPair sealedU (pos sealed "Line Int")
+             , MkPair sealedU (pos sealed "Line n")
+             , MkPair ex (pos exT "Line 3")
+             , MkPair ex (pos exT "Line n")
+             , MkPair ex (pos exT "Line 4")
+             ]))
+     , references
+       ex
+       (past 3 (pos exT "sz.size"))
+       True
+       (check1
+          "references of a theory's field across modules"
+          (locatedAt
+             [ MkPair sealedU (pos sealed "size : a")
+             , MkPair sealedU (past 2 (pos sealed "{ size = \\s"))
+             , MkPair sealedU (past 2 (pos sealed "{ size = count"))
+             , MkPair ex (past 3 (pos exT "sz.size"))
+             , MkPair hiddenU (past 3 (pos hidden "sz.size"))
+             ]))
+     , references
+       ex
+       countAt
+       True
+       (check1
+          "references of a global, its module claim's entry too"
+          (locatedAt (countsIn exT)))
+     , rename
+       ex
+       countAt
+       "tally"
+       (check1
+          "a rename, the module claim's entry too"
+          (\m ->
+             List.length (editsOf sealedU m) == 4
+             && List.length (editsOf ex m) == 1))
+     , Change ex added
+     , Diagnostics ex (check1 "a use added: no diagnostics" clean)
+     , references
+       ex
+       countAt
+       True
+       (check1
+          "references of a global, a use added in the editor"
+          (locatedAt
+             (Cons (MkPair ex (pos added "count counter")) (countsIn added))))
+     , Close ex
+     ]
 
 -- | the session in the modules' project: diagnostics of the editor's
 -- | text, hovers and definitions across modules, a name two imports
@@ -1039,6 +1146,7 @@ modulesSteps dir disk =
            "an unknown request"
            (\m -> intAt ["error", "code"] m == 0 - 32601))
       ]
+    , acrossSteps u disk
     , shutDown
     ]
 
@@ -1083,7 +1191,15 @@ modules name =
      let here = toString working
      copiedFrom (root ^ "/test/modules") "modules"
      let dir = here ^ "/modules"
-     texts <- readAll dir ["src/a.hf", "qualified.hf"]
+     texts <-
+       readAll
+         dir
+         [ "src/a.hf"
+         , "qualified.hf"
+         , "exposing.hf"
+         , "exposing-hidden.hf"
+         , "src/sealed.hf"
+         ]
      session (modulesSteps dir (textIn texts))))
 
 -- What once stopped heff
@@ -1115,7 +1231,8 @@ saysWhere m =
 
 -- (a response, not an error)
 answered : JSON.Json -> Bool
-answered m = strEq (writtenAt ["error"] m) "" && not (strEq (writtenAt ["result"] m) "")
+answered m =
+  strEq (writtenAt ["error"] m) "" && not (strEq (writtenAt ["result"] m) "")
 
 -- (the files changed on disk, told of)
 diskChanged : String -> Int -> Step
@@ -1126,7 +1243,9 @@ diskChanged u kind =
        [ JSON.kv
          "changes"
          (JArray
-            [JSON.obj [JSON.kv "uri" (JSON.jstr u), JSON.kv "type" (JSON.num kind)]])
+            [ JSON.obj
+              [JSON.kv "uri" (JSON.jstr u), JSON.kv "type" (JSON.num kind)]
+            ])
        ])
 
 -- | the session with a file heff once stopped elaborating at -- a
@@ -1194,7 +1313,10 @@ failureSteps dir disk =
               List.any
                 (\d -> contains "does not elaborate" (textAt ["message"] d))
                 (diagnostics m)))
-      , hover user (pos importsFailing "x") (check1 "a hover on that file" answered)
+      , hover
+        user
+        (pos importsFailing "x")
+        (check1 "a hover on that file" answered)
       , Put (dir ^ "/lsp-fail-disk.hf") failingText
       , diskChanged (u "lsp-fail-disk.hf") 1
       , references
@@ -1251,7 +1373,8 @@ overflowText =
   ^ "\n"
 
 afterText : String
-afterText = "module test.surface.lsp-after\n\none : Int\none = 1\n\ntwo : Int\ntwo = one\n"
+afterText =
+  "module test.surface.lsp-after\n\none : Int\none = 1\n\ntwo : Int\ntwo = one\n"
 
 -- | a file whose elaboration overflows the server's stack: said, as a
 -- | failure is, and the server answers on
@@ -2040,6 +2163,174 @@ claimSteps root =
      , Close u
      ]
 
+-- (a file of each way a local is bound: a parameter, `let`, a `case`
+-- arm, a lambda, `<-` and `let mut` and `for` in a `do` block, a local
+-- definition of a `where`; a `let` that shadows a parameter)
+localsText : String
+localsText =
+  joinWith
+    "\n"
+    [ "module test.surface.lsp-locals"
+    , ""
+    , "import co"
+    , ""
+    , "shadow : Int -> Int"
+    , "shadow x ="
+    , "  let x = x + 1"
+    , "  in let y = x * 2"
+    , "  in y + x"
+    , ""
+    , "caseOf : Maybe Int -> Int"
+    , "caseOf m = case m of"
+    , "  Just k -> k + k"
+    , "  Nothing -> 0"
+    , ""
+    , "lam : Int -> Int"
+    , "lam = \\n -> n * n"
+    , ""
+    , "bound : {e : HFunctor} -> Co e Int"
+    , "bound = do"
+    , "  got <- pure 1"
+    , "  pure (got + got)"
+    , ""
+    , "summed : List Int -> Int"
+    , "summed xs = run do"
+    , "  let mut acc = 1"
+    , "  for v in xs do"
+    , "    acc := acc + v"
+    , "  return acc"
+    , ""
+    , "scaled : Int -> Int"
+    , "scaled k = go k"
+    , "  where"
+    , "    go : Int -> Int"
+    , "    go m = m * k"
+    , ""
+    , "-- >>> shadow 1 + lam 2 + summed [1, 2] + scaled 3"
+    , "-- 23"
+    , ""
+    ]
+
+-- (the results start at just these positions)
+startsAt : List Pos -> JSON.Json -> Bool
+startsAt ps m =
+  List.length (results m) == List.length ps
+  && List.all
+    (\(p : Pos) -> List.any (\r -> samePos (startOf r) p) (results m))
+    ps
+
+-- (the results start at just these positions, in the file `u`)
+startsIn : String -> List Pos -> JSON.Json -> Bool
+startsIn u ps m =
+  startsAt ps m && List.all (\r -> strEq (textAt ["uri"] r) u) (results m)
+
+highlights : String -> Pos -> List Check -> Step
+highlights u p checks = asked "textDocument/documentHighlight" u p checks
+
+-- (a definition asked for at `from`, in the file `u`: at `to`, there)
+goneFrom : String -> String -> Pos -> Pos -> Step
+goneFrom u name from to = definition u from (check1 name (definedAt u to))
+
+-- | a local, gone to from a use: its binder, however it is bound (and
+-- | from its binder, itself); a use of a parameter a `let` shadows after
+-- | it, the parameter; a local definition's use, its signature; a
+-- | parameter used in a local definition; an equation's head, the
+-- | signature.  References of a parameter and of the `let` shadowing it,
+-- | each its own; of a `let mut` variable, set and read; the occurrences
+-- | in the file, highlighted: a local's, and a global's
+findSteps : String -> List Step
+findSteps root =
+  let u = uriIn root "test/surface/lsp-locals.hf"
+  in let t = localsText
+  in let outerX = past 7 (pos t "shadow x =")
+  in let innerX = past 6 (pos t "  let x = x")
+  in let rhsX = past 10 (pos t "  let x = x")
+  in let timesX = pos t "x * 2"
+  in let lastX = past 9 (pos t "  in y + x")
+  in let accAt = pos t "acc = 1"
+  in let setAcc = pos t "acc := "
+  in let scaledK = past 7 (pos t "scaled k =")
+  in let goneTo = \(name : String) (from : Pos) (to : Pos) ->
+      goneFrom u name from to
+  in [ Open u t
+     , Diagnostics u (check1 "a file of locals: no diagnostics" clean)
+     , goneTo "definition of a local shadowing a parameter" lastX innerX
+     , goneTo "definition of the parameter it shadows, before it" rhsX outerX
+     , goneTo "definition at a binder: itself" innerX innerX
+     , goneTo
+       "definition of what a `case` arm binds"
+       (pos t "k + k")
+       (past 7 (pos t "  Just k"))
+     , goneTo
+       "definition of a lambda's parameter"
+       (pos t "n * n")
+       (past 7 (pos t "lam = \\n"))
+     , goneTo
+       "definition of what `<-` binds"
+       (pos t "got + got")
+       (pos t "got <-")
+     , goneTo "definition of a `let mut` variable, set" setAcc accAt
+     , goneTo "definition of a `let mut` variable, read" (past 7 setAcc) accAt
+     , goneTo
+       "definition of what `for` binds"
+       (past 6 (pos t "acc + v"))
+       (pos t "v in xs")
+     , goneTo
+       "definition of a local definition"
+       (past 11 (pos t "scaled k = go k"))
+       (pos t "go : Int")
+     , goneTo
+       "definition of a parameter, in a local definition"
+       (past 4 (pos t "m * k"))
+       scaledK
+     , goneTo
+       "definition at an equation's head: the signature"
+       (pos t "shadow x =")
+       (pos t "shadow :")
+     , references
+       u
+       outerX
+       True
+       (check1
+          "references of a parameter a `let` shadows"
+          (startsIn u [outerX, rhsX]))
+     , references
+       u
+       outerX
+       False
+       (check1
+          "references of a parameter, without its binder"
+          (startsIn u [rhsX]))
+     , references
+       u
+       timesX
+       True
+       (check1
+          "references of the `let` shadowing it"
+          (startsIn u [innerX, timesX, lastX]))
+     , references
+       u
+       accAt
+       True
+       (check1
+          "references of a `let mut` variable"
+          (startsIn
+             u
+             [accAt, setAcc, past 7 setAcc, past 9 (pos t "  return acc")]))
+     , highlights
+       u
+       lastX
+       (check1 "a local highlighted" (startsAt [innerX, timesX, lastX]))
+     , highlights
+       u
+       (pos t "shadow 1")
+       (check1
+          "a global highlighted"
+          (startsAt
+             [pos t "shadow :", pos t "shadow x =", pos t "shadow 1"]))
+     , Close u
+     ]
+
 unsaved : String -> Test
 unsaved name =
   withinTime
@@ -2055,6 +2346,7 @@ unsaved name =
             (\x -> x)
             [ initialized ("file://" ^ root)
             , deepSteps root
+            , findSteps root
             , completionSteps root (textIn texts)
             , expectationSteps root (textIn texts)
             , splitSteps root
@@ -2069,12 +2361,12 @@ unsaved name =
 definedAtLine : Pos -> JSON.Json -> Bool
 definedAtLine p m = samePos (startOf (resultOf m)) p
 
--- | a global of the file itself, and the standard library's; in a `do`
--- | block, the name hovered, not the `bind` it is read into (and a name
--- | bound there: nothing is recorded of it, and `bind` is not there); a
--- | constructor, in an expression and in a pattern: where its type
--- | declares it; a field, set in a record and projected: where its
--- | theory declares it
+-- | a global of the file itself, and the standard library's; a local,
+-- | its binder; in a `do` block, the name hovered, not the `bind` it is
+-- | read into (and a name bound there: nothing is recorded of it, and
+-- | `bind` is not there); a constructor, in an expression and in a
+-- | pattern: where its type declares it; a field, set in a record and
+-- | projected: where its theory declares it
 definitionSteps : String -> (String -> String) -> List Step
 definitionSteps root disk =
   let basicsU = uriIn root "test/surface/basics.hf"
@@ -2097,8 +2389,10 @@ definitionSteps root disk =
            (definedAt basicsU (at (pos basics "not :").line 0)))
       , definition
         basicsU
-        (pos basics "ys)")
-        (check1 "no definition for a local" (\m -> nullAt ["result"] m))
+        (pos basics "ys)\n")
+        (check1
+           "definition of a local: its binder"
+           (definedAt basicsU (pos basics "ys)")))
       ]
     , opened counterU counter
     , [ hover

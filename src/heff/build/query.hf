@@ -8,6 +8,7 @@ import heff.syntax.diagnostic
 import heff.build.driver as Driver
 import heff.elab.environment as Environment
 import heff.elab.globals as Globals
+import heff.syntax.import as Import
 import heff.elab.locals as Locals
 import heff.elab.params as Params
 import heff.syntax.presyntax as Presyntax
@@ -356,8 +357,10 @@ fieldOf : Params.Spanned (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
 fieldOf (At (DeclareField x sp _ _) _) = Just { name = x, span = sp }
 fieldOf _ = Nothing
 
+-- (a `data`'s tags, a record type's fields)
 sumTags : Presyntax.Expr -> List Named
 sumTags (At (ESum alts) _) = catMaybesQ (List.map tagOf alts)
+sumTags (At (ESig fs) _) = catMaybesQ (List.map fieldOf fs)
 sumTags _ = Nil
 
 equationHead : Params.Spanned (Presyntax.Equation Presyntax.Expr) -> Params.Span
@@ -367,7 +370,7 @@ declSites : Driver.Checked -> Presyntax.Decl -> List Site
 declSites c (At (DeclEquations f fsp _ _ eqs) _) =
   globalSites c f (Cons fsp (List.map equationHead eqs))
 -- (a definition with named arguments, `data Pair a b = ...`: its name
--- and its tags)
+-- and its tags; a record type, its fields)
 declSites c (At (DeclDefine x xsp _ _ body) _) =
   List.append (globalSites c x [xsp]) (memberSites c x (sumTags body))
 declSites c (At (DeclTheory x xsp _ (At (ESig fs) _)) _) =
@@ -379,14 +382,14 @@ declSites c _ = Nil
 
 -- | Where a file defines its names, as its notation says: each
 -- | declaration's name, in its signature and at the head of each
--- | equation; a `data`'s tags; a `theory`'s fields.  (A declaration that
+-- | equation; a `data`'s tags; a `theory`'s fields, a record type's.  (A declaration that
 -- | did not elaborate defines nothing to refer to.)
 sites : Driver.Checked -> List Site
 sites c = List.concatMap (\d -> declSites c d) c.decls
 
--- | where the global the name at an offset resolved to is defined, in a
--- | program (the file last): its file, and the span of its name there.
--- | (A local's binder is not kept by the elaborator: nothing, for one.)
+-- | where what the name at an offset refers to is defined, in a program
+-- | (the file last): its file, and the span of its name there -- a
+-- | global's definition, a local's binder
 type Definition = { path : String, source : String, span : Params.Span }
 
 type Defines = { c : Driver.Checked, name : String, span : Params.Span }
@@ -416,13 +419,55 @@ definitionIn i k d =
       Nothing -> nameIn d.c.source i.name d.span
   }
 
+atOff : Int -> Params.Span -> Bool
+atOff off sp = sp.start <= off && off <= sp.end
+
+atLocal : Int -> Locals.Local -> Bool
+atLocal off l = atOff off l.binder || List.any (\sp -> atOff off sp) l.uses
+
+-- | where a local is bound, at its binder or a use; a record type's
+-- | field used by the fields after it: where it is declared
+localDefinitionIn : Driver.Checked -> Locals.Locals -> Int -> Maybe Definition
+localDefinitionIn c ls off = case List.find (\l -> atLocal off l) ls.locals of
+  Just l -> Just { path = c.path, source = c.source, span = l.binder }
+  Nothing -> case List.find
+      (\(f : Locals.FieldUse) -> atOff off f.use)
+      ls.fields of
+    Just f -> Just { path = c.path, source = c.source, span = f.field }
+    Nothing -> Nothing
+
+orElse : {a : Type} -> Maybe a -> Maybe a -> Maybe a
+orElse (Just x) _ = Just x
+orElse Nothing y = y
+
+-- (where the file first defines what a site of it defines: an
+-- equation's head, its signature's name)
+firstSite : Driver.Checked -> List Site -> Site -> Definition
+firstSite c ss s =
+  { path = c.path
+  , source = c.source
+  , span = case List.find (\(s2 : Site) -> eqTarget s2.target s.target) ss of
+      Just s2 -> s2.span
+      Nothing -> s.span
+  }
+
+-- | ... and a name where the file defines it: where it first does
+localDefinition : Driver.Checked -> Int -> Maybe Definition
+localDefinition c off =
+  orElse
+    (localDefinitionIn c (Locals.locals c.decls) off) (case List.find
+    (\(s : Site) -> atOff off s.span)
+    (sites c) of
+  Just s -> Just (firstSite c (sites c) s)
+  Nothing -> Nothing)
+
 definitionAt : List Driver.Checked -> Int -> Maybe Definition
 definitionAt program off = case List.last program of
   Nothing -> Nothing
   Just c -> case infoAt c off of
-    Nothing -> Nothing
+    Nothing -> localDefinition c off
     Just i -> case i.key of
-      Nothing -> Nothing
+      Nothing -> localDefinition c off
       Just k ->
         -- (a primitive may be declared by more than one file: this
         -- one's first)
@@ -451,13 +496,6 @@ withName program t@{ member = Nothing } = case ownNameOf program t.key of
   Just x -> Just { target = t, name = x }
   Nothing -> Nothing
 
-atOff : Int -> Params.Span -> Bool
-atOff off sp = sp.start <= off && off <= sp.end
-
-orElse : {a : Type} -> Maybe a -> Maybe a -> Maybe a
-orElse (Just x) _ = Just x
-orElse Nothing y = y
-
 siteFound : List Driver.Checked -> Driver.Checked -> Int -> Maybe Found
 siteFound program c off = case List.find
     (\(s : Site) -> atOff off s.span)
@@ -478,9 +516,6 @@ fieldFound program c ls off = case List.find
     Just s -> withName program s.target
     Nothing -> Nothing
   Nothing -> Nothing
-
-atLocal : Int -> Locals.Local -> Bool
-atLocal off l = atOff off l.binder || List.any (\sp -> atOff off sp) l.uses
 
 foundLocal : String -> Locals.Local -> Found
 foundLocal path l = { target = localT path l.binder, name = l.name }
@@ -676,6 +711,21 @@ moreIn t name c =
      else Nil)
     (if isOperatorName name then Nil else expectedIn t name c)
 
+-- (a module claim's entry naming a global, in the file that defines it:
+-- the name in it, `(<+>)`'s operator)
+claimedAs : Target -> String -> Driver.Checked -> Import.Exposed -> Bool
+claimedAs t name c e =
+  strEq e.name name && eqMaybeStr (keyOf c name) (Just t.key)
+
+claimed : Target -> String -> Driver.Checked -> List Params.Span
+claimed t@{ member = Nothing, local = Nothing } name c = case c.exposes of
+  Just es ->
+    List.map
+      (\(e : Import.Exposed) -> nameIn c.source name e.span)
+      (List.keepIf (\e -> claimedAs t name c e) es)
+  Nothing -> Nil
+claimed t name c = Nil
+
 mkOccurrence : Driver.Checked -> Params.Span -> Bool -> Occurrence
 mkOccurrence c sp defines =
   { path = c.path, source = c.source, span = sp, defines = defines }
@@ -715,8 +765,11 @@ inFileSites t name c ss =
     (List.append
        (catMaybesQ (List.map (\i -> useOf t name i) c.top.infos))
        (List.append
-          (List.map (\(s : Site) -> s.span) ss)
-          (fieldUsesOf ss (Locals.locals c.decls))))
+          (List.append (List.map (\(s : Site) -> s.span) ss) (claimed t name c))
+          -- (a field's uses among the fields after it: in the file
+          -- that declares it alone)
+          (if List.null ss then Nil
+           else fieldUsesOf ss (Locals.locals c.decls))))
 
 inFile : Target -> String -> Driver.Checked -> List Occurrence
 inFile t name c =
@@ -751,10 +804,11 @@ localOccurrences c b = case List.find
   Nothing -> Nil
 
 -- | every occurrence in a program of what a name refers to (`name`, as
--- | it is defined), by file, in order: its definition, its uses -- the
--- | elaborator's record of each -- and, as text, in the files that use
--- | it, in a fixity declaration (an operator) and in a watch's
--- | expectation (a local: its binder and its uses, in its file)
+-- | it is defined), by file, in order: its definition, the module
+-- | claim's entry for it, its uses -- the elaborator's record of each --
+-- | and, as text, in the files that use it, in a fixity declaration (an
+-- | operator) and in a watch's expectation (a local: its binder and its
+-- | uses, in its file)
 occurrences : List Driver.Checked -> Target -> String -> List Occurrence
 occurrences program t@{ local = Just b } name = case List.find
     (\(c : Driver.Checked) -> strEq c.path t.key)
@@ -763,6 +817,15 @@ occurrences program t@{ local = Just b } name = case List.find
   Nothing -> Nil
 occurrences program t@{ local = Nothing } name =
   List.concatMap (\c -> inFile t name c) (nubByPath program)
+
+-- | the occurrences in a file (the program's last) of what the name at
+-- | an offset refers to
+highlightsAt : List Driver.Checked -> Int -> List Occurrence
+highlightsAt program off = case List.last program of
+  Just c -> case targetAt program off of
+    Just t -> occurrences [c] t.target t.name
+    Nothing -> Nil
+  Nothing -> Nil
 
 -- | a capitalised name (1), a variable (2), an operator (3), or none (0)
 isNameChar2 : Int -> Bool
