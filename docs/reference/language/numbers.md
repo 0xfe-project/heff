@@ -40,6 +40,11 @@ flags = 0b1010
 - `show` writes a float as such a literal, the fewest digits that read
   back as it: `show 1.0e23` is `"1.0e23"`, `show (neg 0.0)` is
   `"-0.0"`.
+- `parseFloat s` reads such a decimal back, at run time, as a literal is
+  read: `parseFloat "0.1"` is `Just 0.1`, and float32's `parseFloat32`
+  the `Float32` nearest it, rounded once. A `-`, digits, a point and
+  digits, an exponent (`2.5`, `-1e-7`, `12.5E+3`); anything else
+  (`"Infinity"`, `"1."`, `" 1"`) is `Nothing`.
 - Hexadecimal `0x605` and binary `0b1010` are allowed, and `_` can
   separate digits.
 - The literal must fit its type: `300` as a `UInt8` is an error, and so

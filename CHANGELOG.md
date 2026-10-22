@@ -23,6 +23,7 @@
 
 ### Standard library
 
+- `parseFloat : String -> Maybe Float64` (the prelude's) and float32's `parseFloat32` read a decimal, correctly rounded, by the runtime: zig's `std.fmt.parseFloat` in C, `Number` in JavaScript (and, for a `Float32` where rounding twice could differ, an exact comparison). json's `parse` reads its floats so: 3 million floats of 17 digits 1.20 s to 0.23 s in C, 8.0 s to 1.8 s in JavaScript.
 - A float literal at `Float32` is rounded once, to the `Float32` nearest the decimal it writes, not first to a `Float64`: `(1.0000000596046448 : Float32)` is 1.0000001, not 1.0. float32's `fromDecimal` rounds so, as std.math's `fromDecimal` does to a `Float64`.
 - `show` of a `Float64` or a `Float32` is a literal heff reads back as the same float, still the fewest digits: an exponent has a point before it and no `+` (`1.0e23`, `5.0e-324`, `1.5e300`, not `1e+23`, `5e-324`, `1.5e+300`), and -0.0 keeps its sign (`-0.0`, not `0.0`). `NaN`, `Infinity` and `-Infinity` are as before. json's `stringify` writes numbers as before, as JavaScript does.
 - std.map is renamed std.ordmap, and its type `Map` `OrdMap`: the name says what it asks of the keys, an `Order`.
