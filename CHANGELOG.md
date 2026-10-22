@@ -19,6 +19,7 @@
 - `plus` is gone: effects are summed by `<+>` alone. `<:` binds looser than `<+>`, so `h <: h <+> k` is `h <: (h <+> k)`.
 - `xs <- for x in c do body` gathers each turn's value, what its last statement comes to, into a list, in order; a turn left by `continue` gives none, and `break` ends the gathering. A `for` alone runs for its effects, as before.
 - A signature may name more than one definition, `x, y, z : T`, at the top level, in `where` and `mutual`, and for a theory's or a record type's fields (`{ x, y : Int }`).
+- `^` groups to the left: `s ^ a ^ b` is `(s ^ a) ^ b`, so a string grown a piece at a time is grown in place, each piece appended to it, not joined to the next first. A function ending in `x ^ "," ^ f xs` still appends a piece at a time. str_concat 19.5 G to 16.9 G instructions, base64_sha256 41.2 G to 37.0 G, graphemes 27.8 G to 26.0 G.
 
 ### Standard library
 
