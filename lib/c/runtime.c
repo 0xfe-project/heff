@@ -3105,30 +3105,33 @@ static inline int heff_rune_scalar(int64_t r) {
   return r >= 0 && r <= 0x10FFFF && !(r >= 0xD800 && r < 0xE000);
 }
 
-// (the runes' string: each its UTF-8 bytes)
+// (the runes' string: each its UTF-8 bytes, counted first by its value
+// alone, then written; an ASCII rune written where it is)
 HEFF_FN V heff_strOfRunes(V l) {
   int64_t n = 0;
-  uint8_t tmp[4];
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     int64_t r = INT_OF(heff_field(c, 0));
-    n += heff_u8_encode(tmp, heff_rune_scalar(r) ? (uint32_t)r : 0xFFFD);
+    n += !heff_rune_scalar(r) ? 3 : r < 0x80 ? 1 : r < 0x800 ? 2 : r < 0x10000 ? 3 : 4;
   }
   Str *s = heff_str_new(n);
   int64_t k = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     int64_t r = INT_OF(heff_field(c, 0));
-    k += heff_u8_encode(s->s + k, heff_rune_scalar(r) ? (uint32_t)r : 0xFFFD);
+    if (r >= 0 && r < 0x80) s->s[k++] = (uint8_t)r;
+    else k += heff_u8_encode(s->s + k, heff_rune_scalar(r) ? (uint32_t)r : 0xFFFD);
   }
   heff_drop(l);
   return (V)s;
 }
 
 // (the rune at `i`, and how many bytes it takes, `*w`; out of the
-// string, U+FFFD of none)
-HEFF_FN uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
+// string, U+FFFD of none: an ASCII byte read where it is called, any
+// other by the decoder)
+HEFF_FAST uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
+  if (x->p[i] < 0x80) { *w = 1; return x->p[i]; }
   uint32_t u;
-  *w = heff_u8_read(x->p + i, x->len - i, &u);
+  *w = heff_u8_decode(x->p + i, x->len - i, &u);
   return u;
 }
 
@@ -3147,6 +3150,16 @@ HEFF_FAST V heff_strRuneWidth_lent(V a, V i, int give) {
   return MK_INT(w);
 }
 HEFF_FN V heff_strRuneWidth(V a, V i) { return heff_strRuneWidth_lent(a, i, 1); }
+
+// (the rune at `i` and its width, read once: the two of `strRuneAt` and
+// `strRuneWidth`, a tuple)
+HEFF_FAST HeffT2 heff_strRuneDecode_lent(V a, V i, int give) {
+  int64_t w;
+  uint32_t r = heff_str_rune_at((Str *)a, INT_OF(i), &w);
+  HEFF_GIVEN(give, 0, a);
+  return (HeffT2){{MK_INT((int64_t)r), MK_INT(w)}};
+}
+HEFF_FN HeffT2 heff_strRuneDecode(V a, V i) { return heff_strRuneDecode_lent(a, i, 1); }
 
 HEFF_FN V heff_strRuneCount(V a) {
   Str *x = (Str *)a;
