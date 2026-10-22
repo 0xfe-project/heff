@@ -25,15 +25,66 @@ data BindingMode = BDelayedBy Int
 
 data Ctx = CEmpty | CBind Ctx BindingMode Value.Ty | CUndelay Ctx
 
+-- | a step into a value: a record's field, or the `i`th argument of its
+-- | tag `x`
+data PartStep = PartField String | PartArg String Int
+
+samePartStep : PartStep -> PartStep -> Bool
+samePartStep (PartField f) (PartField g) = strEq f g
+samePartStep (PartArg x i) (PartArg y j) = i == j && strEq x y
+samePartStep _ _ = False
+
+samePartSteps : List PartStep -> List PartStep -> Bool
+samePartSteps Nil Nil = True
+samePartSteps (Cons s ss) (Cons t ts) = samePartStep s t && samePartSteps ss ts
+samePartSteps _ _ = False
+
+-- | a part of a local's value: the local, by its level, and the steps
+-- | into it, the last first
+type ValuePart = { root : Int, steps : List PartStep }
+
+samePart : ValuePart -> ValuePart -> Bool
+samePart p q = p.root == q.root && samePartSteps p.steps q.steps
+
+-- | what the matches around a term have established of the values in
+-- | scope (#108): the locals that name a part of another's value (bound
+-- | to it, or to an argument of the tag matched), and the tags a part can
+-- | still have, an arm of a match on it being taken.  The locals do not
+-- | change (a `let mut` variable is bound again where it is set), so
+-- | it holds for whatever is under the arm, lambdas too
+type Matched =
+  { aliases : List (Pair Int ValuePart)
+  , tags : List (Pair ValuePart (List String))
+  }
+
+nothingMatched : Matched
+nothingMatched = { aliases = Nil, tags = Nil }
+
 type Scope =
-  { len : Int, names : List String, locals : Value.Locals Value.V, ctx : Ctx }
+  { len : Int
+  , names : List String
+  , locals : Value.Locals Value.V
+  , ctx : Ctx
+  , matched : Matched
+  }
 
 emptyScope : Scope
-emptyScope = { len = 0, names = Nil, locals = LNil, ctx = CEmpty }
+emptyScope =
+  { len = 0
+  , names = Nil
+  , locals = LNil
+  , ctx = CEmpty
+  , matched = nothingMatched
+  }
 
 undelayScope : Scope -> Scope
 undelayScope sd =
-  { len = sd.len, names = sd.names, locals = sd.locals, ctx = CUndelay sd.ctx }
+  { len = sd.len
+  , names = sd.names
+  , locals = sd.locals
+  , ctx = CUndelay sd.ctx
+  , matched = sd.matched
+  }
 
 letAt : BindingMode -> String -> Value.V -> Value.Ty -> Scope -> Scope
 letAt bm x v a c =
@@ -41,7 +92,91 @@ letAt bm x v a c =
   , names = Cons x c.names
   , locals = Value.snocL c.locals v
   , ctx = CBind c.ctx bm a
+  , matched = c.matched
   }
+
+withMatched : Matched -> Scope -> Scope
+withMatched k sc =
+  { len = sc.len
+  , names = sc.names
+  , locals = sc.locals
+  , ctx = sc.ctx
+  , matched = k
+  }
+
+-- (the part of a value the local `l` names: its own, unless it was bound
+-- to a part of another's)
+partNamed : List (Pair Int ValuePart) -> Int -> ValuePart
+partNamed Nil l = { root = l, steps = Nil }
+partNamed (Cons (MkPair m p) rest) l = if m == l then p else partNamed rest l
+
+partInto : PartStep -> ValuePart -> ValuePart
+partInto s p = { root = p.root, steps = Cons s p.steps }
+
+partIntoM : PartStep -> Maybe ValuePart -> Maybe ValuePart
+partIntoM s (Just p) = Just (partInto s p)
+partIntoM s Nothing = Nothing
+
+-- | the part of a local's value a term is, if it is one: a local, or a
+-- | field of one
+partOf : Scope -> Syntax.Tm -> Maybe ValuePart
+partOf sc (SLocal i) = Just (partNamed sc.matched.aliases (sc.len - 1 - i))
+partOf sc (SProj t f) = partIntoM (PartField f) (partOf sc t)
+partOf sc _ = Nothing
+
+matchedTagsAt : List (Pair ValuePart (List String))
+              -> ValuePart
+              -> Maybe (List String)
+matchedTagsAt Nil p = Nothing
+matchedTagsAt (Cons (MkPair q xs) rest) p =
+  if samePart p q then Just xs else matchedTagsAt rest p
+
+-- | the tags `p` can still have, where a match around says
+matchedTags : Scope -> ValuePart -> Maybe (List String)
+matchedTags sc p = matchedTagsAt sc.matched.tags p
+
+-- | of the tags `xs`, those the part `p` can still have
+tagsLeft : Scope -> Maybe ValuePart -> List String -> List String
+tagsLeft sc (Just p) xs = case matchedTags sc p of
+  Just ys -> List.keepIf (\x -> List.elemBy strEq x ys) xs
+  Nothing -> xs
+tagsLeft sc Nothing xs = xs
+
+-- | an arm's scope, where the tag of `p` is one of `xs`
+matchedTo : Maybe ValuePart -> List String -> Scope -> Scope
+matchedTo (Just p) xs sc =
+  withMatched
+    { aliases = sc.matched.aliases
+    , tags = Cons (MkPair p (tagsLeft sc (Just p) xs)) sc.matched.tags
+    }
+    sc
+matchedTo Nothing xs sc = sc
+
+-- | the local `l` is bound to the part `p`
+namesPart : Int -> Maybe ValuePart -> Scope -> Scope
+namesPart l (Just p) sc =
+  withMatched
+    { aliases = Cons (MkPair l p) sc.matched.aliases, tags = sc.matched.tags }
+    sc
+namesPart l Nothing sc = sc
+
+-- (the `n` locals from the level `l` on, bound to the arguments of the
+-- tag `x` of `p`, from the `i`th)
+argPartsFrom : ValuePart -> String -> Int -> Int -> Int -> Scope -> Scope
+argPartsFrom p x l i n sc =
+  if i >= n then sc
+  else argPartsFrom
+      p
+      x
+      l
+      (i + 1)
+      n
+      (namesPart (l + i) (Just (partInto (PartArg x i) p)) sc)
+
+-- | an arm of the tag `x` of `p` binds its `n` arguments next
+argParts : Maybe ValuePart -> String -> Int -> Scope -> Scope
+argParts (Just p) x n sc = argPartsFrom p x sc.len 0 n sc
+argParts Nothing x n sc = sc
 
 let_ : String -> Value.V -> Value.Ty -> Scope -> Scope
 let_ x v a c = letAt (BDelayedBy 0) x v a c
@@ -194,7 +329,7 @@ type StCore =
 type StepIn st a = st -> Pair (Either Diag a) st
 
 -- | an argument whose check waits until the type it is checked at is
--- | known, and what may be guessed of that type when nothing else says
+-- | matched, and what may be guessed of that type when nothing else says
 -- | it (of a lambda's: that it is a function type; whether it was).
 -- | Each is a step of the handler (`Step`), over the whole state, so
 -- | the state is a `data`, and the fields parametric, to tie the knot.
@@ -260,12 +395,12 @@ restoreAllTo (MkSaved ds ws) st =
 -- Effects
 --------------------------------------------------------------------------------
 
--- | Checks that wait: one delayed until a type is known (with a guess
+-- | Checks that wait: one delayed until a type is matched (with a guess
 -- | of that type, or not), an instance argument wanted; a guess made,
 -- | of the oldest delayed check that has one and still waits, and
--- | whether there is one to make; waking the delayed ones whose types are known (all
+-- | whether there is one to make; waking the delayed ones whose types are matched (all
 -- | of them, with `True`; else finding the wanted ones whose goals are
--- | known, too), trying the wanted ones (and refusing those
+-- | matched, too), trying the wanted ones (and refusing those
 -- | still undetermined, on `True`: whether any was found); whether one
 -- | is ready; the waiting checks saved, and put back (the delayed ones,
 -- | or all).
@@ -364,11 +499,11 @@ throwE d = op (exEv (Throw d)) val
 catchE : {a : Type} -> Elab a -> (Diag -> Elab a) -> Elab a
 catchE m h = op (exEv (Catch m h)) val
 
--- | `chk`, once `ty` is known
+-- | `chk`, once `ty` is matched
 delay : Value.Ty -> Elab Unit -> Elab Unit
 delay ty chk = op (dfEv (Delay ty chk (MkUnit : Unit))) val
 
--- | `chk`, once `ty` is known; and `gs`, a guess of `ty`, if nothing else
+-- | `chk`, once `ty` is matched; and `gs`, a guess of `ty`, if nothing else
 -- | says it (whether it was made)
 delayGuessing : Value.Ty -> Elab Unit -> Elab Bool -> Elab Unit
 delayGuessing ty chk gs =
@@ -387,9 +522,9 @@ canGuess = op (dfEv (CanGuess (\b -> b))) val
 want : Params.Span -> (Bool -> Elab Bool) -> Elab Unit
 want sp f = op (dfEv (Want sp f (MkUnit : Unit))) val
 
--- | run the delayed checks whose types are now known (and those they
+-- | run the delayed checks whose types are now matched (and those they
 -- | delay in turn), and find the instance arguments whose goals are
--- | (one not found yet waits on); with `all`, every delayed check, known
+-- | (one not found yet waits on); with `all`, every delayed check, matched
 -- | or not, and no search
 wake : Bool -> Elab Unit
 wake all = op (dfEv (Wake all (MkUnit : Unit))) val

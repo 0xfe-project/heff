@@ -2813,6 +2813,7 @@ rescope sc v =
   , names = sc.names
   , locals = rebottom v sc.locals
   , ctx = sc.ctx
+  , matched = sc.matched
   }
 
 fieldEvOf : String
@@ -3567,15 +3568,28 @@ recordTags e a vs (Cons (MkPair x tsp) rest) = do
 nonExhaustive : String -> String
 nonExhaustive what = "non-exhaustive pattern: no case provided for " ^ what
 
+-- | the scope of the arm of the tag `x`, of `n` arguments, of a match on
+-- | the part `p`: there `p`'s tag is `x`, and the arguments bound next
+-- | are its parts
+armScope : Maybe ValuePart -> String -> Int -> Scope -> Scope
+armScope p x n sc = argParts p x n (matchedTo p [x] sc)
+
+-- | whether the matches around have ruled out the tag `x` for the part
+-- | `p` (#108)
+ruledOut : Scope -> Maybe ValuePart -> String -> Bool
+ruledOut sc p x = List.null (tagsLeft sc p [x])
+
+-- | (`p`: the part of a value the scrutinee is, if it is one)
 caseArm : Params.Span
         -> ElabEnv
         -> Value.Ty
         -> Value.Ty
+        -> Maybe ValuePart
         -> String
         -> List (Params.Th Value.Ty)
         -> Dict.Dict (Pair (Array String) Chk)
         -> Elab (Pair String (Pair (Array String) Syntax.Tm))
-caseArm sp e b a x ts casesChk = case Dict.lookup casesChk x of
+caseArm sp e b a p x ts casesChk = case Dict.lookup casesChk x of
   Just (MkPair xs bodyChk) ->
     if Array.length xs == List.length ts
     then do
@@ -3587,7 +3601,7 @@ caseArm sp e b a x ts casesChk = case Dict.lookup casesChk x of
              (multiBind
                 (Array.toList xs)
                 (List.map (\t -> Params.forceTh t) ts)
-                e.scope))
+                (armScope p x (List.length ts) e.scope)))
           b
       pure (MkPair x (MkPair xs body.stx))
     else failWith sp 16 ("wrong number of arguments provided for tag " ^ x)
@@ -3602,13 +3616,20 @@ caseArm sp e b a x ts casesChk = case Dict.lookup casesChk x of
              (multiBind
                 (List.map (\t -> "_") ts)
                 (List.map (\t -> Params.forceTh t) ts)
-                e.scope))
+                (armScope p x (List.length ts) e.scope)))
           b
       pure
           (MkPair
              x
              (MkPair (Array.fromList (List.map (\t -> "_") ts)) body.stx))
-    Nothing -> failWith sp 17 (nonExhaustive ("tag " ^ x))
+    -- (a tag the matches around have ruled out is never matched here)
+    Nothing ->
+      if ruledOut e.scope p x
+      then pure
+          (MkPair
+             x
+             (MkPair (Array.fromList (List.map (\t -> "_") ts)) SAbandon))
+      else failWith sp 17 (nonExhaustive ("tag " ^ x))
 
 -- (whether a case names the tag)
 namedIn : {a : Type}
@@ -3718,18 +3739,28 @@ casesWith : Params.Span
           -> Value.Ty
           -> Memoed.El
           -> Value.Ty
+          -> Maybe ValuePart
           -> List (Pair String (Array (Params.Th Value.Ty)))
           -> List (Pair String (Array (Params.Th Value.Ty)))
           -> Dict.Dict (Pair (Array String) Chk)
           -> Chk
           -> Elab Memoed.El
-casesWith sp e b scrut a every named casesChk d = do
+casesWith sp e b scrut a part every named casesChk d = do
   cases <-
     traverseE
       (\p -> case p of
-       MkPair x fs -> caseArm sp e b a x (Array.toList fs) casesChk)
+       MkPair x fs -> caseArm sp e b a part x (Array.toList fs) casesChk)
       named
-  body <- runChk d e b
+  body <-
+    runChk
+      d
+      (withScope
+         e
+         (matchedTo
+            part
+            (List.map fst (List.keepIf (\p -> not (namedIn casesChk p)) every))
+            e.scope))
+      b
   pure
       (Memoed.matchM
          scrut
@@ -3739,28 +3770,31 @@ casesWith sp e b scrut a every named casesChk d = do
 -- | the cases of a match: each tag's -- a default case, `_ => e`, that
 -- | stands for two tags or more, where another case names a tag, checked
 -- | once and copied for each tag it stands for, or kept once where the
--- | copies would be big (#123)
+-- | copies would be big (#123).  Where the scrutinee is a part of a
+-- | local's value (`part`), each arm knows its tag, and a tag the
+-- | matches around have ruled out needs no case (#108)
 casesAt : Params.Span
         -> ElabEnv
         -> Value.Ty
         -> Memoed.El
         -> Value.Ty
+        -> Maybe ValuePart
         -> Params.Variants (Params.Th Value.Ty)
         -> List (Pair String Params.Span)
         -> Dict.Dict (Pair (Array String) Chk)
         -> Elab Memoed.El
-casesAt sp e b scrut a vs tags casesChk = do
+casesAt sp e b scrut a part vs tags casesChk = do
   recordTags e a vs tags
   tagsExposed e a vs tags
   let every = Dict.toList vs
   let named = List.keepIf (\p -> namedIn casesChk p) every
   case sharedDefault casesChk every named of
-    Just d -> casesWith sp e b scrut a every named casesChk d
+    Just d -> casesWith sp e b scrut a part every named casesChk d
     Nothing -> do
       cases <-
         traverseE
           (\p -> case p of
-           MkPair x fs -> caseArm sp e b a x (Array.toList fs) casesChk)
+           MkPair x fs -> caseArm sp e b a part x (Array.toList fs) casesChk)
           every
       pure (Memoed.matchM scrut (Dict.fromList cases))
 
@@ -3774,7 +3808,7 @@ matchLater sp scrut a tags casesChk =
   MkChk (\e2 b2 -> do
   a2 <- Meta.forceT a
   case Value.behavior a2 of
-    LikeSum vs -> casesAt sp e2 b2 scrut a2 vs tags casesChk
+    LikeSum vs -> casesAt sp e2 b2 scrut a2 Nothing vs tags casesChk
     _ -> do
       blocked <- Meta.blockedTy a2
       if blocked then pure (errorHole b2)
@@ -3800,7 +3834,17 @@ sumElim sp scrutSyn tags casesChk =
            MkPair scrut a0 -> do
              a <- Meta.forceT a0
              case Value.behavior a of
-               LikeSum vs -> casesAt sp e b scrut a vs tags casesChk
+               LikeSum vs ->
+                 casesAt
+                   sp
+                   e
+                   b
+                   scrut
+                   a
+                   (partOf e.scope scrut.stx)
+                   vs
+                   tags
+                   casesChk
                _ -> do
                  blocked <- Meta.blockedTy a
                  if blocked then pure (errorHole b)
@@ -3840,38 +3884,59 @@ otherTag : String -> List String -> Maybe String
 otherTag x Nil = Nothing
 otherTag x (Cons y ys) = if strEq x y then otherTag x ys else Just y
 
+-- (each with its index, from `i`)
+numbered : {a : Type} -> Int -> List a -> List (Pair Int a)
+numbered i Nil = Nil
+numbered i (Cons x xs) = Cons (MkPair i x) (numbered (i + 1) xs)
+
 -- | whether the pattern `p` can fail to match a value of the type `a`,
 -- | where a pattern binds (`let p = e`, `p <- e`, `with e as p`, `\p ->
 -- | e`): where it can, the part that can and what it leaves out.  A
--- | literal can; a tag can unless it is the only one of its type, and
--- | its arguments' patterns cannot fail at theirs; a name cannot.  Where
--- | the type does not say (it is not known yet, or no sum), the match
--- | itself finds what it leaves out
-patternCanFail : Value.Ty
+-- | literal can; a tag can unless it is the only one of its type the
+-- | value can have -- the only one, or the only one left where the
+-- | value is a part of a local's (`part`) and the matches around have
+-- | ruled out the others (#108) -- and its arguments' patterns cannot
+-- | fail at theirs; a name cannot.  Where the type does not say (it is
+-- | not known yet, or no sum), the match itself finds what it leaves out
+patternCanFail : Scope
+               -> Maybe ValuePart
+               -> Value.Ty
                -> Presyntax.Pat
                -> Elab (Maybe (Pair Params.Span String))
-patternCanFail a (At (PatVar _) _) = pure Nothing
-patternCanFail a (At (PatAs _ _ p) _) = patternCanFail a p
-patternCanFail a0 (At (PatTag x _ ps) sp) = do
+patternCanFail sc part a (At (PatVar _) _) = pure Nothing
+patternCanFail sc part a (At (PatAs _ _ p) _) = patternCanFail sc part a p
+patternCanFail sc part a0 (At (PatTag x _ ps) sp) = do
   a <- Meta.forceT a0
   case Value.behavior a of
     LikeSum vs -> case Dict.lookup vs x of
-      Just ts -> case otherTag x (List.map fst (Dict.toList vs)) of
+      Just ts -> case otherTag
+          x
+          (tagsLeft sc part (List.map fst (Dict.toList vs))) of
         Just y -> pure (Just (MkPair sp ("tag " ^ y)))
         Nothing ->
           firstElab
             (List.zipWith
-               (\q t -> patternCanFail (Params.forceTh t) q)
+               (\q it ->
+                  patternCanFail
+                    sc
+                    (partIntoM (PartArg x (fst it)) part)
+                    (Params.forceTh (snd it))
+                    q)
                ps
-               (Array.toList ts))
+               (numbered 0 (Array.toList ts)))
       Nothing -> pure Nothing
     _ -> pure Nothing
-patternCanFail a (At (PatInt _) sp) = pure (Just (MkPair sp literalLeft))
-patternCanFail a (At (PatFloat _) sp) = pure (Just (MkPair sp literalLeft))
-patternCanFail a (At (PatString _) sp) = pure (Just (MkPair sp literalLeft))
-patternCanFail a (At (PatRune _) sp) = pure (Just (MkPair sp literalLeft))
-patternCanFail a (At (PatBinary _) sp) = pure (Just (MkPair sp literalLeft))
-patternCanFail a _ = pure Nothing
+patternCanFail sc part a (At (PatInt _) sp) =
+  pure (Just (MkPair sp literalLeft))
+patternCanFail sc part a (At (PatFloat _) sp) =
+  pure (Just (MkPair sp literalLeft))
+patternCanFail sc part a (At (PatString _) sp) =
+  pure (Just (MkPair sp literalLeft))
+patternCanFail sc part a (At (PatRune _) sp) =
+  pure (Just (MkPair sp literalLeft))
+patternCanFail sc part a (At (PatBinary _) sp) =
+  pure (Just (MkPair sp literalLeft))
+patternCanFail sc part a _ = pure Nothing
 
 -- | what a binding's pattern `p` takes apart, `s`: refused where `p` can
 -- | fail to match it, as a `case` that leaves a value out is (E0317)
@@ -3879,7 +3944,7 @@ bindingSyn : Presyntax.Pat -> Syn -> Syn
 bindingSyn p s =
   MkSyn (\e -> do
   pm <- runSyn s e
-  fails <- patternCanFail (snd pm) p
+  fails <- patternCanFail e.scope (partOf e.scope (fst pm).stx) (snd pm) p
   case fails of
     Just (MkPair sp what) ->
       failWithNote
@@ -3899,8 +3964,13 @@ caseLet x scrutSyn body =
   case ps of
     MkPair scrut a0 -> do
       a <- Meta.forceT a0
+      -- (`x` names the scrutinee, a part of a local's value, maybe)
       ebody <-
-        withBound x a e.scope (\v scope' -> runChk body (withScope e scope') b)
+        withBound
+          x
+          a
+          (namesPart e.scope.len (partOf e.scope scrut.stx) e.scope)
+          (\v scope' -> runChk body (withScope e scope') b)
       pure
           (Memoed.app
              (Memoed.lam

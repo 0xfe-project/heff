@@ -124,6 +124,20 @@ value out is. Write a `case`, or in a `do` block `let p = e else s`
 ([do](do.md#statements)), which says what happens when it does not
 match.
 
+A tag cannot fail where the matches around it have ruled out the
+others. In an arm of a `case` on a local (or of an equation, or in the
+statements after a `let p = e else s`), that local, a name bound to it,
+a field of it and an argument of the tag matched can only have the
+tags the arm leaves them, and a `case` on one needs no case for a tag
+ruled out. A name bound again, a `let mut` variable set, or a lambda's
+parameter is another value, which no match has looked at.
+
+```haskell
+first : List Int -> Int
+first Nil = 0
+first xs = let Cons h t = xs in h
+```
+
 ## Order
 
 A definition sees the definitions above it, and itself. A name defined
