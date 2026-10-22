@@ -221,7 +221,8 @@ const numberRoom = 32;
 /// after it: the fewest digits that read back as the same float -- of
 /// those, the nearest -- plain from 1e-7 up to 1e21, else as a digit,
 /// the others after a point, and an exponent; "NaN", "Infinity",
-/// "-Infinity", and "0", of either zero.
+/// "-Infinity", and "0" or "-0" (which JavaScript writes "0"), of a
+/// zero, by its sign.
 export fn heff_js_number(d: f64, out: [*]u8) void {
     jsNumber(f64, d, out[0..numberRoom]);
 }
@@ -241,7 +242,7 @@ fn jsNumber(comptime T: type, x: T, out: *[numberRoom]u8) void {
 fn writeNumber(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (std.math.isNan(x)) return w.writeAll("NaN");
     if (std.math.isInf(x)) return w.writeAll(if (x < 0) "-Infinity" else "Infinity");
-    if (x == 0) return w.writeAll("0");
+    if (x == 0) return w.writeAll(if (std.math.signbit(x)) "-0" else "0");
     const shortest = decimalOf(T, x);
     if (shortest.sign) try w.writeByte('-');
     // (its digits, `k` of them, none of them a last 0, and where the

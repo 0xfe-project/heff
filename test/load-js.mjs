@@ -74,10 +74,14 @@ const showBits = (b) => {
 export const show = (v, arg = false) => {
   if (typeof v === "function") return v.$erased ? "#erased" : "#fun";
   // (a negative number, an argument: `Just (-7)`)
-  if ((typeof v === "bigint" || typeof v === "number") && arg && String(v).startsWith("-")) return "(" + show(v) + ")";
+  if ((typeof v === "bigint" || typeof v === "number") && arg && show(v).startsWith("-")) return "(" + show(v) + ")";
   if (typeof v === "bigint") return v.toString();
   // (a float as a literal writes it: `2.0`, not `2`)
-  if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
+  if (typeof v === "number") {
+    if (v === 0 && 1 / v < 0) return "-0.0";
+    const s = String(v);
+    return isNaN(s + ".0") ? s : s + ".0";
+  }
   if (typeof v === "string") return showString(v);
   if (v instanceof Uint8Array) return v.bits === undefined ? showBytes(v) : showBits(v);
   // (an array, of numbers a `Float64Array`)
