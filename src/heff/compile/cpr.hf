@@ -10,6 +10,12 @@
 -- tag of what it gives back: what a closure, or a call whose value goes
 -- on as it is, calls.
 --
+-- A field that every way out builds as one tag, a tag of fields of its
+-- own -- a loop's `let mut`s, given back as a pair of a pair of ... --
+-- is given back as its fields too, each in a place: a call taking the
+-- field apart in turn is given them, and no tag of it is built (a call
+-- using it whole builds it).
+--
 -- A call taking what it gives apart at once -- `case f x of MkPair a b
 -- -> ...`, or a binding of it only matched on, or only read fields of --
 -- calls the worker and is given the fields: no tag is built.  A match on
@@ -50,7 +56,7 @@ isVar x _ = False
 
 -- | how many words a tuple may be
 maxWords : Int
-maxWords = 4
+maxWords = 12
 
 -- | how many tags a function with a worker may give back
 maxTags : Int
@@ -63,23 +69,54 @@ workerKey g = g ^ "$cpr"
 -- Ways out
 --------------------------------------------------------------------------------
 
--- | a way out of a function: a tag built, of its fields' types; a
--- | record built, of its labels and their types; a call last; anything
--- | else (`abandon` is none)
-data Out
-  = OutTag String (List IR.FieldTy)
-  | OutRecord (List String) (List IR.FieldTy)
-  | OutCall String
-  | OutOther
+-- | a field of what a way out builds: a value of its type; or a tag
+-- | built there (its type, the tag, its fields' types, its fields), so
+-- | that its fields are given back each in a place of the tuple, as the
+-- | outer tag's are -- a loop's variables, a pair of a pair of ...
+data Fld = Flat IR.FieldTy | Nest IR.FieldTy String (List IR.FieldTy) (List Fld)
+
+fldTy : Fld -> IR.FieldTy
+fldTy (Flat a) = a
+fldTy (Nest a _ _ _) = a
+
+-- | the types of a field's values, each a place of the tuple
+leafTys : Fld -> List IR.FieldTy
+leafTys (Flat a) = Cons a Nil
+leafTys (Nest _ _ _ fs) = List.concatMap leafTys fs
+
+leavesOf : List Fld -> List IR.FieldTy
+leavesOf fs = List.concatMap leafTys fs
 
 -- (each field's type, as many as there are fields)
 tysOf : List IR.Expr -> List IR.FieldTy -> List IR.FieldTy
 tysOf args ts =
   List.map (\i -> Repr.tyIn i ts) (List.range 0 (List.length args - 1))
 
+-- (a field `e` of type `ty`: a tag of some fields built there is
+-- nested)
+fldAt : IR.Expr -> IR.FieldTy -> Fld
+fldAt (ETag t args ts) ty =
+  if List.null args then Flat ty
+  else Nest ty t (tysOf args ts) (List.zipWith fldAt args (tysOf args ts))
+fldAt e ty = Flat ty
+
+-- (... with nothing nested)
+flatFld : Fld -> Fld
+flatFld f = Flat (fldTy f)
+
+-- | a way out of a function: a tag built, of its fields; a record
+-- | built, of its labels and their types; a call last; anything else
+-- | (`abandon` is none)
+data Out
+  = OutTag String (List Fld)
+  | OutRecord (List String) (List IR.FieldTy)
+  | OutCall String
+  | OutOther
+
 -- (a way out, onto `acc`)
 outOnto : List Out -> IR.Expr -> List Out
-outOnto acc (ETag t args ts) = Cons (OutTag t (tysOf args ts)) acc
+outOnto acc (ETag t args ts) =
+  Cons (OutTag t (List.zipWith fldAt args (tysOf args ts))) acc
 outOnto acc (ERecord fs ts) =
   Cons (OutRecord (List.map fst fs) (tysOf (List.map snd fs) ts)) acc
 outOnto acc (ECall g _) = Cons (OutCall g) acc
@@ -157,7 +194,7 @@ classesOf m =
 data Shape
   = NoShape
   | RecordShape (List String) (List IR.FieldTy)
-  | TagShape (OrdMap.OrdMap String (List IR.FieldTy))
+  | TagShape (OrdMap.OrdMap String (List Fld))
   | BadShape
 
 -- (two types of a field, one way out's and another's, as one: the same,
@@ -168,15 +205,23 @@ mergeTy a b = if strEq (IR.fieldTyName a) (IR.fieldTyName b) then a else FtOther
 mergeTys : List IR.FieldTy -> List IR.FieldTy -> List IR.FieldTy
 mergeTys args bs = List.zipWith mergeTy args bs
 
--- (a tag's fields' types, with those of it seen before)
-taggedWith : OrdMap.OrdMap String (List IR.FieldTy)
+-- (two ways' field as one: nested where both build the same tag there)
+mergeFld : Fld -> Fld -> Fld
+mergeFld (Nest a t ts fs) (Nest b u us gs) =
+  if strEq t u && List.length fs == List.length gs
+  then Nest (mergeTy a b) t (mergeTys ts us) (List.zipWith mergeFld fs gs)
+  else Flat (mergeTy a b)
+mergeFld f g = Flat (mergeTy (fldTy f) (fldTy g))
+
+-- (a tag's fields, with those of it seen before)
+taggedWith : OrdMap.OrdMap String (List Fld)
            -> String
-           -> List IR.FieldTy
-           -> Maybe (List IR.FieldTy)
+           -> List Fld
+           -> Maybe (List Fld)
            -> Shape
 taggedWith m t ts (Just ts0) =
   if List.length ts0 == List.length ts
-  then TagShape (OrdMap.insert m t (mergeTys ts0 ts))
+  then TagShape (OrdMap.insert m t (List.zipWith mergeFld ts0 ts))
   else BadShape
 taggedWith m t ts Nothing = TagShape (OrdMap.insert m t ts)
 
@@ -223,10 +268,15 @@ shapesOf parent m =
 --------------------------------------------------------------------------------
 
 -- | a tag a tuple may hold the fields of: its name (a record's: ""), its
--- | number, its fields' types, and each field's place among the
--- | tuple's (after its number)
+-- | number, its fields' types, its fields, and each of their values'
+-- | place among the tuple's (after its number)
 type Con =
-  { tag : String, index : Int, tys : List IR.FieldTy, places : List Int }
+  { tag : String
+  , index : Int
+  , tys : List IR.FieldTy
+  , flds : List Fld
+  , places : List Int
+  }
 
 -- | how a worker gives back what its function built: the tuple's tag (a
 -- | tuple of these is one kind of value); whether its first value is the
@@ -287,8 +337,8 @@ placeOne p t =
 -- (the places so far, and the tags placed)
 type Laid = { kinds : List Repr.Repr, cons : List Con }
 
-laidWith : Laid -> String -> List IR.FieldTy -> Placed -> Laid
-laidWith acc t ts p =
+laidWith : Laid -> String -> List Fld -> Placed -> Laid
+laidWith acc t fs p =
   { kinds = p.kinds
   , cons =
       List.append
@@ -296,16 +346,22 @@ laidWith acc t ts p =
         (Cons
            { tag = t
            , index = List.length acc.cons
-           , tys = ts
+           , tys = List.map fldTy fs
+           , flds = fs
            , places = p.places
            }
            Nil)
   }
 
--- (a tag's fields placed, each in the first place of its kind free)
-layTag : Laid -> Pair String (List IR.FieldTy) -> Laid
-layTag acc (MkPair t ts) =
-  laidWith acc t ts (List.foldl placeOne { kinds = acc.kinds, places = Nil } ts)
+-- (a tag's fields' values placed, each in the first place of its kind
+-- free)
+layTag : Laid -> Pair String (List Fld) -> Laid
+layTag acc (MkPair t fs) =
+  laidWith
+    acc
+    t
+    fs
+    (List.foldl placeOne { kinds = acc.kinds, places = Nil } (leavesOf fs))
 
 -- (a layout, where it is worth a worker -- some field is built -- and
 -- small enough)
@@ -343,19 +399,35 @@ recordLayout root ls ts =
           { tag = ""
           , index = 0
           , tys = ts
+          , flds = List.map Flat ts
           , places = List.range 0 (List.length ts - 1)
           }
           Nil
     , group = root
     }
 
+tagsLayout : String -> List (Pair String (List Fld)) -> Maybe Layout
+tagsLayout root ts =
+  tagLayout
+    root
+    (List.length ts > 1)
+    (List.foldl layTag { kinds = Nil, cons = Nil } ts)
+
+-- (... where it fits, else with nothing nested)
+nestedOr : String
+         -> List (Pair String (List Fld))
+         -> Maybe Layout
+         -> Maybe Layout
+nestedOr root ts (Just lay) = Just lay
+nestedOr root ts Nothing =
+  tagsLayout
+    root
+    (List.map (\p -> MkPair (fst p) (List.map flatFld (snd p))) ts)
+
 -- | a class's layout, of what its ways out build (`root` its root)
 layoutOf : String -> Shape -> Maybe Layout
 layoutOf root (TagShape m) =
-  tagLayout
-    root
-    (OrdMap.size m > 1)
-    (List.foldl layTag { kinds = Nil, cons = Nil } (OrdMap.toList m))
+  nestedOr root (OrdMap.toList m) (tagsLayout root (OrdMap.toList m))
 layoutOf root (RecordShape ls ts) = recordLayout root ls ts
 layoutOf root s = Nothing
 
@@ -492,16 +564,105 @@ labelAt : String -> Int -> List String -> Int
 labelAt l i Nil = 0
 labelAt l i (Cons k ks) = if strEq l k then i else labelAt l (i + 1) ks
 
+-- (a field's values, of those of the fields from it on, `xs`)
+splitBy : {a : Type} -> List Fld -> List a -> List (List a)
+splitBy Nil xs = Nil
+splitBy (Cons f fs) xs =
+  Cons
+    (List.take (List.length (leafTys f)) xs)
+    (splitBy fs (List.drop (List.length (leafTys f)) xs))
+
+-- | a field, of its values `ys` in order: a nested tag built
+builtFld : Fld -> List IR.Expr -> IR.Expr
+builtFld (Nest _ t ts gs) ys =
+  ETag t (List.zipWith builtFld gs (splitBy gs ys)) ts
+builtFld f ys = fromMaybe EAbandon (List.head ys)
+
+builtFlds : List Fld -> List IR.Expr -> List IR.Expr
+builtFlds fs xs = List.zipWith builtFld fs (splitBy fs xs)
+
+-- | a variable bound to a field, and the variables of its values
+type FldBind = { var : String, fld : Fld, leaves : List String }
+
+fldBind : String -> Pair Fld (List String) -> FldBind
+fldBind w (MkPair f xs) = { var = w, fld = f, leaves = xs }
+
+fldBinds : List String -> List Fld -> List String -> List FldBind
+fldBinds ws fs xs = List.zipWith fldBind ws (List.zip fs (splitBy fs xs))
+
+-- (how many times the worklist matches on `x` with an arm for `t`, onto
+-- `n`)
+opensW : String -> String -> Int -> List IR.Expr -> Int
+opensW t x n Nil = n
+opensW t x n (Cons (EMatch s arms) rest) =
+  opensW
+    t
+    x
+    (if isVar x s && hasArm (armOf t arms) then n + 1 else n)
+    (Cons s (IR.pushArms arms rest))
+opensW t x n (Cons e rest) = opensW t x n (IR.partsOnto e rest)
+
+-- | `x`, bound to a tag `t`, is only matched on in `b`
+opens : String -> String -> IR.Expr -> Bool
+opens t x b =
+  opensW t x 0 (Cons b Nil) > 0
+  && opensW t x 0 (Cons b Nil) == IR.countW x 0 (Cons b Nil)
+
+-- (an arm, its variables bound by `k` to the fields `gs` of the values
+-- `xs`, its body as `go` gives it)
+openArm : (List FldBind -> IR.Expr -> IR.Expr)
+        -> List Fld
+        -> List String
+        -> (IR.Expr -> IR.Expr)
+        -> Maybe IR.Arm
+        -> IR.Expr
+openArm k gs xs go (Just (MkArm _ ws b)) = k (fldBinds ws gs xs) (go b)
+openArm k gs xs go Nothing = EAbandon
+
+-- (each match on the binding's variable, a tag `t` of the fields `gs`,
+-- its arm for `t`, the arm's variables bound by `k`)
+openIn : (List FldBind -> IR.Expr -> IR.Expr)
+       -> FldBind
+       -> String
+       -> List Fld
+       -> IR.Expr
+       -> IR.Expr
+openIn k fb t gs (EMatch s arms) =
+  if isVar fb.var s
+  then openArm k gs fb.leaves (openIn k fb t gs) (armOf t arms)
+  else IR.mapParts (\_ p -> openIn k fb t gs p) (EMatch s arms)
+openIn k fb t gs e = IR.mapParts (\_ p -> openIn k fb t gs p) e
+
+-- (a binding's variable, of the field `f`, bound in `b` by `k`: its
+-- value; a nested tag taken apart where it is only matched on, else
+-- built)
+bindAs : (List FldBind -> IR.Expr -> IR.Expr)
+       -> FldBind
+       -> Fld
+       -> IR.Expr
+       -> IR.Expr
+bindAs k fb (Nest _ t ts gs) b =
+  if opens t fb.var b then openIn k fb t gs b
+  else ELet
+      fb.var
+      (ETag t (builtFlds gs (List.map (\x -> EVar x) fb.leaves)) ts)
+      b
+bindAs k fb f b = ELet fb.var (EVar (fromMaybe "" (List.head fb.leaves))) b
+
+-- | the bindings' variables bound in `b`, each to its field
+bindFlds : List FldBind -> IR.Expr -> IR.Expr
+bindFlds Nil b = b
+bindFlds (Cons fb rest) b = bindAs bindFlds fb fb.fld (bindFlds rest b)
+
 -- (an arm's body, its variables bound to those of its tag's fields'
 -- places: its own, not the places' -- a place is of another tag's field
 -- on another way, or nothing, and what one way knows of a variable, a
 -- record read at its shape, heff.compile.refcount knows of it on all)
 armBodyAs : Layout -> List String -> Con -> Maybe IR.Arm -> IR.Expr
 armBodyAs lay vs c (Just (MkArm _ ws b)) =
-  List.foldr
-    (\p acc -> ELet (fst p) (EVar (placeVar lay vs (snd p))) acc)
+  bindFlds
+    (fldBinds ws c.flds (List.map (\i -> placeVar lay vs i) c.places))
     b
-    (List.zip ws c.places)
 armBodyAs lay vs c Nothing = EAbandon
 
 -- (whether the tuple's number is the tag's)
@@ -656,13 +817,23 @@ letsAround ls e = List.foldr (\p acc -> ELet (fst p) (snd p) acc) e ls
 conOf : Layout -> String -> Con
 conOf lay t =
   fromMaybe
-    { tag = t, index = 0, tys = Nil, places = Nil }
+    { tag = t, index = 0, tys = Nil, flds = Nil, places = Nil }
     (List.find (\(c : Con) -> strEq c.tag t) lay.cons)
 
--- (a tag or a record built at a way out, of `es`: its tuple)
+-- (a field's values, of `e` built at a way out: a nested tag's fields')
+leafExprs : Fld -> IR.Expr -> List IR.Expr
+leafExprs (Nest _ _ _ gs) (ETag _ args _) =
+  List.concatMap (\p -> leafExprs (fst p) (snd p)) (List.zip gs args)
+leafExprs f e = Cons e Nil
+
+-- (a tag or a record built at a way out, of `es`: its tuple, of the
+-- values of its fields)
 builtOut : Layout -> Con -> List IR.Expr -> S IR.Expr
 builtOut lay c es = do
-  b <- boundAll { lets = Nil, vals = Nil } es
+  b <-
+    boundAll
+      { lets = Nil, vals = Nil }
+      (List.concatMap (\p -> leafExprs (fst p) (snd p)) (List.zip c.flds es))
   pure (letsAround b.lets (tupleOfCon lay c b.vals))
 
 -- | a worker's way out: a tag or a record built, its tuple; a call last,
@@ -683,7 +854,10 @@ builtOf lay vs c =
          lay.labels
          c.places)
       c.tys
-  else ETag c.tag (List.map (\i -> EVar (placeVar lay vs i)) c.places) c.tys
+  else ETag
+      c.tag
+      (builtFlds c.flds (List.map (\i -> EVar (placeVar lay vs i)) c.places))
+      c.tys
 
 -- | a function with a worker: the wrapper, which calls the worker and
 -- | builds the tag of what it gives back
