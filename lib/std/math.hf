@@ -1,12 +1,15 @@
 -- The functions of a float: the trigonometric ones (of an angle in
 -- radians), the exponential and the logarithm, powers, rounding, and
--- the constants `pi` and `e` (`sqrt` and `floor` are the prelude's).
+-- the constants `pi` and `e` (`sqrt` and `floor` are the prelude's),
+-- and the float a decimal is, correctly rounded (`fromDecimal`).
 -- The primitives are JavaScript's `Math` and C's libm, which may differ
 -- in the last place of what they compute (`tan 1.0`, by a unit there):
 -- a program whose output must be the same on each backend shows fewer
 -- places than a float has.
 
 module std.math
+
+import int as Int
 
 -- (each a `Float64`'s, a 64-bit float's; a Float32's would be beside it,
 -- `float32Sin` and the like: C's `sinf`, JavaScript's `Math.fround` of
@@ -147,3 +150,100 @@ round x =
   -- (of a float not below 0, a half up; `y - floor y` is exact)
   halfUp : Float64 -> Int
   halfUp y = if y - toFloat (floor y) >= 0.5 then floor y + 1 else floor y
+
+-- The float of a decimal
+--------------------------------------------------------------------------------
+
+-- (10 to the power `k`, `k` from 0 to 22: exact)
+tenToFloat : Int -> Float64
+tenToFloat k =
+  if k == 0 then 1.0
+  else if k % 2 == 1 then 10.0 * tenToFloat (k - 1)
+  else (let h : Float64 = tenToFloat (k / 2) in h * h)
+
+-- (10 to the power `k`, `k` at least 0, an integer)
+tenTo : Int -> Int
+tenTo k =
+  if k == 0 then 1
+  else if k % 2 == 1 then 10 * tenTo (k - 1)
+  else (let h : Int = tenTo (k / 2) in h * h)
+
+-- (how many bits `n`, from 0 to 2^(2k) - 1, is written in, after `acc`:
+-- its upper `k` and then its lower, halving)
+bitsBelow : Int -> Int -> Int -> Int
+bitsBelow n acc k =
+  if k == 0 then acc + n
+  else if n >= shiftL 1 k then bitsBelow (shiftR n k) (acc + k) (k / 2)
+  else bitsBelow n acc (k / 2)
+
+-- (how many bits `n`, at least 0, is written in, after `acc`)
+bitLengthFrom : Int -> Int -> Int
+bitLengthFrom n acc =
+  if n >= shiftL 1 64 then bitLengthFrom (shiftR n 64) (acc + 64)
+  else bitsBelow n acc 32
+
+-- (`q` rounded up where the rest `r` of a division by `d` is above half
+-- of it, or half and `q` odd: to the nearest, a tie to the even)
+roundedHalfEven : Int -> Int -> Int -> Int
+roundedHalfEven q r d =
+  if 2 * r > d || (2 * r == d && q % 2 == 1) then q + 1 else q
+
+-- (the IEEE bits of `q` times 2 to the power `b` -- `q` below 2^53, and
+-- at least 2^52 but where `b` is the least, a subnormal's -- `q` rounded
+-- by the rest `r` of a division by `d`; above the largest, an infinity's)
+doubleBitsOf : Int -> Int -> Int -> Int -> Int
+doubleBitsOf b q r d =
+  min
+    ((b + 1074) * shiftL 1 52 + roundedHalfEven q r d)
+    (2047 * shiftL 1 52)
+
+-- (the IEEE bits of `num` over `den`, both above 0, the float nearest
+-- it whose last place is 2 to the power `b`, its quotient 53 bits or 54
+-- -- then its last place 2 to the power `b + 1`)
+doubleBitsAt : Int -> Int -> Int -> Int
+doubleBitsAt num den b =
+  let n : Int = shiftL num (max 0 (0 - b))
+  in let d : Int = shiftL den (max 0 b)
+  in let q : Int = n / d
+  in if q >= shiftL 1 53
+  then doubleBitsOf (b + 1) (q / 2) ((q % 2) * d + (n - q * d)) (2 * d)
+  else doubleBitsOf b q (n - q * d) d
+
+-- (the IEEE bits of `m` times 10 to the power `e`, `m` above 0, rounded
+-- to the nearest float: beyond the largest, an infinity's, and below
+-- half the least, 0's)
+nearestDoubleBits : Int -> Int -> Int
+nearestDoubleBits m e =
+  if e > 309 then 2047 * shiftL 1 52
+  else if bitLengthFrom m 0 * 302 / 1000 + 1 + e < 0 - 324 then 0
+  else (let num : Int = if e > 0 then m * tenTo e else m
+        in let den : Int = if e < 0 then tenTo (0 - e) else 1
+        in doubleBitsAt
+          num
+          den
+          (max
+             (bitLengthFrom num 0 - bitLengthFrom den 0 - 53)
+             (0 - 1074)))
+
+-- | `m` times 10 to the power `e`, correctly rounded: the float nearest
+-- | it, a tie to the even, as C's `strtod` reads a decimal -- beyond the
+-- | greatest float, an infinity, and below half the least, 0.0 (with
+-- | the sign of `m`).  Where `m` is below 2^53 and `e` within 22 of 0, it
+-- | is one operation of exact floats; else it is worked out in integers.
+-- | >>> fromDecimal 1 (0 - 1)
+-- | 0.1
+-- | >>> fromDecimal 5 (0 - 324)
+-- | 5e-324
+-- | >>> fromDecimal 9007199254740993 0
+-- | 9007199254740992.0
+-- | >>> fromDecimal (0 - 17976931348623159) 292
+-- | -Infinity
+fromDecimal : Int -> Int -> Float64
+fromDecimal m e =
+  if m < 0 then neg (fromDecimal (0 - m) e)
+  else if m == 0 then 0.0
+  else if m < shiftL 1 53 && 0 <= e && e <= 22
+  then floatFromInt m * tenToFloat e
+  else if m < shiftL 1 53 && 0 - 22 <= e && e < 0
+  then floatFromInt m /. tenToFloat (0 - e)
+  else floatOfBits 64 (nearestDoubleBits m e)
