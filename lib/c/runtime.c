@@ -125,6 +125,14 @@ typedef struct { V f[1]; } HeffT1;
 typedef struct { V f[2]; } HeffT2;
 typedef struct { V f[3]; } HeffT3;
 typedef struct { V f[4]; } HeffT4;
+typedef struct { V f[5]; } HeffT5;
+typedef struct { V f[6]; } HeffT6;
+typedef struct { V f[7]; } HeffT7;
+typedef struct { V f[8]; } HeffT8;
+typedef struct { V f[9]; } HeffT9;
+typedef struct { V f[10]; } HeffT10;
+typedef struct { V f[11]; } HeffT11;
+typedef struct { V f[12]; } HeffT12;
 
 // (a call last whose callee takes what its caller takes -- the same
 // parameters, the same result -- made a jump, the caller's frame let go
