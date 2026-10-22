@@ -3277,6 +3277,67 @@ freshNames base n =
     xs <- freshNames base (n - 1)
     pure (Cons x xs)
 
+-- What follows is simplified already, as an argument of the match, and
+-- each way out it is given the values that way gives.  It is
+-- simplified again only where one of them tells it more than a
+-- variable or a literal does, for a parameter it uses (a tag, a record,
+-- a function, a global, what computes); otherwise each parameter is
+-- the value -- put in its place, or, not used, left out (bound, if it
+-- computes) -- and what follows is what it already is.  (Each copy
+-- simplified again simplified again the copies within it, of what
+-- followed every statement after it: a `do` of a few statements run by
+-- a known handler took time exponential in them to compile, and the
+-- fuel it burnt was not left for what came after.)
+
+-- (the parameters given atomic values: those put in their place)
+atomsGiven : List String -> List IR.Expr -> OrdMap.OrdMap String IR.Expr
+atomsGiven (Cons y ys) (Cons v vs) =
+  if atomic v then OrdMap.insert (atomsGiven ys vs) y v else atomsGiven ys vs
+atomsGiven _ _ = OrdMap.empty
+
+-- (the others bound to their values: those not used left out, but
+-- what computes)
+valuesGiven : IR.Expr
+            -> List String
+            -> List IR.Expr
+            -> List (Pair String IR.Expr)
+valuesGiven b (Cons y ys) (Cons v vs) =
+  if atomic v || (IR.isValue v && occCountOf y b == 0)
+  then valuesGiven b ys vs
+  else Cons (MkPair y v) (valuesGiven b ys vs)
+valuesGiven b _ _ = Nil
+
+-- (a value that tells more than a variable or a literal, for a parameter
+-- used)
+givenTelling : IR.Expr -> List String -> List IR.Expr -> Bool
+givenTelling b (Cons x xs) (Cons v vs) =
+  (not (opaque v) && occCountOf x b > 0) || givenTelling b xs vs
+givenTelling b _ _ = False
+
+-- (what follows, simplified already, given a way's values)
+followerGiven : SK -> IR.Expr -> List IR.Expr -> M IR.Expr
+followerGiven r (ELam xs b) vs =
+  if List.length xs == List.length vs && not (givenTelling b xs vs)
+  then pure (letsOf (valuesGiven b xs vs) (IR.subst (atomsGiven xs vs) b))
+  else r.applyTo (ELam xs b) vs
+followerGiven r f vs = r.applyTo f vs
+
+-- (`k` replaced by a copy of what follows, given the values where it is
+-- called)
+followersIn : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
+followersIn r k f (EVar y) = if strEq y k then copy f else pure (EVar y)
+followersIn r k f (EApp (EVar y) argv) =
+  if strEq y k
+  then do
+    argv' <- traverseS (\q -> followersIn r k f q) argv
+    f2 <- copy f
+    followerGiven r f2 argv'
+  else do
+    argv' <- traverseS (\q -> followersIn r k f q) argv
+    pure (mkApp (EVar y) argv')
+followersIn r k f e =
+  IR.traversePartsM (mo := instanceMonadM) (\_ q -> followersIn r k f q) e
+
 -- (... where they do not all come to `k` -- a way that goes on no more,
 -- `stop`'s, among those that do -- what follows put where `k` is, a
 -- copy each time, if the code grows by no more than a function bound
@@ -3290,8 +3351,7 @@ followerCopied : SK
                -> IR.Expr
                -> M IR.Expr
 followerCopied r saved orig k f m = do
-  m2 <- substCopies k f m
-  e <- r.simp m2
+  e <- followersIn r k f m
   if not (IR.sizeAbove (IR.size orig + handedSize) e) then pure e
   else do
     st <- get
@@ -3318,7 +3378,7 @@ followerSet r orig k f s arms argv = do
       if n > 0 && occCountOf k m2 == 0
       then do
         xs <- freshNames "v" n
-        body <- r.applyTo f (List.map (\x -> EVar x) xs)
+        body <- followerGiven r f (List.map (\x -> EVar x) xs)
         pure (ESet xs m2 body)
       else followerCopied r saved orig k f m
     Nothing -> followerCopied r saved orig k f m
