@@ -291,6 +291,44 @@ fn decimalOf(comptime T: type, x: T) std.fmt.float.FloatDecimal(u64) {
     );
 }
 
+/// The float, of 64 bits or of 32, nearest the decimal `p[0..n]` -- a
+/// `-`, digits, perhaps a point and digits, perhaps an exponent --
+/// rounded once, a tie to the even, by zig's (Eisel-Lemire, and digit by
+/// digit where that cannot tell): of other text (a `+`, a `_`, `inf`,
+/// hexadecimal, which zig's would read), NaN.
+export fn heff_float_of_decimal(p: [*]const u8, n: i64, bits: c_int) f64 {
+    const text = p[0..@intCast(n)];
+    if (!isDecimal(text)) return std.math.nan(f64);
+    if (bits == 32) return std.fmt.parseFloat(f32, text) catch std.math.nan(f64);
+    return std.fmt.parseFloat(f64, text) catch std.math.nan(f64);
+}
+
+// (the end of the digits of `text` from `i` on)
+fn digitsEnd(text: []const u8, i: usize) usize {
+    var j = i;
+    while (j < text.len and std.ascii.isDigit(text[j])) j += 1;
+    return j;
+}
+
+// (whether `text` is a decimal, as `heff_float_of_decimal` reads one)
+fn isDecimal(text: []const u8) bool {
+    var i: usize = if (text.len > 0 and text[0] == '-') 1 else 0;
+    var j = digitsEnd(text, i);
+    if (j == i) return false;
+    if (j < text.len and text[j] == '.') {
+        i = j + 1;
+        j = digitsEnd(text, i);
+        if (j == i) return false;
+    }
+    if (j < text.len and (text[j] == 'e' or text[j] == 'E')) {
+        i = j + 1;
+        if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+        j = digitsEnd(text, i);
+        if (j == i) return false;
+    }
+    return j == text.len;
+}
+
 // Integers beyond a word: their magnitudes
 // ---------------------------------------------------------------------
 // A magnitude is its 64-bit digits, the least first, as `Big` holds
