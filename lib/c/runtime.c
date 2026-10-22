@@ -2223,9 +2223,9 @@ HEFF_FN V heff_big_lit(const char *s) {
 #define HEFF_BIG(s) ({ static V heff_lit_; heff_lit_ ? heff_lit_ : (heff_lit_ = heff_big_lit(s)); })
 #endif
 
-// (a float's integer part, beyond a word if it must be)
-HEFF_FN V heff_int_of_double(double f) {
-  if (f < (double)INT_LIM && f >= -(double)INT_LIM) return MK_INT((int64_t)f);
+// (a float's integer part, beyond a word if it must be: a word's
+// inlined, a big one's the call)
+HEFF_SLOW V heff_int_of_double_big(double f) {
   int e;
   double fr = frexp(fabs(f), &e);
   uint64_t mant = (uint64_t)ldexp(fr, 53);
@@ -2240,12 +2240,23 @@ HEFF_FN V heff_int_of_double(double f) {
   return big_make(f < 0, d, n);
 }
 
-HEFF_FN double heff_double_of_int(V v) {
-  if (IS_INT(v)) return (double)INT_OF(v);
+HEFF_FAST V heff_int_of_double(double f) {
+  if (HEFF_LIKELY(f < (double)INT_LIM && f >= -(double)INT_LIM)) return MK_INT((int64_t)f);
+  return heff_int_of_double_big(f);
+}
+
+// (an integer as the nearest float: a word's inlined, a big one's by its
+// digits, the call)
+HEFF_SLOW double heff_double_of_big(V v) {
   char *c = heff_int_cstr(v);
   double d = strtod(c, NULL);
   free(c);
   return d;
+}
+
+HEFF_FAST double heff_double_of_int(V v) {
+  if (HEFF_LIKELY(IS_INT(v))) return (double)INT_OF(v);
+  return heff_double_of_big(v);
 }
 
 // Strings
@@ -2748,19 +2759,29 @@ static inline float heff_f32_of(V v) {
 // `Float32` is a word of its bits (`heff_f32`): C's `float` is IEEE's,
 // each operation rounded, as JavaScript's `Math.fround` rounds.
 
-// (an integer's lowest 64 bits, as two's complement has them; borrowed)
-HEFF_FN uint64_t heff_int_low64(V v) {
-  if (IS_INT(v)) return (uint64_t)INT_OF(v);
+// (an integer's lowest 64 bits, as two's complement has them; borrowed:
+// a word's inlined, a big one's the call)
+HEFF_SLOW uint64_t heff_big_low64(V v) {
   Big *b = (Big *)v;
   uint64_t m = b->n > 0 ? b->d[0] : 0;
   if (b->n > 1) m |= (uint64_t)b->d[1] << 32;
   return b->neg ? (uint64_t)0 - m : m;
 }
 
-HEFF_FN V heff_int_u64(uint64_t m) {
-  if (m < (uint64_t)INT_LIM) return MK_INT((int64_t)m);
+HEFF_FAST uint64_t heff_int_low64(V v) {
+  if (HEFF_LIKELY(IS_INT(v))) return (uint64_t)INT_OF(v);
+  return heff_big_low64(v);
+}
+
+// (an integer of 64 bits, unsigned: a word inlined, a big one the call)
+HEFF_SLOW V heff_u64_big(uint64_t m) {
   uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
   return big_make(0, d, 2);
+}
+
+HEFF_FAST V heff_int_u64(uint64_t m) {
+  if (HEFF_LIKELY(m < (uint64_t)INT_LIM)) return MK_INT((int64_t)m);
+  return heff_u64_big(m);
 }
 
 // (a value of the type `T`, its 64 bits taken (and consumed), and one
