@@ -138,6 +138,47 @@ first Nil = 0
 first xs = let Cons h t = xs in h
 ```
 
+### Arms never taken
+
+An arm no value can take is warned of. It is a warning, not an error:
+the definition is accepted as it is.
+
+- An arm of a `case` whose tag the matches around have ruled out for
+  the same value, by the same rule as above, is W0358. So is a `_`
+  whose every tag they have ruled out. The warning says where the arm
+  (or the match) that ruled it out is.
+- An arm whose every value the arms above it match (its tag again, a
+  `_` after arms of every tag, `Cons a (Cons b c)` after `_`), and an
+  equation whose every argument the equations above it match, are
+  W0359.
+
+```haskell
+size : List Int -> Int
+size xs = case xs of
+  Nil -> 0
+  Cons h t -> case xs of
+    Nil -> 1        -- W0358: ruled out by the arm `Cons h t`
+    Cons a b -> 2
+
+pick : Int -> Int
+pick 0 = 0
+pick n = n
+pick 1 = 1          -- W0359: never used
+```
+
+Only arms the source writes in a `case` are warned of, and equations:
+not those of an `if`, of `&&` and `||`, of a `do` block's
+`let p = e else s`, nor the ones the compiler adds; nor an arm inside
+one already warned of. An equation of names after equations of every
+tag is not warned of, nor such an arm of a `case` of nested patterns:
+which tags the type has is not looked at there.
+
+| Code | Meaning |
+|---|---|
+| E0317 | a match, or a pattern that binds, leaves a value out |
+| W0358 | an arm the matches around rule out |
+| W0359 | an arm, or an equation, the ones above match every value of |
+
 ## Order
 
 A definition sees the definitions above it, and itself. A name defined

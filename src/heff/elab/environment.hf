@@ -46,16 +46,17 @@ type ValuePart = { root : Int, steps : List PartStep }
 samePart : ValuePart -> ValuePart -> Bool
 samePart p q = p.root == q.root && samePartSteps p.steps q.steps
 
+-- | the tags a part can still have, and where: the arm, taken, that
+-- | says so
+type TagsLeft = { part : ValuePart, tags : List String, at : Params.Span }
+
 -- | what the matches around a term have established of the values in
 -- | scope (#108): the locals that name a part of another's value (bound
 -- | to it, or to an argument of the tag matched), and the tags a part can
--- | still have, an arm of a match on it being taken.  The locals do not
--- | change (a `let mut` variable is bound again where it is set), so
--- | it holds for whatever is under the arm, lambdas too
-type Matched =
-  { aliases : List (Pair Int ValuePart)
-  , tags : List (Pair ValuePart (List String))
-  }
+-- | still have, an arm of a match on it being taken (the last first).
+-- | The locals do not change (a `let mut` variable is bound again where
+-- | it is set), so it holds for whatever is under the arm, lambdas too
+type Matched = { aliases : List (Pair Int ValuePart), tags : List TagsLeft }
 
 nothingMatched : Matched
 nothingMatched = { aliases = Nil, tags = Nil }
@@ -124,12 +125,10 @@ partOf sc (SLocal i) = Just (partNamed sc.matched.aliases (sc.len - 1 - i))
 partOf sc (SProj t f) = partIntoM (PartField f) (partOf sc t)
 partOf sc _ = Nothing
 
-matchedTagsAt : List (Pair ValuePart (List String))
-              -> ValuePart
-              -> Maybe (List String)
+matchedTagsAt : List TagsLeft -> ValuePart -> Maybe (List String)
 matchedTagsAt Nil p = Nothing
-matchedTagsAt (Cons (MkPair q xs) rest) p =
-  if samePart p q then Just xs else matchedTagsAt rest p
+matchedTagsAt (Cons t rest) p =
+  if samePart p t.part then Just t.tags else matchedTagsAt rest p
 
 -- | the tags `p` can still have, where a match around says
 matchedTags : Scope -> ValuePart -> Maybe (List String)
@@ -142,15 +141,42 @@ tagsLeft sc (Just p) xs = case matchedTags sc p of
   Nothing -> xs
 tagsLeft sc Nothing xs = xs
 
--- | an arm's scope, where the tag of `p` is one of `xs`
-matchedTo : Maybe ValuePart -> List String -> Scope -> Scope
-matchedTo (Just p) xs sc =
+-- | the scope of an arm, at `at`, where the tag of `p` is one of `xs`
+matchedTo : Maybe ValuePart -> List String -> Params.Span -> Scope -> Scope
+matchedTo (Just p) xs at sc =
   withMatched
     { aliases = sc.matched.aliases
-    , tags = Cons (MkPair p (tagsLeft sc (Just p) xs)) sc.matched.tags
+    , tags =
+        Cons
+          { part = p, tags = tagsLeft sc (Just p) xs, at = at }
+          sc.matched.tags
     }
     sc
-matchedTo Nothing xs sc = sc
+matchedTo Nothing xs at sc = sc
+
+-- (of the arms that left `p` tags, the first that left it none of `x`:
+-- each leaves fewer than the one around it)
+ruledOutAt : List TagsLeft
+           -> ValuePart
+           -> String
+           -> Maybe Params.Span
+           -> Maybe Params.Span
+ruledOutAt Nil p x found = found
+ruledOutAt (Cons t rest) p x found =
+  if samePart p t.part && not (List.elemBy strEq x t.tags)
+  then ruledOutAt rest p x (Just t.at)
+  else ruledOutAt rest p x found
+
+-- | where the matches around ruled out the tag `x` of the part `p`: the
+-- | arm that did it first, if they did
+ruledOutBy : Scope -> Maybe ValuePart -> String -> Maybe Params.Span
+ruledOutBy sc (Just p) x = ruledOutAt sc.matched.tags p x Nothing
+ruledOutBy sc Nothing x = Nothing
+
+-- | whether no value gets here: the matches around have left a part no
+-- | tag
+unreachable : Scope -> Bool
+unreachable sc = List.any (\(t : TagsLeft) -> List.null t.tags) sc.matched.tags
 
 -- | the local `l` is bound to the part `p`
 namesPart : Int -> Maybe ValuePart -> Scope -> Scope
@@ -314,6 +340,24 @@ type TraceEvent = { span : Params.Span, kind : String, text : Unit -> String }
 type Postponed =
   { shape : Params.CtxShape, left : Value.V, right : Value.V, failed : Bool }
 
+-- | what elaboration saw of an arm (#108), by where the source has it:
+-- | taken; never taken, where the matches around ruled out what it
+-- | matches (`ArmRuledOut at by what`: the arm `by` did, of the tag or
+-- | tags `what`); never reached, as others match every value it would
+-- | (an arm's, an equation's: what it says)
+data ArmSeen
+  = ArmTaken Params.Span
+  | ArmRuledOut Params.Span Params.Span String
+  | ArmCovered Params.Span String
+  | EquationCovered Params.Span
+
+-- | where the arm is
+armPlace : ArmSeen -> Params.Span
+armPlace (ArmTaken sp) = sp
+armPlace (ArmRuledOut sp _ _) = sp
+armPlace (ArmCovered sp _) = sp
+armPlace (EquationCovered sp) = sp
+
 type StCore =
   { infos : List Noted
   , recovered : List Diag
@@ -323,13 +367,14 @@ type StCore =
   , postponed : List Postponed
   , trace : List TraceEvent
   , selfKey : Maybe String
+  , arms : List ArmSeen
   }
 
 -- (a step of the handler, over a state `st`)
 type StepIn st a = st -> Pair (Either Diag a) st
 
 -- | an argument whose check waits until the type it is checked at is
--- | matched, and what may be guessed of that type when nothing else says
+-- | known, and what may be guessed of that type when nothing else says
 -- | it (of a lambda's: that it is a function type; whether it was).
 -- | Each is a step of the handler (`Step`), over the whole state, so
 -- | the state is a `data`, and the fields parametric, to tie the knot.
@@ -355,6 +400,7 @@ emptyCore =
   , postponed = Nil
   , trace = Nil
   , selfKey = Nothing
+  , arms = Nil
   }
 
 emptySt : ElabSt
@@ -395,12 +441,12 @@ restoreAllTo (MkSaved ds ws) st =
 -- Effects
 --------------------------------------------------------------------------------
 
--- | Checks that wait: one delayed until a type is matched (with a guess
+-- | Checks that wait: one delayed until a type is known (with a guess
 -- | of that type, or not), an instance argument wanted; a guess made,
 -- | of the oldest delayed check that has one and still waits, and
--- | whether there is one to make; waking the delayed ones whose types are matched (all
+-- | whether there is one to make; waking the delayed ones whose types are known (all
 -- | of them, with `True`; else finding the wanted ones whose goals are
--- | matched, too), trying the wanted ones (and refusing those
+-- | known, too), trying the wanted ones (and refusing those
 -- | still undetermined, on `True`: whether any was found); whether one
 -- | is ready; the waiting checks saved, and put back (the delayed ones,
 -- | or all).
@@ -499,11 +545,11 @@ throwE d = op (exEv (Throw d)) val
 catchE : {a : Type} -> Elab a -> (Diag -> Elab a) -> Elab a
 catchE m h = op (exEv (Catch m h)) val
 
--- | `chk`, once `ty` is matched
+-- | `chk`, once `ty` is known
 delay : Value.Ty -> Elab Unit -> Elab Unit
 delay ty chk = op (dfEv (Delay ty chk (MkUnit : Unit))) val
 
--- | `chk`, once `ty` is matched; and `gs`, a guess of `ty`, if nothing else
+-- | `chk`, once `ty` is known; and `gs`, a guess of `ty`, if nothing else
 -- | says it (whether it was made)
 delayGuessing : Value.Ty -> Elab Unit -> Elab Bool -> Elab Unit
 delayGuessing ty chk gs =
@@ -522,9 +568,9 @@ canGuess = op (dfEv (CanGuess (\b -> b))) val
 want : Params.Span -> (Bool -> Elab Bool) -> Elab Unit
 want sp f = op (dfEv (Want sp f (MkUnit : Unit))) val
 
--- | run the delayed checks whose types are now matched (and those they
+-- | run the delayed checks whose types are now known (and those they
 -- | delay in turn), and find the instance arguments whose goals are
--- | (one not found yet waits on); with `all`, every delayed check, matched
+-- | (one not found yet waits on); with `all`, every delayed check, known
 -- | or not, and no search
 wake : Bool -> Elab Unit
 wake all = op (dfEv (Wake all (MkUnit : Unit))) val
@@ -571,6 +617,7 @@ pushTrace ev c =
   , postponed = c.postponed
   , trace = Cons ev c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
 
 -- | ... made here (a record alias built in another module trips the host)
@@ -589,6 +636,7 @@ pushInfo i c =
   , postponed = c.postponed
   , trace = c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
 
 -- | elaborator codes are numbered from 300
@@ -633,6 +681,7 @@ setMetas mc next c =
   , postponed = c.postponed
   , trace = c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
 
 setPostponed : List Postponed -> StCore -> StCore
@@ -645,6 +694,7 @@ setPostponed ps c =
   , postponed = ps
   , trace = c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
 
 setPoisoned : OrdMap.OrdMap Int Unit -> StCore -> StCore
@@ -657,6 +707,7 @@ setPoisoned ps c =
   , postponed = c.postponed
   , trace = c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
 
 setRecovered : List Diag -> StCore -> StCore
@@ -669,7 +720,27 @@ setRecovered ds c =
   , postponed = c.postponed
   , trace = c.trace
   , selfKey = c.selfKey
+  , arms = c.arms
   }
+
+-- | what was seen of an arm, kept
+pushArm : ArmSeen -> StCore -> StCore
+pushArm a c =
+  { infos = c.infos
+  , recovered = c.recovered
+  , poisoned = c.poisoned
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = c.selfKey
+  , arms = Cons a c.arms
+  }
+
+-- | what was seen of the arms, kept
+seeArms : List ArmSeen -> Elab Unit
+seeArms Nil = val MkUnit
+seeArms (Cons a rest) = bind (modify (pushArm a)) (\u -> seeArms rest)
 
 setSelfKey : Maybe String -> StCore -> StCore
 setSelfKey k c =
@@ -681,4 +752,5 @@ setSelfKey k c =
   , postponed = c.postponed
   , trace = c.trace
   , selfKey = k
+  , arms = c.arms
   }

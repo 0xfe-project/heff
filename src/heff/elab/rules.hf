@@ -3568,16 +3568,64 @@ recordTags e a vs (Cons (MkPair x tsp) rest) = do
 nonExhaustive : String -> String
 nonExhaustive what = "non-exhaustive pattern: no case provided for " ^ what
 
--- | the scope of the arm of the tag `x`, of `n` arguments, of a match on
--- | the part `p`: there `p`'s tag is `x`, and the arguments bound next
--- | are its parts
-armScope : Maybe ValuePart -> String -> Int -> Scope -> Scope
-armScope p x n sc = argParts p x n (matchedTo p [x] sc)
+-- | the scope of the arm, at `at`, of the tag `x`, of `n` arguments, of
+-- | a match on the part `p`: there `p`'s tag is `x`, and the arguments
+-- | bound next are its parts
+armScope : Maybe ValuePart -> String -> Int -> Params.Span -> Scope -> Scope
+armScope p x n at sc = argParts p x n (matchedTo p [x] at sc)
 
 -- | whether the matches around have ruled out the tag `x` for the part
 -- | `p` (#108)
 ruledOut : Scope -> Maybe ValuePart -> String -> Bool
 ruledOut sc p x = List.null (tagsLeft sc p [x])
+
+-- (where the matches around ruled out every tag of `xs` for `p`: the arm
+-- that ruled out the first, if they ruled out all)
+allRuledOutBy : Scope -> Maybe ValuePart -> List String -> Maybe Params.Span
+allRuledOutBy sc p Nil = Nothing
+allRuledOutBy sc p (Cons x xs) =
+  if List.all (\y -> ruledOut sc p y) xs then ruledOutBy sc p x else Nothing
+
+-- (where a case's tag, or its default, `_`, is written)
+writtenAt : List (Pair String Params.Span) -> String -> Maybe Params.Span
+writtenAt Nil x = Nothing
+writtenAt (Cons (MkPair y sp) rest) x =
+  if strEq x y then Just sp else writtenAt rest x
+
+spanOr : Params.Span -> Maybe Params.Span -> Params.Span
+spanOr sp (Just at) = at
+spanOr sp Nothing = sp
+
+armSeenOf : Params.Span -> String -> Maybe Params.Span -> ArmSeen
+armSeenOf at what (Just by) = ArmRuledOut at by what
+armSeenOf at what Nothing = ArmTaken at
+
+-- | what is seen of the arm at `at`, for the tags `xs` of the part `p`
+-- | (#108): never taken, where the matches around ruled out them all
+-- | (`what` says which), else taken; nothing, where no value gets (an
+-- | arm around is never taken)
+seeArm : Scope
+       -> Maybe ValuePart
+       -> List String
+       -> String
+       -> Maybe Params.Span
+       -> Elab Unit
+seeArm sc p xs what (Just at) =
+  if unreachable sc then pure MkUnit
+  else modify (pushArm (armSeenOf at what (allRuledOutBy sc p xs)))
+seeArm sc p xs what Nothing = pure MkUnit
+
+-- | a default, `_`, at `at`, where the other cases name every tag (`named`):
+-- | never reached
+seeCovered : Scope -> Bool -> Maybe Params.Span -> Elab Unit
+seeCovered sc True (Just at) =
+  if unreachable sc then pure MkUnit
+  else modify (pushArm (ArmCovered at "the other arms name every tag"))
+seeCovered sc named at = pure MkUnit
+
+-- (what the default stands for, as an arm's warning says)
+standsFor : String
+standsFor = "every tag `_` stands for"
 
 -- | (`p`: the part of a value the scrutinee is, if it is one)
 caseArm : Params.Span
@@ -3585,14 +3633,16 @@ caseArm : Params.Span
         -> Value.Ty
         -> Value.Ty
         -> Maybe ValuePart
+        -> List (Pair String Params.Span)
         -> String
         -> List (Params.Th Value.Ty)
         -> Dict.Dict (Pair (Array String) Chk)
         -> Elab (Pair String (Pair (Array String) Syntax.Tm))
-caseArm sp e b a p x ts casesChk = case Dict.lookup casesChk x of
+caseArm sp e b a p tags x ts casesChk = case Dict.lookup casesChk x of
   Just (MkPair xs bodyChk) ->
     if Array.length xs == List.length ts
     then do
+      seeArm e.scope p [x] ("`" ^ x ^ "`") (writtenAt tags x)
       body <-
         runChk
           bodyChk
@@ -3601,13 +3651,19 @@ caseArm sp e b a p x ts casesChk = case Dict.lookup casesChk x of
              (multiBind
                 (Array.toList xs)
                 (List.map (\t -> Params.forceTh t) ts)
-                (armScope p x (List.length ts) e.scope)))
+                (armScope
+                   p
+                   x
+                   (List.length ts)
+                   (spanOr sp (writtenAt tags x))
+                   e.scope)))
           b
       pure (MkPair x (MkPair xs body.stx))
     else failWith sp 16 ("wrong number of arguments provided for tag " ^ x)
   -- extension: a default case `_ => e` covers the tags not listed
   Nothing -> case Dict.lookup casesChk "_" of
     Just (MkPair us bodyChk) -> do
+      seeArm e.scope p [x] standsFor (writtenAt tags "_")
       body <-
         runChk
           bodyChk
@@ -3616,7 +3672,12 @@ caseArm sp e b a p x ts casesChk = case Dict.lookup casesChk x of
              (multiBind
                 (List.map (\t -> "_") ts)
                 (List.map (\t -> Params.forceTh t) ts)
-                (armScope p x (List.length ts) e.scope)))
+                (armScope
+                   p
+                   x
+                   (List.length ts)
+                   (spanOr sp (writtenAt tags "_"))
+                   e.scope)))
           b
       pure
           (MkPair
@@ -3740,26 +3801,26 @@ casesWith : Params.Span
           -> Memoed.El
           -> Value.Ty
           -> Maybe ValuePart
+          -> List (Pair String Params.Span)
           -> List (Pair String (Array (Params.Th Value.Ty)))
           -> List (Pair String (Array (Params.Th Value.Ty)))
           -> Dict.Dict (Pair (Array String) Chk)
           -> Chk
           -> Elab Memoed.El
-casesWith sp e b scrut a part every named casesChk d = do
+casesWith sp e b scrut a part tags every named casesChk d = do
   cases <-
     traverseE
       (\p -> case p of
-       MkPair x fs -> caseArm sp e b a part x (Array.toList fs) casesChk)
+       MkPair x fs -> caseArm sp e b a part tags x (Array.toList fs) casesChk)
       named
+  let rest = List.map fst (List.keepIf (\p -> not (namedIn casesChk p)) every)
+  seeArm e.scope part rest standsFor (writtenAt tags "_")
   body <-
     runChk
       d
       (withScope
          e
-         (matchedTo
-            part
-            (List.map fst (List.keepIf (\p -> not (namedIn casesChk p)) every))
-            e.scope))
+         (matchedTo part rest (spanOr sp (writtenAt tags "_")) e.scope))
       b
   pure
       (Memoed.matchM
@@ -3788,13 +3849,19 @@ casesAt sp e b scrut a part vs tags casesChk = do
   tagsExposed e a vs tags
   let every = Dict.toList vs
   let named = List.keepIf (\p -> namedIn casesChk p) every
+  seeCovered
+      e.scope
+      (namedIn casesChk (MkPair "_" (MkUnit : Unit))
+       && List.length named == List.length every)
+      (writtenAt tags "_")
   case sharedDefault casesChk every named of
-    Just d -> casesWith sp e b scrut a part every named casesChk d
+    Just d -> casesWith sp e b scrut a part tags every named casesChk d
     Nothing -> do
       cases <-
         traverseE
           (\p -> case p of
-           MkPair x fs -> caseArm sp e b a part x (Array.toList fs) casesChk)
+           MkPair x fs ->
+             caseArm sp e b a part tags x (Array.toList fs) casesChk)
           every
       pure (Memoed.matchM scrut (Dict.fromList cases))
 

@@ -2316,3 +2316,112 @@ caseTree : Params.Span
 caseTree sp altNs = do
   rows <- traverseC (\n -> caseAlt n) altNs
   caseTreeUsing sp rows (caseNames rows)
+
+-- Equations and arms never reached
+--------------------------------------------------------------------------------
+
+-- A row no value reaches: the rows above match every value it does --
+-- whatever its body, it is never the answer.  Where the patterns do not
+-- say, it is taken to be reached: a column's tags are not known to be
+-- all of its type's (its type is not known here), so a row of names
+-- after rows of every tag is reached; a record or a binary of a row
+-- above is not taken to match what a name does.
+
+-- (the pattern, `x@p` taken for `p` all through)
+bare : MatchPat -> MatchPat
+bare (PAs _ p) = bare p
+bare (PTag t ps sp) = PTag t (List.map bare ps) sp
+bare p = p
+
+-- (a row above, its first pattern `p`, where the row tested starts with
+-- the tag `t` of `n` arguments: the arguments' patterns then the rest,
+-- or none, where it cannot match that tag)
+tagRowAt : String -> Int -> MatchPat -> List MatchPat -> Maybe (List MatchPat)
+tagRowAt t n (PTag t2 ps _) rest =
+  if strEq t t2 && List.length ps == n then Just (appendC ps rest)
+  else Nothing
+tagRowAt t n (PVar _) rest =
+  Just (appendC (List.map (\(i : Int) -> PVar "_") (upTo n)) rest)
+tagRowAt t n _ rest = Nothing
+
+-- (... where it starts with the literal `l`)
+litRowAt : Presyntax.Pat -> MatchPat -> List MatchPat -> Maybe (List MatchPat)
+litRowAt l (PLit l2) rest = if sameLit l l2 then Just rest else Nothing
+litRowAt l (PVar _) rest = Just rest
+litRowAt l _ rest = Nothing
+
+-- (... where it starts with anything else)
+anyRowAt : MatchPat -> List MatchPat -> Maybe (List MatchPat)
+anyRowAt (PVar _) rest = Just rest
+anyRowAt _ rest = Nothing
+
+rowBy : (MatchPat -> List MatchPat -> Maybe (List MatchPat))
+      -> List MatchPat
+      -> Maybe (List MatchPat)
+rowBy f (Cons p ps) = f p ps
+rowBy f Nil = Nothing
+
+-- | whether a value matches the patterns `q` but none of the rows above,
+-- | `rows` (each as long as `q`), as far as the patterns say
+reached : List (List MatchPat) -> List MatchPat -> Bool
+reached Nil q = True
+reached rows Nil = False
+reached rows (Cons (PTag t ps _) q) =
+  reached
+    (catMaybesC (List.map (rowBy (tagRowAt t (List.length ps))) rows))
+    (appendC ps q)
+reached rows (Cons (PLit l) q) =
+  reached (catMaybesC (List.map (rowBy (litRowAt l)) rows)) q
+reached rows (Cons p q) =
+  reached (catMaybesC (List.map (rowBy anyRowAt) rows)) q
+
+-- (the indices, from `i`, of the rows no value reaches; `above`, the
+-- rows above that are reached)
+unreachedGo : List (List MatchPat) -> Int -> List Clause -> List Int
+unreachedGo above i Nil = Nil
+unreachedGo above i (Cons r rest) =
+  if reached above (List.map bare r.pats)
+  then unreachedGo (Cons (List.map bare r.pats) above) (i + 1) rest
+  else Cons i (unreachedGo above (i + 1) rest)
+
+-- (where each of the rows `rows` no value reaches is, the rows of `ns`,
+-- each where `spanOf` says)
+unreachedAt : {a : Type}
+            -> (a -> Params.Span)
+            -> List a
+            -> Either Err (List Clause)
+            -> List Params.Span
+unreachedAt spanOf ns (Right rows) =
+  catMaybesC
+    (List.map
+       (\i -> case nthC ns i of
+        Just n -> Just (spanOf n)
+        Nothing -> Nothing)
+       (unreachedGo Nil 0 rows))
+unreachedAt spanOf ns (Left e) = Nil
+
+-- (an equation's head: its name and its patterns)
+equationHead : Params.Spanned (Presyntax.Equation Presyntax.Checkable)
+             -> Params.Span
+equationHead (At (MkEquation f fsp ps rhs) _) =
+  Presyntax.spanning
+    fsp
+    (Params.spanOf (Presyntax.lastOr (At (PatVar f) fsp) ps))
+
+altPattern : Params.Spanned (Presyntax.Alt Presyntax.Checkable) -> Params.Span
+altPattern (At (MkAlt p rhs) _) = Params.spanOf p
+
+-- | the heads of the equations no argument reaches: the equations above
+-- | match every value it does (#108)
+unreachedEquations : List
+                     (Params.Spanned (Presyntax.Equation Presyntax.Checkable))
+                   -> List Params.Span
+unreachedEquations eqNs =
+  unreachedAt equationHead eqNs (traverseC (\n -> equation n) eqNs)
+
+-- | the patterns of the alternatives of a `case` no value reaches, as
+-- | `unreachedEquations`
+unreachedAlts : List (Params.Spanned (Presyntax.Alt Presyntax.Checkable))
+              -> List Params.Span
+unreachedAlts altNs =
+  unreachedAt altPattern altNs (traverseC (\n -> caseAlt n) altNs)

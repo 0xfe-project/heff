@@ -720,6 +720,7 @@ withStruct m own t =
     t.spans
     t.infos
     t.trace
+    t.unreached
 
 directFix : List Checked -> Fixity.Fixities
 directFix direct =
@@ -1012,6 +1013,55 @@ fileClaimDiags : String
 fileClaimDiags path modName g own h =
   if isManifest path then Nil else claimDiags modName g own h
 
+-- (whether the source writes an arm at `sp`, in a `case`)
+writtenAt : List Params.Span -> Params.Span -> Bool
+writtenAt written sp =
+  List.any
+    (\(w : Params.Span) -> w.start == sp.start && w.end == sp.end)
+    written
+
+-- (where what an arm matches was ruled out: by an arm the source writes,
+-- or by a match it does not -- an arm of the clause compiler's stands
+-- for the rows of names, and is where its match is)
+ruledOutAt : String -> List Params.Span -> Params.Span -> String
+ruledOutAt src written by =
+  (if writtenAt written by then "ruled out by the arm at "
+   else "ruled out by the match at ")
+  ^ Surface.placeOfOffset "" src by.start
+
+-- (a warning of the elaborator's, its code numbered as an error's is)
+armWarning : Int -> String -> Params.Span -> Maybe String -> Diag
+armWarning code msg sp note =
+  { code = 300 + code, severity = SWarning, msg = msg, span = sp, note = note }
+
+-- | a warning of an arm elaboration found never taken, or never reached,
+-- | or of an equation never used (#108): an arm's where the source
+-- | writes it in a `case` (`written`), none of a match the reader or the
+-- | clause compiler made; where the arm that ruled out what it matches
+-- | is, said as a line and a column of `src`
+unreachedDiags : String -> List Params.Span -> Environment.ArmSeen -> List Diag
+unreachedDiags src written (ArmRuledOut at by what) =
+  if writtenAt written at
+  then [ armWarning
+         58
+         ("this arm never runs: the matches around it have ruled out " ^ what)
+         at
+         (Just (ruledOutAt src written by))
+       ]
+  else Nil
+unreachedDiags src written (ArmCovered at why) =
+  if writtenAt written at
+  then [armWarning 59 ("this arm never runs: " ^ why) at Nothing]
+  else Nil
+unreachedDiags src written (EquationCovered at) =
+  [ armWarning
+    59
+    "this equation is never used: the equations above it match every value it does"
+    at
+    Nothing
+  ]
+unreachedDiags src written (ArmTaken _) = Nil
+
 elabTop : Source
         -> Import.Imports
         -> List Checked
@@ -1038,7 +1088,11 @@ elabTop s imps direct r t =
              t.globals
              (ownOf s.module t.keys)
              imps.claim)
-          (List.map hint (appendD r.diags t.diags))))
+          (appendD
+             (List.map hint (appendD r.diags t.diags))
+             (List.concatMap
+                (unreachedDiags s.source r.arms)
+                t.unreached))))
     (ownOf s.module t.keys)
     (importNames imps.imports)
     (openNames (Import.written imps))
@@ -1098,6 +1152,7 @@ refusePrims r refused =
   , diags = appendD r.diags (List.map primRefused refused)
   , fixities = r.fixities
   , broken = appendD r.broken (List.map fst refused)
+  , arms = r.arms
   }
 
 elabRead : List Checked
@@ -1360,7 +1415,8 @@ lean c =
        c.top.tests
        c.top.spans
        (List.map Environment.leanInfo c.top.infos)
-       Nil)
+       Nil
+       c.top.unreached)
     c.diags
     c.own
     c.deps
@@ -1388,7 +1444,8 @@ traceless c =
        c.top.tests
        c.top.spans
        c.top.infos
-       Nil)
+       Nil
+       c.top.unreached)
     c.diags
     c.own
     c.deps

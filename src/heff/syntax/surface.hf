@@ -44,6 +44,7 @@ type St =
   , lenient : Bool
   , at : Int -> String
   , knot : OrdMap.OrdMap String String
+  , arms : List Params.Span
   }
 
 type P a = St -> Pair (Either Diag a) St
@@ -83,8 +84,9 @@ mkSt : Array CST.T
      -> Bool
      -> (Int -> String)
      -> OrdMap.OrdMap String String
+     -> List Params.Span
      -> St
-mkSt toks scope known binders patVars fix lenient at knot =
+mkSt toks scope known binders patVars fix lenient at knot arms =
   { toks = toks
   , scope = scope
   , known = known
@@ -94,23 +96,24 @@ mkSt toks scope known binders patVars fix lenient at knot =
   , lenient = lenient
   , at = at
   , knot = knot
+  , arms = arms
   }
 
 setScope : List String -> St -> St
 setScope sc s =
-  mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient s.at s.knot
+  mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient s.at s.knot s.arms
 
 setBinders : OrdMap.OrdMap String (List Binders) -> St -> St
 setBinders b s =
-  mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient s.at s.knot
+  mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient s.at s.knot s.arms
 
 setPatVars : List String -> St -> St
 setPatVars pv s =
-  mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient s.at s.knot
+  mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient s.at s.knot s.arms
 
 setKnot : OrdMap.OrdMap String String -> St -> St
 setKnot k s =
-  mkSt s.toks s.scope s.known s.binders s.patVars s.fix s.lenient s.at k
+  mkSt s.toks s.scope s.known s.binders s.patVars s.fix s.lenient s.at k s.arms
 
 -- Tokens and spans
 --------------------------------------------------------------------------------
@@ -138,6 +141,23 @@ mkSpan a b = { start = a, end = b }
 appendS : {a : Type} -> List a -> List a -> List a
 appendS Nil ys = ys
 appendS (Cons x xs) ys = Cons x (appendS xs ys)
+
+-- | the arms of a `case` the source writes: where their patterns, their
+-- | tags and their `_`s are, the elaborator's warnings of an arm being
+-- | of these alone (#108)
+writeArms : List Params.Span -> St -> St
+writeArms sps s =
+  mkSt
+    s.toks
+    s.scope
+    s.known
+    s.binders
+    s.patVars
+    s.fix
+    s.lenient
+    s.at
+    s.knot
+    (appendS sps s.arms)
 
 withScope : {a : Type} -> List String -> P a -> P a
 withScope xs p = do
@@ -1544,6 +1564,28 @@ lambdaL r binders body = do
            body'
            bs))
 
+-- (where a pattern's tags are, and its operators that are tags, onto
+-- `acc`)
+patTags : Presyntax.Pat -> List Params.Span -> List Params.Span
+patTags (At (PatTag _ tsp ps) _) acc =
+  Cons tsp (List.foldl (\a p -> patTags p a) acc ps)
+patTags (At (PatOp _ xsp ps) _) acc =
+  Cons xsp (List.foldl (\a p -> patTags p a) acc ps)
+patTags (At (PatAs _ _ p) _) acc = patTags p acc
+patTags (At (PatRecord fs) _) acc =
+  List.foldl
+    (\a f -> case f of
+     MkFieldPat _ p -> patTags p a)
+    acc
+    fs
+patTags p acc = acc
+
+-- (an alternative's pattern, and its tags)
+altArms : Params.Spanned (Presyntax.Alt Presyntax.Expr)
+        -> List Params.Span
+        -> List Params.Span
+altArms (At (MkAlt p _) _) acc = Cons (Params.spanOf p) (patTags p acc)
+
 -- | `C x y -> e`: `x` and `y` are bound in `e`
 altL : Lw -> CST.E -> P (Params.Spanned (Presyntax.Alt Presyntax.Expr))
 altL r (EAlt p arrow e) = do
@@ -2266,6 +2308,7 @@ exprL r (Lam bs binders arrow body) = lambdaL r binders body
 exprL r e0@(Case kw scrut o alts) = do
   scrut' <- r.e scrut
   alts' <- block (\a -> altL r a) alts
+  pModify (writeArms (List.foldl (\a alt -> altArms alt a) Nil alts'))
   pure (At (EMatch scrut' alts') (spanTE kw (CST.lastE e0).end))
 exprL r e0@(ETry kw ty body c) = do
   ty' <- tryTypeL r ty
@@ -3384,7 +3427,13 @@ fixitiesOfText imported src =
 -- The program loop
 --------------------------------------------------------------------------------
 
-type ProgRes = { items : List Item, diags : List Diag, broken : List String }
+-- | (`arms`: those of a `case` the source writes, `St`'s)
+type ProgRes =
+  { items : List Item
+  , diags : List Diag
+  , broken : List String
+  , arms : List Params.Span
+  }
 
 appendRev : {a : Type} -> List a -> List a -> List a
 appendRev Nil acc = acc
@@ -3399,8 +3448,13 @@ brokenPlus : CST.St -> List String -> List String
 brokenPlus cs broken =
   appendRev (CST.declaredMore cs) (brokenOne (CST.declaredAt cs) broken)
 
-mkProgRes : List Item -> List Diag -> List String -> ProgRes
-mkProgRes items diags broken = { items = items, diags = diags, broken = broken }
+mkProgRes : List Item
+          -> List Diag
+          -> List String
+          -> List Params.Span
+          -> ProgRes
+mkProgRes items diags broken arms =
+  { items = items, diags = diags, broken = broken, arms = arms }
 
 -- | a declaration, lowered where nothing local is in scope
 lowerDecl : CST.D -> St -> Pair (Either Diag (List Item)) St
@@ -3415,6 +3469,7 @@ progGo cs s items diags broken =
       (List.reverse items)
       (List.reverse diags)
       (List.reverse broken)
+      s.arms
   else case CST.declStep cs of
     MkPair (Left d) cs2 ->
       progGo
@@ -3459,11 +3514,15 @@ type Options =
   , path : String = ""
   }
 
+-- | (`arms`: where the arms of each `case` the source writes are,
+-- | their patterns, their tags: an arm of a match the reader made, or
+-- | the clause compiler, is none of them)
 type Read =
   { decls : List Presyntax.Decl
   , diags : List Diag
   , fixities : Fixity.Fixities
   , broken : List String
+  , arms : List Params.Span
   }
 
 lexDiagOf : Lex.Err -> Diag
@@ -3512,6 +3571,7 @@ initialSt o at toks declared own =
     o.lenient
     at
     OrdMap.empty
+    Nil
 
 readPlaced : (Int -> String)
            -> List Diag
@@ -3535,6 +3595,7 @@ readPlaced at lexDiags own r placed =
                     (twiceDiags at (spread r.items))))))
   , fixities = own.fixities
   , broken = r.broken
+  , arms = r.arms
   }
 
 readOut : (Int -> String) -> String -> List Diag -> FixRead -> ProgRes -> Read

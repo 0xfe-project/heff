@@ -352,12 +352,33 @@ tagSpanOf : Presyntax.Pat
           -> List (Pair String Params.Span)
 tagSpanOf p acc = case (Presyntax.patSpineOf p).head of
   At (PatTag x _ _) tsp -> Cons (MkPair x tsp) acc
+  At (PatVar "_") sp -> Cons (MkPair "_" sp) acc
   _ -> acc
 
 tagSpans : List (Params.Spanned (Presyntax.Alt Presyntax.Checkable))
          -> List (Pair String Params.Span)
 tagSpans Nil = Nil
 tagSpans (Cons (At (MkAlt p _) _) rest) = tagSpanOf p (tagSpans rest)
+
+-- (why an arm of a flat `case` that names what an arm above names is
+-- never reached)
+namedAbove : String -> String
+namedAbove "_" = "an arm above it is `_` already"
+namedAbove x = "an arm above it matches `" ^ x ^ "` already"
+
+-- | the arms of a flat `case` that name what an arm above names, a tag
+-- | or `_` (`seen`): never reached, the first is taken (#108)
+namedTwice : List String -> List (Pair String Params.Span) -> List ArmSeen
+namedTwice seen Nil = Nil
+namedTwice seen (Cons (MkPair x sp) rest) =
+  if List.elemBy strEq x seen
+  then Cons (ArmCovered sp (namedAbove x)) (namedTwice seen rest)
+  else namedTwice (Cons x seen) rest
+
+-- (why an alternative of a `case` the alternatives above cover is never
+-- reached)
+coveredAbove : String
+coveredAbove = "the arms above it match every value it does"
 
 -- Operators in patterns
 --------------------------------------------------------------------------------
@@ -487,7 +508,9 @@ localEqs : TK
          -> Elab Rules.Chk
 localEqs tk f eqs sp = case Clauses.desugar f Nil eqs sp of
   Left err -> failP err.span 10 err.msg
-  Right b -> tk.chkJ b
+  Right b -> do
+    seeArms (List.map EquationCovered (Clauses.unreachedEquations eqs))
+    tk.chkJ b
 
 -- (an operator in a pattern is found where the globals are in hand)
 localBody : TK
@@ -755,6 +778,7 @@ matchF tk sp see scrutN casesN =
   -- which does not say its type there: it is bound to a name, below)
   if allL flatCaseAlt casesN && not (annotatesData scrutN)
   then do
+    seeArms (namedTwice Nil (tagSpans casesN))
     scrut <- tk.infJ scrutN
     cases <- traverseEL (\m -> doCase tk m) casesN
     pure
@@ -769,6 +793,10 @@ matchF tk sp see scrutN casesN =
   else case Clauses.caseTree sp casesN of
     Left err -> treeFailed tk see scrutN err.span err.msg
     Right r -> do
+      seeArms
+          (List.map
+             (\sp -> ArmCovered sp coveredAbove)
+             (Clauses.unreachedAlts casesN))
       scrut <- tk.infJ scrutN
       body <- tk.chkJ r.tree
       pure (Rules.caseLet r.scrutinee (seen see scrut) body)
@@ -1081,6 +1109,7 @@ equationsBody name args eqs sp = do
   bodyN <- case Clauses.desugar name (explicitNames args) eqs sp of
     Left err -> failP err.span 10 err.msg
     Right b -> pure b
+  seeArms (List.map EquationCovered (Clauses.unreachedEquations eqs))
   -- (in descriptive position as the clause compiler made it)
   tk.chkJ (Presyntax.markTerm De bodyN)
 
@@ -1678,6 +1707,7 @@ type TopResult =
   , spans : List (Pair String Params.Span)
   , infos : List Info
   , trace : List TraceEvent
+  , unreached : List ArmSeen
   }
 
 mkTop : Globals.Globals
@@ -1689,8 +1719,9 @@ mkTop : Globals.Globals
       -> List (Pair String Params.Span)
       -> List Info
       -> List TraceEvent
+      -> List ArmSeen
       -> TopResult
-mkTop globals diags keys broken watches tests spans infos trace =
+mkTop globals diags keys broken watches tests spans infos trace unreached =
   { globals = globals
   , diags = diags
   , keys = keys
@@ -1700,6 +1731,7 @@ mkTop globals diags keys broken watches tests spans infos trace =
   , spans = spans
   , infos = infos
   , trace = trace
+  , unreached = unreached
   }
 
 appendT : {a : Type} -> List a -> List a -> List a
@@ -1726,6 +1758,49 @@ consAll ds xs = List.foldl (\a x -> Cons x a) ds xs
 failedList : Elaborated -> List Diag
 failedList { failed = Just d } = reportedD d
 failedList { failed = Nothing } = Nil
+
+-- (a place, the same as another)
+samePlace : Params.Span -> Params.Span -> Bool
+samePlace a b = a.start == b.start && a.end == b.end
+
+-- (an arm seen taken at `sp`, or never reached there: either way not one
+-- never taken)
+takenOrCovered : Params.Span -> ArmSeen -> Bool
+takenOrCovered sp (ArmTaken at) = samePlace sp at
+takenOrCovered sp (ArmCovered at _) = samePlace sp at
+takenOrCovered sp _ = False
+
+-- (whether what is said of the arms says something of `sp` already)
+saidOf : List ArmSeen -> Params.Span -> Bool
+saidOf said sp = List.any (\a -> samePlace sp (armPlace a)) said
+
+-- (what is said of the arms seen, `seen` all of them, in the order seen;
+-- `said`, so far, the last first)
+armsSaid : List ArmSeen -> List ArmSeen -> List ArmSeen -> List ArmSeen
+armsSaid seen said Nil = said
+armsSaid seen said (Cons (ArmTaken _) rest) = armsSaid seen said rest
+armsSaid seen said (Cons (ArmRuledOut at by what) rest) =
+  if saidOf said at || List.any (takenOrCovered at) seen
+  then armsSaid seen said rest
+  else armsSaid seen (Cons (ArmRuledOut at by what) said) rest
+armsSaid seen said (Cons a rest) =
+  if saidOf said (armPlace a) then armsSaid seen said rest
+  else armsSaid seen (Cons a said) rest
+
+elaborated : Elaborated -> Bool
+elaborated { failed = Nothing } = True
+elaborated { failed = Just _ } = False
+
+-- | what a declaration's elaboration found of its arms (#108), the last
+-- | first: those never taken -- where it went through an arm more than
+-- | once (a body the equations' match puts in more than one place),
+-- | taken in none -- and those never reached; nothing of a declaration
+-- | with errors
+unreachedOf : ElabSt -> Elaborated -> List ArmSeen
+unreachedOf st r =
+  if List.null (core st).recovered && elaborated r
+  then armsSaid (core st).arms Nil (List.reverse (core st).arms)
+  else Nil
 
 -- | the module a key is of, by the name it has there (`m.x`, `x`: `m`;
 -- | a key that is its name, as an expectation's, of none)
@@ -1780,6 +1855,7 @@ topBroken kf acc n diags = case Presyntax.declName n of
       acc.spans
       acc.infos
       acc.trace
+      acc.unreached
   Nothing ->
     mkTop
       acc.globals
@@ -1791,6 +1867,7 @@ topBroken kf acc n diags = case Presyntax.declName n of
       acc.spans
       acc.infos
       acc.trace
+      acc.unreached
 
 -- (what the definition noted for the IDE, each type with the solutions
 -- its metavariables came to)
@@ -1811,6 +1888,7 @@ keepSt st acc =
     acc.spans
     (appendT (settledInfos st) acc.infos)
     (appendT (core st).trace acc.trace)
+    acc.unreached
 
 -- (a definition under the key `k` itself, not one `k` is a name of)
 knownEntry : Globals.Globals -> String -> Bool
@@ -1850,6 +1928,7 @@ topTake kf acc n (MkPair (Right r) st) =
     (Cons (MkPair r.name (Params.spanOf n)) acc.spans)
     (appendT (settledInfos st) acc.infos)
     (appendT (core st).trace acc.trace)
+    (appendT (unreachedOf st r) acc.unreached)
 
 watchTake : TopResult
           -> Params.Span
@@ -1866,6 +1945,7 @@ watchTake acc sp (MkPair (Left d) st) =
     acc.spans
     (appendT (settledInfos st) acc.infos)
     (appendT (core st).trace acc.trace)
+    acc.unreached
 watchTake acc sp (MkPair (Right entry) st) =
   mkTop
     acc.globals
@@ -1877,6 +1957,7 @@ watchTake acc sp (MkPair (Right entry) st) =
     acc.spans
     (appendT (settledInfos st) acc.infos)
     (appendT (core st).trace acc.trace)
+    acc.unreached
 
 -- (the same diagnostic, said at the same place)
 sameDiag : Diag -> Diag -> Bool
@@ -1911,6 +1992,7 @@ topOne kf acc (At (DeclTest x _) sp) =
     acc.spans
     acc.infos
     acc.trace
+    acc.unreached
 topOne kf acc n =
   topTake kf acc n (Meta.runE (elabDecl kf acc.globals n) emptySt)
 
@@ -1929,10 +2011,11 @@ topGo kf acc Nil =
     (List.reverse acc.spans)
     (List.reverse acc.infos)
     (List.reverse acc.trace)
+    (List.reverse acc.unreached)
 topGo kf acc (Cons n rest) = topGo kf (topOne kf acc n) rest
 
 emptyTop : Globals.Globals -> TopResult
-emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil Nil Nil
+emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil Nil Nil Nil
 
 -- | every declaration of a module, each elaborated in a fresh state
 -- | >>> List.length (topModule "m" Globals.emptyGlobals Nil).keys
@@ -1994,6 +2077,7 @@ thawKeep acc d g =
     (Cons (MkPair d.name d.span) acc.spans)
     acc.infos
     acc.trace
+    acc.unreached
 
 -- (the name is the module's own definition's, a primitive's too, as
 -- `topTake` has it)
@@ -2030,6 +2114,7 @@ thawDone acc =
     (List.reverse acc.spans)
     acc.infos
     acc.trace
+    acc.unreached
 
 -- | a module thawed from a cache: its definitions' syntax evaluated
 -- | back into globals -- `topModule` with the elaboration already done
