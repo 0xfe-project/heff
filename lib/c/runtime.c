@@ -2144,6 +2144,15 @@ HEFF_FAST V heff_intShr(V a, V b) {
   return heff_intShr_big(a, b);
 }
 
+// (a word's decimal digits, a '-' before a negative one, written
+// backwards to `end`: where they start, 20 bytes at most before it)
+static inline char *heff_word_digits(int64_t k, char *end) {
+  uint64_t u = k < 0 ? (uint64_t)0 - (uint64_t)k : (uint64_t)k;
+  do { *--end = (char)('0' + u % 10); u /= 10; } while (u);
+  if (k < 0) *--end = '-';
+  return end;
+}
+
 // (an integer's decimal digits, a '-' before a negative one: malloc'd)
 HEFF_FN char *heff_int_cstr(V v) {
   Num x;
@@ -2584,7 +2593,13 @@ HEFF_FN V heff_strFromByte(V c) {
   return (V)s;
 }
 
+// (a word's digits on the stack, nothing allocated but the string; a
+// big one's by its digits')
 HEFF_FN V heff_intShow(V a) {
+  if (HEFF_LIKELY(IS_INT(a))) {
+    char b[24], *p = heff_word_digits(INT_OF(a), b + sizeof b);
+    return heff_str_of(p, b + sizeof b - p);
+  }
   char *c = heff_int_cstr(a);
   heff_drop(a);
   V s = heff_str_ascii(c);
@@ -5478,10 +5493,11 @@ HEFF_FN void heff_show(Buf *b, V v, int arg) {
     return;
   }
   if (IS_INT(v) || (IS_OBJ(v) && OBJ(v)->kind == K_BIG)) {
-    char *c = heff_int_cstr(v);
+    char w[24], *c = IS_INT(v) ? heff_word_digits(INT_OF(v), w + sizeof w - 1) : heff_int_cstr(v);
+    w[sizeof w - 1] = 0;
     if (arg && c[0] == '-') { buf_str(b, "("); buf_str(b, c); buf_str(b, ")"); }
     else buf_str(b, c);
-    free(c);
+    if (!IS_INT(v)) free(c);
     return;
   }
   int tag = -1, n = 0;
