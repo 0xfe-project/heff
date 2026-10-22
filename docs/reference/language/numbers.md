@@ -32,7 +32,11 @@ flags = 0b1010
 - An integer literal can be of any number type; a fractional one, `2.5`,
   of a float type. A fractional literal may have an exponent after its
   digits, `6.02e23`, `1.5e-3`; a point comes first, `1.0e23`, not
-  `1e23`. It is the float nearest the decimal it writes.
+  `1e23`. It is the float of its type nearest the decimal it writes,
+  rounded once: `(1.0000000596046448 : Float32)` is the `Float32` above
+  1, not 1.0, as it would be rounded to a `Float64` first. Below half
+  the least float of its type it is `0.0`; beyond the greatest, an
+  error, as is any literal that does not fit its type.
 - `show` writes a float as such a literal, the fewest digits that read
   back as it: `show 1.0e23` is `"1.0e23"`, `show (neg 0.0)` is
   `"-0.0"`.

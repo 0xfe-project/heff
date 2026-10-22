@@ -2915,10 +2915,9 @@ F32_CMP(Lt, <)
 F32_CMP(Le, <=)
 HEFF_FN V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
 
-// (the fewest digits that read back as the same `Float32`, read as a float
-// reads them (through a double), written as a float is: for each count of
-// digits, the number of that many nearest it (of two as near, the one
-// whose last digit is even, as printf rounds), if it reads back so; nine
+// (the fewest digits that read back as the same `Float32`, as a literal
+// at `Float32` reads them, rounded once, written as a float is: of those,
+// the nearest it (of two as near, the one whose last digit is even); nine
 // always do)
 HEFF_FN V heff_float32Show(V a) {
   char buf[64];
