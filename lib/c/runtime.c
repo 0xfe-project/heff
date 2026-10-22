@@ -2144,6 +2144,15 @@ HEFF_FAST V heff_intShr(V a, V b) {
   return heff_intShr_big(a, b);
 }
 
+// (a word's decimal digits, a '-' before a negative one, written
+// backwards to `end`: where they start, 20 bytes at most before it)
+static inline char *heff_word_digits(int64_t k, char *end) {
+  uint64_t u = k < 0 ? (uint64_t)0 - (uint64_t)k : (uint64_t)k;
+  do { *--end = (char)('0' + u % 10); u /= 10; } while (u);
+  if (k < 0) *--end = '-';
+  return end;
+}
+
 // (an integer's decimal digits, a '-' before a negative one: malloc'd)
 HEFF_FN char *heff_int_cstr(V v) {
   Num x;
@@ -2214,9 +2223,9 @@ HEFF_FN V heff_big_lit(const char *s) {
 #define HEFF_BIG(s) ({ static V heff_lit_; heff_lit_ ? heff_lit_ : (heff_lit_ = heff_big_lit(s)); })
 #endif
 
-// (a float's integer part, beyond a word if it must be)
-HEFF_FN V heff_int_of_double(double f) {
-  if (f < (double)INT_LIM && f >= -(double)INT_LIM) return MK_INT((int64_t)f);
+// (a float's integer part, beyond a word if it must be: a word's
+// inlined, a big one's the call)
+HEFF_SLOW V heff_int_of_double_big(double f) {
   int e;
   double fr = frexp(fabs(f), &e);
   uint64_t mant = (uint64_t)ldexp(fr, 53);
@@ -2231,12 +2240,23 @@ HEFF_FN V heff_int_of_double(double f) {
   return big_make(f < 0, d, n);
 }
 
-HEFF_FN double heff_double_of_int(V v) {
-  if (IS_INT(v)) return (double)INT_OF(v);
+HEFF_FAST V heff_int_of_double(double f) {
+  if (HEFF_LIKELY(f < (double)INT_LIM && f >= -(double)INT_LIM)) return MK_INT((int64_t)f);
+  return heff_int_of_double_big(f);
+}
+
+// (an integer as the nearest float: a word's inlined, a big one's by its
+// digits, the call)
+HEFF_SLOW double heff_double_of_big(V v) {
   char *c = heff_int_cstr(v);
   double d = strtod(c, NULL);
   free(c);
   return d;
+}
+
+HEFF_FAST double heff_double_of_int(V v) {
+  if (HEFF_LIKELY(IS_INT(v))) return (double)INT_OF(v);
+  return heff_double_of_big(v);
 }
 
 // Strings
@@ -2244,7 +2264,7 @@ HEFF_FN double heff_double_of_int(V v) {
 
 HEFF_FN Str *heff_str_new(int64_t len) {
   Str *s = heff_obj_alloc(sizeof(Str) + len);
-  s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = len;
+  s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = (len + 7) & ~(int64_t)7;
   s->p = s->s;
   return s;
 }
@@ -2289,10 +2309,48 @@ HEFF_FN V heff_str_valid(const void *c, int64_t n) {
   return (V)s;
 }
 
+// A string's room.  One made has room for its bytes, and no more than
+// the allocator's rounding to 8 gives it: what is made once and kept --
+// a map's key, a field -- takes what it needs.  Only a string grown in
+// place, its last reference appended to, is given more, and only where
+// that is cheap: while it is a small object (`SMALL_MAX`), it grows to
+// what it needs, rounded so, each time a copy of at most so many bytes;
+// beyond, to twice its room (or what it needs, if more), by `realloc`,
+// which extends it where it is where it can -- so a string built a piece
+// at a time is copied a logarithmic number of times, not once a piece,
+// and the room not yet written in a large block is the system's pages
+// not yet touched, not memory.
+
+// (the string `x`, its last reference and not a view, room for `n` bytes
+// made in it: the string, moved where it must be)
+HEFF_FN Str *heff_str_grow(Str *x, int64_t n) {
+  size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
+  size_t room = (sizeof(Str) + n + 7) / 8 * 8;
+  Str *g;
+  if (room > SMALL_MAX) {
+    size_t twice = (sizeof(Str) + 2 * x->cap + 7) / 8 * 8;
+    if (twice > room) room = twice;
+  }
+  if (was > SMALL_MAX) {
+    // (from `malloc`, the allocator's own beyond `SMALL_MAX`)
+    HEFF_COUNTED(room / 8);
+    g = realloc(x, room);
+    if (!g) heff_fail("out of memory");
+  } else {
+    // (from the allocator objects are given back to, rounded as it
+    // rounds: a block it frees to a free list must be the whole of
+    // that list's size)
+    g = heff_obj_alloc(room);
+    memcpy(g, x, sizeof(Str) + x->len);
+    heff_obj_free(x, was);
+  }
+  g->cap = (int64_t)(room - sizeof(Str));
+  g->p = g->s;
+  return g;
+}
+
 // (the first string, its last reference and not a view, grown in place,
-// room made for twice what it needs -- a string built a piece at a time
-// copied a logarithmic number of times, not once a piece; `Bytes` too, a
-// new one of the kind `kind`)
+// as above; `Bytes` too, a new one of the kind `kind`)
 HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
@@ -2300,23 +2358,19 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   // there is room it is no view, and that is not looked at)
   if (heff_alone(&x->h) && (n <= x->cap || !HEFF_STR_VIEW(x))) {
     if (n > x->cap) {
-      int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
-      size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
-      // (from the allocator objects are given back to, rounded as it
-      // rounds: a block it frees to a free list must be the whole of
-      // that list's size)
-      Str *g = heff_obj_alloc(sizeof(Str) + cap);
-      memcpy(g, x, sizeof(Str) + x->len);
-      heff_obj_free(x, was);
-      g->cap = (int32_t)cap;
-      g->p = g->s;
-      x = g;
+      if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
+      x = heff_str_grow(x, n);
     }
     memcpy(x->s + x->len, y->p, (size_t)y->len);
     x->len = n;
     heff_drop(b);
     return (V)x;
   }
+  // (to nothing, or nothing to it, where a string would be made: the one
+  // that is something, as it is, where it is of the kind wanted -- a
+  // view is a string's)
+  if (y->len == 0 && x->h.kind == kind) { heff_drop(b); return a; }
+  if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
   Str *s = heff_str_new(n);
   s->h.kind = kind;
   memcpy(s->s, x->p, (size_t)x->len);
@@ -2576,15 +2630,32 @@ HEFF_FAST V heff_strByteAt_lent(V a, V i, int give) {
 }
 HEFF_FN V heff_strByteAt(V a, V i) { return heff_strByteAt_lent(a, i, 1); }
 
-// (the string of one byte, a `UInt8`: a word of its value, 0 to 255)
-HEFF_FN V heff_strFromByte(V c) {
-  int64_t k = INT_OF(c);
-  Str *s = heff_str_new(1);
-  s->s[0] = (uint8_t)k;
-  return (V)s;
-}
+// (the 256 strings of one byte, made by the C compiler, immortal: a
+// string's room, as a static one's is, in the program's first file)
+typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[8]; } HeffByteStr;
+#ifdef HEFF_PART
+extern HeffByteStr heff_byte_strs[256];
+#else
+#define HEFF_BYTE_STR(b) {{IMMORTAL, K_STR, 0}, 1, 1, heff_byte_strs[b].s, {b}}
+#define HEFF_BYTE_STR4(b) HEFF_BYTE_STR(b), HEFF_BYTE_STR(b + 1), HEFF_BYTE_STR(b + 2), HEFF_BYTE_STR(b + 3)
+#define HEFF_BYTE_STR16(b) HEFF_BYTE_STR4(b), HEFF_BYTE_STR4(b + 4), HEFF_BYTE_STR4(b + 8), HEFF_BYTE_STR4(b + 12)
+#define HEFF_BYTE_STR64(b) HEFF_BYTE_STR16(b), HEFF_BYTE_STR16(b + 16), HEFF_BYTE_STR16(b + 32), HEFF_BYTE_STR16(b + 48)
+HeffByteStr heff_byte_strs[256] = {
+  HEFF_BYTE_STR64(0), HEFF_BYTE_STR64(64), HEFF_BYTE_STR64(128), HEFF_BYTE_STR64(192)
+};
+#endif
 
+// (the string of one byte, a `UInt8`: a word of its value, 0 to 255 --
+// one of the 256, nothing made)
+HEFF_FN V heff_strFromByte(V c) { return (V)&heff_byte_strs[(uint8_t)INT_OF(c)]; }
+
+// (a word's digits on the stack, nothing allocated but the string; a
+// big one's by its digits')
 HEFF_FN V heff_intShow(V a) {
+  if (HEFF_LIKELY(IS_INT(a))) {
+    char b[24], *p = heff_word_digits(INT_OF(a), b + sizeof b);
+    return heff_str_of(p, b + sizeof b - p);
+  }
   char *c = heff_int_cstr(a);
   heff_drop(a);
   V s = heff_str_ascii(c);
@@ -2688,19 +2759,29 @@ static inline float heff_f32_of(V v) {
 // `Float32` is a word of its bits (`heff_f32`): C's `float` is IEEE's,
 // each operation rounded, as JavaScript's `Math.fround` rounds.
 
-// (an integer's lowest 64 bits, as two's complement has them; borrowed)
-HEFF_FN uint64_t heff_int_low64(V v) {
-  if (IS_INT(v)) return (uint64_t)INT_OF(v);
+// (an integer's lowest 64 bits, as two's complement has them; borrowed:
+// a word's inlined, a big one's the call)
+HEFF_SLOW uint64_t heff_big_low64(V v) {
   Big *b = (Big *)v;
   uint64_t m = b->n > 0 ? b->d[0] : 0;
   if (b->n > 1) m |= (uint64_t)b->d[1] << 32;
   return b->neg ? (uint64_t)0 - m : m;
 }
 
-HEFF_FN V heff_int_u64(uint64_t m) {
-  if (m < (uint64_t)INT_LIM) return MK_INT((int64_t)m);
+HEFF_FAST uint64_t heff_int_low64(V v) {
+  if (HEFF_LIKELY(IS_INT(v))) return (uint64_t)INT_OF(v);
+  return heff_big_low64(v);
+}
+
+// (an integer of 64 bits, unsigned: a word inlined, a big one the call)
+HEFF_SLOW V heff_u64_big(uint64_t m) {
   uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
   return big_make(0, d, 2);
+}
+
+HEFF_FAST V heff_int_u64(uint64_t m) {
+  if (HEFF_LIKELY(m < (uint64_t)INT_LIM)) return MK_INT((int64_t)m);
+  return heff_u64_big(m);
 }
 
 // (a value of the type `T`, its 64 bits taken (and consumed), and one
@@ -5478,10 +5559,11 @@ HEFF_FN void heff_show(Buf *b, V v, int arg) {
     return;
   }
   if (IS_INT(v) || (IS_OBJ(v) && OBJ(v)->kind == K_BIG)) {
-    char *c = heff_int_cstr(v);
+    char w[24], *c = IS_INT(v) ? heff_word_digits(INT_OF(v), w + sizeof w - 1) : heff_int_cstr(v);
+    w[sizeof w - 1] = 0;
     if (arg && c[0] == '-') { buf_str(b, "("); buf_str(b, c); buf_str(b, ")"); }
     else buf_str(b, c);
-    free(c);
+    if (!IS_INT(v)) free(c);
     return;
   }
   int tag = -1, n = 0;

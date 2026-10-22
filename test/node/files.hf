@@ -174,6 +174,10 @@ chunks path = do
 -- Lines
 --------------------------------------------------------------------------------
 
+-- (lines folded into a list, in order)
+inOrder : Either FileError (List String) -> Either FileError (List String)
+inOrder ls = either (\err -> Left err) (\l -> Right (List.reverse l)) ls
+
 -- (the lines of a file, from its start)
 linesOf : {e : HFunctor}
         -> {{disk : filesystem <: e}}
@@ -186,10 +190,39 @@ linesOf path = do
       path
       { access = Read }
       (\h -> foldLines h Nil (\acc l -> pure (l :: acc)))
-  pure (either (\err -> Left err) (\l -> Right (List.reverse l)) ls)
+  pure (inOrder ls)
+
+-- (the lines of a file, from its start, read `n` bytes at a time)
+linesBy : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> Int
+        -> String
+        -> Co e (Either FileError (List String))
+linesBy n path = do
+  ls <-
+    withFile
+      path
+      { access = Read }
+      (\h -> foldLinesBy n h Nil (\acc l -> pure (l :: acc)))
+  pure (inOrder ls)
+
+-- (whether a file's lines, read a few bytes at a time, are `want`)
+sameBy : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> String
+       -> List String
+       -> Co e Bool
+sameBy path want = do
+  got <- for n in ([1, 2, 3, 4, 5, 7, 64] : List Int) do
+    linesBy n path
+  pure (List.all (\l -> show (must l) == show want) got)
 
 -- | Lines ended by `\n` and `\r\n`, an empty one, the last one with no
--- | newline; one longer than a buffer.
+-- | newline; one longer than a buffer; read a few bytes at a time, a
+-- | `\r\n` split between two reads; lines past a chunk, and one longer
+-- | than a chunk.
 lineReading : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{disk : filesystem <: e}}
@@ -207,6 +240,37 @@ lineReading dir = do
   writeFile (dir ^ "/empty.txt") ""
   none <- linesOf (dir ^ "/empty.txt")
   print ("no lines: " ^ show (must none))
+  crlf <- sameBy (dir ^ "/crlf.txt") (must ls)
+  writeFile (dir ^ "/split.txt") "a\r\n\r\nbc\r\n\n\nlast\r"
+  split <- linesOf (dir ^ "/split.txt")
+  splitBy <- sameBy (dir ^ "/split.txt") (must split)
+  longBy <- linesBy 4096 (dir ^ "/long.txt")
+  emptyBy <- sameBy (dir ^ "/empty.txt") Nil
+  print
+      ("a few bytes at a time: "
+       ^ show crlf
+       ^ " "
+       ^ show (must split)
+       ^ " "
+       ^ show splitBy
+       ^ ", long "
+       ^ show (List.map strLength (must longBy))
+       ^ ", none "
+       ^ show emptyBy)
+  let line = "0123456789abcdefghijklmnopqrstuvwxyz"
+  writeFile (dir ^ "/many.txt") (joinWith "" (List.replicate 60000 (line ^ "\n")))
+  many <- linesOf (dir ^ "/many.txt")
+  writeFile
+      (dir ^ "/huge.txt")
+      ("first\n" ^ joinWith "" (List.replicate 300000 "abcdefghij") ^ "\r\nend")
+  huge <- linesOf (dir ^ "/huge.txt")
+  print
+      ("past a chunk: "
+       ^ show (List.length (must many))
+       ^ " lines, each the same "
+       ^ show (List.all (\l -> l == line) (must many))
+       ^ "; "
+       ^ show (List.map strLength (must huge)))
 
 -- Seek, tell, status
 --------------------------------------------------------------------------------
@@ -571,19 +635,18 @@ greenLines : {e : HFunctor}
            -> {{disk : filesystem <: e}}
            -> Co e Unit
 greenLines = do
-  with withStdin as i do
-    with withStdout as o do
-      counted <- newChan
-      read <- newChan
-      spawn
-          (bind
-             (foldLines i 0 (\n l -> pure (n + 1)))
-             (\r -> send read (must r)))
-      spawn (counting counted 1000 0)
-      n <- recv counted
-      writeString o ("counted while the reader waits: " ^ show n ^ "\n")
-      m <- recv read
-      writeString o ("read: " ^ show m ^ " lines\n")
+  with withStdout as o do
+    counted <- newChan
+    read <- newChan
+    spawn
+        (bind
+           (foldStdinLines 0 (\n l -> pure (n + 1)))
+           (\r -> send read (must r)))
+    spawn (counting counted 1000 0)
+    n <- recv counted
+    writeString o ("counted while the reader waits: " ^ show n ^ "\n")
+    m <- recv read
+    writeString o ("read: " ^ show m ^ " lines\n")
   pure MkUnit
 
 -- The programs

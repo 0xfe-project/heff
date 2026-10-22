@@ -12,7 +12,7 @@
 --
 -- -- | the words of the standard input, read a line at a time
 -- wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e (Either FileError Int)
--- wordsIn = withStdin (\i -> foldLines i 0 (\n line -> pure (n + List.length (words line))))
+-- wordsIn = foldStdinLines 0 (\n line -> pure (n + List.length (words line)))
 --
 -- -- | a file's text, with a line added
 -- appended : {e : HFunctor}
@@ -53,7 +53,7 @@
 -- The standard streams are had the same way (`withStdin`, `withStdout`,
 -- `withStderr`), by the shared `held`, as they are always there, and left
 -- open when their body ends, so that a program reads its input a line at a
--- time, in as little memory as a line takes.
+-- time (`foldLines`), in as little memory as a chunk and a line take.
 --
 -- An operation on a path that fails throws why, a `FileError`, over the
 -- `exception` effect: the system's errno, its name and what the system
@@ -115,10 +115,13 @@ module std.filesystem
   , tell
   , fileStatus
   , foldLines
+  , foldLinesBy
+  , foldStdinLines
   , copyOpen
   , showFileError
   )
 
+import bytes as Bytes
 import co
 import exception
 import int as Int
@@ -688,21 +691,120 @@ fileStatus f = op (ev (FileStatus (inside f) (\r -> r))) val
 -- Streams
 --------------------------------------------------------------------------------
 
--- (the next line given to `step`, then `again`, or the fold's end)
-foldLinesNext : {e : HFunctor}
-              -> {a : Type}
-              -> (a -> Co e (Either FileError a))
-              -> (a -> String -> Co e a)
-              -> a
-              -> Either FileError (Maybe String)
-              -> Co e (Either FileError a)
-foldLinesNext again step acc (Right (Just line)) = bind (step acc line) again
-foldLinesNext again step acc (Right Nothing) = pure (Right acc)
-foldLinesNext again step acc (Left err) = pure (Left err)
+-- (how much a copy, or a fold of lines, reads at a time)
+chunkSize : Int
+chunkSize = 65536
+
+-- (where the line of `s` from `i` to its newline at `j` ends: before
+-- the `\r` before the newline, where there is one)
+lineEnd : String -> Int -> Int -> Int
+lineEnd s i j = if j > i && byteAt s (j - 1) == 13 then j - 1 else j
+
+-- (what is left of `s` from `i`: `s` itself from its start, so that
+-- what a long line has gathered grows in place)
+leftFrom : String -> Int -> String
+leftFrom s 0 = s
+leftFrom s i = strSlice s i (strLength s)
+
+-- (the lines of `s` from `i`, each given to `step`, the next newline
+-- looked for from `k`; then `again` with what is left after the last
+-- newline, the start of a line the next chunk goes on with)
+linesFrom : {e : HFunctor}
+          -> {a : Type}
+          -> (String -> a -> Co e (Either FileError a))
+          -> (a -> String -> Co e a)
+          -> String
+          -> Int
+          -> Int
+          -> a
+          -> Co e (Either FileError a)
+linesFrom again step s i k acc =
+  let j = strFind "\n" s k
+  in if j < 0 then again (leftFrom s i) acc
+  else bind
+      (step acc (strSlice s i (lineEnd s i j)))
+      (\next -> linesFrom again step s (j + 1) (j + 1) next)
+
+-- (`rest`, the start of a line, gone on with by `s`)
+goneOn : String -> String -> String
+goneOn "" s = s
+goneOn rest s = rest ^ s
+
+-- (the lines of `s`, its last `n` bytes a chunk just read, each given to
+-- `step`: what is before them has no newline, so is not looked through
+-- again; `rest` is not had past `goneOn`, so that it grows in place)
+gathered : {e : HFunctor}
+         -> {a : Type}
+         -> (String -> a -> Co e (Either FileError a))
+         -> (a -> String -> Co e a)
+         -> String
+         -> Int
+         -> a
+         -> Co e (Either FileError a)
+gathered again step s n acc = linesFrom again step s 0 (strLength s - n) acc
+
+-- (the last line, where no newline ends it, given to `step`)
+lastLine : {e : HFunctor}
+         -> {a : Type}
+         -> (a -> String -> Co e a)
+         -> String
+         -> a
+         -> Co e (Either FileError a)
+lastLine step "" acc = pure (Right acc)
+lastLine step rest acc = bind (step acc rest) (\next -> pure (Right next))
+
+-- (a chunk read: its lines given to `step`, the first going on from
+-- `rest`, then `again`; at the file's end, the last line)
+chunkRead : {e : HFunctor}
+          -> {a : Type}
+          -> (String -> a -> Co e (Either FileError a))
+          -> (a -> String -> Co e a)
+          -> String
+          -> a
+          -> Either FileError Bytes
+          -> Co e (Either FileError a)
+chunkRead again step rest acc (Right b) =
+  if bytesLength b == 0 then lastLine step rest acc
+  else gathered again step (goneOn rest (Bytes.asString b)) (bytesLength b) acc
+chunkRead again step rest acc (Left err) = pure (Left err)
+
+-- (the lines of the file after `rest`, read `n` bytes at a time)
+linesAfter : {e : HFunctor}
+           -> {s : Type}
+           -> {{ev : filesystem <: e}}
+           -> {a : Type}
+           -> Int
+           -> With s OpenFile
+           -> (a -> String -> Co e a)
+           -> String
+           -> a
+           -> Co e (Either FileError a)
+linesAfter n f step rest acc =
+  bind
+    (readChunk f n)
+    (chunkRead (\left next -> linesAfter n f step left next) step rest acc)
+
+-- | `foldLines`, the file read `n` bytes at a time (as `readChunk`
+-- | reads them): however few, each line is given whole.
+foldLinesBy : {e : HFunctor}
+            -> {s : Type}
+            -> {{ev : filesystem <: e}}
+            -> {a : Type}
+            -> Int
+            -> With s OpenFile
+            -> a
+            -> (a -> String -> Co e a)
+            -> Co e (Either FileError a)
+foldLinesBy n f acc step = linesAfter n f step "" acc
 
 -- | Each line of the file, from where it is to its end, given to
 -- | `step` with what the lines before it came to: what they all come
--- | to.  One line at a time is held, however long the file.
+-- | to.  A line is as `readLine` gives it: without its `\n` (or
+-- | `\r\n`), the last one too where no `\n` ends it.  The file is read
+-- | 64 kibibytes at a time (from a pipe or a terminal, as much as has
+-- | come), so that a chunk and a line are held, however long the file;
+-- | should the fold be left before its end, what it read past the line
+-- | it was at is not read again.
 foldLines : {e : HFunctor}
           -> {s : Type}
           -> {{ev : filesystem <: e}}
@@ -711,12 +813,17 @@ foldLines : {e : HFunctor}
           -> a
           -> (a -> String -> Co e a)
           -> Co e (Either FileError a)
-foldLines f acc step =
-  bind (readLine f) (foldLinesNext (\next -> foldLines f next step) step acc)
+foldLines f acc step = foldLinesBy chunkSize f acc step
 
--- (how much a copy reads at a time)
-chunkSize : Int
-chunkSize = 65536
+-- | Each line of the standard input given to `step`, as `foldLines`
+-- | gives them: what they all come to.
+foldStdinLines : {e : HFunctor}
+               -> {{ev : filesystem <: e}}
+               -> {a : Type}
+               -> a
+               -> (a -> String -> Co e a)
+               -> Co e (Either FileError a)
+foldStdinLines acc step = withStdin (\i -> foldLines i acc step)
 
 -- (after a write: `again`, `n` bytes written so far; or why it failed)
 copyWritten : {e : HFunctor}
