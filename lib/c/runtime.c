@@ -2309,6 +2309,7 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   // there is room it is no view, and that is not looked at)
   if (heff_alone(&x->h) && (n <= x->cap || !HEFF_STR_VIEW(x))) {
     if (n > x->cap) {
+      if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
       size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
       // (from the allocator objects are given back to, rounded as it
@@ -2326,6 +2327,11 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
     heff_drop(b);
     return (V)x;
   }
+  // (to nothing, or nothing to it, where a string would be made: the one
+  // that is something, as it is, where it is of the kind wanted -- a
+  // view is a string's)
+  if (y->len == 0 && x->h.kind == kind) { heff_drop(b); return a; }
+  if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
   Str *s = heff_str_new(n);
   s->h.kind = kind;
   memcpy(s->s, x->p, (size_t)x->len);
