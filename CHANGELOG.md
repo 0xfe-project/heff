@@ -23,6 +23,7 @@
 
 ### Standard library
 
+- `show` of a `Float64` or a `Float32` is a literal heff reads back as the same float, still the fewest digits: an exponent has a point before it and no `+` (`1.0e23`, `5.0e-324`, `1.5e300`, not `1e+23`, `5e-324`, `1.5e+300`), and -0.0 keeps its sign (`-0.0`, not `0.0`). `NaN`, `Infinity` and `-Infinity` are as before. json's `stringify` writes numbers as before, as JavaScript does.
 - std.map is renamed std.ordmap, and its type `Map` `OrdMap`: the name says what it asks of the keys, an `Order`.
 - std.map: the theory `Mapping c` of a map of any kind, with `Key` and `Value` as its fields: `empty`, `insert`, `lookup`, `remove`, `size` and `foldl`, and an instance for std.ordmap, std.hashmap and std.hashtable, so that one definition serves all three and a program picks one by its type.
 - check: `within ms t` is now `withinTime ms t`, `within` being co's.

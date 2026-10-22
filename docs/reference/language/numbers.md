@@ -30,7 +30,12 @@ flags = 0b1010
 ```
 
 - An integer literal can be of any number type; a fractional one, `2.5`,
-  of a float type.
+  of a float type. A fractional literal may have an exponent after its
+  digits, `6.02e23`, `1.5e-3`; a point comes first, `1.0e23`, not
+  `1e23`. It is the float nearest the decimal it writes.
+- `show` writes a float as such a literal, the fewest digits that read
+  back as it: `show 1.0e23` is `"1.0e23"`, `show (neg 0.0)` is
+  `"-0.0"`.
 - Hexadecimal `0x605` and binary `0b1010` are allowed, and `_` can
   separate digits.
 - The literal must fit its type: `300` as a `UInt8` is an error, and so

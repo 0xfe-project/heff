@@ -212,37 +212,37 @@ fn isOwn(p: [*]const u8, u: u32, w: c_int) bool {
 // Floats
 // ---------------------------------------------------------------------
 
-/// The room a number written as JavaScript writes it takes, its NUL
-/// too: at most a sign, "0.000000" and 17 digits.
+/// The room a float written as a literal takes, its NUL too: at most a
+/// sign, "0.000000" and 17 digits.
 const numberRoom = 32;
 
-/// A `Float64` as JavaScript writes a number (ECMAScript's
-/// Number::toString), at `out`, which has room for 32 bytes, a NUL
-/// after it: the fewest digits that read back as the same float -- of
-/// those, the nearest -- plain from 1e-7 up to 1e21, else as a digit,
-/// the others after a point, and an exponent; "NaN", "Infinity",
-/// "-Infinity", and "0" or "-0" (which JavaScript writes "0"), of a
-/// zero, by its sign.
-export fn heff_js_number(d: f64, out: [*]u8) void {
-    jsNumber(f64, d, out[0..numberRoom]);
+/// A `Float64` as a heff literal writes it, `show`'s text, at `out`,
+/// which has room for 32 bytes, a NUL after it: the fewest digits that
+/// read back as the same float -- of those, the nearest -- placed as
+/// JavaScript places them (plain from 1e-7 up to 1e21, else a digit, a
+/// point, the others and an exponent), but always with a point and a
+/// digit after it, and an exponent without a `+`: "100.0", "0.5",
+/// "1.0e21", "5.0e-324", "-0.0"; "NaN", "Infinity", "-Infinity".
+export fn heff_show_float(d: f64, out: [*]u8) void {
+    literalText(f64, d, out[0..numberRoom]);
 }
 
 /// A `Float32` so: the fewest digits that read back as the same
-/// `Float32`, written as JavaScript writes a number.
-export fn heff_js_number32(f: f32, out: [*]u8) void {
-    jsNumber(f32, f, out[0..numberRoom]);
+/// `Float32`.
+export fn heff_show_float32(f: f32, out: [*]u8) void {
+    literalText(f32, f, out[0..numberRoom]);
 }
 
-fn jsNumber(comptime T: type, x: T, out: *[numberRoom]u8) void {
+fn literalText(comptime T: type, x: T, out: *[numberRoom]u8) void {
     var w: std.Io.Writer = .fixed(out[0 .. numberRoom - 1]);
-    writeNumber(T, x, &w) catch unreachable;
+    writeLiteral(T, x, &w) catch unreachable;
     out[w.end] = 0;
 }
 
-fn writeNumber(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!void {
+fn writeLiteral(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (std.math.isNan(x)) return w.writeAll("NaN");
     if (std.math.isInf(x)) return w.writeAll(if (x < 0) "-Infinity" else "Infinity");
-    if (x == 0) return w.writeAll(if (std.math.signbit(x)) "-0" else "0");
+    if (x == 0) return w.writeAll(if (std.math.signbit(x)) "-0.0" else "0.0");
     const shortest = decimalOf(T, x);
     if (shortest.sign) try w.writeByte('-');
     // (its digits, `k` of them, none of them a last 0, and where the
@@ -260,6 +260,7 @@ fn writeNumber(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!vo
     if (k <= n and n <= 21) {
         try w.writeAll(digits);
         try w.splatByteAll('0', @intCast(n - k));
+        try w.writeAll(".0");
     } else if (0 < n and n <= 21) {
         try w.writeAll(digits[0..@intCast(n)]);
         try w.writeByte('.');
@@ -270,11 +271,9 @@ fn writeNumber(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!vo
         try w.writeAll(digits);
     } else {
         try w.writeByte(digits[0]);
-        if (k > 1) {
-            try w.writeByte('.');
-            try w.writeAll(digits[1..]);
-        }
-        try w.print("e{c}{d}", .{ @as(u8, if (n - 1 < 0) '-' else '+'), @abs(n - 1) });
+        try w.writeByte('.');
+        try w.writeAll(if (k > 1) digits[1..] else "0");
+        try w.print("e{d}", .{n - 1});
     }
 }
 

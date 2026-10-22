@@ -168,9 +168,10 @@ static inline int heff_u8_read(const uint8_t *p, int64_t n, uint32_t *out) {
 }
 int heff_u8_encode(uint8_t *o, uint32_t u);
 int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own);
-// (a float as JavaScript writes a number, at `out`, room for 32 bytes)
-void heff_js_number(double d, char *out);
-void heff_js_number32(float f, char *out);
+// (a float as a literal writes it, `show`'s text, at `out`, room for 32
+// bytes)
+void heff_show_float(double d, char *out);
+void heff_show_float32(float f, char *out);
 // (integers beyond a word, their magnitudes compared, added, subtracted,
 // multiplied and divided, as "Integers" below says; and bits read and
 // written as Erlang's bit syntax has them, as "Bits" says)
@@ -2745,9 +2746,8 @@ HEFF_FN V heff_floatFloor(V a) {
 
 HEFF_FN V heff_floatShow(V a) {
   char buf[64];
-  heff_js_number(FLT_OF(a), buf);
+  heff_show_float(FLT_OF(a), buf);
   heff_drop(a);
-  if (!strpbrk(buf, ".eNI")) strcat(buf, ".0");
   return heff_str_ascii(buf);
 }
 
@@ -2922,8 +2922,7 @@ HEFF_FN V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
 // always do)
 HEFF_FN V heff_float32Show(V a) {
   char buf[64];
-  heff_js_number32(heff_f32_of(a), buf);
-  if (!strpbrk(buf, ".eNI")) strcat(buf, ".0");
+  heff_show_float32(heff_f32_of(a), buf);
   return heff_str_ascii(buf);
 }
 
@@ -5606,8 +5605,7 @@ HEFF_FN void heff_show(Buf *b, V v, int arg) {
     switch (o->kind) {
     case K_TAG: case K_TAGF: tag = o->tag; n = (int)((Tag *)v)->n; fs = ((Tag *)v)->f; break;
     case K_FLT: {
-      heff_js_number(FLT_OF(v), tmp);
-      if (!strpbrk(tmp, ".eNI")) strcat(tmp, ".0");
+      heff_show_float(FLT_OF(v), tmp);
       if (arg && tmp[0] == '-') { buf_str(b, "("); buf_str(b, tmp); buf_str(b, ")"); }
       else buf_str(b, tmp);
       return;

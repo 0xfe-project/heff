@@ -78,9 +78,15 @@ export const show = (v, arg = false) => {
   if (typeof v === "bigint") return v.toString();
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") {
-    if (v === 0 && 1 / v < 0) return "-0.0";
+    if (v === 0) return 1 / v < 0 ? "-0.0" : "0.0";
     const s = String(v);
-    return isNaN(s + ".0") ? s : s + ".0";
+    if (!Number.isFinite(v)) return s;
+    // (with a point and a digit after it, an exponent without a `+`:
+    // `1.0e21`, `5.0e-324`)
+    const i = s.indexOf("e");
+    if (i < 0) return s.includes(".") ? s : s + ".0";
+    const m = s.slice(0, i);
+    return (m.includes(".") ? m : m + ".0") + "e" + s.slice(s[i + 1] === "+" ? i + 2 : i + 1);
   }
   if (typeof v === "string") return showString(v);
   if (v instanceof Uint8Array) return v.bits === undefined ? showBytes(v) : showBits(v);
