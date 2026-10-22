@@ -54,23 +54,26 @@ fn intOf(v: V) i64 {
 /// An object's header: its count, its kind, its tag.
 const Obj = extern struct { rc: u32, kind: u16, tag: u16 };
 
-/// An integer beyond a word: its sign, and its `n` digits of 32 bits
+/// An integer beyond a word: its sign, and its `n` digits of 64 bits
 /// after it, the lowest first.
+const Digit = u64;
 const Big = extern struct {
     h: Obj,
     neg: i32,
     n: i32,
 
-    fn digits(b: *const Big) []const u32 {
-        const after: [*]const u32 = @ptrCast(@as([*]const Big, @ptrCast(b)) + 1);
+    fn digits(b: *const Big) []const Digit {
+        const after: [*]const Digit = @ptrCast(@alignCast(@as([*]const Big, @ptrCast(b)) + 1));
         return after[0..@intCast(b.n)];
     }
 };
 
-/// The layout above, as the C half checks it: each offset and size.
+/// The layout above, as the C half checks it: each offset and size, a
+/// big integer's digit's last.
 export const heff_zig_layout = [_]u16{
     @sizeOf(Obj), @offsetOf(Obj, "kind"), @offsetOf(Obj, "tag"),
     @sizeOf(Big), @offsetOf(Big, "neg"),  @offsetOf(Big, "n"),
+    @sizeOf(Digit),
 };
 
 // Hashes
@@ -117,8 +120,7 @@ export fn heff_hash_bytes(p: [*]const u8, n: i64) u64 {
 export fn heff_int_hash(a: V) u64 {
     if (isInt(a)) return fmix64(@bitCast(intOf(a)));
     const big: *const Big = @ptrFromInt(a);
-    const d = big.digits();
-    const low: u64 = @as(u64, d[0]) | if (d.len > 1) @as(u64, d[1]) << 32 else 0;
+    const low = big.digits()[0];
     return fmix64(if (big.neg != 0) 0 -% low else low);
 }
 
@@ -291,12 +293,13 @@ fn decimalOf(comptime T: type, x: T) std.fmt.float.FloatDecimal(u64) {
 
 // Integers beyond a word: their magnitudes
 // ---------------------------------------------------------------------
-// A magnitude is its 32-bit digits, the least first, as `Big` holds
+// A magnitude is its 64-bit digits, the least first, as `Big` holds
 // them; the C half gives each result room, and makes an integer of it.
+// A result may be written over an operand where a function says so.
 
 /// `a` against `b`, as magnitudes of `an` and `bn` digits, no top digit
 /// 0: -1, 0 or 1.
-export fn heff_mag_cmp(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int) c_int {
+export fn heff_mag_cmp(a: [*]const u64, an: c_int, b: [*]const u64, bn: c_int) c_int {
     if (an != bn) return if (an < bn) -1 else 1;
     var i: usize = @intCast(an);
     while (i > 0) {
@@ -306,125 +309,221 @@ export fn heff_mag_cmp(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int) c
     return 0;
 }
 
-/// `a` plus `b`, into `o`, which has room for max(an, bn) + 1 digits:
-/// how many digits it has.
-export fn heff_mag_add(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) c_int {
+/// `a` plus `b`, into `o`, which has room for max(an, bn) + 1 digits
+/// (and may be `a` or `b`): how many digits it has.
+export fn heff_mag_add(a: [*]const u64, an: c_int, b: [*]const u64, bn: c_int, o: [*]u64) c_int {
     if (an < bn) return heff_mag_add(b, bn, a, an, o);
     const x = a[0..@intCast(an)];
     const y = b[0..@intCast(bn)];
-    var carry: u64 = 0;
-    for (x, 0..) |d, i| {
-        carry += @as(u64, d) + if (i < y.len) y[i] else 0;
-        o[i] = @truncate(carry);
-        carry >>= 32;
+    var carry: u1 = 0;
+    for (y, 0..) |e, i| {
+        const s = @addWithOverflow(x[i], e);
+        const t = @addWithOverflow(s[0], carry);
+        o[i] = t[0];
+        carry = s[1] | t[1];
     }
-    o[x.len] = @truncate(carry);
+    for (x[y.len..], y.len..) |d, i| {
+        const s = @addWithOverflow(d, carry);
+        o[i] = s[0];
+        carry = s[1];
+    }
+    o[x.len] = carry;
     return an + 1;
 }
 
 /// `a` minus `b`, `a` not below `b`, into `o`, which has room for `an`
-/// digits: how many digits it has, `an`.
-export fn heff_mag_sub(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) c_int {
+/// digits (and may be `a` or `b`): how many digits it has, `an`.
+export fn heff_mag_sub(a: [*]const u64, an: c_int, b: [*]const u64, bn: c_int, o: [*]u64) c_int {
     const x = a[0..@intCast(an)];
     const y = b[0..@intCast(bn)];
-    var borrow: i64 = 0;
-    for (x, 0..) |d, i| {
-        borrow += @as(i64, d) - if (i < y.len) y[i] else 0;
-        o[i] = @truncate(@as(u64, @bitCast(borrow)));
-        borrow = if (borrow < 0) -1 else 0;
+    var borrow: u1 = 0;
+    for (y, 0..) |e, i| {
+        const s = @subWithOverflow(x[i], e);
+        const t = @subWithOverflow(s[0], borrow);
+        o[i] = t[0];
+        borrow = s[1] | t[1];
+    }
+    for (x[y.len..], y.len..) |d, i| {
+        const s = @subWithOverflow(d, borrow);
+        o[i] = s[0];
+        borrow = s[1];
     }
     return an;
 }
 
 /// `a` times `b`, into `o`, which has room for an + bn digits, all of
-/// them written.
-export fn heff_mag_mul(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) void {
+/// them written: row by row of the shorter's digits, each row along
+/// the longer, so that an integer times a word is one pass.
+export fn heff_mag_mul(a: [*]const u64, an: c_int, b: [*]const u64, bn: c_int, o: [*]u64) void {
+    if (an < bn) return heff_mag_mul(b, bn, a, an, o);
     const x = a[0..@intCast(an)];
     const y = b[0..@intCast(bn)];
-    @memset(o[0 .. x.len + y.len], 0);
+    if (y.len == 0) return @memset(o[0..x.len], 0);
+    var carry: u64 = 0;
     for (x, 0..) |d, i| {
-        var carry: u64 = 0;
-        for (y, 0..) |e, j| {
-            carry += @as(u64, d) * e + o[i + j];
-            o[i + j] = @truncate(carry);
-            carry >>= 32;
-        }
-        o[i + y.len] = @truncate(carry);
+        const p = @as(u128, d) * y[0] + carry;
+        o[i] = @truncate(p);
+        carry = @intCast(p >> 64);
     }
+    o[x.len] = carry;
+    for (y[1..], 1..) |e, j| {
+        carry = 0;
+        for (x, 0..) |d, i| {
+            const p = @as(u128, d) * e + o[i + j] + carry;
+            o[i + j] = @truncate(p);
+            carry = @intCast(p >> 64);
+        }
+        o[j + x.len] = carry;
+    }
+}
+
+/// The reciprocal of a divisor whose top bit is set, as Möller and
+/// Granlund's division by an invariant integer takes it:
+/// (2^128 - 1) / v - 2^64.
+fn reciprocal(v: u64) u64 {
+    return @truncate(~@as(u128, 0) / v);
+}
+
+/// `hi:lo` divided by `v`, its top bit set and `hi` below it, by its
+/// reciprocal `inv` (Möller and Granlund's algorithm 4): the quotient,
+/// the remainder at `r`.  Two multiplications, no division.
+fn div21(hi: u64, lo: u64, v: u64, inv: u64, r: *u64) u64 {
+    const p = @as(u128, inv) * hi +% ((@as(u128, hi + 1) << 64) | lo);
+    var q: u64 = @truncate(p >> 64);
+    var m = lo -% q *% v;
+    if (m > @as(u64, @truncate(p))) {
+        q -%= 1;
+        m +%= v;
+    }
+    if (m >= v) {
+        q += 1;
+        m -= v;
+    }
+    r.* = m;
+    return q;
+}
+
+/// `u`, `m` digits, divided by the digit `d`, not 0: the quotient into
+/// `q`, `m` digits (it may be `u`), the remainder returned.
+export fn heff_mag_div1(u: [*]const u64, m: c_int, d: u64, q: [*]u64) u64 {
+    var j: usize = @intCast(m);
+    if (j == 0) return 0;
+    const s: u6 = @intCast(@clz(d));
+    const v = d << s;
+    const inv = reciprocal(v);
+    var r: u64 = 0;
+    if (s == 0) {
+        while (j > 0) {
+            j -= 1;
+            q[j] = div21(r, u[j], v, inv, &r);
+        }
+        return r;
+    }
+    // (the dividend shifted as the divisor is, a digit at a time)
+    const back: u6 = @intCast(64 - @as(u7, s));
+    r = u[j - 1] >> back;
+    while (j > 0) {
+        j -= 1;
+        const low = (u[j] << s) | if (j > 0) u[j - 1] >> back else 0;
+        q[j] = div21(r, low, v, inv, &r);
+    }
+    return r >> s;
 }
 
 /// `u`, `m` digits, divided by `v`, `n` digits whose top is not 0, as
 /// Knuth's algorithm D: the quotient `q` gets max(m - n + 1, 1) digits,
 /// the remainder `r` gets `n`; `vn` and `un` are room for `n` and `m +
-/// 1` digits, the normalised divisor and dividend.
-export fn heff_mag_divmod(u: [*]const u32, m: c_int, v: [*]const u32, n: c_int, q: [*]u32, r: [*]u32, vn: [*]u32, un: [*]u32) void {
+/// 1` digits, the normalised divisor and dividend.  Each quotient digit
+/// is guessed from the top two of the dividend's by the divisor's top
+/// one's reciprocal.
+export fn heff_mag_divmod(u: [*]const u64, m: c_int, v: [*]const u64, n: c_int, q: [*]u64, r: [*]u64, vn: [*]u64, un: [*]u64) void {
     const mu: usize = @intCast(m);
     const nv: usize = @intCast(n);
     if (mu < nv) {
+        q[0] = 0;
         @memcpy(r[0..mu], u[0..mu]);
         @memset(r[mu..nv], 0);
         return;
     }
     if (nv == 1) {
-        var k: u64 = 0;
-        var j = mu;
-        while (j > 0) {
-            j -= 1;
-            const t = (k << 32) | u[j];
-            q[j] = @truncate(t / v[0]);
-            k = t - @as(u64, q[j]) * v[0];
-        }
-        r[0] = @truncate(k);
+        r[0] = heff_mag_div1(u, m, v[0], q);
         return;
     }
     // (the divisor's top digit made to have its top bit set, and the
     // dividend shifted as much, so that each guess of a quotient digit
     // is at most 2 too big)
-    const s: u5 = @intCast(@clz(v[nv - 1]));
-    const back: u5 = @truncate(32 - @as(u6, s));
-    var i = nv - 1;
-    while (i > 0) : (i -= 1) vn[i] = (v[i] << s) | (if (s != 0) v[i - 1] >> back else 0);
-    vn[0] = v[0] << s;
-    un[mu] = if (s != 0) u[mu - 1] >> back else 0;
-    i = mu - 1;
-    while (i > 0) : (i -= 1) un[i] = (u[i] << s) | (if (s != 0) u[i - 1] >> back else 0);
-    un[0] = u[0] << s;
+    const s: u6 = @intCast(@clz(v[nv - 1]));
+    if (s == 0) {
+        @memcpy(vn[0..nv], v[0..nv]);
+        @memcpy(un[0..mu], u[0..mu]);
+        un[mu] = 0;
+    } else {
+        const back: u6 = @intCast(64 - @as(u7, s));
+        var i = nv - 1;
+        while (i > 0) : (i -= 1) vn[i] = (v[i] << s) | (v[i - 1] >> back);
+        vn[0] = v[0] << s;
+        un[mu] = u[mu - 1] >> back;
+        i = mu - 1;
+        while (i > 0) : (i -= 1) un[i] = (u[i] << s) | (u[i - 1] >> back);
+        un[0] = u[0] << s;
+    }
+    const top = vn[nv - 1];
+    const next = vn[nv - 2];
+    const inv = reciprocal(top);
     var j = mu - nv + 1;
     while (j > 0) {
         j -= 1;
-        const num = (@as(u64, un[j + nv]) << 32) | un[j + nv - 1];
-        var qhat = num / vn[nv - 1];
-        var rhat = num - qhat * vn[nv - 1];
-        while (qhat >> 32 != 0 or qhat * vn[nv - 2] > ((rhat << 32) | un[j + nv - 2])) {
+        const top2 = un[j + nv];
+        const top1 = un[j + nv - 1];
+        var qhat: u64 = undefined;
+        var rhat: u64 = undefined;
+        var over = false;
+        if (top2 >= top) {
+            qhat = std.math.maxInt(u64);
+            const t = @addWithOverflow(top1, top);
+            rhat = t[0];
+            over = t[1] == 1;
+        } else qhat = div21(top2, top1, top, inv, &rhat);
+        while (!over and @as(u128, qhat) * next > ((@as(u128, rhat) << 64) | un[j + nv - 2])) {
             qhat -= 1;
-            rhat += vn[nv - 1];
-            if (rhat >> 32 != 0) break;
+            const t = @addWithOverflow(rhat, top);
+            rhat = t[0];
+            over = t[1] == 1;
         }
-        var k: i64 = 0;
-        var t: i64 = 0;
+        var carry: u64 = 0;
+        var borrow: u1 = 0;
         for (0..nv) |l| {
-            const p = qhat * vn[l];
-            t = @as(i64, un[l + j]) - k - @as(i64, @intCast(p & 0xFFFFFFFF));
-            un[l + j] = @truncate(@as(u64, @bitCast(t)));
-            k = @as(i64, @intCast(p >> 32)) - (t >> 32);
+            const p = @as(u128, qhat) * vn[l] + carry;
+            carry = @intCast(p >> 64);
+            const a = @subWithOverflow(un[l + j], @as(u64, @truncate(p)));
+            const b = @subWithOverflow(a[0], borrow);
+            un[l + j] = b[0];
+            borrow = a[1] | b[1];
         }
-        t = @as(i64, un[j + nv]) - k;
-        un[j + nv] = @truncate(@as(u64, @bitCast(t)));
-        q[j] = @truncate(qhat);
-        if (t < 0) {
+        const a = @subWithOverflow(un[j + nv], carry);
+        const b = @subWithOverflow(a[0], borrow);
+        un[j + nv] = b[0];
+        q[j] = qhat;
+        if (a[1] | b[1] == 1) {
             // (the guess was one too big: a digit less, and the divisor
             // added back)
             q[j] -%= 1;
-            k = 0;
+            var c: u1 = 0;
             for (0..nv) |l| {
-                t = @as(i64, un[l + j]) + vn[l] + k;
-                un[l + j] = @truncate(@as(u64, @bitCast(t)));
-                k = t >> 32;
+                const x = @addWithOverflow(un[l + j], vn[l]);
+                const y = @addWithOverflow(x[0], c);
+                un[l + j] = y[0];
+                c = x[1] | y[1];
             }
-            un[j + nv] +%= @truncate(@as(u64, @bitCast(k)));
+            un[j + nv] +%= c;
         }
     }
-    for (0..nv) |l| r[l] = (un[l] >> s) | (if (s != 0) un[l + 1] << back else 0);
+    if (s == 0) {
+        @memcpy(r[0..nv], un[0..nv]);
+    } else {
+        const back: u6 = @intCast(64 - @as(u7, s));
+        for (0..nv) |l| r[l] = (un[l] >> s) | (un[l + 1] << back);
+    }
 }
 
 // Bits

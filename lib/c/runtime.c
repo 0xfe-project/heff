@@ -174,11 +174,12 @@ void heff_js_number32(float f, char *out);
 // (integers beyond a word, their magnitudes compared, added, subtracted,
 // multiplied and divided, as "Integers" below says; and bits read and
 // written as Erlang's bit syntax has them, as "Bits" says)
-int heff_mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn);
-int heff_mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
-int heff_mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
-void heff_mag_mul(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
-void heff_mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint32_t *q, uint32_t *r, uint32_t *vn, uint32_t *un);
+int heff_mag_cmp(const uint64_t *a, int an, const uint64_t *b, int bn);
+int heff_mag_add(const uint64_t *a, int an, const uint64_t *b, int bn, uint64_t *o);
+int heff_mag_sub(const uint64_t *a, int an, const uint64_t *b, int bn, uint64_t *o);
+void heff_mag_mul(const uint64_t *a, int an, const uint64_t *b, int bn, uint64_t *o);
+uint64_t heff_mag_div1(const uint64_t *u, int m, uint64_t d, uint64_t *q);
+void heff_mag_divmod(const uint64_t *u, int m, const uint64_t *v, int n, uint64_t *q, uint64_t *r, uint64_t *vn, uint64_t *un);
 uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n);
 void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n);
 uint64_t heff_bits_little(uint64_t u, int64_t n, int out);
@@ -274,7 +275,7 @@ static const uint8_t heff_arr_width[] = { sizeof(V), 8, 8, 8, 4, 4, 2, 2, 1, 1, 
 // (the elements an object's walk sees: a flat array's none)
 #define heff_arr_slots(r) (HEFF_ARR_KIND(r) == HEFF_ARR_V ? (r)->n : 0)
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Bnc;
-typedef struct { Obj h; int32_t neg; int32_t n; uint32_t d[]; } Big;
+typedef struct { Obj h; int32_t neg; int32_t n; uint64_t d[]; } Big;
 
 #define IS_INT(v) (((v) & 1) == 1)
 #define INT_OF(v) ((int64_t)(v) >> 1)
@@ -1249,7 +1250,7 @@ HEFF_FN size_t heff_size(V v) {
   case K_FLT: return sizeof(Flt);
   case K_ARR: return heff_arr_bytes((Arr *)v);
   case K_BNC: return sizeof(Bnc) + ((Bnc *)v)->n * sizeof(V);
-  case K_BIG: return sizeof(Big) + ((Big *)v)->n * sizeof(uint32_t);
+  case K_BIG: return sizeof(Big) + ((Big *)v)->n * sizeof(uint64_t);
   case K_FGN: return sizeof(Fgn);
   default: return SMALL_MAX + 1;
   }
@@ -1793,20 +1794,18 @@ HEFF_FN void heff_reopen(size_t base) {
 // ---------------------------------------------------------------------
 // An integer is a word while it fits in 62 bits and a sign (`MK_INT`,
 // from -2^62 up to 2^62); beyond, a big one (`K_BIG`): its sign and its
-// magnitude's 32-bit digits, the least first.  Each result fitting in a
+// magnitude's 64-bit digits, the least first.  Each result fitting in a
 // word is one, so that two equal integers are both words or both big.
 
 // (an integer's sign and digits, to compute with: a word's in `buf`)
-typedef struct { int neg; int n; const uint32_t *d; uint32_t buf[2]; } Num;
+typedef struct { int neg; int n; const uint64_t *d; uint64_t buf[1]; } Num;
 
 HEFF_FN void num_of(V v, Num *x) {
   if (IS_INT(v)) {
     int64_t i = INT_OF(v);
-    uint64_t m = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
     x->neg = i < 0;
-    x->buf[0] = (uint32_t)m;
-    x->buf[1] = (uint32_t)(m >> 32);
-    x->n = x->buf[1] ? 2 : x->buf[0] ? 1 : 0;
+    x->buf[0] = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
+    x->n = x->buf[0] != 0;
     x->d = x->buf;
   } else {
     Big *b = (Big *)v;
@@ -1814,24 +1813,47 @@ HEFF_FN void num_of(V v, Num *x) {
   }
 }
 
-// (digits as an integer: a word if they fit)
-HEFF_FN V big_make(int neg, const uint32_t *d, int n) {
-  while (n > 0 && d[n - 1] == 0) n--;
-  if (n <= 2) {
-    uint64_t m = n == 0 ? 0 : n == 1 ? d[0] : ((uint64_t)d[1] << 32) | d[0];
-    if (m < (uint64_t)INT_LIM || (neg && m == (uint64_t)INT_LIM))
+// (a big one's bytes, of `n` digits)
+#define BIG_BYTES(n) (sizeof(Big) + (size_t)(n) * sizeof(uint64_t))
+
+// (room for `n` digits, a result written into it where it is computed,
+// then made an integer by `big_fin`: nothing copied)
+static inline Big *big_new(int64_t n) {
+  if (n > INT32_MAX) heff_fail("out of memory");
+  Big *b = heff_obj_alloc(BIG_BYTES(n));
+  b->h.rc = 1; b->h.kind = K_BIG; b->h.tag = 0; b->neg = 0; b->n = (int32_t)n;
+  return b;
+}
+
+// (the first `n` digits of `b`'s room as an integer: a word if they
+// fit, `b` given back; else `b`, its top zeros dropped -- moved to an
+// object of its size where that is another of the sizes kept apart, so
+// that it is given back as the size it was made)
+HEFF_FN V big_fin(Big *b, int neg, int n) {
+  int cap = b->n;
+  while (n > 0 && b->d[n - 1] == 0) n--;
+  if (n <= 1) {
+    uint64_t m = n == 0 ? 0 : b->d[0];
+    if (m < (uint64_t)INT_LIM || (neg && m == (uint64_t)INT_LIM)) {
+      heff_obj_free(b, BIG_BYTES(cap));
       return MK_INT(neg ? (int64_t)((uint64_t)0 - m) : (int64_t)m);
+    }
   }
-  Big *b = heff_obj_alloc(sizeof(Big) + n * sizeof(uint32_t));
-  b->h.rc = 1; b->h.kind = K_BIG; b->h.tag = 0; b->neg = neg; b->n = n;
-  memcpy(b->d, d, n * sizeof(uint32_t));
+  size_t was = (BIG_BYTES(cap) + 7) / 8, now = (BIG_BYTES(n) + 7) / 8;
+  if (now != was && (now <= SMALL_MAX / 8 || was <= SMALL_MAX / 8)) {
+    Big *c = big_new(n);
+    memcpy(c->d, b->d, (size_t)n * sizeof(uint64_t));
+    heff_obj_free(b, BIG_BYTES(cap));
+    b = c;
+  }
+  b->neg = neg; b->n = n;
   return (V)b;
 }
 
 HEFF_SLOW V heff_int_big(int64_t i) {
-  uint64_t m = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
-  uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
-  return big_make(i < 0, d, 2);
+  Big *b = big_new(1);
+  b->d[0] = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
+  return big_fin(b, i < 0, 1);
 }
 
 HEFF_FAST V heff_int(int64_t i) {
@@ -1844,39 +1866,48 @@ HEFF_FAST V heff_int(int64_t i) {
 // made of it, here)
 // (a + b, signed)
 HEFF_FN V num_add(const Num *a, int bneg, const Num *b) {
-  int n = (a->n > b->n ? a->n : b->n) + 1;
-  uint32_t *o = alloca(n * sizeof(uint32_t));
-  if (a->neg == bneg) return big_make(a->neg, o, heff_mag_add(a->d, a->n, b->d, b->n, o));
-  if (heff_mag_cmp(a->d, a->n, b->d, b->n) >= 0) return big_make(a->neg, o, heff_mag_sub(a->d, a->n, b->d, b->n, o));
-  return big_make(bneg, o, heff_mag_sub(b->d, b->n, a->d, a->n, o));
+  if (a->neg == bneg) {
+    Big *o = big_new((a->n > b->n ? a->n : b->n) + 1);
+    return big_fin(o, a->neg, heff_mag_add(a->d, a->n, b->d, b->n, o->d));
+  }
+  if (heff_mag_cmp(a->d, a->n, b->d, b->n) >= 0) {
+    Big *o = big_new(a->n);
+    return big_fin(o, a->neg, heff_mag_sub(a->d, a->n, b->d, b->n, o->d));
+  }
+  Big *o = big_new(b->n);
+  return big_fin(o, bneg, heff_mag_sub(b->d, b->n, a->d, a->n, o->d));
 }
 
 // (a divided by b, rounded down, as the other backends round: the
-// quotient, or the remainder (b's sign))
+// quotient, or the remainder (b's sign) -- the one wanted written into
+// the integer made, the other on the stack)
 HEFF_FN V num_divmod(const Num *a, const Num *b, int want_mod) {
   int qn = a->n - b->n + 1 > 0 ? a->n - b->n + 1 : 1;
-  uint32_t *q = alloca((qn + 1) * sizeof(uint32_t)), *r = alloca((b->n + 1) * sizeof(uint32_t));
-  uint32_t *vn = alloca(b->n * sizeof(uint32_t)), *un = alloca((a->n + 1) * sizeof(uint32_t));
-  memset(q, 0, (qn + 1) * sizeof(uint32_t));
-  heff_mag_divmod(a->d, a->n, b->d, b->n, q, r, vn, un);
+  uint64_t *vn = alloca(b->n * sizeof(uint64_t)), *un = alloca((a->n + 1) * sizeof(uint64_t));
+  if (want_mod) {
+    uint64_t *q = alloca(qn * sizeof(uint64_t));
+    Big *r = big_new(b->n);
+    heff_mag_divmod(a->d, a->n, b->d, b->n, q, r->d, vn, un);
+    int rn = b->n;
+    while (rn > 0 && r->d[rn - 1] == 0) rn--;
+    if (!(rn > 0 && a->neg != b->neg)) return big_fin(r, a->neg, rn);
+    return big_fin(r, b->neg, heff_mag_sub(b->d, b->n, r->d, rn, r->d));
+  }
+  uint64_t *r = alloca(b->n * sizeof(uint64_t));
+  Big *q = big_new(qn + 1);
+  heff_mag_divmod(a->d, a->n, b->d, b->n, q->d, r, vn, un);
   int rn = b->n;
   while (rn > 0 && r[rn - 1] == 0) rn--;
-  int down = rn > 0 && a->neg != b->neg;
-  if (want_mod) {
-    if (!down) return big_make(a->neg, r, rn);
-    uint32_t *o = alloca((b->n + 1) * sizeof(uint32_t));
-    return big_make(b->neg, o, heff_mag_sub(b->d, b->n, r, rn, o));
-  }
-  if (!down) return big_make(a->neg != b->neg, q, qn);
-  uint32_t one = 1, *o = alloca((qn + 2) * sizeof(uint32_t));
-  return big_make(1, o, heff_mag_add(q, qn, &one, 1, o));
+  if (!(rn > 0 && a->neg != b->neg)) return big_fin(q, a->neg != b->neg, qn);
+  uint64_t one = 1;
+  return big_fin(q, 1, heff_mag_add(q->d, qn, &one, 1, q->d));
 }
 
 HEFF_FN V num_mul(const Num *a, const Num *b) {
   int n = a->n + b->n;
-  uint32_t *o = alloca(n * sizeof(uint32_t));
-  heff_mag_mul(a->d, a->n, b->d, b->n, o);
-  return big_make(a->neg != b->neg, o, n);
+  Big *o = big_new(n);
+  heff_mag_mul(a->d, a->n, b->d, b->n, o->d);
+  return big_fin(o, a->neg != b->neg, n);
 }
 
 HEFF_FN int num_cmp(const Num *a, const Num *b) {
@@ -1993,39 +2024,38 @@ INT_CMP(heff_intLe, <=, <= 0)
 
 // An integer's bits are as two's complement has them, its sign extended
 // for ever (Python's): two words' operation is the words', a big one's
-// done on as many 32-bit words as the longer has, and one more for the
+// done on as many 64-bit words as the longer has, and one more for the
 // sign.
 
 // (`x` as `n` words of two's complement, the least first)
-HEFF_FN void num_twos(const Num *x, uint32_t *t, int n) {
-  uint64_t carry = 1;
+HEFF_FN void num_twos(const Num *x, uint64_t *t, int n) {
+  int carry = 1;
   for (int i = 0; i < n; i++) {
-    uint32_t w = i < x->n ? x->d[i] : 0;
+    uint64_t w = i < x->n ? x->d[i] : 0;
     if (x->neg) {
-      uint64_t s = (uint64_t)(uint32_t)~w + carry;
-      t[i] = (uint32_t)s;
-      carry = s >> 32;
+      t[i] = ~w + (uint64_t)carry;
+      carry = carry && t[i] == 0;
     } else t[i] = w;
   }
 }
 
-// (`n` words of two's complement as an integer; `t` is overwritten)
-HEFF_FN V twos_make(uint32_t *t, int n) {
-  int neg = (int)(t[n - 1] >> 31);
+// (`n` words of two's complement, written in `b`'s room, as an integer)
+HEFF_FN V twos_fin(Big *b, int n) {
+  uint64_t *t = b->d;
+  int neg = (int)(t[n - 1] >> 63);
   if (neg) {
-    uint64_t carry = 1;
+    int carry = 1;
     for (int i = 0; i < n; i++) {
-      uint64_t s = (uint64_t)(uint32_t)~t[i] + carry;
-      t[i] = (uint32_t)s;
-      carry = s >> 32;
+      t[i] = ~t[i] + (uint64_t)carry;
+      carry = carry && t[i] == 0;
     }
   }
-  return big_make(neg, t, n);
+  return big_fin(b, neg, n);
 }
 
 // (as the sum is: both words, inlined -- the words' operation on `2x + 1`
 // and `2y + 1` is `2(x op y) + 1`'s, the low bit set again after `^` --
-// else a call, on as many 32-bit words as the longer has, and one more
+// else a call, on as many 64-bit words as the longer has, and one more
 // for the sign)
 #define INT_BITS(name, op)                                                  \
   HEFF_SLOW V name##_big(V a, V b) {                                        \
@@ -2033,12 +2063,12 @@ HEFF_FN V twos_make(uint32_t *t, int n) {
     num_of(a, &x);                                                          \
     num_of(b, &y);                                                          \
     int n = (x.n > y.n ? x.n : y.n) + 1;                                    \
-    uint32_t *s = alloca(n * sizeof(uint32_t));                             \
-    uint32_t *t = alloca(n * sizeof(uint32_t));                             \
-    num_twos(&x, s, n);                                                     \
+    Big *s = big_new(n);                                                    \
+    uint64_t *t = alloca(n * sizeof(uint64_t));                             \
+    num_twos(&x, s->d, n);                                                  \
     num_twos(&y, t, n);                                                     \
-    for (int i = 0; i < n; i++) s[i] = s[i] op t[i];                        \
-    V r = twos_make(s, n);                                                  \
+    for (int i = 0; i < n; i++) s->d[i] = s->d[i] op t[i];                  \
+    V r = twos_fin(s, n);                                                   \
     heff_drop(a);                                                           \
     heff_drop(b);                                                           \
     return r;                                                               \
@@ -2070,16 +2100,14 @@ HEFF_SLOW V heff_intShl_big(V a, V b) {
   }
   Num x;
   num_of(a, &x);
-  int64_t w = k / 32, s = k % 32, n = x.n + w + 1;
-  uint32_t *o = heff_alloc(n * sizeof(uint32_t));
-  memset(o, 0, n * sizeof(uint32_t));
-  for (int i = 0; i < x.n; i++) {
-    uint64_t v = (uint64_t)x.d[i] << s;
-    o[i + w] |= (uint32_t)v;
-    o[i + w + 1] |= (uint32_t)(v >> 32);
-  }
-  V r = big_make(x.neg, o, (int)n);
-  free(o);
+  int64_t w = k / 64, s = k % 64, n = x.n + w + 1;
+  Big *ob = big_new(n);
+  uint64_t *o = ob->d;
+  memset(o, 0, w * sizeof(uint64_t));
+  o[x.n + w] = 0;
+  for (int i = 0; i < x.n; i++) o[i + w] = s ? x.d[i] << s | (i ? x.d[i - 1] >> (64 - s) : 0) : x.d[i];
+  if (s) o[x.n + w] = x.d[x.n - 1] >> (64 - s);
+  V r = big_fin(ob, x.neg, (int)n);
   heff_drop(a);
   return r;
 }
@@ -2107,28 +2135,23 @@ HEFF_SLOW V heff_intShr_big(V a, V b) {
   if (IS_INT(a)) return MK_INT(k >= 63 ? (aneg ? -1 : 0) : INT_OF(a) >> k);
   Num x;
   num_of(a, &x);
-  int64_t w = k / 32, s = k % 32;
+  int64_t w = k / 64, s = k % 64;
   if (w >= x.n) { heff_drop(a); return MK_INT(aneg ? -1 : 0); }
   int n = x.n - (int)w;
-  uint32_t *o = alloca((n + 1) * sizeof(uint32_t));
+  Big *ob = big_new(n + 1);
+  uint64_t *o = ob->d;
   for (int i = 0; i < n; i++) {
-    uint64_t v = x.d[i + w] | ((uint64_t)(i + w + 1 < x.n ? x.d[i + w + 1] : 0) << 32);
-    o[i] = (uint32_t)(v >> s);
+    uint64_t hi = i + w + 1 < x.n ? x.d[i + w + 1] : 0;
+    o[i] = s ? x.d[i + w] >> s | hi << (64 - s) : x.d[i + w];
   }
   o[n] = 0;
   // (a negative one rounds down: its magnitude up, where a bit set was
   // shifted out)
-  int lost = s && (x.d[w] & (((uint32_t)1 << s) - 1));
+  int lost = s && (x.d[w] & (((uint64_t)1 << s) - 1));
   for (int64_t i = 0; i < w && !lost; i++) lost = x.d[i] != 0;
-  if (x.neg && lost) {
-    uint64_t carry = 1;
-    for (int i = 0; i <= n && carry; i++) {
-      uint64_t v = (uint64_t)o[i] + carry;
-      o[i] = (uint32_t)v;
-      carry = v >> 32;
-    }
-  }
-  V r = big_make(x.neg, o, n + 1);
+  if (x.neg && lost)
+    for (int i = 0; i <= n && ++o[i] == 0; i++) {}
+  V r = big_fin(ob, x.neg, n + 1);
   heff_drop(a);
   return r;
 }
@@ -2153,25 +2176,22 @@ static inline char *heff_word_digits(int64_t k, char *end) {
   return end;
 }
 
-// (an integer's decimal digits, a '-' before a negative one: malloc'd)
+// (an integer's decimal digits, a '-' before a negative one: malloc'd.
+// Its magnitude divided by 10^19 again and again, in place, each
+// remainder 19 of them -- a 64-bit digit has 20 at most)
 HEFF_FN char *heff_int_cstr(V v) {
   Num x;
   num_of(v, &x);
-  uint32_t *m = alloca((x.n + 1) * sizeof(uint32_t));
-  memcpy(m, x.d, x.n * sizeof(uint32_t));
+  uint64_t *m = alloca((x.n + 1) * sizeof(uint64_t));
+  memcpy(m, x.d, x.n * sizeof(uint64_t));
   int n = x.n;
-  size_t cap = (size_t)n * 10 + 3, at = cap;
+  size_t cap = (size_t)n * 20 + 3, at = cap;
   char *c = heff_alloc(cap);
   c[--at] = 0;
   do {
-    uint64_t k = 0;
-    for (int j = n - 1; j >= 0; j--) {
-      uint64_t t = (k << 32) | m[j];
-      m[j] = (uint32_t)(t / 1000000000u);
-      k = t % 1000000000u;
-    }
+    uint64_t k = heff_mag_div1(m, n, 10000000000000000000u, m);
     while (n > 0 && m[n - 1] == 0) n--;
-    for (int i = 0; i < 9 && (n > 0 || k > 0 || i == 0); i++) {
+    for (int i = 0; i < 19 && (n > 0 || k > 0 || i == 0); i++) {
       c[--at] = (char)('0' + k % 10);
       k /= 10;
     }
@@ -2186,20 +2206,21 @@ HEFF_FN V heff_big_lit(const char *s) {
   int neg = *s == '-';
   if (neg) s++;
   size_t len = strlen(s);
-  int cap = (int)(len / 9) + 2, n = 0;
-  uint32_t *d = alloca(cap * sizeof(uint32_t));
+  int n = 0;
+  Big *b = big_new((int64_t)(len / 19) + 2);
+  uint64_t *d = b->d;
   for (size_t i = 0; i < len;) {
     uint64_t chunk = 0, scale = 1;
-    for (int k = 0; k < 9 && i < len; k++, i++) { chunk = chunk * 10 + (uint64_t)(s[i] - '0'); scale *= 10; }
+    for (int k = 0; k < 19 && i < len; k++, i++) { chunk = chunk * 10 + (uint64_t)(s[i] - '0'); scale *= 10; }
     uint64_t c = chunk;
     for (int j = 0; j < n; j++) {
-      c += (uint64_t)d[j] * scale;
-      d[j] = (uint32_t)c;
-      c >>= 32;
+      unsigned __int128 t = (unsigned __int128)d[j] * scale + c;
+      d[j] = (uint64_t)t;
+      c = (uint64_t)(t >> 64);
     }
-    if (c) d[n++] = (uint32_t)c;
+    if (c) d[n++] = c;
   }
-  V v = big_make(neg, d, n);
+  V v = big_fin(b, neg, n);
   if (IS_OBJ(v)) OBJ(v)->rc = IMMORTAL;
   return v;
 }
@@ -2229,15 +2250,13 @@ HEFF_SLOW V heff_int_of_double_big(double f) {
   int e;
   double fr = frexp(fabs(f), &e);
   uint64_t mant = (uint64_t)ldexp(fr, 53);
-  int sh = e - 53, n = sh / 32 + 3;
-  uint32_t *d = alloca(n * sizeof(uint32_t));
-  memset(d, 0, n * sizeof(uint32_t));
-  int w = sh / 32, b = sh % 32;
+  int sh = e - 53, w = sh / 64, b = sh % 64;
+  Big *o = big_new(w + 2);
+  memset(o->d, 0, w * sizeof(uint64_t));
   unsigned __int128 x = (unsigned __int128)mant << b;
-  d[w] = (uint32_t)x;
-  d[w + 1] = (uint32_t)(x >> 32);
-  d[w + 2] = (uint32_t)(x >> 64);
-  return big_make(f < 0, d, n);
+  o->d[w] = (uint64_t)x;
+  o->d[w + 1] = (uint64_t)(x >> 64);
+  return big_fin(o, f < 0, w + 2);
 }
 
 HEFF_FAST V heff_int_of_double(double f) {
@@ -2763,8 +2782,7 @@ static inline float heff_f32_of(V v) {
 // a word's inlined, a big one's the call)
 HEFF_SLOW uint64_t heff_big_low64(V v) {
   Big *b = (Big *)v;
-  uint64_t m = b->n > 0 ? b->d[0] : 0;
-  if (b->n > 1) m |= (uint64_t)b->d[1] << 32;
+  uint64_t m = b->d[0];
   return b->neg ? (uint64_t)0 - m : m;
 }
 
@@ -2775,8 +2793,9 @@ HEFF_FAST uint64_t heff_int_low64(V v) {
 
 // (an integer of 64 bits, unsigned: a word inlined, a big one the call)
 HEFF_SLOW V heff_u64_big(uint64_t m) {
-  uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
-  return big_make(0, d, 2);
+  Big *b = big_new(1);
+  b->d[0] = m;
+  return big_fin(b, 0, 1);
 }
 
 HEFF_FAST V heff_int_u64(uint64_t m) {
@@ -5706,11 +5725,12 @@ static V heff_entry(void);
 // (the layout the runtime's Zig reads values by, held to the one here
 // where the program is not optimised: each offset and size it says)
 #ifndef __OPTIMIZE__
-extern const uint16_t heff_zig_layout[6];
+extern const uint16_t heff_zig_layout[7];
 static void heff_layout_held(void) {
   static const uint16_t here[] = {
     sizeof(Obj), __builtin_offsetof(Obj, kind), __builtin_offsetof(Obj, tag),
-    sizeof(Big), __builtin_offsetof(Big, neg), __builtin_offsetof(Big, n) };
+    sizeof(Big), __builtin_offsetof(Big, neg), __builtin_offsetof(Big, n),
+    sizeof(((Big *)0)->d[0]) };
   if (memcmp(here, heff_zig_layout, sizeof here)) {
     fprintf(stderr, "heff: the runtime's Zig lays values out otherwise than its C\n");
     abort();
