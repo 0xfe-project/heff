@@ -52,7 +52,9 @@ What is done with them is in the library:
   [`strLength`](../../api/prelude.md#strLength),
   [`runes`](../../api/prelude.md#runes),
   [`ofRunes`](../../api/prelude.md#ofRunes) and
-  [`split`](../../api/prelude.md#split); `^` joins two;
+  [`split`](../../api/prelude.md#split); `^` joins two, and groups to
+  the left: `s ^ a ^ b` is `(s ^ a) ^ b`, so a string that nothing else
+  holds is grown in place;
 - runes: [`rune`](../../api/rune.md), imported as `import rune as Rune`.
 
 JavaScript's own UTF-16 text is another type, `JSString`: see
