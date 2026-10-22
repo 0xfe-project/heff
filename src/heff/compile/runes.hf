@@ -1,0 +1,395 @@
+-- A rune read once: a string's rune at a byte and its width, each read
+-- where the same is read of the same operands -- `runeAt s i`'s two
+-- fields, its record taken apart (heff.compile.simplify) --
+--
+--   let r = strRuneAt s i               let t = strRuneDecode s i
+--   ...                                 case t of
+--   let n = intAdd i (strRuneWidth s i)   #_,_ r w -> ... let n = intAdd i w
+--
+-- are read by one primitive giving back both, a tuple (as a worker of
+-- heff.compile.cpr gives one back), where the first of them is computed
+-- whenever the binding it is in is: along a run of bindings, a call's
+-- operands, a match's scrutinee, a condition's first test -- not an
+-- arm's, nor a lambda's.  The other may be read anywhere after it, but
+-- in a lambda: in an arm too, where it is the tuple's then.  Both are
+-- pure and cannot fail, so it may be read earlier; where the operands'
+-- names are bound again, it is no longer the same.  An operand is a
+-- name, a literal, or a primitive that cannot fail of those (`intAdd i
+-- 1`); a name bound to a name is that name.
+--
+-- Only the C backend has the primitive: this runs on what it is given
+-- (heff.compile.lower), in monadic form (heff.compile.monadic), so that a
+-- binding in an operand is one of the run; what it makes is too, the
+-- tuple bound before it is matched on.
+
+module heff.compile.runes
+
+import heff.compile.ir as IR
+import heff.elab.primitive
+import heff.compile.repr as Repr
+import heff.compile.simplify as Simplify
+import heff.compile.supply
+import std.ordmap as OrdMap
+
+-- Operands
+--------------------------------------------------------------------------------
+
+-- | the names bound to a name, along the run of bindings: each the name
+-- | it is
+type Aliases = OrdMap.OrdMap String String
+
+nameOf : Aliases -> String -> String
+nameOf al x = fromMaybe x (OrdMap.lookup al x)
+
+-- (a name or a literal, as a key)
+atomKey : Aliases -> IR.Expr -> Maybe String
+atomKey al (EVar x) = Just ("v" ^ nameOf al x)
+atomKey al (EInt n) = Just ("i" ^ show n)
+atomKey al _ = Nothing
+
+-- (each a name or a literal, their keys)
+atomKeys : Aliases -> List IR.Expr -> Maybe (List String)
+atomKeys al Nil = Just Nil
+atomKeys al (Cons e rest) = case atomKey al e of
+  Just k -> maybe Nothing (\ks -> Just (Cons k ks)) (atomKeys al rest)
+  Nothing -> Nothing
+
+-- | an operand, as a key: the same key, the same value, wherever none
+-- | of its names is bound again
+-- | >>> (MkPair (operandKey OrdMap.empty (EPrimCall IntAdd [EVar "i", EInt 1])) (operandKey OrdMap.empty (EPrimCall IntShl [EVar "i", EInt 1])) : Pair (Maybe String) (Maybe String))
+-- | MkPair (Just "intAdd(vi,i1)") Nothing
+operandKey : Aliases -> IR.Expr -> Maybe String
+operandKey al (EPrimCall p argv) =
+  if Simplify.primFails p then Nothing
+  else maybe
+      Nothing
+      (\ks -> Just (primName p ^ "(" ^ joinWith "," ks ^ ")"))
+      (atomKeys al argv)
+operandKey al e = atomKey al e
+
+-- (the names of an operand, as the key has them)
+operandVars : Aliases -> IR.Expr -> List String
+operandVars al (EVar x) = Cons (nameOf al x) Nil
+operandVars al (EPrimCall _ argv) = IR.concatMapI (operandVars al) argv
+operandVars al _ = Nil
+
+-- Reads
+--------------------------------------------------------------------------------
+
+-- | a rune read (`rune`), or its width: of its operands, their key and
+-- | names, where along the run of bindings it is (`at`), and whether it
+-- | is computed whenever the binding there is (`sure`)
+type Read =
+  { rune : Bool
+  , key : String
+  , args : List IR.Expr
+  , vars : List String
+  , at : Int
+  , sure : Bool
+  }
+
+-- (of two operands)
+readOf2 : Aliases -> Bool -> Bool -> Int -> List IR.Expr -> Maybe Read
+readOf2 al rune sure at (Cons s (Cons i Nil)) = case operandKey al s of
+  Just ks ->
+    maybe
+      Nothing
+      (\ki ->
+         Just
+           { rune = rune
+           , key = ks ^ ";" ^ ki
+           , args = Cons s (Cons i Nil)
+           , vars = IR.appendI (operandVars al s) (operandVars al i)
+           , at = at
+           , sure = sure
+           })
+      (operandKey al i)
+  Nothing -> Nothing
+readOf2 al rune sure at _ = Nothing
+
+-- | a primitive's call, if a read
+readOf : Aliases -> Bool -> Int -> Prim -> List IR.Expr -> Maybe Read
+readOf al sure at StrRuneAt argv = readOf2 al True sure at argv
+readOf al sure at StrRuneWidth argv = readOf2 al False sure at argv
+readOf al sure at p argv = Nothing
+
+consRead : Maybe Read -> List Read -> List Read
+consRead (Just r) rs = Cons r rs
+consRead Nothing rs = rs
+
+-- (what a condition computes whenever it is: its first test's)
+condSure : IR.Cond -> List IR.Expr -> List IR.Expr
+condSure (CRel _ x y) rest = Cons x (Cons y rest)
+condSure (CTest x) rest = Cons x rest
+condSure (CNot c) rest = condSure c rest
+condSure (CIf a _ _) rest = condSure a rest
+condSure _ rest = rest
+
+-- | the reads computed whenever the worklist is, the first of it at `at`:
+-- | its operands', not an arm's nor a lambda's, nor a binding's in it
+sureW : Aliases -> Int -> List Read -> List IR.Expr -> List Read
+sureW al at acc Nil = acc
+sureW al at acc (Cons (EPrimCall p argv) rest) =
+  sureW al at (consRead (readOf al True at p argv) acc) (IR.appendI argv rest)
+sureW al at acc (Cons (ECall _ argv) rest) =
+  sureW al at acc (IR.appendI argv rest)
+sureW al at acc (Cons (EApp f argv) rest) =
+  sureW al at acc (Cons f (IR.appendI argv rest))
+sureW al at acc (Cons (ETag _ argv _) rest) =
+  sureW al at acc (IR.appendI argv rest)
+sureW al at acc (Cons (ERecord fs _) rest) =
+  sureW al at acc (IR.pushFields fs rest)
+sureW al at acc (Cons (EProj e _ _ _) rest) = sureW al at acc (Cons e rest)
+sureW al at acc (Cons (EMatch s _) rest) = sureW al at acc (Cons s rest)
+sureW al at acc (Cons (EBool c) rest) = sureW al at acc (condSure c rest)
+sureW al at acc (Cons (EValues es) rest) = sureW al at acc (IR.appendI es rest)
+sureW al at acc (Cons _ rest) = sureW al at acc rest
+
+-- (the reads of which none of `xs` is a name)
+unbound : List String -> List Read -> List Read
+unbound xs rs =
+  List.keepIf
+    (\(r : Read) -> not (List.any (\x -> List.any (strEq x) r.vars) xs))
+    rs
+
+-- (a primitive's call, if a read, not surely computed)
+readIn : Aliases -> Int -> IR.Expr -> Maybe Read
+readIn al at (EPrimCall p argv) = readOf al False at p argv
+readIn al at e = Nothing
+
+-- | every read in `e`, but a lambda's, and one whose names are bound
+-- | again around it
+anyReads : Aliases -> Int -> IR.Expr -> List Read
+anyReads al at (ELam _ _) = Nil
+anyReads al at (EFix _ _) = Nil
+anyReads al at e =
+  consRead
+    (readIn al at e)
+    (IR.foldParts
+       (\xs p rs -> IR.appendI (unbound xs (anyReads al at p)) rs)
+       e
+       Nil)
+
+-- (the reads of the binding at `at`: those surely computed, then all)
+readsAt : Aliases -> Int -> IR.Expr -> List Read
+readsAt al at e = sureW al at (anyReads al at e) (Cons e Nil)
+
+-- (one a rune read, the other a width)
+otherKind : Bool -> Bool -> Bool
+otherKind True b = not b
+otherKind False b = b
+
+-- (the first of `rs` surely computed, of the key of `r`, `r` where none
+-- is before it)
+firstSure : List Read -> Read -> Read
+firstSure Nil r = r
+firstSure (Cons q rs) r =
+  firstSure rs (if q.sure && strEq q.key r.key && q.at < r.at then q else r)
+
+-- (of `rs`, the other read of `r`'s key, where it or after)
+partnerIn : List Read -> Read -> Bool
+partnerIn rs r =
+  List.any
+    (\(q : Read) ->
+       otherKind q.rune r.rune && strEq q.key r.key && q.at >= r.at)
+    rs
+
+-- | a read surely computed, the first of its key, whose other read is
+-- | among `rs` too, after it
+pairedIn : List Read -> Maybe Read
+pairedIn rs = case List.find
+    (\(r : Read) -> r.sure && partnerIn rs (firstSure rs r))
+    rs of
+  Just r -> Just (firstSure rs r)
+  Nothing -> Nothing
+
+-- (`al`, the name `x` bound again: not one any name is, nor bound to it)
+rebound : Aliases -> String -> Aliases
+rebound al x =
+  OrdMap.fromList
+    (List.keepIf
+       (\(p : Pair String String) -> not (strEq (fst p) x || strEq (snd p) x))
+       (OrdMap.toList al))
+
+-- (`al`, a binding gone past: a name bound to a name, as that name)
+aliasing : Aliases -> String -> IR.Expr -> Aliases
+aliasing al x (EVar y) = OrdMap.insert (rebound al x) x (nameOf al y)
+aliasing al x a = rebound al x
+
+-- | along the run of bindings, `seen` the reads before the one at `at`:
+-- | a read surely computed whose other read is computed there or after,
+-- | before either's names are bound again
+pairAlong : Aliases -> Int -> List Read -> IR.Expr -> Maybe Read
+pairAlong al at seen (ELet x a b) = case pairedIn
+    (IR.appendI (readsAt al at a) seen) of
+  Just r -> Just r
+  Nothing ->
+    pairAlong
+      (aliasing al x a)
+      (at + 1)
+      (unbound [x] (IR.appendI (readsAt al at a) seen))
+      b
+pairAlong al at seen (ESet xs a b) = case pairedIn
+    (IR.appendI (readsAt al at a) seen) of
+  Just r -> Just r
+  Nothing ->
+    pairAlong
+      (List.foldl rebound al xs)
+      (at + 1)
+      (unbound xs (IR.appendI (readsAt al at a) seen))
+      b
+pairAlong al at seen e = pairedIn (IR.appendI (readsAt al at e) seen)
+
+-- Read once
+--------------------------------------------------------------------------------
+
+-- | the key of the reads made one, its operands' names, and the names
+-- | the rune and the width are given
+type Once =
+  { key : String, vars : List String, runeName : String, widthName : String }
+
+-- (a call of `p`, a read of the key: the name it is given)
+readName : Once -> Aliases -> Prim -> List IR.Expr -> Maybe String
+readName o al p argv = case readOf al False 0 p argv of
+  Just r ->
+    if strEq r.key o.key
+    then Just (if r.rune then o.runeName else o.widthName)
+    else Nothing
+  Nothing -> Nothing
+
+-- (whether one of `xs` is a name of the key's operands)
+rebinds : Once -> List String -> Bool
+rebinds o xs = List.any (\x -> List.any (strEq x) o.vars) xs
+
+-- | each read of the key in `e`, its name: but in a lambda, or where a
+-- | name of its operands is bound again
+named : Once -> Aliases -> IR.Expr -> IR.Expr
+named o al (ELam xs b) = ELam xs b
+named o al (EFix x b) = EFix x b
+named o al (EPrimCall p argv) = case readName o al p argv of
+  Just x -> EVar x
+  Nothing -> EPrimCall p (List.map (named o al) argv)
+named o al e = IR.mapParts (\xs p -> if rebinds o xs then p else named o al p) e
+
+readNameOf : Once -> Aliases -> IR.Expr -> Maybe String
+readNameOf o al (EPrimCall p argv) = readName o al p argv
+readNameOf o al e = Nothing
+
+-- (a binding along the run, what follows gone on along it: of a read,
+-- its name put for the one bound)
+letNamed : Maybe String -> String -> IR.Expr -> IR.Expr -> IR.Expr
+letNamed (Just y) x a b = IR.subst (OrdMap.singleton x (EVar y)) b
+letNamed Nothing x a b = ELet x a b
+
+-- | ... along the run of bindings, until a name of its operands is bound
+-- | again
+namedAlong : Once -> Aliases -> IR.Expr -> IR.Expr
+namedAlong o al (ELet x a b) =
+  letNamed
+    (readNameOf o al a)
+    x
+    (named o al a)
+    (if rebinds o [x] then b else namedAlong o (aliasing al x a) b)
+namedAlong o al (ESet xs a b) =
+  ESet
+    xs
+    (named o al a)
+    (if rebinds o xs then b else namedAlong o (List.foldl rebound al xs) b)
+namedAlong o al e = named o al e
+
+-- (the read of both, bound to `t`, `e` given their names)
+readBoth : Once -> Aliases -> List IR.Expr -> String -> IR.Expr -> IR.Expr
+readBoth o al args t e =
+  ELet
+    t
+    (EPrimCall StrRuneDecode args)
+    (EMatch
+       (EVar t)
+       [ MkArm
+         (Repr.tupleTag [RepV, RepV])
+         [o.runeName, o.widthName]
+         (namedAlong o al e)
+       ])
+
+-- | the read of both, bound to `t`, at `at` along the run of bindings,
+-- | the reads from there on its names
+readOnceAt : Once
+           -> Aliases
+           -> List IR.Expr
+           -> String
+           -> Int
+           -> IR.Expr
+           -> IR.Expr
+readOnceAt o al args t at (ELet x a b) =
+  if at > 0 then ELet x a (readOnceAt o (aliasing al x a) args t (at - 1) b)
+  else readBoth o al args t (ELet x a b)
+readOnceAt o al args t at (ESet xs a b) =
+  if at > 0
+  then ESet xs a (readOnceAt o (List.foldl rebound al xs) args t (at - 1) b)
+  else readBoth o al args t (ESet xs a b)
+readOnceAt o al args t at e = readBoth o al args t e
+
+-- The pass
+--------------------------------------------------------------------------------
+
+-- (the parts of a run of bindings off it, by `go`: each binding's, and
+-- the end's)
+alongOf : (IR.Expr -> S IR.Expr) -> IR.Expr -> S IR.Expr
+alongOf go (ELet x a b) = do
+  a2 <- go a
+  b2 <- alongOf go b
+  pure (ELet x a2 b2)
+alongOf go (ESet xs a b) = do
+  a2 <- go a
+  b2 <- alongOf go b
+  pure (ESet xs a2 b2)
+alongOf go e = IR.traverseParts (\_ p -> go p) e
+
+-- | an expression: each pair of reads along its run of bindings read
+-- | once, then its parts
+exprOf : IR.Expr -> S IR.Expr
+exprOf e = case pairAlong OrdMap.empty 0 Nil e of
+  Just r -> do
+    t <- freshS "t"
+    rn <- freshS "rune"
+    wn <- freshS "width"
+    exprOf
+        (readOnceAt
+           { key = r.key, vars = r.vars, runeName = rn, widthName = wn }
+           OrdMap.empty
+           r.args
+           t
+           r.at
+           e)
+  Nothing -> alongOf exprOf e
+
+isRead : Prim -> Bool
+isRead StrRuneAt = True
+isRead StrRuneWidth = True
+isRead _ = False
+
+-- (whether a rune or a width is read in `e`)
+reads : IR.Expr -> Bool
+reads (EPrimCall p argv) = isRead p || List.any reads argv
+reads e = IR.foldParts (\_ p b -> b || reads p) e False
+
+defOf : IR.Def -> S IR.Def
+defOf d =
+  if reads d.body
+  then do
+    b <- exprOf d.body
+    pure (IR.mkDef d.key d.name b)
+  else pure d
+
+-- | the program, each definition gone through; where fresh names go on
+-- | from
+-- | >>> fst (runesProgram 0 [IR.mkDef "f" "f" (ELam ["s", "i"] (ELet "r" (EPrimCall StrRuneAt [EVar "s", EVar "i"]) (EPrimCall IntAdd [EVar "r", EPrimCall StrRuneWidth [EVar "s", EVar "i"]])))])
+-- | [{ key = "f", name = "f", body = ELam ["s", "i"] (ELet "t$0" (EPrimCall StrRuneDecode [EVar "s", EVar "i"]) (EMatch (EVar "t$0") [MkArm "#_,_" ["rune$1", "width$2"] (EPrimCall IntAdd [EVar "rune$1", EVar "width$2"])])) }]
+-- | >>> fst (runesProgram 0 [IR.mkDef "f" "f" (ELam ["s", "i"] (ELet "w" (EPrimCall StrRuneWidth [EVar "s", EVar "i"]) (ELet "s2" (EVar "s") (EMatch (EBool (CRel RuneEq (EPrimCall StrRuneAt [EVar "s2", EVar "i"]) (EInt 65533))) [MkArm "True" [] (EVar "w"), MkArm "False" [] (EPrimCall StrRuneWidth [EVar "s", EVar "i"])]))))])
+-- | [{ key = "f", name = "f", body = ELam ["s", "i"] (ELet "t$0" (EPrimCall StrRuneDecode [EVar "s", EVar "i"]) (EMatch (EVar "t$0") [MkArm "#_,_" ["rune$1", "width$2"] (ELet "s2" (EVar "s") (EMatch (EBool (CRel RuneEq (EVar "rune$1") (EInt 65533))) [MkArm "True" [] (EVar "width$2"), MkArm "False" [] (EVar "width$2")]))])) }]
+-- | >>> fst (runesProgram 0 [IR.mkDef "f" "f" (ELam ["s", "i"] (ELet "r" (EPrimCall StrRuneAt [EVar "s", EVar "i"]) (ELet "i" (EInt 0) (EPrimCall StrRuneWidth [EVar "s", EVar "i"]))))])
+-- | [{ key = "f", name = "f", body = ELam ["s", "i"] (ELet "r" (EPrimCall StrRuneAt [EVar "s", EVar "i"]) (ELet "i" (EInt 0) (EPrimCall StrRuneWidth [EVar "s", EVar "i"]))) }]
+-- | >>> fst (runesProgram 0 [IR.mkDef "f" "f" (ELam ["s", "i"] (EMatch (EVar "s") [MkArm "A" [] (EPrimCall StrRuneAt [EVar "s", EVar "i"]), MkArm "B" [] (EPrimCall StrRuneWidth [EVar "s", EVar "i"])]))])
+-- | [{ key = "f", name = "f", body = ELam ["s", "i"] (EMatch (EVar "s") [MkArm "A" [] (EPrimCall StrRuneAt [EVar "s", EVar "i"]), MkArm "B" [] (EPrimCall StrRuneWidth [EVar "s", EVar "i"])]) }]
+runesProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+runesProgram n defs = traverseS defOf defs n
