@@ -190,10 +190,15 @@ type StCore =
   , selfKey : Maybe String
   }
 
+-- (a step of the handler, over a state `st`)
+type StepIn st a = st -> Pair (Either Diag a) st
+
 -- | an argument whose check waits until the type it is checked at is
--- | known.  It is a step of the handler (`Step`), over the whole state,
--- | so the state is a `data`, and the field parametric, to tie the knot.
-data Delayed st = MkDelayed Value.Ty (st -> Pair (Either Diag Unit) st)
+-- | known, and what may be guessed of that type when nothing else says
+-- | it (of a lambda's: that it is a function type; whether it was).
+-- | Each is a step of the handler (`Step`), over the whole state, so
+-- | the state is a `data`, and the fields parametric, to tie the knot.
+data Delayed st = MkDelayed Value.Ty (StepIn st Unit) (Maybe (StepIn st Bool))
 
 -- | an instance argument to find.  `resolve final` searches
 -- | once the goal has no unsolved metavariables; it answers whether it
@@ -255,8 +260,10 @@ restoreAllTo (MkSaved ds ws) st =
 -- Effects
 --------------------------------------------------------------------------------
 
--- | Checks that wait: one delayed until a type is known, an instance
--- | argument wanted; waking the delayed ones whose types are known (all
+-- | Checks that wait: one delayed until a type is known (with a guess
+-- | of that type, or not), an instance argument wanted; a guess made,
+-- | of the oldest delayed check that has one and still waits, and
+-- | whether there is one to make; waking the delayed ones whose types are known (all
 -- | of them, with `True`; else finding the wanted ones whose goals are
 -- | known, too), trying the wanted ones (and refusing those
 -- | still undetermined, on `True`: whether any was found); whether one
@@ -264,6 +271,9 @@ restoreAllTo (MkSaved ds ws) st =
 -- | or all).
 data DeferF (m : Type -> Type) x
   = Delay Value.Ty (m Unit) x
+  | DelayGuessing Value.Ty (m Unit) (m Bool) x
+  | Guess (Bool -> x)
+  | CanGuess (Bool -> x)
   | Want Params.Span (Bool -> m Bool) x
   | Wake Bool x
   | Resolve Bool (Bool -> x)
@@ -277,6 +287,9 @@ defer =
   { f = DeferF
   , hfmap = \m g p -> case p of
       Delay ty c x -> Delay ty c (g x)
+      DelayGuessing ty c gs x -> DelayGuessing ty c gs (g x)
+      Guess k -> Guess (\b -> g (k b))
+      CanGuess k -> CanGuess (\b -> g (k b))
       Want sp f x -> Want sp f (g x)
       Wake all x -> Wake all (g x)
       Resolve final k -> Resolve final (\b -> g (k b))
@@ -286,6 +299,9 @@ defer =
       RestoreWaiting sv x -> RestoreWaiting sv (g x)
   , hmap = \m n nt p -> case p of
       Delay ty c x -> Delay ty (nt c) x
+      DelayGuessing ty c gs x -> DelayGuessing ty (nt c) (nt gs) x
+      Guess k -> Guess k
+      CanGuess k -> CanGuess k
       Want sp f x -> Want sp (\b -> nt (f b)) x
       Wake all x -> Wake all x
       Resolve final k -> Resolve final k
@@ -351,6 +367,21 @@ catchE m h = op (exEv (Catch m h)) val
 -- | `chk`, once `ty` is known
 delay : Value.Ty -> Elab Unit -> Elab Unit
 delay ty chk = op (dfEv (Delay ty chk (MkUnit : Unit))) val
+
+-- | `chk`, once `ty` is known; and `gs`, a guess of `ty`, if nothing else
+-- | says it (whether it was made)
+delayGuessing : Value.Ty -> Elab Unit -> Elab Bool -> Elab Unit
+delayGuessing ty chk gs =
+  op (dfEv (DelayGuessing ty chk gs (MkUnit : Unit))) val
+
+-- | a guess made: of the oldest delayed check that has one and still
+-- | waits (whether one was made)
+guess : Elab Bool
+guess = op (dfEv (Guess (\b -> b))) val
+
+-- | whether a delayed check that still waits has a guess to make
+canGuess : Elab Bool
+canGuess = op (dfEv (CanGuess (\b -> b))) val
 
 -- | an instance argument to find later (see `Wanted`)
 want : Params.Span -> (Bool -> Elab Bool) -> Elab Unit

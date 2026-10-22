@@ -1365,6 +1365,24 @@ metaOfStx (SMetaApp k _ _) = k
 metaOfStx _ = 0 - 1
 
 -- | check `c` at `ty` later, once `ty` (flexible now) is known: a hole
+-- | stands for the result until then; `waits` says what it waits on
+delayChkBy : (Elab Unit -> Elab Unit)
+           -> ElabEnv
+           -> Params.Span
+           -> String
+           -> Chk
+           -> Value.Ty
+           -> Elab Memoed.El
+delayChkBy waits e sp what c ty = do
+  hole <- freshMeta e.scope.len e.scope.locals ty what sp
+  waits (delayedCheck e sp what c ty (metaOfStx (hole.stx)) hole)
+  traceE
+      sp
+      "delay"
+      (\u -> what ^ " waits for its type ?" ^ show (metaOfStx hole.stx))
+  pure (mEl hole.stx hole.val)
+
+-- | check `c` at `ty` later, once `ty` (flexible now) is known: a hole
 -- | stands for the result until then; `keyTy` is the unsolved type whose
 -- | solution unblocks the check
 delayChkOn : ElabEnv
@@ -1374,17 +1392,66 @@ delayChkOn : ElabEnv
            -> Value.Ty
            -> Value.Ty
            -> Elab Memoed.El
-delayChkOn e sp what c keyTy ty = do
-  hole <- freshMeta e.scope.len e.scope.locals ty what sp
-  delay keyTy (delayedCheck e sp what c ty (metaOfStx (hole.stx)) hole)
-  traceE
-      sp
-      "delay"
-      (\u -> what ^ " waits for its type ?" ^ show (metaOfStx hole.stx))
-  pure (mEl hole.stx hole.val)
+delayChkOn e sp what c keyTy ty = delayChkBy (delay keyTy) e sp what c ty
 
 delayChk : ElabEnv -> Params.Span -> String -> Chk -> Value.Ty -> Elab Memoed.El
 delayChk e sp what c ty = delayChkOn e sp what c ty ty
+
+-- (the universe of a type not known yet)
+universeOf : Value.Ty -> Params.Universe
+universeOf (VDecode h sp u described el) = u
+universeOf _ = SmallU
+
+-- (`?A -> ?B`, of two types in the scope of `e`)
+guessedFunction : ElabEnv -> Hole -> Hole -> Value.Ty
+guessedFunction e dom cod =
+  Memoed.tyN
+    (Memoed.function
+       e.globals
+       e.scope.locals
+       (Memoed.fromVTy N e.scope.len (Value.decodeN dom.val))
+       (AbsConst (Memoed.fromVTy N e.scope.len (Value.decodeN cod.val))))
+
+guessFunctionTy : ElabEnv
+                -> Params.Span
+                -> Value.Ty
+                -> Elab (Either Conversion.EqErr Unit)
+guessFunctionTy e sp a = do
+  dom <- freshMeta e.scope.len e.scope.locals (VU (universeOf a)) "argument" sp
+  cod <- freshMeta e.scope.len e.scope.locals (VU (universeOf a)) "result" sp
+  traceE
+      sp
+      "guess"
+      (\u ->
+         "lambda's type guessed a function type ?"
+         ^ show (metaOfStx dom.stx)
+         ^ " -> ?"
+         ^ show (metaOfStx cod.stx))
+  Meta.unifyTy e.globals (shape e.scope) a (guessedFunction e dom cod)
+
+isRightGuess : Either Conversion.EqErr Unit -> Bool
+isRightGuess (Right _) = True
+isRightGuess (Left _) = False
+
+-- | a lambda still waiting for its type `a0` when nothing else says it
+-- | (settling's last resort): its type guessed a function type, explicit
+-- | and not dependent, `?A -> ?B`; whether it could be
+guessFunction : ElabEnv -> Params.Span -> Value.Ty -> Elab Bool
+guessFunction e sp a0 = do
+  a <- Meta.forceT a0
+  r <- Meta.attempt (guessFunctionTy e sp a)
+  pure (isRightGuess r)
+
+-- | a lambda checked at `a` later, once `a` (flexible now) is known, or
+-- | when nothing else says it, at the function type guessed
+delayLambda : ElabEnv
+            -> Params.Span
+            -> String
+            -> Chk
+            -> Value.Ty
+            -> Elab Memoed.El
+delayLambda e sp what c a =
+  delayChkBy (\chk -> delayGuessing a chk (guessFunction e sp a)) e sp what c a
 
 -- | a lambda checked at a type that is no function's: of a `mutual`
 -- | block's knot field (its argument's name says whose), the definition
@@ -1440,7 +1507,7 @@ lambdaChk waits sp x body =
     _ -> do
       blocked <- Meta.blockedTy a
       if waits && Unify.isFlexTy a && not blocked
-      then delayChk e sp "lambda" (lambdaChk False sp x body) a
+      then delayLambda e sp "lambda" (lambdaChk False sp x body) a
       else failWith (a := Memoed.El) sp 1 (notFunctionMsg x))
 
 functionIntro : Params.Span -> String -> Chk -> Chk
@@ -1980,21 +2047,25 @@ notAFunction e sp ecallee a =
         ("the value applied here is `" ^ applied ^ "`")
 
 -- | Application.  An argument that can only be checked, at a type that
--- | is still an unsolved implicit, waits: a hole stands for it.
+-- | is still an unsolved implicit, waits: a hole stands for it (one that
+-- | is a lambda, `lambda`, with its guess).
 elimGo : Bool
+       -> Bool
        -> Params.Span
        -> Chk
        -> ElabEnv
        -> Pair Memoed.El Value.Ty
        -> Elab (Pair Memoed.El Value.Ty)
-elimGo checksOnly sp arg e (MkPair ecallee a) = case Value.behavior a of
+elimGo checksOnly lambda sp arg e (MkPair ecallee a) = case Value.behavior a of
   LikeFunction level dom cod implicit ->
     if checksOnly
     then do
       fdom <- Meta.forceT dom
       if not (Unify.isFlexTy fdom) then elimPlain e ecallee dom cod arg
       else do
-        hole <- delayChk e sp "argument" arg fdom
+        hole <-
+          if lambda then delayLambda e sp "argument" arg fdom
+          else delayChk e sp "argument" arg fdom
         pure
             (MkPair
                (Memoed.app ecallee hole)
@@ -2280,27 +2351,23 @@ apply sp syn =
         else insertImplicits e sp m0 a1
       applyGo sp e a pi)
 
--- (the universe of a type not known yet)
-universeOf : Value.Ty -> Params.Universe
-universeOf (VDecode h sp u described el) = u
-universeOf _ = SmallU
-
 -- | an application of a value whose type is not known yet waits for it,
 -- | as a lambda does: a hole of a type of its own stands for it, and it
 -- | is elaborated once that type is known
 elimWaits : Bool
+          -> Bool
           -> Params.Span
           -> Chk
           -> ElabEnv
           -> Pair Memoed.El Value.Ty
           -> Elab (Pair Memoed.El Value.Ty)
-elimWaits checksOnly sp arg e pi@(MkPair ecallee a) =
+elimWaits checksOnly lambda sp arg e pi@(MkPair ecallee a) =
   -- (`a` is forced, as implicit arguments were inserted)
   if not (Unify.isFlexTy a)
-  then elimGo checksOnly sp arg e pi
+  then elimGo checksOnly lambda sp arg e pi
   else do
     blocked <- Meta.blockedTy a
-    if blocked then elimGo checksOnly sp arg e pi
+    if blocked then elimGo checksOnly lambda sp arg e pi
     else do
       t <-
         freshMeta
@@ -2318,22 +2385,22 @@ elimWaits checksOnly sp arg e pi@(MkPair ecallee a) =
              sp
              (MkSyn (\e2 -> do
               pi2 <- insertImplicits e2 sp ecallee a
-              elimGo checksOnly sp arg e2 pi2)))
+              elimGo checksOnly lambda sp arg e2 pi2)))
           a
           (Value.decodeN t.val)
       pure (MkPair hole (Value.decodeN t.val))
 
-functionElimC : Bool -> Params.Span -> Syn -> Chk -> Syn
-functionElimC checksOnly sp callee arg =
+functionElimC : Bool -> Bool -> Params.Span -> Syn -> Chk -> Syn
+functionElimC checksOnly lambda sp callee arg =
   MkSyn (\e -> do
   pc <- runSyn callee e
   case pc of
     MkPair ecallee0 a0 -> do
       pi <- insertImplicits e sp ecallee0 a0
-      elimWaits checksOnly sp arg e pi)
+      elimWaits checksOnly lambda sp arg e pi)
 
 functionElim : Params.Span -> Syn -> Chk -> Syn
-functionElim sp callee arg = functionElimC False sp callee arg
+functionElim sp callee arg = functionElimC False False sp callee arg
 
 annot : Typ -> Chk -> Syn
 annot typ chk =

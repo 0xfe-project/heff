@@ -152,7 +152,7 @@ retryPostponed : Globals.Globals -> Elab (List Postponed)
 retryPostponed g = retryGo g 0
 
 delayedReady : Value.MetaCtx -> Bool -> Delayed ElabSt -> Bool
-delayedReady mc all (MkDelayed ty chk) =
+delayedReady mc all (MkDelayed ty chk gs) =
   all || not (Unify.isFlexTy (Value.forceTy mc ty))
 
 anyDelayed : Value.MetaCtx -> List (Delayed ElabSt) -> Bool
@@ -195,7 +195,7 @@ catchStep h (MkPair (Right x) st) = MkPair (Right x) st
 -- (the delayed checks, oldest first)
 runEachS : List (Delayed ElabSt) -> Step Unit
 runEachS Nil = \st -> MkPair (Right MkUnit) st
-runEachS (Cons (MkDelayed ty chk) rest) = \st ->
+runEachS (Cons (MkDelayed ty chk gs) rest) = \st ->
     bindStep (chk st) (\u -> runEachS rest)
 
 readyIn : Bool -> ElabSt -> List (Delayed ElabSt)
@@ -218,6 +218,29 @@ wakeS all = \st ->
                    ds)
               st))
         (\u -> wakeS all)
+
+-- (a delayed check's guess, if it has one and still waits for its type)
+guessOf : Value.MetaCtx -> Delayed ElabSt -> Maybe (Step Bool)
+guessOf mc (MkDelayed ty chk gs) =
+  if delayedReady mc False (MkDelayed ty chk gs) then Nothing else gs
+
+-- | the guess of the first of the delayed checks (oldest first) that has
+-- | one and still waits, made; if it is not made, the next one's
+guessS : List (Delayed ElabSt) -> Step Bool
+guessS Nil = \st -> MkPair (Right False) st
+guessS (Cons d rest) = \st -> case guessOf (core st).metas d of
+  Just gs ->
+    bindStep
+      (gs st)
+      (\made st2 -> if made then MkPair (Right True) st2 else guessS rest st2)
+  Nothing -> guessS rest st
+
+isJustGuess : {a : Type} -> Maybe a -> Bool
+isJustGuess (Just _) = True
+isJustGuess Nothing = False
+
+canGuessIn : Value.MetaCtx -> List (Delayed ElabSt) -> Bool
+canGuessIn mc ds = List.any (\d -> isJustGuess (guessOf mc d)) ds
 
 -- (a search as it is: its failure is the elaboration's)
 asItIs : Step Bool -> Step Bool
@@ -286,7 +309,17 @@ exceptionAlg (Catch c h) = \st -> catchStep h (c st)
 
 deferAlg : {a : Type} -> DeferF Step a -> Step a
 deferAlg (Delay ty c x) = \st ->
-    MkPair (Right x) (withDelayed (\ds -> Cons (MkDelayed ty c) ds) st)
+    MkPair (Right x) (withDelayed (\ds -> Cons (MkDelayed ty c Nothing) ds) st)
+deferAlg (DelayGuessing ty c gs x) = \st ->
+    MkPair
+      (Right x)
+      (withDelayed (\ds -> Cons (MkDelayed ty c (Just gs)) ds) st)
+deferAlg (Guess k) = \st ->
+    bindStep
+      (guessS (List.reverse (delayedOf st)) st)
+      (\b st2 -> MkPair (Right (k b)) st2)
+deferAlg (CanGuess k) = \st ->
+    MkPair (Right (k (canGuessIn (core st).metas (delayedOf st)))) st
 deferAlg (Want sp f x) = \st ->
     MkPair
       (Right x)
@@ -380,6 +413,67 @@ approximateFirst g (Cons p rest) =
               p.right))
     if approximated r then pure True else approximateFirst g rest
 
+-- | every delayed check run, known or not, the instance arguments still
+-- | undetermined refused, the problems retried: how settling ends
+forceAll : Globals.Globals -> Elab (List Postponed)
+forceAll g = do
+  runDelayed True
+  moved <- resolveWanteds True
+  retryPostponed g
+
+-- (an end with nothing left: no problem stuck, no error recovered from,
+-- no metavariable unsolved)
+endsClean : List Postponed -> Elab Bool
+endsClean left = do
+  recoveredNone <- gets (\c -> List.null c.recovered)
+  unsolved <- unsolvedMetas
+  pure (List.null left && recoveredNone && List.null unsolved)
+
+cleanEnd : List Postponed -> Elab (Maybe (List Postponed))
+cleanEnd left = do
+  clean <- endsClean left
+  pure (if clean then Just left else Nothing)
+
+-- (how settling by `m` ends, if it ends clean)
+cleanly : Elab (List Postponed) -> Elab (Maybe (List Postponed))
+cleanly m = catchE (bind m cleanEnd) (\d -> pure Nothing)
+
+restoreAll : StCore -> Saved -> Elab Unit
+restoreAll before waiting = do
+  putSt before
+  restoreWaiting waiting
+
+-- | Nothing moves, and nothing is approximated: settling ends.  Where it
+-- | would not end clean, and a delayed check still waiting has a guess
+-- | of its type (a lambda's: a function type, `?A -> ?B`), that guess is
+-- | made from where settling stopped, and settling goes on (`again`),
+-- | guessing anew where it stops again.  If that does not end clean
+-- | either, every guess is undone and settling ends as it would have:
+-- | a guess only ever turns an error into a definition that checks (#109).
+lastResort : (Int -> Elab (List Postponed))
+           -> Globals.Globals
+           -> Int
+           -> Elab (List Postponed)
+lastResort again g fuel = do
+  can <- canGuess
+  recoveredNone <- gets (\c -> List.null c.recovered)
+  if not can || not recoveredNone || fuel > 50 then forceAll g
+  else do
+    before <- gets (\c -> c)
+    waiting <- saveDelayed
+    ended <- cleanly (forceAll g)
+    case ended of
+      Just left -> pure left
+      Nothing -> do
+        restoreAll before waiting
+        made <- guess
+        guessedEnd <- if made then cleanly (again (fuel + 1)) else pure Nothing
+        case guessedEnd of
+          Just left -> pure left
+          Nothing -> do
+            restoreAll before waiting
+            forceAll g
+
 settleGo : Globals.Globals -> Int -> Elab (List Postponed)
 settleGo g fuel = do
   runDelayed False
@@ -391,12 +485,9 @@ settleGo g fuel = do
   else do
     -- nothing moves: a problem still stuck approximated, then again
     stuck <- gets (\c -> List.reverse c.postponed)
-    guessed <- approximateFirst g stuck
-    if guessed && fuel <= 50 then settleGo g (fuel + 1)
-    else do
-      runDelayed True
-      moved2 <- resolveWanteds True
-      retryPostponed g
+    approximatedOne <- approximateFirst g stuck
+    if approximatedOne && fuel <= 50 then settleGo g (fuel + 1)
+    else lastResort (\f -> settleGo g f) g fuel
 
 -- | Let the postponed problems and the delayed checks feed one another
 -- | until neither moves; then force what is left, and retry once more.

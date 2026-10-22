@@ -103,6 +103,13 @@ increments = List.map (\x -> x + 1) [1, 2]
   They can use the equation's arguments.
 - `\x -> e` is a function; `\(x : T) -> e` gives its argument a type;
   `\(a, b) -> e` takes its argument apart.
+- A lambda whose type is not known where it is written waits until the
+  rest of the definition says it. Where nothing ever does, it is taken
+  as an explicit function, `a -> b`:
+  `List.foldl (\acc f -> f acc) 1 (List.map (\j -> \v -> v + j) [0, 1])`
+  checks. If that does not fit either (it was to take an implicit
+  argument, or its result's type depends on its argument), the error is
+  the one without the guess: give the lambda's argument a type.
 
 `&&` and `||` evaluate their right side only when needed.
 
