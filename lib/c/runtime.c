@@ -2585,13 +2585,24 @@ HEFF_FAST V heff_strByteAt_lent(V a, V i, int give) {
 }
 HEFF_FN V heff_strByteAt(V a, V i) { return heff_strByteAt_lent(a, i, 1); }
 
-// (the string of one byte, a `UInt8`: a word of its value, 0 to 255)
-HEFF_FN V heff_strFromByte(V c) {
-  int64_t k = INT_OF(c);
-  Str *s = heff_str_new(1);
-  s->s[0] = (uint8_t)k;
-  return (V)s;
-}
+// (the 256 strings of one byte, made by the C compiler, immortal: a
+// string's room, as a static one's is, in the program's first file)
+typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[8]; } HeffByteStr;
+#ifdef HEFF_PART
+extern HeffByteStr heff_byte_strs[256];
+#else
+#define HEFF_BYTE_STR(b) {{IMMORTAL, K_STR, 0}, 1, 1, heff_byte_strs[b].s, {b}}
+#define HEFF_BYTE_STR4(b) HEFF_BYTE_STR(b), HEFF_BYTE_STR(b + 1), HEFF_BYTE_STR(b + 2), HEFF_BYTE_STR(b + 3)
+#define HEFF_BYTE_STR16(b) HEFF_BYTE_STR4(b), HEFF_BYTE_STR4(b + 4), HEFF_BYTE_STR4(b + 8), HEFF_BYTE_STR4(b + 12)
+#define HEFF_BYTE_STR64(b) HEFF_BYTE_STR16(b), HEFF_BYTE_STR16(b + 16), HEFF_BYTE_STR16(b + 32), HEFF_BYTE_STR16(b + 48)
+HeffByteStr heff_byte_strs[256] = {
+  HEFF_BYTE_STR64(0), HEFF_BYTE_STR64(64), HEFF_BYTE_STR64(128), HEFF_BYTE_STR64(192)
+};
+#endif
+
+// (the string of one byte, a `UInt8`: a word of its value, 0 to 255 --
+// one of the 256, nothing made)
+HEFF_FN V heff_strFromByte(V c) { return (V)&heff_byte_strs[(uint8_t)INT_OF(c)]; }
 
 // (a word's digits on the stack, nothing allocated but the string; a
 // big one's by its digits')
