@@ -45,35 +45,100 @@ hexDigit d = strSlice "0123456789abcdef" d (d + 1)
 hex2 : Int -> String
 hex2 c = hexDigit (c / 16) ^ hexDigit (c % 16)
 
--- (an ASCII character of a string, as JSON writes it)
-escapeAt : String -> Int -> String
-escapeAt s i =
-  if byteAt s i == 34 then "\\\""
-  else if byteAt s i == 92 then "\\\\"
-  else if byteAt s i == 10 then "\\n"
-  else if byteAt s i == 13 then "\\r"
-  else if byteAt s i == 9 then "\\t"
-  else if byteAt s i == 8 then "\\b"
-  else if byteAt s i == 12 then "\\f"
-  else if byteAt s i < 32 then "\\u00" ^ hex2 (byteAt s i)
-  else strSlice s i (i + 1)
+-- (an ASCII byte JSON writes escaped: its escape)
+escapeOf : Int -> String
+escapeOf c =
+  if c == 34 then "\\\""
+  else if c == 92 then "\\\\"
+  else if c == 10 then "\\n"
+  else if c == 13 then "\\r"
+  else if c == 9 then "\\t"
+  else if c == 8 then "\\b"
+  else if c == 12 then "\\f"
+  else "\\u00" ^ hex2 c
 
--- (a rune not ASCII's, of a string, at `i`: its bytes, as they are;
--- where they are not UTF-8, U+FFFD, so that what is written is text)
-runeText : String -> Int -> RuneAt -> String
-runeText s i r =
-  if Rune.toInt r.rune == Rune.toInt Rune.replacement
-  then ofRunes [Rune.replacement]
-  else strSlice s i (i + r.width)
+-- (a rune not ASCII's: how many of its bytes are written as they are,
+-- all of them, or none where they are not UTF-8)
+keptWidth : RuneAt -> Int
+keptWidth r =
+  if Rune.toInt r.rune == Rune.toInt Rune.replacement then 0 else r.width
 
-escapeGo : String -> Int -> String -> String
-escapeGo s i acc =
-  if i >= strLength s then acc
-  else if byteAt s i < 128 then escapeGo s (i + 1) (acc ^ escapeAt s i)
-  else (let r = runeAt s i in escapeGo s (i + r.width) (acc ^ runeText s i r))
+-- (a byte written as it is: printable ASCII, but `"` and `\`)
+isPlainByte : Int -> Bool
+isPlainByte c = 32 <= c && c < 128 && c /= 34 && c /= 92
 
-quoted : String -> String
-quoted s = "\"" ^ escapeGo s 0 "" ^ "\""
+-- (the end of the characters from `i` on written as they are: plain
+-- bytes, and runes not ASCII's whose bytes are UTF-8)
+plainEnd : String -> Int -> Int
+plainEnd s i =
+  if isPlainByte (byteAt s i) then plainEnd s (i + 1)
+  else if byteAt s i >= 128 && keptWidth (runeAt s i) > 0
+  then plainEnd s (i + keptWidth (runeAt s i))
+  else i
+
+-- (the character at `i` not written as it is: what is written instead, an
+-- ASCII byte's escape or U+FFFD, and how many bytes it takes)
+escapedText : String -> Int -> String
+escapedText s i =
+  if byteAt s i < 128 then escapeOf (byteAt s i) else ofRunes [Rune.replacement]
+
+escapedWidth : String -> Int -> Int
+escapedWidth s i = if byteAt s i < 128 then 1 else (runeAt s i).width
+
+-- (`acc`, then `s` from `i` on: from 0, `s` itself, not a copy)
+tailInto : String -> String -> Int -> String
+tailInto acc s i = if i == 0 then acc ^ s else acc ^ strSlice s i (strLength s)
+
+-- (`acc`, then the text of `s` from `i` on as the inside of a JSON string:
+-- what is written as it is a run of bytes at a time)
+escapeInto : String -> String -> Int -> String
+escapeInto acc s i =
+  let j : Int = plainEnd s i
+  in if j >= strLength s then tailInto acc s i
+  else escapeInto
+      (acc ^ strSlice s i j ^ escapedText s j)
+      s
+      (j + escapedWidth s j)
+
+-- (`acc`, then a string as JSON writes it)
+quotedInto : String -> String -> String
+quotedInto acc s = escapeInto (acc ^ "\"") s 0 ^ "\""
+
+-- (`acc`, then each element after the first, `sep` before it)
+restInto : {a : Type}
+         -> String
+         -> (String -> a -> String)
+         -> String
+         -> List a
+         -> String
+restInto sep write acc Nil = acc
+restInto sep write acc (Cons x xs) = restInto sep write (write (acc ^ sep) x) xs
+
+-- (`acc`, then the elements, `sep` between them)
+joinInto : {a : Type}
+         -> String
+         -> (String -> a -> String)
+         -> String
+         -> List a
+         -> String
+joinInto sep write acc Nil = acc
+joinInto sep write acc (Cons x xs) = restInto sep write (write acc x) xs
+
+-- (`acc`, then a field as JSON writes it, its value by `write`)
+fieldInto : (String -> Json -> String) -> String -> Pair String Json -> String
+fieldInto write acc (MkPair k v) = write (quotedInto acc k ^ ":") v
+
+-- (`acc`, then a value as `stringify` writes it: each part appended to
+-- the one text, not made apart and joined)
+writeInto : String -> Json -> String
+writeInto acc JNull = acc ^ "null"
+writeInto acc (JBool b) = acc ^ (if b then "true" else "false")
+writeInto acc (JInt i) = acc ^ show i
+writeInto acc (JFloat x) = acc ^ show x
+writeInto acc (JString s) = quotedInto acc s
+writeInto acc (JArray xs) = joinInto "," writeInto (acc ^ "[") xs ^ "]"
+writeInto acc (JObject fs) =
+  joinInto "," (fieldInto writeInto) (acc ^ "{") fs ^ "}"
 
 -- | The text of a value, as JavaScript's `JSON.stringify` writes it: no
 -- | space, an object's fields in their order.
@@ -84,30 +149,31 @@ quoted s = "\"" ^ escapeGo s 0 "" ^ "\""
 -- | >>> stringify (JString ("é😀" ^ strSlice "😀" 0 1 ^ "\t"))
 -- | "\"é😀\u{FFFD}\\t\""
 stringify : Json -> String
-stringify JNull = "null"
-stringify (JBool b) = if b then "true" else "false"
-stringify (JInt i) = show i
-stringify (JFloat x) = show x
-stringify (JString s) = quoted s
-stringify (JArray xs) = "[" ^ joinWith "," (List.map stringify xs) ^ "]"
-stringify (JObject fs) =
-  "{"
-  ^ joinWith "," (List.map (\p -> quoted (fst p) ^ ":" ^ stringify (snd p)) fs)
-  ^ "}"
+stringify j = writeInto "" j
 
--- (as the source writes it)
-reprField : (Json -> String) -> Pair String Json -> String
-reprField repr (MkPair k v) = "MkPair " ^ show k ^ " (" ^ repr v ^ ")"
+-- (`acc`, then a field as the source writes it)
+reprFieldInto : (String -> Json -> String)
+              -> String
+              -> Pair String Json
+              -> String
+reprFieldInto repr acc (MkPair k v) =
+  repr (acc ^ "MkPair " ^ show k ^ " (") v ^ ")"
+
+-- (`acc`, then a value as the source writes it)
+reprInto : String -> Json -> String
+reprInto acc JNull = acc ^ "JNull"
+reprInto acc (JBool b) = acc ^ "JBool " ^ show b
+reprInto acc (JInt i) =
+  acc ^ "JInt " ^ (if i < 0 then "(" ^ show i ^ ")" else show i)
+reprInto acc (JFloat x) =
+  acc ^ "JFloat " ^ (if x < 0.0 then "(" ^ show x ^ ")" else show x)
+reprInto acc (JString s) = acc ^ "JString " ^ show s
+reprInto acc (JArray xs) = joinInto ", " reprInto (acc ^ "JArray [") xs ^ "]"
+reprInto acc (JObject fs) =
+  joinInto ", " (reprFieldInto reprInto) (acc ^ "JObject [") fs ^ "]"
 
 repr : Json -> String
-repr JNull = "JNull"
-repr (JBool b) = "JBool " ^ show b
-repr (JInt i) = "JInt " ^ (if i < 0 then "(" ^ show i ^ ")" else show i)
-repr (JFloat x) = "JFloat " ^ (if x < 0.0 then "(" ^ show x ^ ")" else show x)
-repr (JString s) = "JString " ^ show s
-repr (JArray xs) = "JArray [" ^ joinWith ", " (List.map repr xs) ^ "]"
-repr (JObject fs) =
-  "JObject [" ^ joinWith ", " (List.map (reprField repr) fs) ^ "]"
+repr j = reprInto "" j
 
 -- | A value as the source writes it.
 -- | >>> show (JArray [JInt -1, JString "a", JObject [MkPair "b" JNull]] : Json)
