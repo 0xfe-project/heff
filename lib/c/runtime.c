@@ -172,6 +172,9 @@ int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own);
 // bytes)
 void heff_show_float(double d, char *out);
 void heff_show_float32(float f, char *out);
+// (the float, of 64 bits or of 32, nearest the decimal of `n` bytes at
+// `p`, correctly rounded; of what is no decimal, NaN)
+double heff_float_of_decimal(const char *p, int64_t n, int bits);
 // (integers beyond a word, their magnitudes compared, added, subtracted,
 // multiplied and divided, as "Integers" below says; and bits read and
 // written as Erlang's bit syntax has them, as "Bits" says)
@@ -4193,6 +4196,18 @@ HEFF_FN V heff_floatOfBits(V n, V v) {
   if (bits == 32) { uint32_t w = (uint32_t)u; float g; memcpy(&g, &w, 4); return heff_flt((double)g); }
   return heff_abandon();
 }
+
+// (the `Float64` nearest the decimal `strSlice s i j`, or the `Float32`
+// nearest it, of `w` 64 or 32; of text that is no decimal, NaN)
+HEFF_FAST V heff_floatOfDecimal_lent(V w, V s, V i, V j, int give) {
+  Str *x = (Str *)s;
+  int64_t m, b = heff_str_range(x, i, j, &m), bits = INT_OF(w);
+  double d = bits == 64 || bits == 32 ? heff_float_of_decimal((const char *)x->p + b, m, (int)bits) : 0;
+  HEFF_GIVEN(give, 1, s);
+  if (bits != 64 && bits != 32) return heff_abandon();
+  return heff_flt(d);
+}
+HEFF_FN V heff_floatOfDecimal(V w, V s, V i, V j) { return heff_floatOfDecimal_lent(w, s, i, j, 2); }
 
 // What providers share
 // ---------------------------------------------------------------------
