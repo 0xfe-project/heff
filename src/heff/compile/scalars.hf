@@ -596,8 +596,136 @@ callersDef m d =
   then IR.mkDef d.key d.name (callersRw m d.body)
   else d
 
+-- Built once, passed on
+--------------------------------------------------------------------------------
+
+-- A record or tag the loop binds, then only passes on to itself, whole
+-- (`let rest = MkRange (a + 1) b`, then `loop rest` on each way an `if`
+-- takes), is not built at a call: its fields are bound where it was,
+-- each to a variable of its own, and the record or tag is built, of
+-- those, at each call -- so that it is built there, and kept as its
+-- fields.  Nothing is computed twice: what is copied is only the record
+-- or tag, of variables.  Where no more parameters are kept so, the loop
+-- is left as it was.
+
+-- (whether a pass splits a binding of the value: of records, a record;
+-- of tags, a tag with fields, not one bound where it is made)
+splits : Kind -> IR.Expr -> Bool
+splits OfRecords (ERecord fs _) = not (List.null fs)
+splits OfTags (ETag t args ts) =
+  not (List.null args) && not (IR.keepsValue (ETag t args ts))
+splits kind e = False
+
+-- (how often the worklist passes `x`, whole, to `f`, onto `n`)
+passedW : String -> String -> Int -> List IR.Expr -> Int
+passedW f x n Nil = n
+passedW f x n (Cons (ECall g args) rest) =
+  passedW
+    f
+    x
+    (if strEq g f then n + List.length (List.keepIf (isVar x) args) else n)
+    (IR.appendI args rest)
+passedW f x n (Cons e rest) = passedW f x n (IR.partsOnto e rest)
+
+-- (whether `b` uses `x` only passed, whole, to `f`, not in a lambda)
+passedOnly : String -> String -> IR.Expr -> Bool
+passedOnly f x b =
+  not (IR.lamW x (Cons b Nil))
+  && IR.countW x 0 (Cons b Nil) == passedW f x 0 (Cons b Nil)
+  && passedW f x 0 (Cons b Nil) > 0
+
+-- (whether `f`'s worklist binds a record or tag it only passes on)
+bindsPassedW : Kind -> String -> List IR.Expr -> Bool
+bindsPassedW kind f Nil = False
+bindsPassedW kind f (Cons (ELet x a b) rest) =
+  (splits kind a && passedOnly f x b)
+  || bindsPassedW kind f (Cons a (Cons b rest))
+bindsPassedW kind f (Cons e rest) = bindsPassedW kind f (IR.partsOnto e rest)
+
+-- (a field copied as it is: a variable, or a constant)
+isAtom : IR.Expr -> Bool
+isAtom (EVar _) = True
+isAtom (EGlobal _) = True
+isAtom (EPrim _) = True
+isAtom (EInt _) = True
+isAtom (EFloat _) = True
+isAtom (EFixed _ _) = True
+isAtom (EFloat32 _) = True
+isAtom e = False
+
+-- | a field of a split binding: the variable it is bound to, if it is
+-- | not an atom, and what the record or tag is built of
+type Field = { bound : Maybe (Pair String IR.Expr), atom : IR.Expr }
+
+fieldOf : String -> IR.Expr -> S Field
+fieldOf x e =
+  if isAtom e then pure { bound = Nothing, atom = e }
+  else do
+    v <- freshS (IR.baseOf x)
+    pure { bound = Just (MkPair v e), atom = EVar v }
+
+bindMaybe : Maybe (Pair String IR.Expr) -> IR.Expr -> IR.Expr
+bindMaybe (Just (MkPair v e)) b = ELet v e b
+bindMaybe Nothing b = b
+
+bindField : Field -> IR.Expr -> IR.Expr
+bindField fd b = bindMaybe fd.bound b
+
+fieldsOf : IR.Expr -> List IR.Expr
+fieldsOf (ERecord fs _) = List.map snd fs
+fieldsOf (ETag _ args _) = args
+fieldsOf e = Nil
+
+-- (the record or tag, built of the fields' atoms)
+rebuilt : IR.Expr -> List Field -> IR.Expr
+rebuilt (ERecord fs ts) fds =
+  ERecord (List.zipWith (\p (fd : Field) -> MkPair (fst p) fd.atom) fs fds) ts
+rebuilt (ETag t _ ts) fds = ETag t (List.map (\(fd : Field) -> fd.atom) fds) ts
+rebuilt e fds = e
+
+-- (the binding of `x` to `a`, split: its fields bound, then `b`, each
+-- use of `x` the record or tag built of them)
+splitWith : String -> IR.Expr -> IR.Expr -> List Field -> IR.Expr
+splitWith x a b fds =
+  List.foldr
+    bindField
+    (IR.subst (OrdMap.fromList (Cons (MkPair x (rebuilt a fds)) Nil)) b)
+    fds
+
+-- | `f`'s body, each record or tag it binds and only passes on to
+-- | itself, whole, split
+splitIn : Kind -> String -> IR.Expr -> S IR.Expr
+splitIn kind f (ELet x a b) =
+  if splits kind a && passedOnly f x b
+  then do
+    fds <- traverseS (fieldOf x) (fieldsOf a)
+    b2 <- splitIn kind f b
+    pure (splitWith x a b2 fds)
+  else IR.traverseParts (\_ p -> splitIn kind f p) (ELet x a b)
+splitIn kind f e = IR.traverseParts (\_ p -> splitIn kind f p) e
+
 -- | a definition and its slots
 type Found = { def : IR.Def, slots : List Slot }
+
+-- (the one keeping more parameters as their fields, else the first)
+moreKept : Found -> Found -> Found
+moreKept a b = if List.length b.slots > List.length a.slots then b else a
+
+splitDef : Kind -> IR.Def -> S IR.Def
+splitDef kind d@{ body = ELam xs b } = do
+  b2 <- splitIn kind d.key b
+  pure (IR.mkDef d.key d.name (ELam xs b2))
+splitDef kind d = pure d
+
+-- (whether a loop binds a record or tag it only passes on, where the
+-- pass looks at it)
+bindsPassed : Kind -> IR.Def -> Bool
+bindsPassed kind d@{ body = ELam xs b } =
+  looks kind xs b && bindsPassedW kind d.key (Cons b Nil)
+bindsPassed kind d = False
+
+foundSplit : Kind -> Found -> IR.Def -> Found
+foundSplit kind f d = moreKept f { def = d, slots = slotsOf kind d }
 
 -- (the loops with slots, by key)
 loopsOf : List Found -> OrdMap.OrdMap String (List Slot)
@@ -624,8 +752,18 @@ programOf : Kind
 programOf kind fs (MkPair dss n) =
   MkPair (callersIn kind fs (List.concatMap (\ds -> ds) dss)) n
 
-foundOf : Kind -> IR.Def -> Found
-foundOf kind d = { def = d, slots = slotsOf kind d }
+foundWith : Kind -> IR.Def -> Found -> S Found
+foundWith kind d f =
+  if bindsPassed kind d
+  then do
+    d2 <- splitDef kind d
+    pure (foundSplit kind f d2)
+  else pure f
+
+-- (a definition and its slots: its records or tags only passed on
+-- split, where that keeps more)
+foundOf : Kind -> IR.Def -> S Found
+foundOf kind d = foundWith kind d { def = d, slots = slotsOf kind d }
 
 programWith : Kind -> List Found -> S (List IR.Def)
 programWith kind fs n =
@@ -634,11 +772,14 @@ programWith kind fs n =
     fs
     (traverseS (\(f : Found) -> defWith kind f.def f.slots) fs n)
 
+foundThen : Kind -> Pair (List Found) IR.Supply -> Pair (List IR.Def) IR.Supply
+foundThen kind (MkPair fs n) = programWith kind fs n
+
 -- (the program, each loop carrying what the pass keeps round given a
 -- worker carrying its fields)
 keptProgram : Kind -> IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
 keptProgram kind supply defs =
-  programWith kind (List.map (foundOf kind) defs) supply
+  foundThen kind (traverseS (foundOf kind) defs supply)
 
 -- | the program, each loop carrying a record round given a worker
 -- | carrying its fields; fresh names from `supply` on
