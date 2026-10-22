@@ -15,13 +15,16 @@
 -- ```
 --
 -- A number without a fraction or an exponent is a `JInt`, of any size, as
--- an `Int` is; one with either, a `JFloat`.  An object keeps its fields in
--- order, and a key given twice twice.  A string is text: an escape of a
--- surrogate not in a pair is U+FFFD, as what is not UTF-8 is in a string
--- heff reads.
+-- an `Int` is; one with either, a `JFloat`, the float nearest it (as C's
+-- `strtod` reads it), written so that it is read back the very float --
+-- but an infinity or NaN, which JSON has no number for, written `null`,
+-- as JavaScript writes them.  An object keeps its fields in order, and a
+-- key given twice twice.  A string is text: an escape of a surrogate not
+-- in a pair is U+FFFD, as what is not UTF-8 is in a string heff reads.
 
 module json
 
+import int as Int
 import rune as Rune
 
 -- | A JSON value: a number without a fraction or an exponent a `JInt`,
@@ -128,13 +131,22 @@ joinInto sep write acc (Cons x xs) = restInto sep write (write acc x) xs
 fieldInto : (String -> Json -> String) -> String -> Pair String Json -> String
 fieldInto write acc (MkPair k v) = write (quotedInto acc k ^ ":") v
 
+-- (a float as `stringify` writes it: as `show` does, -0.0 with its sign;
+-- one not finite, which JSON has no number for, `null`, as JavaScript's
+-- `JSON.stringify` writes it)
+floatText : Float64 -> String
+floatText x =
+  if not (x - x == 0.0) then "null"
+  else if x == 0.0 && 1.0 /. x < 0.0 then "-0.0"
+  else show x
+
 -- (`acc`, then a value as `stringify` writes it: each part appended to
 -- the one text, not made apart and joined)
 writeInto : String -> Json -> String
 writeInto acc JNull = acc ^ "null"
 writeInto acc (JBool b) = acc ^ (if b then "true" else "false")
 writeInto acc (JInt i) = acc ^ show i
-writeInto acc (JFloat x) = acc ^ show x
+writeInto acc (JFloat x) = acc ^ floatText x
 writeInto acc (JString s) = quotedInto acc s
 writeInto acc (JArray xs) = joinInto "," writeInto (acc ^ "[") xs ^ "]"
 writeInto acc (JObject fs) =
@@ -144,6 +156,12 @@ writeInto acc (JObject fs) =
 -- | space, an object's fields in their order.
 -- | >>> stringify (JObject [MkPair "a" (JInt 1), MkPair "b" (JArray [JString "x\n", JNull, JBool True])])
 -- | "{\"a\":1,\"b\":[\"x\\n\",null,true]}"
+-- |
+-- | (a float as `show` writes it, -0.0 with its sign, so that `parse`
+-- | reads back the very float; an infinity or NaN, which JSON has no
+-- | number for, `null`, as JavaScript writes them)
+-- | >>> stringify (JArray [JFloat 1.0e300, JFloat (neg 0.0), JFloat (1.0 /. 0.0), JFloat (0.0 /. 0.0)])
+-- | "[1e+300,-0.0,null,null]"
 -- |
 -- | (a string's text: what is not UTF-8 in it, U+FFFD)
 -- | >>> stringify (JString ("é😀" ^ strSlice "😀" 0 1 ^ "\t"))
@@ -226,24 +244,89 @@ digitsValue s i j acc =
 square : Float64 -> Float64
 square x = x * x
 
--- (10 to the power `k`, `k` at least 0: exact up to 10^22)
+-- (10 to the power `k`, `k` from 0 to 22: exact)
 pow10 : Int -> Float64
 pow10 k =
   if k == 0 then 1.0
   else if k % 2 == 1 then 10.0 * pow10 (k - 1)
   else square (pow10 (k / 2))
 
--- (`m` times 10 to the power `e`: correctly rounded where `m` is below
--- 2^53 and `e` within 22 of 0, as the fast path of a C library's
--- `strtod` is, and within an ulp or so elsewhere)
+-- (how many bits `n`, from 0 to 2^(2k) - 1, is written in, after `acc`:
+-- its upper `k` and then its lower, halving)
+bitsBelow : Int -> Int -> Int -> Int
+bitsBelow n acc k =
+  if k == 0 then acc + n
+  else if n >= shiftL 1 k then bitsBelow (shiftR n k) (acc + k) (k / 2)
+  else bitsBelow n acc (k / 2)
+
+-- (how many bits `n`, at least 0, is written in, after `acc`)
+bitLengthFrom : Int -> Int -> Int
+bitLengthFrom n acc =
+  if n >= shiftL 1 64 then bitLengthFrom (shiftR n 64) (acc + 64)
+  else bitsBelow n acc 32
+
+-- (`q` rounded up where the rest `r` of a division by `d` is above half
+-- of it, or half and `q` odd: to the nearest, a tie to the even)
+roundedHalfEven : Int -> Int -> Int -> Int
+roundedHalfEven q r d =
+  if 2 * r > d || (2 * r == d && q % 2 == 1) then q + 1 else q
+
+-- (10 to the power `k`, `k` at least 0, an integer)
+tenTo : Int -> Int
+tenTo k =
+  if k == 0 then 1
+  else if k % 2 == 1 then 10 * tenTo (k - 1)
+  else (let h : Int = tenTo (k / 2) in h * h)
+
+-- (the IEEE bits of `q` times 2 to the power `b` -- `q` below 2^53, and
+-- at least 2^52 but where `b` is the least, a subnormal's -- `q` rounded
+-- by the rest `r` of a division by `d`; above the largest, an infinity's)
+bitsOf : Int -> Int -> Int -> Int -> Int
+bitsOf b q r d =
+  min
+    ((b + 1074) * shiftL 1 52 + roundedHalfEven q r d)
+    (2047 * shiftL 1 52)
+
+-- (the IEEE bits of `num` over `den`, both above 0, the float nearest
+-- it whose last place is 2 to the power `b`, its quotient 53 bits or 54
+-- -- then its last place 2 to the power `b + 1`)
+bitsAt : Int -> Int -> Int -> Int
+bitsAt num den b =
+  let n : Int = shiftL num (max 0 (0 - b))
+  in let d : Int = shiftL den (max 0 b)
+  in let q : Int = n / d
+  in if q >= shiftL 1 53
+  then bitsOf (b + 1) (q / 2) ((q % 2) * d + (n - q * d)) (2 * d)
+  else bitsOf b q (n - q * d) d
+
+-- (the IEEE bits of `m` times 10 to the power `e`, `m` above 0, rounded
+-- to the nearest float: beyond the largest, an infinity's, and below
+-- half the least, 0's)
+nearestBits : Int -> Int -> Int
+nearestBits m e =
+  if e > 309 then 2047 * shiftL 1 52
+  else if bitLengthFrom m 0 * 302 / 1000 + 1 + e < 0 - 324 then 0
+  else (let num : Int = if e > 0 then m * tenTo e else m
+        in let den : Int = if e < 0 then tenTo (0 - e) else 1
+        in bitsAt
+          num
+          den
+          (max
+             (bitLengthFrom num 0 - bitLengthFrom den 0 - 53)
+             (0 - 1074)))
+
+-- (`m` times 10 to the power `e`, `m` at least 0, correctly rounded --
+-- the float nearest it, a tie to the even, as a C library's `strtod`
+-- reads it: where `m` is below 2^53 and `e` within 22 of 0, by one
+-- operation of exact floats, else in integers)
 scaled : Int -> Int -> Float64
 scaled m e =
-  if e >= 0 then floatFromInt m * pow10 (if e > 400 then 400 else e)
-  else if e < 0 - 300
-  then floatFromInt m
-    /. pow10 300
-    /. pow10 (if e < 0 - 700 then 400 else 0 - e - 300)
-  else floatFromInt m /. pow10 (0 - e)
+  if m == 0 then 0.0
+  else if m < shiftL 1 53 && 0 <= e && e <= 22
+  then floatFromInt m * pow10 e
+  else if m < shiftL 1 53 && 0 - 22 <= e && e < 0
+  then floatFromInt m /. pow10 (0 - e)
+  else floatOfBits 64 (nearestBits m e)
 
 -- (the exponent's part of a number from `i`, `e` or `E` there: its end,
 -- and its value, or -1 where it has no digits)
@@ -264,11 +347,11 @@ exponentValue s i j =
 floatOf : String -> Int -> Int -> Int -> Int -> Int -> Float64
 floatOf s start d p f end =
   let whole : Int = digitsValue s d p 0
-  in let fraction : Int = if f > p then digitsValue s (p + 1) f whole else whole
-  in let m : Int = if byteAt s start == 45 then 0 - fraction else fraction
+  in let m : Int = if f > p then digitsValue s (p + 1) f whole else whole
   in let places : Int = if f > p then f - p - 1 else 0
   in let e : Int = if end > f then exponentValue s (f + 1) end else 0
-  in scaled m (e - places)
+  in if byteAt s start == 45 then neg (scaled m (e - places))
+  else scaled m (e - places)
 
 -- (a number's text, from `start`, its integer's digits from `d` up to
 -- `p`, then perhaps a fraction and an exponent)
