@@ -1,15 +1,17 @@
 -- A language server (the Language Server Protocol, over stdio) for `.hf`
 -- files: diagnostics, hover, go to definition, completion, formatting,
--- an outline, splitting a variable into cases, the module claim's name
--- (a quick fix, and `heff/moduleName` for an editor to write it);
--- and, over the whole project, references and renaming, and the symbols
--- of every file.
+-- an outline, the occurrences of a name in the document, splitting a
+-- variable into cases, the module claim's name (a quick fix, and
+-- `heff/moduleName` for an editor to write it); and, over the whole
+-- project, references and renaming, and the symbols of every file.
 --
 -- A document is elaborated with what it imports, from its text in the
 -- editor; an import open in the editor is read from there too, else from
 -- disk.  The project -- every file under its root, with what each
 -- imports -- is elaborated when it is asked about, and kept until a
--- document changes.  The server pulls: it awaits a
+-- document changes; for a name's references and renaming, only the
+-- files whose text has the name are elaborated, what else they import
+-- thawed from the cache.  A local's are found in its document alone.  The server pulls: it awaits a
 -- message, or the time a document's check waits for, and its state goes
 -- along the loop.  A failure of heff's own -- elaborating a document,
 -- answering a message -- is caught: said of the document, or answered
@@ -46,12 +48,22 @@ type Doc = { uri : String, text : String }
 -- | a document's last elaboration, of what text
 type Elaborated = { text : String, program : List Driver.Checked }
 
-type Project = { root : String, program : List Driver.Checked }
+-- | a project elaborated: every file of it (`names` nothing), or those
+-- | whose text has one of `names`, a name's references being looked for;
+-- | whether no document has changed since; and the modules elaborated
+-- | in it, kept to be used again while they are as they were
+type Project =
+  { root : String
+  , names : Maybe (List String)
+  , program : List Driver.Checked
+  , current : Bool
+  , kept : OrdMap.OrdMap String Session.Kept
+  }
 
 -- | the documents open, by path; the last elaboration of each; when a
 -- | document changed in the editor is to be checked (the typing paused);
--- | the project last elaborated, by its root (forgotten when a document
--- | changes); whether the client tells of files changed on disk when
+-- | the project last elaborated, by its root, and for which names
+-- | (elaborated again when a document has changed); whether the client tells of files changed on disk when
 -- | asked to (`watch`); the standard library
 type St =
   { docs : OrdMap.OrdMap String Doc
@@ -102,8 +114,26 @@ mkDoc uri text = { uri = uri, text = text }
 mkElaborated : String -> List Driver.Checked -> Elaborated
 mkElaborated text program = { text = text, program = program }
 
-mkProject : String -> List Driver.Checked -> Project
-mkProject root program = { root = root, program = program }
+mkProject : String
+          -> Maybe (List String)
+          -> List Driver.Checked
+          -> Bool
+          -> OrdMap.OrdMap String Session.Kept
+          -> Project
+mkProject root names program current kept =
+  { root = root
+  , names = names
+  , program = program
+  , current = current
+  , kept = kept
+  }
+
+-- | the project, to be elaborated again: a document has changed
+staled : St -> St
+staled s = case s.project of
+  Just pr ->
+    withProject (Just (mkProject pr.root pr.names pr.program False pr.kept)) s
+  Nothing -> s
 
 shutDown : St -> St
 shutDown s = mkSt s.docs s.checked s.due s.project s.watch True s.lib
@@ -699,31 +729,6 @@ loadAll read lib (Cons f rest) = do
   more <- loadAll read lib rest
   pure (List.append l.sources more)
 
--- | the files, with what each imports, elaborated as one program
-elabFiles : {e : HFunctor}
-          -> {{disk : filesystem <: e}}
-          -> (String -> Co e (Maybe String))
-          -> Load.Host
-          -> List String
-          -> Co e (List Driver.Checked)
-elabFiles read lib files = do
-  sources <- loadAll read lib (nubPaths files)
-  pure (Driver.checkProgramLean (nubSources sources))
-
--- | every file of a project (and `f`, if it is not one), with what each
--- | imports, elaborated as one program
-elabProject : {e : HFunctor}
-            -> {{disk : filesystem <: e}}
-            -> {{wire : RPC.rpc <: e}}
-            -> (String -> Co e (Maybe String))
-            -> Load.Host
-            -> String
-            -> String
-            -> Co e (List Driver.Checked)
-elabProject read lib root f = do
-  files <- RPC.projectFiles root
-  elabFiles read lib (List.append files [f])
-
 type WithProgram = { st : St, program : List Driver.Checked }
 
 mkWithProgram : St -> List Driver.Checked -> WithProgram
@@ -731,37 +736,149 @@ mkWithProgram st program = { st = st, program = program }
 
 -- (a program, or none where its elaboration failed: what is asked of it
 -- answered empty)
-elaboratedOr : Either String (List Driver.Checked) -> List Driver.Checked
-elaboratedOr (Right program) = program
-elaboratedOr (Left why) = Nil
+elaboratedOr : Either String Session.Elaborated -> Session.Elaborated
+elaboratedOr (Right e) = e
+elaboratedOr (Left why) = { program = Nil, kept = OrdMap.empty }
 
+-- (a project elaborated for the names `had` serves one wanted for
+-- `wanted`: every file elaborated serves any)
+covers : Maybe (List String) -> Maybe (List String) -> Bool
+covers Nothing wanted = True
+covers (Just had) (Just wanted) =
+  List.all (\n -> List.elemBy strEq n had) wanted
+covers (Just had) Nothing = False
+
+-- (whether a text has one of the names)
+mentions : List String -> String -> Bool
+mentions names text = List.any (\n -> contains n text) names
+
+-- (the files whose text has one of the names)
+mentionedIn : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> St
+            -> List String
+            -> List String
+            -> Co e (List String)
+mentionedIn st names Nil = pure Nil
+mentionedIn st names (Cons p rest) = do
+  t <- readOpen st p
+  more <- mentionedIn st names rest
+  pure (if mentions names (fromMaybe "" t) then Cons p more else more)
+
+-- (the files of a project that may have one of the names: every one,
+-- for no names)
+filesNamed : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> St
+           -> Maybe (List String)
+           -> List String
+           -> Co e (List String)
+filesNamed st Nothing files = pure files
+filesNamed st (Just names) files = mentionedIn st names files
+
+-- (a module whose names are wanted: one that may have one of them)
+wanted : Maybe (List String) -> Driver.Source -> Bool
+wanted Nothing s = True
+wanted (Just names) s = mentions names s.source
+
+-- (the modules kept from the project elaborated before, at the root)
+keptAt : St -> String -> OrdMap.OrdMap String Session.Kept
+keptAt st root = case st.project of
+  Just pr -> if strEq pr.root root then pr.kept else OrdMap.empty
+  Nothing -> OrdMap.empty
+
+-- | the files, with what each imports, elaborated as one program: those
+-- | `full` takes elaborated, or kept from before, the others thawed from
+-- | the cache where they can be
+elabFiles : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> (String -> Co e (Maybe String))
+          -> Load.Host
+          -> (Driver.Source -> Bool)
+          -> OrdMap.OrdMap String Session.Kept
+          -> String
+          -> List String
+          -> Co e Session.Elaborated
+elabFiles read lib full kept f files = do
+  sources <- loadAll read lib (nubPaths files)
+  ps <- Load.pathsFor lib f
+  Session.cachedWhere full kept ps (nubSources sources)
+
+-- | the project at `root` elaborated, as far as the names go (all of it,
+-- | for none): the files whose text has one of them, and `f`, with what
+-- | each imports.  A module whose text has one is elaborated; the others
+-- | are thawed from the cache where they can be, since no name of theirs
+-- | is one of them.
 projectAnew : {e : HFunctor}
             -> {{disk : filesystem <: e}}
             -> {{wire : RPC.rpc <: e}}
             -> St
             -> String
             -> String
+            -> Maybe (List String)
             -> Co e WithProgram
-projectAnew st root f = do
-  r <- RPC.attempt (\u -> elabProject (\p -> readOpen st p) st.lib root f)
-  program <- pure (elaboratedOr r)
-  pure (mkWithProgram (withProject (Just (mkProject root program)) st) program)
+projectAnew st root f names = do
+  r <-
+    RPC.attempt (\u -> do
+    files <- RPC.projectFiles root
+    fs <- filesNamed st names files
+    elabFiles
+        (\p -> readOpen st p)
+        st.lib
+        (wanted names)
+        (keptAt st root)
+        f
+        (List.append fs [f]))
+  e <- pure (elaboratedOr r)
+  pure
+      (mkWithProgram
+         (withProject
+            (Just
+               (mkProject
+                  root
+                  names
+                  e.program
+                  True
+                  (if List.null e.program then keptAt st root else e.kept)))
+            st)
+         e.program)
 
--- | the project a document is in, every file of it elaborated, an open
--- | one as its text is in the editor
+-- | the project a document is in, as far as the names go (all of it,
+-- | for none), an open file as its text is in the editor
+projectFor : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{wire : RPC.rpc <: e}}
+           -> St
+           -> String
+           -> Maybe (List String)
+           -> Co e WithProgram
+projectFor st f names = do
+  ps <- Load.pathsFor st.lib f
+  case st.project of
+    Just pr ->
+      if pr.current && strEq pr.root ps.root && covers pr.names names
+      then pure (mkWithProgram st pr.program)
+      else projectAnew st ps.root f names
+    Nothing -> projectAnew st ps.root f names
+
+-- | the project a document is in, every file of it elaborated
 project : {e : HFunctor}
         -> {{disk : filesystem <: e}}
         -> {{wire : RPC.rpc <: e}}
         -> St
         -> String
         -> Co e WithProgram
-project st f = do
-  ps <- Load.pathsFor st.lib f
-  case st.project of
-    Just pr ->
-      if strEq pr.root ps.root then pure (mkWithProgram st pr.program)
-      else projectAnew st ps.root f
-    Nothing -> projectAnew st ps.root f
+project st f = projectFor st f Nothing
+
+-- | ... every file of it whose text has one of the names
+mentioning : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{wire : RPC.rpc <: e}}
+           -> St
+           -> String
+           -> List String
+           -> Co e WithProgram
+mentioning st f names = projectFor st f (Just names)
 
 -- Requests
 --------------------------------------------------------------------------------
@@ -787,6 +904,7 @@ capabilities =
            "completionProvider"
            (obj [kv "triggerCharacters" (JArray [jstr "."])])
          , kv "referencesProvider" jtrue
+         , kv "documentHighlightProvider" jtrue
          , kv "renameProvider" (obj [kv "prepareProvider" jtrue])
          , kv "documentSymbolProvider" jtrue
          , kv "workspaceSymbolProvider" jtrue
@@ -872,6 +990,15 @@ hoverOf a p = case List.last a.program of
     Nothing -> JNull
   Nothing -> JNull
 
+-- (where what the name at the position refers to is in the document)
+highlightsOf : Asked -> Json -> Json
+highlightsOf a p =
+  JArray
+    (List.map
+       (\(o : Query.Occurrence) ->
+          obj [kv "range" (range o.source o.span), kv "kind" (num 1)])
+       (Query.highlightsAt a.program (offsetIn a.text p)))
+
 completionItem : Query.Completion -> Json
 completionItem i =
   obj
@@ -935,24 +1062,33 @@ pointedAt : List Driver.Checked -> String -> Query.Found -> Pointed
 pointedAt program f t =
   mkPointed f t.target t.name (Query.occurrences program t.target t.name)
 
-targetIn : St -> String -> Doc -> Json -> List Driver.Checked -> Targeted
-targetIn st f d p program = case List.find
-    (\(c : Driver.Checked) -> strEq c.path f)
-    program of
-  Just c ->
-    if strEq c.source d.text
-    then case Query.targetAt
-        (List.append
-           (List.keepIf
-              (\(c2 : Driver.Checked) -> not (strEq c2.path f))
-              program)
-           [c])
-        (offsetIn d.text p) of
-      Just t -> mkTargeted st (offsetIn d.text p) (Just (pointedAt program f t))
-      Nothing -> mkTargeted st 0 Nothing
-    else mkTargeted st 0 Nothing
-  Nothing -> mkTargeted st 0 Nothing
+-- (a local: in its document alone; a global or a member: in the files
+-- of the project that may refer to it -- else, where they could not be
+-- elaborated, in the document's program)
+pointedIn : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> {{wire : RPC.rpc <: e}}
+          -> Asked
+          -> String
+          -> Int
+          -> Query.Found
+          -> Co e Targeted
+pointedIn a f off t@{ target = { local = Just _ } } =
+  pure (mkTargeted a.st off (Just (pointedAt a.program f t)))
+pointedIn a f off t@{ target = { local = Nothing } } = do
+  wp <- mentioning a.st f [t.name]
+  pure
+      (mkTargeted
+         wp.st
+         off
+         (Just
+            (pointedAt
+               (if List.null wp.program then a.program else wp.program)
+               f
+               t)))
 
+-- | what the name at a request's position refers to, as the document's
+-- | elaboration says, and every occurrence of it
 withTarget : {e : HFunctor}
            -> {{disk : filesystem <: e}}
            -> {{wire : RPC.rpc <: e}}
@@ -960,14 +1096,13 @@ withTarget : {e : HFunctor}
            -> Json
            -> Co e Targeted
 withTarget st p = do
+  a <- withProgram st p
   mf <- docPath p
   case mf of
-    Nothing -> pure (mkTargeted st 0 Nothing)
-    Just f -> case OrdMap.lookup st.docs f of
-      Nothing -> pure (mkTargeted st 0 Nothing)
-      Just d -> do
-        wp <- project st f
-        pure (targetIn wp.st f d p wp.program)
+    Nothing -> pure (mkTargeted a.st 0 Nothing)
+    Just f -> case Query.targetAt a.program (offsetIn a.text p) of
+      Just t -> pointedIn a f (offsetIn a.text p) t
+      Nothing -> pure (mkTargeted a.st 0 Nothing)
 
 locationOf : {e : HFunctor}
            -> {{wire : RPC.rpc <: e}}
@@ -1125,6 +1260,24 @@ inPaths : List String -> List Driver.Checked -> List Driver.Checked
 inPaths paths program =
   List.keepIf (\(c : Driver.Checked) -> List.elemBy strEq c.path paths) program
 
+-- (what a renaming is held to: a local's document, as elaborated; else
+-- the files of the project that have the old name or the new -- no other
+-- file can come to mean something else)
+renameBase : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{wire : RPC.rpc <: e}}
+           -> St
+           -> Pointed
+           -> String
+           -> Co e WithProgram
+renameBase st t@{ target = { local = Just _ } } new = case OrdMap.lookup
+    st.checked
+    t.path of
+  Just e -> pure (mkWithProgram st e.program)
+  Nothing -> mentioning st t.path [t.name, new]
+renameBase st t@{ target = { local = Nothing } } new =
+  mentioning st t.path [t.name, new]
+
 renameChecked : {e : HFunctor}
               -> {{disk : filesystem <: e}}
               -> {{wire : RPC.rpc <: e}}
@@ -1133,7 +1286,7 @@ renameChecked : {e : HFunctor}
               -> String
               -> Co e (Pair St (Maybe String))
 renameChecked st t new = do
-  before <- project st t.path
+  before <- renameBase st t new
   affected <-
     pure
       (affectedGo
@@ -1153,18 +1306,21 @@ renameChecked st t new = do
             Just txt -> pure (Just txt)
             Nothing -> readOpen st p)
            st.lib
+           (\(s : Driver.Source) -> List.elemBy strEq s.path affected)
+           OrdMap.empty
+           t.path
            affected)
   pure
       (either
          (\why -> MkPair before.st (renameFailed t new why))
-         (\after ->
+         (\(after : Session.Elaborated) ->
             renameVerdict
               before
               t
               new
               (errorCount (inPaths affected before.program))
-              (errorCount (inPaths affected after))
-              after)
+              (errorCount (inPaths affected after.program))
+              after.program)
          tried)
 
 editOf : String -> Query.Occurrence -> Json
@@ -1715,6 +1871,11 @@ request st m id p =
         reply id (obj [kv "uri" (jstr u), kv "range" (range d.source d.span)])
       Nothing -> reply id JNull
     pure a.st
+  else if strEq m "textDocument/documentHighlight"
+  then do
+    a <- withProgram st p
+    reply id (highlightsOf a p)
+    pure a.st
   else if strEq m "textDocument/completion"
   then do
     a <- withProgram st p
@@ -1894,6 +2055,49 @@ notified st m p = do
       -- (`$/...`, and what we do not know)
       else pure st
 
+-- (a text, as the file is on disk)
+asOnDisk : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> Maybe String
+         -> Maybe String
+         -> Co e Bool
+asOnDisk (Just f) (Just text) = do
+  t <- Files.readFile f
+  pure (case t of
+    Just d -> strEq d text
+    Nothing -> False)
+asOnDisk _ _ = pure False
+
+-- | whether what the project was elaborated from stays as it was: a
+-- | document saved, or opened or closed as it is on disk, changes
+-- | nothing; a document changed in the editor, or files on disk, do
+keepsProject : {e : HFunctor}
+             -> {{disk : filesystem <: e}}
+             -> {{wire : RPC.rpc <: e}}
+             -> St
+             -> String
+             -> Json
+             -> Co e Bool
+keepsProject st m p =
+  if strEq m "textDocument/didSave" then pure True
+  else if strEq m "textDocument/didOpen"
+  then do
+    mf <- docPath p
+    asOnDisk mf (str ["textDocument", "text"] p)
+  else if strEq m "textDocument/didClose"
+  then do
+    mf <- docPath p
+    asOnDisk
+        mf (case mf of
+      Just f -> case OrdMap.lookup st.docs f of
+        Just d -> Just d.text
+        Nothing -> Nothing
+      Nothing -> Nothing)
+  else pure
+      (not
+         (startsWith "textDocument/" m
+          || strEq m "workspace/didChangeWatchedFiles"))
+
 notification : {e : HFunctor}
              -> {{disk : filesystem <: e}}
              -> {{wire : RPC.rpc <: e}}
@@ -1901,16 +2105,11 @@ notification : {e : HFunctor}
              -> String
              -> Json
              -> Co e St
-notification st m p =
+notification st m p = do
   -- (a document changed: the project is elaborated again when asked
   -- about)
-  notified
-    (if startsWith "textDocument/" m
-        || strEq m "workspace/didChangeWatchedFiles"
-     then withProject Nothing st
-     else st)
-    m
-    p
+  keep <- keepsProject st m p
+  notified (if keep then st else staled st) m p
 
 -- The loop
 --------------------------------------------------------------------------------

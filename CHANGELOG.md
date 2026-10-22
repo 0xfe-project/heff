@@ -54,6 +54,7 @@
 
 ### Compiler and tools
 
+- The language server goes to a local's definition, its binder, and highlights a name's occurrences in the file. References and renaming elaborate only the files whose text has the name, the rest thawed from the cache, and keep what they elaborated until it changes: references of `IR.Expr` in heff's own project take 1.8 s the first time and 0.7 s after an edit, not 10 s each time; a local's references are found in its file alone. A module claim's entry is a reference too, and is renamed.
 - `heff get` takes a package no tag is a version of at a pseudo-version, `0.0.0-TIME-COMMIT`, of its default branch's commit, or with `PATH@BRANCH` or `PATH@COMMIT` of that commit. A pseudo-version is older than every release.
 
 ### Docs
