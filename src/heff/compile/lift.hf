@@ -201,3 +201,101 @@ liftDef d = case lk.go d { out = Nil, n = 0 } d.body of
 -- | Cons (ELam (Cons "n" (Cons "i" Nil)) (EApp (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (Cons (EVar "n") Nil))) (Cons (ELam (Cons "n" Nil) (ELet "go" (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (EApp (EVar "go") (Cons (EInt 0) Nil)))) Nil)
 liftProgram : List IR.Def -> List IR.Def
 liftProgram defs = List.concatMap liftDef defs
+
+-- Local functions only called
+--------------------------------------------------------------------------------
+
+-- A function a `let` binds and that is only called, given what it takes
+-- -- `let byte = \j -> ... in ... byte 0 ... byte 3`, what the
+-- simplifier did not put where it is called -- is a global of its own
+-- too, taking the variables it mentions first: each call a call of the
+-- global given them, no closure built.
+
+-- (how many calls of `x` given `k` arguments the worklist makes, onto
+-- `n`)
+callsW : String -> Int -> Int -> List IR.Expr -> Int
+callsW x k n Nil = n
+callsW x k n (EApp (EVar y) args :: rest) =
+  callsW
+    x
+    k
+    (if strEq y x && List.length args == k then n + 1 else n)
+    (IR.appendI args rest)
+callsW x k n (e :: rest) = callsW x k n (IR.partsOnto e rest)
+
+-- | `x` is called in `b`, given `k` arguments, and used no other way
+onlyCalled : String -> Int -> IR.Expr -> Bool
+onlyCalled x k b = callsW x k 0 [b] > 0 && callsW x k 0 [b] == IR.countW x 0 [b]
+
+-- | each call of `x` a call of the global `g` given `fvs` first
+callsOf : String -> IR.Expr -> List IR.Expr -> IR.Expr -> IR.Expr
+callsOf x g fvs (EApp (EVar y) args) =
+  if strEq y x
+  then EApp g (IR.appendI fvs (List.map (callsOf x g fvs) args))
+  else EApp (EVar y) (List.map (callsOf x g fvs) args)
+callsOf x g fvs e = IR.mapParts (\_ p -> callsOf x g fvs p) e
+
+-- (the global of `x`, of the definition `d`: its parameters `ys` after
+-- the variables `fvs` its body mentions; what follows calling it)
+calledAt : LiftK
+         -> IR.Def
+         -> String
+         -> String
+         -> List String
+         -> IR.Expr
+         -> List String
+         -> IR.Expr
+         -> Acc
+         -> Pair IR.Expr Acc
+calledAt k d key x ys body fvs rest acc =
+  k.go
+    d
+    { out =
+        IR.mkDef
+          key
+          (d.name ^ "." ^ IR.baseOf x)
+          (ELam (IR.appendI fvs ys) body)
+        :: acc.out
+    , n = acc.n + 1
+    }
+    (callsOf x (EGlobal key) (List.map (\v -> EVar v) fvs) rest)
+
+calledWith : LiftK
+           -> IR.Def
+           -> String
+           -> List String
+           -> IR.Expr
+           -> Pair IR.Expr Acc
+           -> Pair IR.Expr Acc
+calledWith k d x ys rest (MkPair body acc) =
+  calledAt
+    k
+    d
+    (d.key ^ "." ^ IR.baseOf x ^ "$l" ^ show acc.n)
+    x
+    ys
+    body
+    (freeVars ys body)
+    rest
+    acc
+
+calledGo : LiftK -> IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc
+calledGo k d acc (ELet x (ELam ys body) rest) =
+  if onlyCalled x (List.length ys) rest
+  then calledWith k d x ys rest (k.go d acc body)
+  else liftParts k d acc (ELet x (ELam ys body) rest)
+calledGo k d acc e = liftParts k d acc e
+
+ck : LiftK
+ck = { go = \d acc e -> calledGo ck d acc e }
+
+-- | a definition, after the globals of its local functions only called
+calledDef : IR.Def -> List IR.Def
+calledDef d = case ck.go d { out = Nil, n = 0 } d.body of
+  MkPair b acc -> IR.appendI (List.reverse acc.out) [IR.mkDef d.key d.name b]
+
+-- | every local function of the program only called a global of its own
+-- | >>> List.map (\(d : IR.Def) -> d.body) (liftCalled [IR.mkDef "m.f" "f" (ELam ["n"] (ELet "g" (ELam ["i"] (EVar "n")) (EApp (EVar "g") [EInt 0])))])
+-- | Cons (ELam (Cons "n" (Cons "i" Nil)) (EVar "n")) (Cons (ELam (Cons "n" Nil) (EApp (EGlobal "m.f.g$l0") (Cons (EVar "n") (Cons (EInt 0) Nil)))) Nil)
+liftCalled : List IR.Def -> List IR.Def
+liftCalled defs = List.concatMap calledDef defs
