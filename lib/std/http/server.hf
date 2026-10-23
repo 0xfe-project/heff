@@ -600,38 +600,35 @@ serve l handle =
 stoppedOn : {e : HFunctor}
           -> {{gr : green <: e}}
           -> Int
-          -> Either Net.NetError Bool
+          -> Either Net.NetError Unit
           -> Co e Unit
 stoppedOn stopped (Left err) = send stopped err.code
-stoppedOn stopped (Right served) = pure MkUnit
+stoppedOn stopped (Right u) = pure MkUnit
 
 -- (a thread accepting the listener's next connection: a thread spawned
 -- to accept the one after it, then the connection served, and closed as
 -- the thread ends; where accepting failed, `stopped` told.  The throw
--- is heard in this thread, by `attempt` -- not by a `try` of the
--- scheduler's caller, which would run the body alone, its spawn
--- dropped -- so no exception is asked for)
+-- is heard in this thread, by a `recover` of its own -- not by a `try`
+-- of the scheduler's caller, which would run the body alone, its spawn
+-- dropped.  The thread spawned is this one again, in the same world:
+-- not under a handler of this thread's, which the one after it would
+-- be under too, and so on, each connection's thread under one more)
 acceptor : {e : HFunctor}
          -> {s : Type}
          -> {{gr : green <: e}}
          -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
          -> Int
          -> With s Net.TcpListener
          -> (Request -> Co e HTTP.Response)
          -> Co e Unit
 acceptor stopped l handle =
-  bind
-    (attempt Net.NetError (do
-     with Net.accept (ev := _) (ex := _) l as c do
-       spawn
-           (ev := _)
-           (lift (\p -> InR p) (acceptor stopped l handle))
-       serveConnection
-           (nt := _)
-           (\r -> False)
-           (\r -> lift (\p -> InR p) (handle r))
-           c))
-    (stoppedOn stopped)
+  recover
+    (Net.accept l (\c -> do
+     spawn (acceptor stopped l handle)
+     _ <- serveConnection (\r -> False) handle c
+     pure MkUnit))
+    (\(err : Net.NetError) -> send stopped err.code)
 
 -- | The listener's connections served at once, each by a green thread
 -- | of its own (`serveConnection`): the connection is had by `Net.accept`'s
@@ -650,6 +647,17 @@ serveConcurrently : {e : HFunctor}
                   -> Co e Unit
 serveConcurrently l handle = do
   stopped <- newChan
-  spawn (acceptor stopped l handle)
+  spawn
+      (bind
+         (attempt
+            Net.NetError
+            (acceptor
+               (gr := _)
+               (nt := _)
+               (ex := \p -> InL p)
+               stopped
+               l
+               (\r -> lift (\p -> InR p) (handle r))))
+         (stoppedOn stopped))
   _ <- recv stopped
   pure MkUnit
