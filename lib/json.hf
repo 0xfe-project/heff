@@ -227,21 +227,67 @@ instanceToStringJson = { toString = stringify }
 -- Parsing
 --------------------------------------------------------------------------------
 
--- | Where the text is not JSON: the byte at which it is not, and what
--- | was expected there.
-data ParseError = Expected Int String
+-- (where a parse missed, as it reads: the byte, and what was expected
+-- there)
+data Miss = Expected Int String
 
+-- | Where the text is not JSON: the byte at which it is not (`offset`,
+-- | from 0), its line and its column there (from 1, the column counted
+-- | in characters, as an editor counts them), and what was expected
+-- | there.
+type ParseError = { offset : Int, line : Int, column : Int, expected : String }
+
+-- | A parse error as it is written.
 showParseError : ParseError -> String
-showParseError (Expected i what) = "Expected " ^ show i ^ " " ^ show what
+showParseError err =
+  "{ offset = "
+  ^ show err.offset
+  ^ ", line = "
+  ^ show err.line
+  ^ ", column = "
+  ^ show err.column
+  ^ ", expected = "
+  ^ show err.expected
+  ^ " }"
 
--- | >>> show (Expected 3 "a value" : ParseError)
--- | "Expected 3 \"a value\""
+-- | >>> show ({ offset = 3, line = 1, column = 4, expected = "a value" } : ParseError)
+-- | "{ offset = 3, line = 1, column = 4, expected = \"a value\" }"
 instance instanceShowParseError : Show ParseError
 instanceShowParseError = { show = showParseError }
 
--- | What a parse error says: `at byte 3: expected a value`.
+-- | What a parse error says: `line 1, column 4: expected a value`.
 describe : ParseError -> String
-describe (Expected i what) = "at byte " ^ show i ^ ": expected " ^ what
+describe err =
+  "line "
+  ^ show err.line
+  ^ ", column "
+  ^ show err.column
+  ^ ": expected "
+  ^ err.expected
+
+-- | >>> toString ({ offset = 3, line = 1, column = 4, expected = "a value" } : ParseError)
+-- | "line 1, column 4: expected a value"
+instance instanceToStringParseError : ToString ParseError
+instanceToStringParseError = { toString = describe }
+
+-- (a byte that goes on a character begun before it, UTF-8's)
+isContinuation : Int -> Bool
+isContinuation b = 128 <= b && b < 192
+
+-- (the line and the column at byte `i` of `s`, counted from byte `j`, at
+-- the line `l` and the column `c`)
+positionFrom : String -> Int -> Int -> Int -> Int -> Pair Int Int
+positionFrom s i j l c =
+  if j >= i || j >= strLength s then MkPair l c
+  else if byteAt s j == 10 then positionFrom s i (j + 1) (l + 1) 1
+  else if isContinuation (byteAt s j) then positionFrom s i (j + 1) l c
+  else positionFrom s i (j + 1) l (c + 1)
+
+-- (a miss of the text `s`, as a parse error says it)
+located : String -> Miss -> ParseError
+located s (Expected i what) =
+  let at = positionFrom s i 0 1 1
+  in { offset = i, line = fst at, column = snd at, expected = what }
 
 isSpaceByte : Int -> Bool
 isSpaceByte c = c == 32 || c == 10 || c == 13 || c == 9
@@ -275,7 +321,7 @@ numberAfterDigits : String
                   -> Int
                   -> Int
                   -> Int
-                  -> Either ParseError (Pair Json Int)
+                  -> Either Miss (Pair Json Int)
 numberAfterDigits s start d p =
   let f : Int = if byteAt s p == 46 then digitsEnd s (p + 1) else p
   in let hasExponent : Bool = byteAt s f == 101 || byteAt s f == 69
@@ -290,7 +336,7 @@ numberAfterDigits s start d p =
   else Right (MkPair (JFloat (floatOfDecimal 64 s start end)) end)
 
 -- (a number at `i`, and where it ends)
-numberAt : String -> Int -> Either ParseError (Pair Json Int)
+numberAt : String -> Int -> Either Miss (Pair Json Int)
 numberAt s i =
   let d : Int = if byteAt s i == 45 then i + 1 else i
   in if byteAt s d == 48 then numberAfterDigits s i d (d + 1)
@@ -315,7 +361,7 @@ hex4 s i =
 -- (a `\u` escape's text, the escape's `u` at `i`: a surrogate pair's
 -- rune, the second's escape right after the first; one not in a pair,
 -- U+FFFD)
-unicodeEscape : String -> Int -> Either ParseError (Pair String Int)
+unicodeEscape : String -> Int -> Either Miss (Pair String Int)
 unicodeEscape s i =
   let c : Int = hex4 s (i + 1)
   in let lo : Int = hex4 s (i + 7)
@@ -333,7 +379,7 @@ unicodeEscape s i =
   else Right (MkPair (ofRunes [Rune.fromInt c]) (i + 5))
 
 -- (an escape's text, its letter at `i`, and where it ends)
-escapeText : String -> Int -> Either ParseError (Pair String Int)
+escapeText : String -> Int -> Either Miss (Pair String Int)
 escapeText s i =
   let c : Int = byteAt s i
   in if c == 34 then Right (MkPair "\"" (i + 1))
@@ -353,7 +399,7 @@ stringFrom : String
            -> Int
            -> Int
            -> String
-           -> Either ParseError (Pair String Int)
+           -> Either Miss (Pair String Int)
 stringFrom s start i acc =
   let c : Int = byteAt s i
   in if c == 34 then Right (MkPair (acc ^ strSlice s start i) (i + 1))
@@ -366,7 +412,7 @@ stringFrom s start i acc =
   else stringFrom s start (i + 1) acc
 
 -- (a string, its `"` at `i`, and where it ends)
-stringAt : String -> Int -> Either ParseError (Pair String Int)
+stringAt : String -> Int -> Either Miss (Pair String Int)
 stringAt s i =
   if byteAt s i == 34 then stringFrom s (i + 1) (i + 1) ""
   else Left (Expected i "a string")
@@ -383,14 +429,14 @@ data Step
   = Value Int (List Frame)
   | Got Json Int (List Frame)
   | Finished Json
-  | Failed ParseError
+  | Failed Miss
 
 -- (after a field's key, `k`, read up to `j`: its `:`, then its value
 -- inside the object, its fields so far `fs`)
 colonThen : String
           -> List (Pair String Json)
           -> List Frame
-          -> Either ParseError (Pair String Int)
+          -> Either Miss (Pair String Int)
           -> Step
 colonThen s fs frames (Right (MkPair k j)) =
   let c : Int = skipSpace s j
@@ -415,7 +461,7 @@ word s i w v frames =
 read : {a : Type}
      -> (a -> Json)
      -> List Frame
-     -> Either ParseError (Pair a Int)
+     -> Either Miss (Pair a Int)
      -> Step
 read make frames (Right (MkPair x j)) = Got (make x) j frames
 read make frames (Left e) = Failed e
@@ -462,7 +508,7 @@ steps : String -> Step -> Either ParseError Json
 steps s (Value i frames) = steps s (valueAt s (skipSpace s i) frames)
 steps s (Got v i frames) = steps s (gotAt s v (skipSpace s i) frames)
 steps s (Finished v) = Right v
-steps s (Failed e) = Left e
+steps s (Failed e) = Left (located s e)
 
 -- | The value a text is, white space around it; or where it is not one.
 -- | It reads as it goes, a value inside another kept on a list, not on
@@ -470,7 +516,9 @@ steps s (Failed e) = Left e
 -- | >>> parse " {\"a\": [1, -2.5e1, \"\\u00e9\\ud83d\\ude00\"], \"b\": null} "
 -- | Right (JObject [MkPair "a" (JArray [JInt 1, JFloat (-25.0), JString "é😀"]), MkPair "b" (JNull)])
 -- | >>> parse "[1, 2"
--- | Left (Expected 5 "',' or ']'")
+-- | Left ({ offset = 5, line = 1, column = 6, expected = "',' or ']'" })
+-- | >>> either describe (\j -> "parsed") (parse "{\n  \"é\": tru\n}")
+-- | "line 2, column 8: expected a value"
 parse : String -> Either ParseError Json
 parse s = steps s (Value 0 Nil)
 

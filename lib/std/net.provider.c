@@ -49,6 +49,8 @@ static V heff_provider_net(V p, V k) {
 typedef struct {
   uint32_t magic;
   int fd;              // (-1 once it is closed)
+  char *address;       // (where it is, as a failure names it: the host and
+                       //  port it was given, or an accepted one's other side)
 } NetSock;
 
 // (the socket closed, once: what waits on it told so, not polled
@@ -67,6 +69,7 @@ static void net_let_go(void *x) {
   NetSock *s = x;
   net_close(s);
   s->magic = 0;
+  free(s->address);
   free(s);
 }
 
@@ -137,13 +140,13 @@ static const char *net_gai_name(int e) {
   }
 }
 
-static uint32_t net_error_shape[3] = { LBL_code, LBL_name, LBL_message };
+static uint32_t net_error_shape[4] = { LBL_code, LBL_name, LBL_message, LBL_address };
 static uint32_t net_address_shape[2] = { LBL_host, LBL_port };
 
 // (a `NetError` of getaddrinfo's code `gai`, or where it is 0 or says
-// the system's, of errno `err`)
-static V net_error(int err, int gai) {
-  V f[3];
+// the system's, of errno `err`; of the address `address`)
+static V net_error(int err, int gai, const char *address) {
+  V f[4];
   if (gai && gai != EAI_SYSTEM) {
     f[0] = heff_int(gai);
     f[1] = heff_str_text(net_gai_name(gai));
@@ -156,23 +159,45 @@ static V net_error(int err, int gai) {
     f[1] = heff_str_text(name);
     f[2] = heff_str_text(strerror(err));
   }
-  return heff_rec(3, net_error_shape, f);
+  f[3] = heff_str_text(address ? address : "");
+  return heff_rec(4, net_error_shape, f);
 }
 
-static V net_left(int err, int gai) {
-  V x = net_error(err, gai);
+static V net_left(int err, int gai, const char *address) {
+  V x = net_error(err, gai, address);
   return heff_tag_n(TAG_Left, 1, &x);
 }
 
 static V net_right(V x) { return heff_tag_n(TAG_Right, 1, &x); }
 
-// (a socket made, the host's own: `Right` a foreign value, closed where
-// the program lets go of it)
-static V net_value(int fd) {
+// (a socket made, the host's own, at `address`, taken: `Right` a foreign
+// value, closed where the program lets go of it)
+static V net_value(int fd, char *address) {
   NetSock *s = heff_alloc(sizeof *s);
   s->magic = NET_MAGIC;
   s->fd = fd;
+  s->address = address;
   return net_right(heff_foreign(s, net_let_go));
+}
+
+// (a host and a port as a failure names them, as a URL has them -- an
+// IPv6 host in brackets: malloc'd)
+static char *net_named(const char *host, const char *port) {
+  size_t n = strlen(host) + strlen(port) + 4;
+  char *a = heff_alloc(n);
+  snprintf(a, n, strchr(host, ':') ? "[%s]:%s" : "%s:%s", host, port);
+  return a;
+}
+
+// (the other side of the connection `fd`, as a failure names it)
+static char *net_peer_named(int fd) {
+  struct sockaddr_storage ss;
+  socklen_t n = sizeof ss;
+  char host[1025], port[32];  // (NI_MAXHOST, NI_MAXSERV)
+  if (getpeername(fd, (struct sockaddr *)&ss, &n) < 0
+      || getnameinfo((struct sockaddr *)&ss, n, host, sizeof host, port, sizeof port, NI_NUMERICHOST | NI_NUMERICSERV) != 0)
+    return heff_strdup("");
+  return net_named(host, port);
 }
 
 // An operation, in steps
@@ -201,6 +226,8 @@ struct NetOp {
   V held;              // (what the op holds: its operation, and so the socket
                        //  it is given -- not let go of under it -- and a
                        //  write's bytes)
+  char *address;       // (its socket's, or the host and port it is given,
+                       //  as a failure names them: malloc'd)
 };
 
 // (an op, done within `ms` milliseconds from now where they are more
@@ -474,17 +501,18 @@ static int net_lookup(NetOp *o, V host, int64_t port, int passive) {
 static V net_address(struct sockaddr *sa, socklen_t n) {
   char host[1025], port[32];  // (NI_MAXHOST, NI_MAXSERV)
   int r = getnameinfo(sa, n, host, sizeof host, port, sizeof port, NI_NUMERICHOST | NI_NUMERICSERV);
-  if (r != 0) return net_left(errno, r);
+  if (r != 0) return net_left(errno, r, "");
   V f[2] = { heff_str_text(host), heff_int(strtol(port, NULL, 10)) };
   return net_right(heff_rec(2, net_address_shape, f));
 }
 
-// (where the socket `fd` is: the other side's, `peer`, or this side's)
-static V net_where(int fd, int peer) {
+// (where the socket `s` is: the other side's, `peer`, or this side's)
+static V net_where(NetSock *s, int peer) {
   struct sockaddr_storage ss;
   socklen_t n = sizeof ss;
+  int fd = s->fd;
   int r = peer ? getpeername(fd, (struct sockaddr *)&ss, &n) : getsockname(fd, (struct sockaddr *)&ss, &n);
-  if (r < 0) return net_left(errno, 0);
+  if (r < 0) return net_left(errno, 0, s->address);
   return net_address((struct sockaddr *)&ss, n);
 }
 
@@ -497,6 +525,7 @@ static void net_op_free(NetOp *o) {
   if (o->lookup) net_lookup_let_go(o->lookup);
   free(o->buf);
   if (o->held) heff_drop(o->held);
+  free(o->address);
   free(o);
 }
 
@@ -514,19 +543,19 @@ static V net_answer(HeffWait *w) {
       close(w->fd);
       w->fd = -1;
     }
-    if (o->gai && !w->err) r = net_left(err, o->gai);
-    else if (w->err) r = net_left(w->err, 0);
-    else if (w->fd >= 0) r = net_value(w->fd);
-    else r = net_left(err ? err : EADDRNOTAVAIL, 0);
+    if (o->gai && !w->err) r = net_left(err, o->gai, o->address);
+    else if (w->err) r = net_left(w->err, 0, o->address);
+    else if (w->fd >= 0) r = net_value(w->fd, heff_strdup(o->address));
+    else r = net_left(err ? err : EADDRNOTAVAIL, 0, o->address);
     break;
   case NET_ACCEPT:
-    r = !w->err && o->n >= 0 ? net_value((int)o->n) : net_left(err, 0);
+    r = !w->err && o->n >= 0 ? net_value((int)o->n, net_peer_named((int)o->n)) : net_left(err, 0, o->address);
     break;
   case NET_READ:
-    r = err ? net_left(err, 0) : net_right(heff_bytes_in(o->buf, o->done));
+    r = err ? net_left(err, 0, o->address) : net_right(heff_bytes_in(o->buf, o->done));
     break;
   default:
-    r = err ? net_left(err, 0) : net_right(NTAG(TAG_MkUnit));
+    r = err ? net_left(err, 0, o->address) : net_right(NTAG(TAG_MkUnit));
     break;
   }
   net_op_free(o);
@@ -554,6 +583,10 @@ static V net_go(NetOp *o, V f, V k) {
 // name resolved -- where a scheduler runs and it is no address, by a
 // thread of its own -- then `step` taken)
 static V net_made(NetOp *o, V host, int64_t port, int passive, int (*step)(HeffWait *), V f, V k) {
+  char *h = heff_cstr_text(host), number[24];
+  snprintf(number, sizeof number, "%lld", (long long)port);
+  o->address = net_named(h ? h : "", number);
+  free(h);
   o->then = step;
   o->w.step = step;
   int gai = net_resolve(o, host, port, passive, heff_group != 0);
@@ -575,10 +608,11 @@ static V net_made(NetOp *o, V host, int64_t port, int passive, int (*step)(HeffW
 // (a number given as an `Int`: -1 where it is beyond a word's)
 static int64_t net_int(V v) { return IS_INT(v) ? INT_OF(v) : -1; }
 
-// (an operation given a socket its `with` closed: `EBADF`)
-static V net_closed(V p, V f, V k) {
+// (an operation given a socket its `with` closed, `s`: `EBADF`)
+static V net_closed(V p, NetSock *s, V f, V k) {
+  V r = net_left(EBADF, 0, s->address);
   heff_drop(p);
-  V x = heff_answer(f, net_left(EBADF, 0));
+  V x = heff_answer(f, r);
   return heff_tail(k, 1, &x);
 }
 
@@ -612,8 +646,9 @@ static V heff_provider_net(V p, V k) {
   case TAG_Accept: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) return net_closed(p, f, k);
+    if (s->fd < 0) return net_closed(p, s, f, k);
     NetOp *o = net_op(NET_ACCEPT, 0);
+    o->address = heff_strdup(s->address);
     o->held = p;
     o->w.fd = s->fd;
     o->w.step = net_accept_step;
@@ -624,13 +659,14 @@ static V heff_provider_net(V p, V k) {
     int64_t n = net_int(heff_field(p, 1));
     int64_t ms = net_int(heff_field(p, 2));
     V f = heff_dup(heff_field(p, 3));
-    if (s->fd < 0) return net_closed(p, f, k);
+    if (s->fd < 0) return net_closed(p, s, f, k);
     if (n <= 0) {
       heff_drop(p);
       V x = heff_answer(f, net_right(heff_bytes_in("", 0)));
       return heff_tail(k, 1, &x);
     }
     NetOp *o = net_op(NET_READ, ms);
+    o->address = heff_strdup(s->address);
     o->n = n > NET_READ_MAX ? NET_READ_MAX : n;
     o->buf = heff_alloc((size_t)o->n);
     o->held = p;
@@ -642,8 +678,9 @@ static V heff_provider_net(V p, V k) {
     NetSock *s = net_sock(heff_field(p, 0));
     int64_t ms = net_int(heff_field(p, 2));
     V f = heff_dup(heff_field(p, 3));
-    if (s->fd < 0) return net_closed(p, f, k);
+    if (s->fd < 0) return net_closed(p, s, f, k);
     NetOp *o = net_op(NET_WRITE, ms);
+    o->address = heff_strdup(s->address);
     // (the bytes are `p`'s, held until they are written)
     o->data = heff_bytes_data(heff_field(p, 1), &o->n);
     o->held = p;
@@ -654,8 +691,8 @@ static V heff_provider_net(V p, V k) {
   case TAG_Shutdown: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) return net_closed(p, f, k);
-    V r = shutdown(s->fd, SHUT_WR) < 0 ? net_left(errno, 0) : net_right(NTAG(TAG_MkUnit));
+    if (s->fd < 0) return net_closed(p, s, f, k);
+    V r = shutdown(s->fd, SHUT_WR) < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
@@ -666,9 +703,9 @@ static V heff_provider_net(V p, V k) {
   case TAG_ReleaseListener: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) return net_closed(p, f, k);
+    if (s->fd < 0) return net_closed(p, s, f, k);
     if (heff_tag_of(p) == TAG_Release) shutdown(s->fd, SHUT_WR);
-    V r = net_close(s) < 0 ? net_left(errno, 0) : net_right(NTAG(TAG_MkUnit));
+    V r = net_close(s) < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
@@ -678,8 +715,8 @@ static V heff_provider_net(V p, V k) {
   case TAG_Local: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) return net_closed(p, f, k);
-    V r = net_where(s->fd, heff_tag_of(p) == TAG_Peer);
+    if (s->fd < 0) return net_closed(p, s, f, k);
+    V r = net_where(s, heff_tag_of(p) == TAG_Peer);
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);

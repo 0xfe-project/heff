@@ -282,14 +282,27 @@ static void heff_st_show(V l) {
 }
 
 static uint32_t heff_st_ran_shape[3] = { LBL_ended, LBL_out, LBL_err };
+static uint32_t heff_st_error_shape[4] = { LBL_code, LBL_name, LBL_message, LBL_path };
 
 // (how a command ended, as std.process's `Ended`: `how` 0 by itself,
-// its status `code`; 1 by the signal `code`; 3 not run)
-static V heff_st_ended(int how, int64_t code) {
+// its status `code`; 1 by the signal `code`; 3 not run, as the errno
+// `code` says, the command `name` -- a string, taken -- at fault)
+static V heff_st_ended(int how, int64_t code, V name) {
   V x = MK_INT(code);
-  if (how == 0) return heff_tag_n(TAG_Exited, 1, &x);
-  if (how == 1) return heff_tag_n(TAG_Signalled, 1, &x);
-  return NTAG(TAG_NotRun);
+  if (how == 0 || how == 1) {
+    heff_drop(name);
+    return heff_tag_n(how == 0 ? TAG_Exited : TAG_Signalled, 1, &x);
+  }
+  int err = code > 0 ? (int)code : EINVAL;
+  const char *e = heff_errno_name(err);
+  char number[24];
+  if (e[1] == '?') {
+    snprintf(number, sizeof number, "errno %d", err);
+    e = number;
+  }
+  V f[4] = { heff_int(err), heff_str_text(e), heff_str_text(strerror(err)), name };
+  x = heff_rec(4, heff_st_error_shape, f);
+  return heff_tag_n(TAG_NotRun, 1, &x);
 }
 
 #ifndef _WIN32
@@ -332,13 +345,14 @@ static void heff_st_packets(Buf *pb, V f) {
 extern char **environ;
 // (the command `as` run as std.process's `run` runs it, no input given
 // it, with `ZIG_PROGRESS` where `f` is given, its progress drawn by `f`
-// as it comes: how it ended, as heff_ended says, its status or signal
-// `*code`)
+// as it comes: how it ended, as heff_st_ended says, its status, signal
+// or errno `*code`)
 static int heff_st_capture(char **as, Buf *bo, Buf *be, V f, int64_t *code) {
   int po[2], pe[2], pp[2] = { -1, -1 };
-  if (pipe(po) != 0) return 3;
-  if (pipe(pe) != 0) { close(po[0]); close(po[1]); return 3; }
-  if (f && pipe(pp) != 0) { close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); return 3; }
+  *code = EINVAL;
+  if (pipe(po) != 0) { *code = errno; return 3; }
+  if (pipe(pe) != 0) { *code = errno; close(po[0]); close(po[1]); return 3; }
+  if (f && pipe(pp) != 0) { *code = errno; close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); return 3; }
   // (the environment, its ZIG_PROGRESS the pipe's end)
   int ne = 0;
   while (environ[ne]) ne++;
@@ -354,6 +368,7 @@ static int heff_st_capture(char **as, Buf *bo, Buf *be, V f, int64_t *code) {
   int closed[4] = { po[0], pe[0], null, pp[0] };
   pid_t pid = heff_exec_in_dir(as, env, null, po[1], pe[1], closed, f ? 4 : 3);
   int ok = pid > 0;
+  if (!ok) *code = errno ? errno : ENOENT;
   if (null >= 0) close(null);
   free(env);
   close(po[1]);
@@ -384,9 +399,10 @@ static int heff_st_capture(char **as, Buf *bo, Buf *be, V f, int64_t *code) {
   int st;
   pid_t w;
   while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
-  if (w != pid) return 3;
-  if (WIFEXITED(st)) { *code = WEXITSTATUS(st); return 0; }
-  if (WIFSIGNALED(st)) { *code = WTERMSIG(st); return 1; }
+  if (w == pid && WIFEXITED(st)) { *code = WEXITSTATUS(st); return 0; }
+  if (w == pid && WIFSIGNALED(st)) { *code = WTERMSIG(st); return 1; }
+  // (its end lost)
+  *code = ECHILD;
   return 3;
 }
 #endif
@@ -422,6 +438,7 @@ static V heff_provider_terminal(V p, V k) {
     }
     as[i] = NULL;
     V f = heff_dup(heff_field(p, 2)), r = heff_dup(heff_field(p, 3));
+    V name = heff_dup(heff_field(p, 0));
     heff_drop(p);
     Buf bo = {0}, be = {0};
     int64_t code = 0;
@@ -429,14 +446,16 @@ static V heff_provider_terminal(V p, V k) {
     // (no signals there: -1 its exit code where it could not be run)
     code = ok ? heff_capture(as, &bo, &be) : -1;
     int how = code == -1 ? 3 : 0;
+    if (how == 3) code = ok ? ENOENT : EINVAL;
 #else
+    code = EINVAL;
     int how = !ok ? 3 : heff_st_capture(as, &bo, &be, heff_st_terminal() && !heff_st_over ? f : 0, &code);
 #endif
     heff_drop(f);
     for (int64_t j = 0; j < i; j++) free(as[j]);
     free(as);
     V fs[3] = {
-      heff_st_ended(how, code),
+      heff_st_ended(how, code, name),
       heff_str_bytes(bo.s ? bo.s : "", (int64_t)bo.n),
       heff_str_bytes(be.s ? be.s : "", (int64_t)be.n),
     };
