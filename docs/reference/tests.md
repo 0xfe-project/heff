@@ -104,7 +104,7 @@ tool =
 An integration test can also run commands and use files: it gets
 `std.process` and `std.filesystem` besides `check`, and what they throw
 (`exception ProcessError`, `exception FileError`). A throw the test does
-not hear fails it.
+not hear fails it, saying the program or the path it was of.
 
 - `heff test` builds the file's tests into a C program, and runs each
   integration test in a process of its own.

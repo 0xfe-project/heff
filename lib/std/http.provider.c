@@ -186,10 +186,10 @@ static V http_headers(const char *s, size_t n, int64_t *status) {
 }
 
 static uint32_t http_response_shape[3] = { LBL_status, LBL_headers, LBL_body };
-static uint32_t http_error_shape[2] = { LBL_code, LBL_message };
+static uint32_t http_error_shape[3] = { LBL_code, LBL_message, LBL_url };
 
-// (an `Either HttpError Response` of what came back)
-static V http_answer(HttpGot *g) {
+// (an `Either HttpError Response` of what came back from `url`)
+static V http_answer(HttpGot *g, const char *url) {
   V r;
   if (g->ok) {
     int64_t status;
@@ -198,8 +198,9 @@ static V http_answer(HttpGot *g) {
     V x = heff_rec(3, http_response_shape, f);
     r = heff_tag_n(TAG_Right, 1, &x);
   } else {
-    V f[2] = { heff_int(g->code), heff_str_text_n(g->why.s ? g->why.s : "", (int64_t)g->why.n) };
-    V x = heff_rec(2, http_error_shape, f);
+    V f[3] = { heff_int(g->code), heff_str_text_n(g->why.s ? g->why.s : "", (int64_t)g->why.n),
+               heff_str_text(url ? url : "") };
+    V x = heff_rec(3, http_error_shape, f);
     r = heff_tag_n(TAG_Left, 1, &x);
   }
   free(g->head.s);
@@ -812,7 +813,7 @@ static void http_transfer_free(HttpTransfer *t) {
 static V http_transfer_answer(HeffWait *w) {
   HttpTransfer *t = (HttpTransfer *)w;
   http_ended(&t->g, t->result, t->err);
-  V r = http_answer(&t->g);
+  V r = http_answer(&t->g, t->q.url);
   http_transfer_free(t);
   return r;
 }
@@ -890,10 +891,11 @@ static V heff_provider_http(V p, V k) {
       g.head.n = g.body.n = g.why.n = 0;
       http_spawned(&q, &g);
     }
+    V r = http_answer(&g, q.url);
     http_req_free(&q);
     // (the request's body read: let go of)
     heff_drop(p);
-    V x = heff_answer(f, http_answer(&g));
+    V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
   default:

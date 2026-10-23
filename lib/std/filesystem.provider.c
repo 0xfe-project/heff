@@ -38,35 +38,163 @@
 #define heff_is_sep(c) ((c) == '/')
 #endif
 
-// (what an operation answers, `Either FileError a`: below, with the open
-// files')
-static V fs_left(int err);
-static V fs_right(V x);
-static V fs_done(void);
+// Why an operation failed
+// ---------------------------------------------------------------------
+//
+// A `FileError` names the path the failing call was given -- in a tree,
+// the one inside it -- as the program wrote it: the system is given a
+// path from this thread's directory (`heff_path_in_dir`), and a path it
+// was given under one the program wrote is said from that one again.
 
-// (the errno a failure left, or EIO where it left none)
-static int fs_errno(void) { return errno ? errno : EIO; }
+static uint32_t fs_error_shape[5] = { LBL_code, LBL_name, LBL_message, LBL_path, LBL_other };
 
-// (a file's text, or why it could not be read)
-static V heff_read_file(const char *path) {
+// (a `FileError` of errno `err`, of the path `path` and the other,
+// `other` -- 0, none -- both taken)
+static V fs_error(int err, V path, V other) {
+  const char *name = heff_errno_name(err);
+  char number[24];
+  if (name[1] == '?') {
+    snprintf(number, sizeof number, "errno %d", err);
+    name = number;
+  }
+  V f[5] = { heff_int(err), heff_str_text(name), heff_str_text(strerror(err)), path,
+             other ? heff_just(other) : heff_nothing };
+  return heff_rec(5, fs_error_shape, f);
+}
+
+static V fs_right(V x) { return heff_tag_n(TAG_Right, 1, &x); }
+
+// (`Right MkUnit`)
+static V fs_done(void) { return fs_right(NTAG(TAG_MkUnit)); }
+
+// (`Left` a `FileError` of errno `err`, of the path the C string `path`)
+static V fs_left_at(int err, const char *path) {
+  V x = fs_error(err, heff_str_bytes(path, (int64_t)strlen(path)), 0);
+  return heff_tag_n(TAG_Left, 1, &x);
+}
+
+// (`Left` EINVAL, of a path that is none, a string with a NUL in it:
+// `s`, not taken)
+static V fs_invalid(V s) {
+  V x = fs_error(EINVAL, heff_dup(s), 0);
+  return heff_tag_n(TAG_Left, 1, &x);
+}
+
+// (a path as the program wrote it, `given`, and as the system is given
+// it, `full`: both malloc'd, NULL where it has a NUL in it)
+typedef struct {
+  char *given;
+  char *full;
+} FsPath;
+
+// (the path `s` as the system is to be given it: whether it is one)
+static int fs_path(FsPath *p, V s) {
+  p->given = heff_cstr(s);
+  p->full = p->given ? heff_path_in_dir(heff_strdup(p->given)) : NULL;
+  return p->full != NULL;
+}
+
+static void fs_path_free(FsPath *p) {
+  free(p->given);
+  free(p->full);
+}
+
+// (`n` bytes at `a` and the C string `b`, as a string)
+static V fs_joined(const char *a, size_t n, const char *b) {
+  size_t m = strlen(b);
+  char *s = heff_alloc(n + m + 1);
+  memcpy(s, a, n);
+  memcpy(s + n, b, m + 1);
+  V v = heff_str_bytes(s, (int64_t)(n + m));
+  free(s);
+  return v;
+}
+
+// (the path `at`, one the system was given, as the program wrote it:
+// one of the paths `ps` or under it, from that one as written; one above
+// it, where what is between is written the same; else as it is)
+static V fs_named(const char *at, const FsPath *ps, int n) {
+  size_t k = strlen(at);
+  for (int i = 0; i < n; i++) {
+    const char *full = ps[i].full, *given = ps[i].given;
+    if (!full) continue;
+    size_t f = strlen(full), g = strlen(given);
+    if (k >= f && strncmp(at, full, f) == 0 && (at[f] == 0 || heff_is_sep(at[f]))) {
+      // (under it: `given`, then what follows)
+      const char *rest = at + f;
+      if (*rest && g > 0 && heff_is_sep(given[g - 1])) rest++;
+      return fs_joined(given, g, rest);
+    }
+    if (k < f && strncmp(at, full, k) == 0 && heff_is_sep(full[k])) {
+      // (above it: `given`, less what follows `at` in `full`)
+      size_t tail = f - k;
+      if (g > tail && strcmp(given + g - tail, full + k) == 0) return fs_joined(given, g - tail, "");
+    }
+  }
+  return heff_str_bytes(at, (int64_t)k);
+}
+
+// (why an operation failed, as it is found: the errno, the path the
+// failing call was given and, where it took two, the other -- the
+// system's, malloc'd)
+typedef struct {
+  int err;
+  char *at, *other;
+} FsWhy;
+
+// (a failure of the call given `at`, and `other` (NULL, none), with the
+// errno `err` -- 0: errno's, or EIO where it left none -- kept, unless
+// one was before, the innermost of a tree's: 0)
+static int fs_fail2(FsWhy *w, const char *at, const char *other, int err) {
+  if (w->at) return 0;
+  w->err = err ? err : errno ? errno : EIO;
+  w->at = heff_strdup(at);
+  w->other = other ? heff_strdup(other) : NULL;
+  return 0;
+}
+
+// (a failure of the call given `at`, errno's: 0)
+static int fs_fail(FsWhy *w, const char *at) { return fs_fail2(w, at, NULL, 0); }
+
+// (`Left` why, its paths as the program wrote them, of the paths `ps`:
+// `w` let go of)
+static V fs_failed(FsWhy *w, const FsPath *ps, int n) {
+  V at = fs_named(w->at ? w->at : "", ps, n);
+  V other = w->other ? fs_named(w->other, ps, n) : 0;
+  V x = fs_error(w->err ? w->err : EIO, at, other);
+  free(w->at);
+  free(w->other);
+  w->at = w->other = NULL;
+  return heff_tag_n(TAG_Left, 1, &x);
+}
+
+// Whole files, directories and trees
+// ---------------------------------------------------------------------
+//
+// Each answers whether it was done; where it was not, why is in its
+// `FsWhy`.
+
+// (a file's text, at `*out`)
+static int heff_read_file(const char *path, V *out, FsWhy *w) {
   errno = 0;
   FILE *f = fopen(path, "rb");
-  if (!f) return fs_left(fs_errno());
+  if (!f) return fs_fail(w, path);
   // (a regular file read straight into the string, as long as it says)
   struct stat st;
   int64_t size =
     fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) ? (int64_t)st.st_size : 0;
-  V s = heff_str_read(f, size);
-  int bad = s ? 0 : fs_errno();
+  *out = heff_str_read(f, size);
+  if (!*out) fs_fail(w, path);
   fclose(f);
-  return bad ? fs_left(bad) : fs_right(s);
+  return *out != 0;
 }
 
-static int heff_write_file(const char *path, V s) {
+static int heff_write_file(const char *path, V s, FsWhy *w) {
+  errno = 0;
   FILE *f = fopen(path, "wb");
-  if (!f) return 0;
+  if (!f) return fs_fail(w, path);
   heff_put(f, s);
-  return fclose(f) == 0;
+  return fclose(f) == 0 || fs_fail(w, path);
 }
 
 // (a directory is at `path`, links followed)
@@ -76,8 +204,8 @@ static int heff_is_dir(const char *path) {
 }
 
 // (a directory and those it is in: whether a directory is there -- a
-// file there is none)
-static int heff_mkdir_p(char *path) {
+// file there is none, EEXIST)
+static int heff_mkdir_p(char *path, FsWhy *w) {
   for (char *c = path + 1; *c; c++)
     if (heff_is_sep(*c)) {
       char sep = *c;
@@ -85,17 +213,22 @@ static int heff_mkdir_p(char *path) {
       // (a drive, `C:`, is there already)
       int drive = c[-1] == ':';
       int ok = drive || heff_mkdir(path) == 0 || errno == EEXIST;
+      if (!ok) fs_fail(w, path);
       *c = sep;
       if (!ok) return 0;
     }
-  return heff_mkdir(path) == 0 || (errno == EEXIST && heff_is_dir(path));
+  errno = 0;
+  if (heff_mkdir(path) == 0) return 1;
+  int e = errno;
+  if (e == EEXIST && heff_is_dir(path)) return 1;
+  return fs_fail2(w, path, NULL, e);
 }
 
-// (the names in a directory, sorted, or why it could not be read)
-static V heff_read_dir(const char *path) {
+// (the names in a directory, sorted, at `*out`)
+static int heff_read_dir(const char *path, V *out, FsWhy *w) {
   errno = 0;
   DIR *d = opendir(path);
-  if (!d) return fs_left(fs_errno());
+  if (!d) return fs_fail(w, path);
   int64_t n = 0, cap = 64;
   char **ns = heff_alloc(cap * sizeof(char *));
   struct dirent *e;
@@ -112,234 +245,212 @@ static V heff_read_dir(const char *path) {
   }
   closedir(d);
   qsort(ns, n, sizeof(char *), heff_cmp_cstr);
-  V l = heff_strs_bytes(ns, n);
+  *out = heff_strs_bytes(ns, n);
   for (int64_t i = 0; i < n; i++) free(ns[i]);
   free(ns);
-  return fs_right(l);
+  return 1;
 }
 
 // (every file and directory under `p`, its mode's write bits off, or on:
-// a directory is made writable before what it holds, read-only after)
-static int heff_chmod_all(const char *p, int writable) {
+// a directory is made writable before what it holds, read-only after.
+// -1 where nothing is at `p`)
+static int heff_chmod_all(const char *p, int writable, FsWhy *w) {
   struct stat st;
-  if (lstat(p, &st) != 0) return errno == ENOENT ? -1 : 0;
+  if (lstat(p, &st) != 0) return errno == ENOENT ? -1 : fs_fail(w, p);
   if (S_ISLNK(st.st_mode)) return 1;
   mode_t mode = writable ? (st.st_mode | 0200) : (st.st_mode & ~0222);
   mode &= 07777;
   if (S_ISDIR(st.st_mode)) {
-    if (writable && chmod(p, mode) != 0) return 0;
+    if (writable && chmod(p, mode) != 0) return fs_fail(w, p);
     DIR *d = opendir(p);
-    if (!d) return 0;
+    if (!d) return fs_fail(w, p);
     struct dirent *e;
     int ok = 1;
     while (ok && (e = readdir(d))) {
       if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
       char *q = heff_join(p, e->d_name);
-      ok = heff_chmod_all(q, writable) != 0;
+      ok = heff_chmod_all(q, writable, w) != 0;
       free(q);
     }
     closedir(d);
     if (!ok) return 0;
-    if (!writable && chmod(p, mode) != 0) return 0;
+    if (!writable && chmod(p, mode) != 0) return fs_fail(w, p);
     return 1;
   }
-  return chmod(p, mode) == 0;
+  return chmod(p, mode) == 0 || fs_fail(w, p);
 }
 
 // (a file, or a directory and all it holds; nothing there is no failure)
-static int heff_remove_all(const char *p) {
+static int heff_remove_all(const char *p, FsWhy *w) {
   struct stat st;
-  if (lstat(p, &st) != 0) return errno == ENOENT;
-  if (!S_ISDIR(st.st_mode)) return unlink(p) == 0;
+  if (lstat(p, &st) != 0) return errno == ENOENT || fs_fail(w, p);
+  if (!S_ISDIR(st.st_mode)) return unlink(p) == 0 || fs_fail(w, p);
   DIR *d = opendir(p);
-  if (!d) return 0;
+  if (!d) return fs_fail(w, p);
   struct dirent *e;
   int ok = 1;
   while (ok && (e = readdir(d))) {
     if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
     char *q = heff_join(p, e->d_name);
-    ok = heff_remove_all(q);
+    ok = heff_remove_all(q, w);
     free(q);
   }
   closedir(d);
-  return ok && rmdir(p) == 0;
+  return ok && (rmdir(p) == 0 || fs_fail(w, p));
 }
 
 // (a file's bytes copied to `q`, which is given `mode`)
-static int heff_copy_file(const char *p, const char *q, mode_t mode) {
+static int heff_copy_file(const char *p, const char *q, mode_t mode, FsWhy *w) {
   FILE *f = fopen(p, "rb");
-  if (!f) return 0;
+  if (!f) return fs_fail(w, p);
   FILE *g = fopen(q, "wb");
   if (!g) {
+    int e = errno;
     fclose(f);
-    return 0;
+    return fs_fail2(w, q, NULL, e);
   }
   char *chunk = heff_alloc(65536);
   size_t got;
-  int ok = 1;
-  while (ok && (got = fread(chunk, 1, 65536, f)) > 0) ok = fwrite(chunk, 1, got, g) == got;
-  ok = ok && !ferror(f);
+  const char *bad = NULL;
+  int e = 0;
+  while (!bad && (got = fread(chunk, 1, 65536, f)) > 0)
+    if (fwrite(chunk, 1, got, g) != got) {
+      e = errno;
+      bad = q;
+    }
+  if (!bad && ferror(f)) {
+    e = errno;
+    bad = p;
+  }
   free(chunk);
   fclose(f);
-  ok = fclose(g) == 0 && ok;
-  return ok && chmod(q, mode) == 0;
+  if (fclose(g) != 0 && !bad) {
+    e = errno;
+    bad = q;
+  }
+  if (!bad && chmod(q, mode) != 0) {
+    e = errno;
+    bad = q;
+  }
+  return bad ? fs_fail2(w, bad, NULL, e) : 1;
 }
 
 // (a file, or a directory and all it holds, copied to `q`: links
 // followed, modes kept -- a directory's once what it holds is in it)
-static int heff_copy_all(const char *p, const char *q) {
+static int heff_copy_all(const char *p, const char *q, FsWhy *w) {
   struct stat st;
-  if (stat(p, &st) != 0) return 0;
+  if (stat(p, &st) != 0) return fs_fail(w, p);
   mode_t mode = st.st_mode & 07777;
-  if (!S_ISDIR(st.st_mode)) return heff_copy_file(p, q, mode);
-  if (heff_mkdir(q) != 0) return 0;
+  if (!S_ISDIR(st.st_mode)) return heff_copy_file(p, q, mode, w);
+  if (heff_mkdir(q) != 0) return fs_fail(w, q);
   DIR *d = opendir(p);
-  if (!d) return 0;
+  if (!d) return fs_fail(w, p);
   struct dirent *e;
   int ok = 1;
   while (ok && (e = readdir(d))) {
     if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
     char *a = heff_join(p, e->d_name);
     char *b = heff_join(q, e->d_name);
-    ok = heff_copy_all(a, b);
+    ok = heff_copy_all(a, b, w);
     free(a);
     free(b);
   }
   closedir(d);
-  return ok && chmod(q, mode) == 0;
+  return ok && (chmod(q, mode) == 0 || fs_fail(w, q));
 }
 
-// (nothing is at `p`: no file, directory or link)
-static int heff_nothing_at(const char *p) {
+// (whether something is at `p`, a file, a directory or a link: 1; 0,
+// nothing; -1, the system cannot say, why in `w`)
+static int heff_something_at(const char *p, FsWhy *w) {
   struct stat st;
-  return lstat(p, &st) != 0 && errno == ENOENT;
+  if (lstat(p, &st) == 0) return 1;
+  if (errno == ENOENT) return 0;
+  fs_fail(w, p);
+  return -1;
 }
 
-// (what an operation answers where its path is none, a string with a NUL
-// in it: EINVAL)
-static V heff_fs_failed(V p) {
-  int tag = heff_tag_of(p);
-  int at = tag == TAG_WriteFile || tag == TAG_Copy || tag == TAG_Move || tag == TAG_Replace ? 2 : 1;
-  V f = heff_dup(heff_field(p, at));
-  heff_drop(p);
-  return heff_answer(f, fs_left(EINVAL));
-}
-
-// (done, or the errno it failed with: `err` where it is known, else what
-// errno says)
-static V fs_did(int ok, int err) {
-  return ok ? fs_done() : fs_left(err ? err : fs_errno());
+// (a move or a rename's: `to` free, why not in `w`)
+static int heff_free_at(const char *to, FsWhy *w) {
+  int there = heff_something_at(to, w);
+  if (there > 0) fs_fail2(w, to, NULL, EEXIST);
+  return there == 0;
 }
 
 // (an operation of whole files and paths: answered by an `Either
 // FileError a`)
 static V heff_fs_whole(V p, V k) {
-  char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
-  V x;
-  if (!path) {
-    x = heff_fs_failed(p);
-    return heff_tail(k, 1, &x);
-  }
-  switch (heff_tag_of(p)) {
-  case TAG_ReadFile: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    x = heff_answer(f, heff_read_file(path));
-    break;
-  }
-  case TAG_WriteFile: {
-    errno = 0;
-    int ok = heff_write_file(path, heff_field(p, 1));
-    V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
-    x = heff_answer(f, fs_did(ok, 0));
-    break;
-  }
-  case TAG_MakeDirectory: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    errno = 0;
-    int ok = heff_mkdir_p(path);
-    x = heff_answer(f, fs_did(ok, ok || errno ? 0 : ENOTDIR));
-    break;
-  }
-  case TAG_ReadDirectory: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    x = heff_answer(f, heff_read_dir(path));
-    break;
-  }
-  case TAG_Remove: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    errno = 0;
-    int ok = heff_chmod_all(path, 1) != 0 && heff_remove_all(path);
-    x = heff_answer(f, fs_did(ok, 0));
-    break;
-  }
-  case TAG_ReadOnly: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    errno = 0;
-    int r = heff_chmod_all(path, 0);
-    x = heff_answer(f, fs_did(r == 1, r == -1 ? ENOENT : 0));
-    break;
-  }
-  case TAG_Writable: {
-    V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    errno = 0;
-    int r = heff_chmod_all(path, 1);
-    x = heff_answer(f, fs_did(r == 1, r == -1 ? ENOENT : 0));
-    break;
-  }
-  case TAG_Copy: {
-    char *to = heff_path_in_dir(heff_cstr(heff_field(p, 1)));
-    V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
-    int free_ = to && heff_nothing_at(to);
-    errno = 0;
-    int ok = free_ && heff_copy_all(path, to);
-    x = heff_answer(f, fs_did(ok, !to ? EINVAL : !free_ ? EEXIST : 0));
-    free(to);
-    break;
-  }
-  case TAG_Move: {
-    char *to = heff_path_in_dir(heff_cstr(heff_field(p, 1)));
-    V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
-    int free_ = to && heff_nothing_at(to);
-    errno = 0;
-    int ok = free_ && rename(path, to) == 0;
-    x = heff_answer(f, fs_did(ok, !to ? EINVAL : !free_ ? EEXIST : 0));
-    free(to);
-    break;
-  }
-  case TAG_Replace: {
-    char *to = heff_path_in_dir(heff_cstr(heff_field(p, 1)));
-    V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
-    // (rename(2) puts a file in place of another at once; Windows' does
-    // not over one there, MoveFileEx does)
-    errno = 0;
+  int tag = heff_tag_of(p);
+  int two = tag == TAG_Copy || tag == TAG_Move || tag == TAG_Replace;
+  V f = heff_dup(heff_field(p, tag == TAG_WriteFile || two ? 2 : 1));
+  FsPath ps[2] = { { NULL, NULL }, { NULL, NULL } };
+  FsWhy why = { 0, NULL, NULL };
+  V r = 0;
+  if (!fs_path(&ps[0], heff_field(p, 0))) r = fs_invalid(heff_field(p, 0));
+  else if (two && !fs_path(&ps[1], heff_field(p, 1))) r = fs_invalid(heff_field(p, 1));
+  else {
+    char *path = ps[0].full, *to = ps[1].full;
+    V got;
+    switch (tag) {
+    case TAG_ReadFile:
+      if (heff_read_file(path, &got, &why)) r = fs_right(got);
+      break;
+    case TAG_WriteFile:
+      if (heff_write_file(path, heff_field(p, 1), &why)) r = fs_done();
+      break;
+    case TAG_MakeDirectory:
+      if (heff_mkdir_p(path, &why)) r = fs_done();
+      break;
+    case TAG_ReadDirectory:
+      if (heff_read_dir(path, &got, &why)) r = fs_right(got);
+      break;
+    case TAG_Remove:
+      errno = 0;
+      if (heff_chmod_all(path, 1, &why) != 0 && heff_remove_all(path, &why)) r = fs_done();
+      break;
+    case TAG_ReadOnly:
+    case TAG_Writable: {
+      errno = 0;
+      int c = heff_chmod_all(path, tag == TAG_Writable, &why);
+      if (c == 1) r = fs_done();
+      else if (c == -1) fs_fail2(&why, path, NULL, ENOENT);
+      break;
+    }
+    case TAG_Copy:
+      errno = 0;
+      if (heff_free_at(to, &why) && heff_copy_all(path, to, &why)) r = fs_done();
+      break;
+    case TAG_Move:
+      if (heff_free_at(to, &why)) {
+        errno = 0;
+        if (rename(path, to) == 0) r = fs_done();
+        else fs_fail2(&why, path, to, 0);
+      }
+      break;
+    case TAG_Replace:
+      // (rename(2) puts a file in place of another at once; Windows' does
+      // not over one there, MoveFileEx does)
+      errno = 0;
 #ifdef _WIN32
-    int ok = to && MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0;
+      if (MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0) r = fs_done();
 #else
-    int ok = to && rename(path, to) == 0;
+      if (rename(path, to) == 0) r = fs_done();
 #endif
-    x = heff_answer(f, fs_did(ok, !to ? EINVAL : 0));
-    free(to);
-    break;
+      else fs_fail2(&why, path, to, 0);
+      break;
+    default:
+      heff_fail("not an operation of filesystem");
+      return 0;
+    }
+    if (!r) r = fs_failed(&why, ps, two ? 2 : 1);
   }
-  default:
-    heff_fail("not an operation of filesystem");
-    return 0;
-  }
-  free(path);
+  heff_drop(p);
+  fs_path_free(&ps[0]);
+  fs_path_free(&ps[1]);
+  V x = heff_answer(f, r);
   return heff_tail(k, 1, &x);
 }
 
-// Errors
+// What a file is
 // ---------------------------------------------------------------------
 
 #ifndef EWOULDBLOCK
@@ -360,27 +471,10 @@ static V heff_fs_whole(V p, V k) {
 #endif
 #endif
 
-static uint32_t fs_error_shape[3] = { LBL_code, LBL_name, LBL_message };
 static uint32_t fs_status_shape[4] = { LBL_kind, LBL_size, LBL_modified, LBL_mode };
 
-// (a `FileError` of errno `err`: the runtime's errno record, whose shape
-// a `FileError` is)
-static V fs_error(int err) { return heff_errno(err, fs_error_shape); }
-
-static V fs_left(int err) {
-  V x = fs_error(err);
-  return heff_tag_n(TAG_Left, 1, &x);
-}
-
-static V fs_right(V x) { return heff_tag_n(TAG_Right, 1, &x); }
-
-// (`Right MkUnit`)
-static V fs_done(void) { return fs_right(NTAG(TAG_MkUnit)); }
-
-// (`Right` what the system says of a file -- `r`, stat's answer, 0 -- or
-// `Left` why not)
-static V fs_status(int r, const struct stat *st) {
-  if (r != 0) return fs_left(errno);
+// (`Right` what the system says of a file, stat's `st`)
+static V fs_status(const struct stat *st) {
   int kind = S_ISREG(st->st_mode) ? TAG_Regular
            : S_ISDIR(st->st_mode) ? TAG_Directory
            : S_ISLNK(st->st_mode) ? TAG_Link
@@ -427,6 +521,8 @@ typedef struct {
   uint8_t *buf;      // (read ahead: what is not yet taken, from `at` to
   size_t cap, at, end;  //  `end`)
   uint64_t taken;    // (how many times something was taken from it)
+  char *path;        // (the path it was opened by, as the program wrote
+                     //  it, a failure's; a standard stream's, `<stdin>`)
 } FsFile;
 
 // (the standard streams' files, once asked for: one each, kept, so
@@ -436,6 +532,7 @@ static FsFile *fs_standard[3];
 static void fs_unref(FsFile *h) {
   if (--h->refs > 0) return;
   free(h->buf);
+  free(h->path);
   h->magic = 0;
   free(h);
 }
@@ -451,11 +548,13 @@ static void fs_let_go(void *x) {
   fs_unref(h);
 }
 
-static FsFile *fs_new(int fd, int standard) {
+// (the file of `fd`, opened by `path`, taken)
+static FsFile *fs_new(int fd, int standard, char *path) {
   FsFile *h = heff_alloc(sizeof *h);
   memset(h, 0, sizeof *h);
   h->magic = FS_MAGIC;
   h->fd = fd;
+  h->path = path;
   h->refs = standard >= 0;  // (a standard stream's own: kept)
   h->standard = standard;
   struct stat st;
@@ -482,6 +581,9 @@ static FsFile *fs_file(V v) {
 }
 
 static size_t fs_buffered(FsFile *h) { return h->end - h->at; }
+
+// (`Left` why an operation of the file failed, errno `err`)
+static V fs_left_file(FsFile *h, int err) { return fs_left_at(err, h->path); }
 
 // (room for `n` more bytes after what is read ahead: what is taken let
 // go of, the buffer grown)
@@ -769,7 +871,7 @@ static V fs_answer(HeffWait *w) {
   // EBADF -- or why the op did)
   int err = w->err ? w->err : o->err;
   V r;
-  if (err) r = fs_left(err);
+  if (err) r = fs_left_file(o->h, err);
   else {
     r = o->result;
     o->result = 0;
@@ -801,7 +903,7 @@ static V fs_write(FsFile *h, const uint8_t *data, int64_t len, V held, char *own
     int e = errno;
     if (held) heff_drop(held);
     free(owned);
-    V x = heff_answer(f, fs_left(e));
+    V x = heff_answer(f, fs_left_file(h, e));
     return heff_tail(k, 1, &x);
   }
   FsOp *o = fs_op(FS_WRITE, h);
@@ -857,7 +959,7 @@ static void fs_letters(char *out) {
 // `prefix` and six letters: its path)
 static V fs_temp(V prefix, int file) {
   char *pre = heff_cstr(prefix);
-  if (!pre) return fs_left(EINVAL);
+  if (!pre) return fs_invalid(prefix);
   char root[4096];
   fs_temp_root(root, sizeof root);
   size_t n = strlen(root) + strlen(pre) + 9;
@@ -878,30 +980,32 @@ static V fs_temp(V prefix, int file) {
       int made = mkdir(path, 0700) == 0;
 #endif
       if (made) r = fs_right(heff_str_bytes(path, (int64_t)strlen(path)));
-      else if (errno != EEXIST) r = fs_left(errno);
+      else if (errno != EEXIST) r = fs_left_at(errno, path);
     } else {
       int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_BINARY, 0600);
       if (fd >= 0) {
         close(fd);
         r = fs_right(heff_str_bytes(path, (int64_t)strlen(path)));
-      } else if (errno != EEXIST) r = fs_left(errno);
+      } else if (errno != EEXIST) r = fs_left_at(errno, path);
     }
   }
+  if (!r) r = fs_left_at(EEXIST, path);
   free(pre);
   free(path);
-  return r ? r : fs_left(EEXIST);
+  return r;
 }
 
-// (`path` with its links resolved: `Right` it, or `Left` why not)
-static V fs_real_path(const char *path) {
+// (`p` with its links resolved: `Right` it, or `Left` why not)
+static V fs_real_path(const FsPath *p) {
+  const char *path = p->full;
 #ifdef _WIN32
   struct stat st;
-  if (stat(path, &st) != 0) return fs_left(errno);
+  if (stat(path, &st) != 0) return fs_left_at(errno, p->given);
   char *r = _fullpath(NULL, path, 0);
 #else
   char *r = realpath(path, NULL);
 #endif
-  if (!r) return fs_left(errno);
+  if (!r) return fs_left_at(errno, p->given);
   V s = heff_str_bytes(r, (int64_t)strlen(r));
   free(r);
   return fs_right(s);
@@ -910,19 +1014,18 @@ static V fs_real_path(const char *path) {
 // (what the link at `path` says, as it was written: `Right` it, or
 // `Left` why not -- not a link, EINVAL; on Windows, where links are not
 // seen, EINVAL)
-static V fs_read_link(const char *path) {
+static V fs_read_link(const FsPath *p) {
 #ifdef _WIN32
-  (void)path;
-  return fs_left(EINVAL);
+  return fs_left_at(EINVAL, p->given);
 #else
   size_t cap = 256;
   for (;;) {
     char *b = heff_alloc(cap);
-    ssize_t n = readlink(path, b, cap);
+    ssize_t n = readlink(p->full, b, cap);
     if (n < 0) {
       int err = errno;
       free(b);
-      return fs_left(err);
+      return fs_left_at(err, p->given);
     }
     if ((size_t)n < cap) {
       V s = heff_str_bytes(b, (int64_t)n);
@@ -935,19 +1038,21 @@ static V fs_read_link(const char *path) {
 #endif
 }
 
-// (`path`'s mode set: `Right MkUnit`, or `Left` why not)
-static V fs_set_mode(const char *path, int64_t mode) {
+// (`p`'s mode set: `Right MkUnit`, or `Left` why not)
+static V fs_set_mode(const FsPath *p, int64_t mode) {
+  const char *path = p->full;
 #ifdef _WIN32
   int r = chmod(path, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD);
 #else
   int r = chmod(path, (mode_t)(mode & 07777));
 #endif
-  return r == 0 ? fs_done() : fs_left(errno);
+  return r == 0 ? fs_done() : fs_left_at(errno, p->given);
 }
 
-// (`path` opened as `OpenPath` says: `Right` the file, the host's own;
+// (`p` opened as `OpenPath` says: `Right` the file, the host's own;
 // or `Left` why not -- a directory's, EISDIR)
-static V fs_open(const char *path, int64_t access, int create, int truncate, int exclusive, int64_t mode) {
+static V fs_open(const FsPath *p, int64_t access, int create, int truncate, int exclusive, int64_t mode) {
+  const char *path = p->full;
   int flags = access == 0 ? O_RDONLY : access == 1 ? O_WRONLY : access == 2 ? (O_WRONLY | O_APPEND) : O_RDWR;
   if (create) flags |= O_CREAT;
   if (truncate) flags |= O_TRUNC;
@@ -955,13 +1060,13 @@ static V fs_open(const char *path, int64_t access, int create, int truncate, int
   flags |= O_CLOEXEC | O_BINARY;
   int fd;
   do fd = open(path, flags, (int)(mode & 07777)); while (fd < 0 && errno == EINTR);
-  if (fd < 0) return fs_left(errno);
+  if (fd < 0) return fs_left_at(errno, p->given);
   struct stat st;
   if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
     close(fd);
-    return fs_left(EISDIR);
+    return fs_left_at(EISDIR, p->given);
   }
-  return fs_right(fs_value(fs_new(fd, -1)));
+  return fs_right(fs_value(fs_new(fd, -1, heff_strdup(p->given))));
 }
 
 // (a file closed, but a standard stream: what waits on it told so, not
@@ -994,35 +1099,37 @@ static V fs_answered(V p, int at, V x, V k) {
 static V heff_provider_filesystem(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_PathStatus: {
-    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
+    FsPath path;
     int follow = heff_field(p, 1) == NTAG(TAG_True);
     V r;
-    if (!path) r = fs_left(EINVAL);
+    if (!fs_path(&path, heff_field(p, 0))) r = fs_invalid(heff_field(p, 0));
     else {
       struct stat st;
-      int s = follow ? stat(path, &st) : lstat(path, &st);
-      r = fs_status(s, &st);
-      free(path);
+      int s = follow ? stat(path.full, &st) : lstat(path.full, &st);
+      r = s == 0 ? fs_status(&st) : fs_left_at(errno, path.given);
     }
+    fs_path_free(&path);
     return fs_answered(p, 2, r, k);
   }
   case TAG_SetMode: {
-    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
+    FsPath path;
     int64_t mode;
-    V r = !path || !fs_int(heff_field(p, 1), &mode) ? fs_left(EINVAL) : fs_set_mode(path, mode);
-    free(path);
+    V r = !fs_path(&path, heff_field(p, 0)) ? fs_invalid(heff_field(p, 0))
+        : !fs_int(heff_field(p, 1), &mode) ? fs_left_at(EINVAL, path.given)
+        : fs_set_mode(&path, mode);
+    fs_path_free(&path);
     return fs_answered(p, 2, r, k);
   }
   case TAG_RealPath: {
-    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
-    V r = path ? fs_real_path(path) : fs_left(EINVAL);
-    free(path);
+    FsPath path;
+    V r = fs_path(&path, heff_field(p, 0)) ? fs_real_path(&path) : fs_invalid(heff_field(p, 0));
+    fs_path_free(&path);
     return fs_answered(p, 1, r, k);
   }
   case TAG_ReadLink: {
-    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
-    V r = path ? fs_read_link(path) : fs_left(EINVAL);
-    free(path);
+    FsPath path;
+    V r = fs_path(&path, heff_field(p, 0)) ? fs_read_link(&path) : fs_invalid(heff_field(p, 0));
+    fs_path_free(&path);
     return fs_answered(p, 1, r, k);
   }
   case TAG_TemporaryDirectory:
@@ -1030,19 +1137,23 @@ static V heff_provider_filesystem(V p, V k) {
   case TAG_TemporaryFile:
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 1), k);
   case TAG_OpenPath: {
-    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
+    FsPath path;
     int64_t access, mode;
-    int ok = path && fs_int(heff_field(p, 1), &access) && fs_int(heff_field(p, 5), &mode);
-    V r = !ok ? fs_left(EINVAL)
-              : fs_open(path, access, heff_field(p, 2) == NTAG(TAG_True), heff_field(p, 3) == NTAG(TAG_True),
-                        heff_field(p, 4) == NTAG(TAG_True), mode);
-    free(path);
+    V r;
+    if (!fs_path(&path, heff_field(p, 0))) r = fs_invalid(heff_field(p, 0));
+    else if (!fs_int(heff_field(p, 1), &access) || !fs_int(heff_field(p, 5), &mode))
+      r = fs_left_at(EINVAL, path.given);
+    else
+      r = fs_open(&path, access, heff_field(p, 2) == NTAG(TAG_True), heff_field(p, 3) == NTAG(TAG_True),
+                  heff_field(p, 4) == NTAG(TAG_True), mode);
+    fs_path_free(&path);
     return fs_answered(p, 6, r, k);
   }
   case TAG_Standard: {
+    static const char *const names[3] = { "<stdin>", "<stdout>", "<stderr>" };
     int64_t i = INT_OF(heff_field(p, 0));
     if (i < 0 || i > 2) heff_fail("std.filesystem: no such standard stream");
-    if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i);
+    if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i, heff_strdup(names[i]));
     return fs_answered(p, 1, fs_value(fs_standard[i]), k);
   }
   // (an operation of an open file: one that waits keeps `p`, and so the
@@ -1050,7 +1161,7 @@ static V heff_provider_filesystem(V p, V k) {
   // `with` closed the file, each is `EBADF`)
   case TAG_ReadChunk: {
     FsFile *h = fs_file(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
+    if (h->fd < 0) return fs_answered(p, 2, fs_left_file(h, EBADF), k);
     int64_t n;
     if (!fs_int(heff_field(p, 1), &n)) n = FS_READ_MAX;
     V f = heff_dup(heff_field(p, 2));
@@ -1066,7 +1177,7 @@ static V heff_provider_filesystem(V p, V k) {
   }
   case TAG_ReadLine: {
     FsFile *h = fs_file(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 1, fs_left(EBADF), k);
+    if (h->fd < 0) return fs_answered(p, 1, fs_left_file(h, EBADF), k);
     V f = heff_dup(heff_field(p, 1));
     FsOp *o = fs_op(FS_LINE, h);
     o->held = p;
@@ -1074,7 +1185,7 @@ static V heff_provider_filesystem(V p, V k) {
   }
   case TAG_WriteBytes: {
     FsFile *h = fs_file(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
+    if (h->fd < 0) return fs_answered(p, 2, fs_left_file(h, EBADF), k);
     V f = heff_dup(heff_field(p, 2));
     int64_t n;
     // (the bytes are `p`'s, held until they are written)
@@ -1083,7 +1194,7 @@ static V heff_provider_filesystem(V p, V k) {
   }
   case TAG_WriteString: {
     FsFile *h = fs_file(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
+    if (h->fd < 0) return fs_answered(p, 2, fs_left_file(h, EBADF), k);
     V f = heff_dup(heff_field(p, 2));
     size_t n;
     char *data = heff_bytes(heff_field(p, 1), &n);
@@ -1093,8 +1204,8 @@ static V heff_provider_filesystem(V p, V k) {
     FsFile *h = fs_file(heff_field(p, 0));
     int64_t from, n;
     V r;
-    if (h->fd < 0) r = fs_left(EBADF);
-    else if (!fs_int(heff_field(p, 1), &from) || !fs_int(heff_field(p, 2), &n)) r = fs_left(EINVAL);
+    if (h->fd < 0) r = fs_left_file(h, EBADF);
+    else if (!fs_int(heff_field(p, 1), &from) || !fs_int(heff_field(p, 2), &n)) r = fs_left_file(h, EINVAL);
     else {
       // (from where the program has read up to, not where the file was
       // read ahead to)
@@ -1105,7 +1216,7 @@ static V heff_provider_filesystem(V p, V k) {
 #else
       int64_t at = (int64_t)lseek(h->fd, (off_t)n, whence);
 #endif
-      if (at < 0) r = fs_left(errno);
+      if (at < 0) r = fs_left_file(h, errno);
       else {
         h->at = h->end = 0;
         h->taken++;
@@ -1116,14 +1227,15 @@ static V heff_provider_filesystem(V p, V k) {
   }
   case TAG_FileStatus: {
     FsFile *h = fs_file(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 1, fs_left(EBADF), k);
+    if (h->fd < 0) return fs_answered(p, 1, fs_left_file(h, EBADF), k);
     struct stat st;
-    int s = fstat(h->fd, &st);
-    return fs_answered(p, 1, fs_status(s, &st), k);
+    V r = fstat(h->fd, &st) == 0 ? fs_status(&st) : fs_left_file(h, errno);
+    return fs_answered(p, 1, r, k);
   }
   case TAG_CloseFile: {
-    int err = fs_close(fs_file(heff_field(p, 0)));
-    return fs_answered(p, 1, err ? fs_left(err) : fs_done(), k);
+    FsFile *h = fs_file(heff_field(p, 0));
+    int err = fs_close(h);
+    return fs_answered(p, 1, err ? fs_left_file(h, err) : fs_done(), k);
   }
   default:
     return heff_fs_whole(p, k);

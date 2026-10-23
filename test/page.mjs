@@ -295,8 +295,8 @@ const apps = {
     said("lose the server", "");
     await createInterface({ input: process.stdin })[Symbol.asyncIterator]().next();
     input.value = "tea"; add.fire("click");
-    await until("a call to no server", () => status.text.startsWith("unreachable: fetch: "));
-    said("a call to no server", status.text.startsWith("unreachable: fetch: "));
+    await until("a call to no server", () => status.text.startsWith("unreachable: /api: fetch: "));
+    said("a call to no server", status.text.startsWith("unreachable: /api: fetch: "));
     said("as they were", lines());
     said("stray rejections", stray.join("\n"));
   },

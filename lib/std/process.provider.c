@@ -106,6 +106,8 @@ typedef struct {
   int out_mode, err_mode;  // HEFF_OUT_*: its output, its error stream
   int64_t timeout, keep;  // milliseconds, bytes: 0, no limit
   int group;     // started in a process group of its own, ended with it
+  V command;     // its name, and its directory, as the program gave them
+  V given_dir;   //  (a failure's: 0, none)
 } HeffInvocation;
 
 // (the environment, `NAME=VALUE`s: the program's but those `sets` names,
@@ -214,9 +216,9 @@ static int heff_invocation(V v, HeffInvocation *r) {
   r->timeout = IS_INT(timeout) && INT_OF(timeout) > 0 ? INT_OF(timeout) : 0;
   r->keep = IS_INT(keep) && INT_OF(keep) > 0 ? INT_OF(keep) : 0;
   r->group = group == NTAG(TAG_True);
-  heff_drop(cmd);
+  r->command = cmd;
+  r->given_dir = dir;
   heff_drop(args);
-  heff_drop(dir);
   heff_drop(env);
   heff_drop(in);
   heff_drop(out);
@@ -239,6 +241,8 @@ static void heff_invocation_free(HeffInvocation *r) {
   }
   free(r->dir);
   free(r->in);
+  if (r->command) heff_drop(r->command);
+  if (r->given_dir) heff_drop(r->given_dir);
 }
 
 // (`n` bytes of what a command wrote, kept while fewer than `keep` are)
@@ -250,15 +254,43 @@ static void heff_keep_put(Buf *b, const char *c, size_t n, int64_t keep) {
   buf_put(b, c, n);
 }
 
+static uint32_t heff_error_shape[4] = { LBL_code, LBL_name, LBL_message, LBL_path };
+
+// (a `ProcessError` of errno `err`, of the program or the directory
+// `path`, taken)
+static V heff_process_error(int err, V path) {
+  const char *name = heff_errno_name(err);
+  char number[24];
+  if (name[1] == '?') {
+    snprintf(number, sizeof number, "errno %d", err);
+    name = number;
+  }
+  V f[4] = { heff_int(err), heff_str_text(name), heff_str_text(strerror(err)), path };
+  return heff_rec(4, heff_error_shape, f);
+}
+
+// (why the invocation `v` could not be run: errno `err`, of its
+// directory, `at_dir`, or its command -- as the program gave them)
+static V heff_why_not(HeffInvocation *v, int err, int at_dir) {
+  V path;
+  if (at_dir && v->given_dir && ((Str *)v->given_dir)->len > 0) path = heff_dup(v->given_dir);
+  else if (at_dir && v->dir) path = heff_str_bytes(v->dir, (int64_t)strlen(v->dir));
+  else path = v->command ? heff_dup(v->command) : heff_str_bytes("", 0);
+  return heff_process_error(err, path);
+}
+
 // (how a command ended, as an `Ended`: `how` 0 by itself, its status
-// `code`; 1 by the signal `code`; 2 at its time limit; 3 not run)
-static V heff_ended(int how, int64_t code) {
+// `code`; 1 by the signal `code`; 2 at its time limit; 3 started, its
+// end lost -- the command named `name`'s, ECHILD)
+static V heff_ended(int how, int64_t code, const char *name) {
   V x = MK_INT(code);
   switch (how) {
   case 0: return heff_tag_n(TAG_Exited, 1, &x);
   case 1: return heff_tag_n(TAG_Signalled, 1, &x);
   case 2: return NTAG(TAG_TimedOut);
-  default: return NTAG(TAG_NotRun);
+  default:
+    x = heff_process_error(ECHILD, heff_str_bytes(name, (int64_t)strlen(name)));
+    return heff_tag_n(TAG_NotRun, 1, &x);
   }
 }
 
@@ -320,6 +352,7 @@ struct HeffSub {
   HeffStream out, err;
   int64_t keep, deadline;  // bytes, the time it is killed at: 0, none
   int timed;
+  char *name;      // its command's name, as it was given
   HeffSub *next;   // among those started, to be ended at the program's end
 };
 
@@ -475,16 +508,18 @@ static void heff_sub_free(HeffSub *s) {
   free(s->out.b.s);
   free(s->err.b.s);
   free(s->given);
+  free(s->name);
   free(s);
 }
 
 // (the command started, as `v` says: NULL where it could not be, why in
-// `*err`)
-static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
+// `*err` -- its directory's, `*at_dir`)
+static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err, int *at_dir) {
   SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
   HeffSub *s = heff_alloc(sizeof *s);
   memset(s, 0, sizeof *s);
   s->magic = HEFF_SUB_MAGIC;
+  s->name = heff_strdup(v->as[0]);
   InitializeCriticalSection(&s->lock);
   s->came = CreateEventA(NULL, FALSE, FALSE, NULL);
   s->in_mode = v->in_mode;
@@ -524,7 +559,9 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
   if (s->err.h && ew) CloseHandle(ew);
   if (ir) CloseHandle(ir);
   if (!ok) {
-    *err = GetLastError() == ERROR_FILE_NOT_FOUND ? ENOENT : EACCES;
+    DWORD last = GetLastError();
+    *at_dir = last == ERROR_DIRECTORY;
+    *err = last == ERROR_FILE_NOT_FOUND || last == ERROR_DIRECTORY ? ENOENT : EACCES;
     if (iw) CloseHandle(iw);
     heff_sub_free(s);
     return NULL;
@@ -782,6 +819,7 @@ static void heff_sub_free(HeffSub *s) {
   free(s->out.b.s);
   free(s->err.b.s);
   free(s->given);
+  free(s->name);
   free(s);
 }
 
@@ -796,11 +834,13 @@ static HEFF_TLS sigset_t heff_spawn_mask;
 // (the command started, forked and exec'd as `v` says -- in its
 // directory, with its environment, its input -- or NULL where it could
 // not be: not found, not a program, its directory not there, as the
-// child says through a pipe of its own; why in `*err`)
-static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
+// child says through a pipe of its own; why in `*err`, its directory's
+// where `*at_dir`)
+static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err, int *at_dir) {
   HeffSub *s = heff_alloc(sizeof *s);
   memset(s, 0, sizeof *s);
   s->magic = HEFF_SUB_MAGIC;
+  s->name = heff_strdup(v->as[0]);
   s->out.fd = s->err.fd = s->fin = s->exitfd = -1;
   s->in_mode = v->in_mode;
   s->out.mode = v->out_mode;
@@ -817,8 +857,9 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
     fflush(stderr);
     pid = fork();
     if (pid == 0) {
-      // (the child: nothing but what is safe after a fork)
-      int e;
+      // (the child: nothing but what is safe after a fork; why it failed
+      // said, its errno and whether its directory's)
+      int e[2] = { 0, 0 };
       if (heff_spawn_held) {
         // (the program's handlers of the ending signals not the
         // command's, and the signals held as the program held them)
@@ -830,15 +871,18 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
         sigprocmask(SIG_SETMASK, &heff_spawn_mask, NULL);
       }
       if (v->group) setpgid(0, 0);
-      if (chdir(v->dir) != 0) goto failed;
+      if (chdir(v->dir) != 0) {
+        e[1] = 1;
+        goto failed;
+      }
       if ((pi[0] >= 0 && dup2(pi[0], 0) < 0) || (po[1] >= 0 && dup2(po[1], 1) < 0)
           || (pe[1] >= 0 && dup2(pe[1], 2) < 0))
         goto failed;
       if (v->env) environ = v->env;
       execvp(v->as[0], v->as);
     failed:
-      e = errno;
-      (void)!write(px[1], &e, sizeof e);
+      e[0] = errno;
+      (void)!write(px[1], e, sizeof e);
       _exit(127);
     }
   }
@@ -850,14 +894,15 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
   heff_close(&px[1]);
   if (pid > 0) {
     // (the command's name found and run, or why not, said by the child)
-    int e;
+    int e[2];
     ssize_t said;
-    do said = read(px[0], &e, sizeof e); while (said < 0 && errno == EINTR);
+    do said = read(px[0], e, sizeof e); while (said < 0 && errno == EINTR);
     if (said == (ssize_t)sizeof e) {
       int st;
       while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
       pid = -1;
-      errno = e;
+      errno = e[0];
+      *at_dir = e[1];
     }
   }
   *err = errno ? errno : EINVAL;
@@ -948,26 +993,35 @@ static V heff_sub_ran(HeffSub *s) {
   int64_t code = 0;
   int how = heff_sub_how(s, &code);
   V f[3] = {
-    heff_ended(how, code),
+    heff_ended(how, code, s->name),
     heff_str_bytes(s->out.b.s ? s->out.b.s + s->out.at : "", (int64_t)(s->out.b.n - s->out.at)),
     heff_str_bytes(s->err.b.s ? s->err.b.s + s->err.at : "", (int64_t)(s->err.b.n - s->err.at)),
   };
   return heff_rec(3, heff_run_shape, f);
 }
 
-// (a command not run: its `Ran`)
-static V heff_not_ran(void) {
-  V f[3] = { heff_ended(3, 0), heff_str_bytes("", 0), heff_str_bytes("", 0) };
+// (a command not run, as `why`, a `ProcessError`, says: its `Ran`)
+static V heff_not_ran(V why) {
+  V f[3] = { heff_tag_n(TAG_NotRun, 1, &why), heff_str_bytes("", 0), heff_str_bytes("", 0) };
   return heff_rec(3, heff_run_shape, f);
+}
+
+// (the command of the invocation `inv` started, as `v`; NULL where it
+// could not be, why at `*why`)
+static HeffSub *heff_launched(V inv, HeffInvocation *v, V *why) {
+  int err = EINVAL, at_dir = 0;
+  HeffSub *s = heff_invocation(inv, v) ? heff_sub_spawn(v, &err, &at_dir) : NULL;
+  if (!s) *why = heff_why_not(v, err, at_dir);
+  heff_invocation_free(v);
+  return s;
 }
 
 // (a command run, as an `Invocation` says, to its end: a `Ran`)
 static V heff_run(V inv) {
   HeffInvocation v;
-  int err;
-  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v, &err) : NULL;
-  heff_invocation_free(&v);
-  if (!s) return heff_not_ran();
+  V why;
+  HeffSub *s = heff_launched(inv, &v, &why);
+  if (!s) return heff_not_ran(why);
   heff_await(&s, 1, -1);
   V r = heff_sub_ran(s);
   heff_sub_free(s);
@@ -1058,14 +1112,12 @@ static void heff_sub_let_go(void *x) {
   heff_sub_free(s);
 }
 
-static uint32_t heff_error_shape[3] = { LBL_code, LBL_name, LBL_message };
-
 // (the command started, as an `Invocation` says: `Right` it, the host's
 // own -- a foreign value, ended and let go of where the program drops
 // its last reference to it -- or `Left` why it was not)
 static V heff_start(V inv) {
   HeffInvocation v;
-  int err = EINVAL;
+  V why = 0;
   // (those not ended at the end ended then, from before the first is
   // started)
   HEFF_SUBS_LOCK();
@@ -1081,8 +1133,7 @@ static V heff_start(V inv) {
 #ifndef _WIN32
   heff_spawn_hold();
 #endif
-  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v, &err) : NULL;
-  heff_invocation_free(&v);
+  HeffSub *s = heff_launched(inv, &v, &why);
   if (s) {
     HEFF_SUBS_LOCK();
     s->next = heff_subs;
@@ -1092,10 +1143,7 @@ static V heff_start(V inv) {
 #ifndef _WIN32
   heff_spawn_release();
 #endif
-  if (!s) {
-    V x = heff_errno(err, heff_error_shape);
-    return heff_tag_n(TAG_Left, 1, &x);
-  }
+  if (!s) return heff_tag_n(TAG_Left, 1, &why);
   V x = heff_foreign(s, heff_sub_let_go);
   return heff_tag_n(TAG_Right, 1, &x);
 }
@@ -1675,6 +1723,7 @@ static V heff_provider_process(V p, V k) {
     if (heff_lines) heff_lines(2);
     fflush(stdout);
     fflush(stderr);
+    errno = EINVAL;
     if (as) {
 #ifdef _WIN32
       // (no exec on Windows: the command is run, and its exit code this
@@ -1687,7 +1736,9 @@ static V heff_provider_process(V p, V k) {
       if (chdir(heff_working_dir()) == 0) execvp(c, as);
 #endif
     }
-    fprintf(stderr, "%s: cannot run it\n", c ? c : "the command");
+    // (why, as a `ProcessError` says it)
+    int e = errno ? errno : ENOENT;
+    fprintf(stderr, "%s: %s: %s\n", c ? c : "the command", heff_errno_name(e), strerror(e));
     exit(1);
   }
   default:

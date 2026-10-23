@@ -68,7 +68,8 @@ loadTodos path = do
 `loadTodos` reads the file at `path`, a `Path`, and makes each of its
 lines an open todo. `text <- readFile path` runs `readFile` and names its
 result `text`, the file's text. Where the file cannot be read, `readFile`
-throws why, a `FileError`: so `loadTodos` needs `exception FileError` as
+throws why, a `FileError` -- the system's errno, what it says of it, and
+the path it says it of: so `loadTodos` needs `exception FileError` as
 well as `filesystem`.
 
 As you can see, `printTodos` needs stdio and `loadTodos` needs
@@ -118,7 +119,7 @@ $ heff run app/hello/main.hf
 [ ] read the reference
 $ rm todos.txt
 $ heff run app/hello/main.hf
-ENOENT: No such file or directory
+todos.txt: ENOENT: No such file or directory
 ```
 
 ## Output, bytes and time

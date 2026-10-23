@@ -1511,8 +1511,15 @@ dumpCCmd file outPath = cThen Nothing outPath file (pure MkUnit)
 ranOut : Ran -> String
 ranOut r = r.out
 
+-- (why a command was not run, said on a line of its own; none where it
+-- was)
+notRunSaid : Ended -> String
+notRunSaid (NotRun err) = showProcessError err ^ "\n"
+notRunSaid _ = ""
+
+-- | what a command wrote to its error stream; where it was not run, why
 ranErr : Ran -> String
-ranErr r = r.err
+ranErr r = notRunSaid r.ended ^ r.err
 
 -- | where `heff build` writes the project's programs: `.heff/bin/`
 binDir : Path.Style -> String
@@ -1700,23 +1707,41 @@ zigMode flags =
 
 -- (each of the runtime's Zig files built by zig, in `mode`, into an
 -- object beside it, `F.o`, a task of `z`'s: the objects, or, where one
--- could not be built, what zig said written, none)
+-- could not be built, how zig ran)
 zigObjects : {e : HFunctor}
-           -> {{io : stdio <: e}}
            -> {{prog : Progress.progress <: e}}
            -> Progress.Task
            -> String
            -> List String
            -> List String
-           -> Co e (Maybe (List String))
-zigObjects z mode Nil made = pure (Just (List.reverse made))
+           -> Co e (Either Ran (List String))
+zigObjects z mode Nil made = pure (Right (List.reverse made))
 zigObjects z mode (Cons f rest) made = do
   o <- pure (strSlice f 0 (strLength f - 4) ^ ".o")
   r <- Progress.runUnder z "zig" ["build-obj", f, "-O", mode, "-femit-bin=" ^ o]
   if succeeded r then zigObjects z mode rest (Cons o made)
-  else do
-    writeErr (ranErr r)
-    pure Nothing
+  else pure (Left r)
+
+-- (the C files and the objects linked by `zig cc`, given these flags,
+-- into `out`; or, where an object was not built, how zig ran for it)
+zigLinked : {e : HFunctor}
+          -> {{prog : Progress.progress <: e}}
+          -> Progress.Task
+          -> List String
+          -> List String
+          -> String
+          -> Either Ran (List String)
+          -> Co e Ran
+zigLinked z flags files out (Left r) = pure r
+zigLinked z flags files out (Right os) =
+  Progress.runUnder
+    z
+    "zig"
+    (Cons
+       "cc"
+       (List.append
+          flags
+          (Cons "-w" (List.append files (List.append os ["-o", out, "-lm"])))))
 
 -- (the C files of `dir`, a file a module, by `zig cc` given these flags
 -- (its level, and what else the program is built with) -- which builds
@@ -1743,19 +1768,7 @@ zigBuildFlagsOr failed who st flags p dir out next = do
   zigs <- pure (endingIn st dir ".zig" (fromMaybe Nil names))
   z <- Progress.start p "zig cc" (List.length files + List.length zigs + 1)
   objects <- zigObjects z (zigMode flags) zigs Nil
-  r <- case objects of
-    Just os ->
-      Progress.runUnder
-        z
-        "zig"
-        (Cons
-           "cc"
-           (List.append
-              flags
-              (Cons
-                 "-w"
-                 (List.append files (List.append os ["-o", out, "-lm"])))))
-    Nothing -> pure { ended = NotRun, out = "", err = "" }
+  r <- zigLinked z flags files out objects
   Progress.end z
   if succeeded r then next
   else do
