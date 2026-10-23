@@ -5,9 +5,11 @@
 -- another's cown from inside it, each way, without deadlock (Listing 3
 -- and 4 of the paper); a log written in the order the behaviours were
 -- caused (Listing 8); five philosophers; cowns of two types in one
--- behaviour; cowns that overlap, abandoned; and a behaviour that waits
--- for good.  Each run on its store and nothing else (`runBoc`), in the
--- language.
+-- behaviour; cowns that overlap, abandoned; a behaviour that waits
+-- for good; cowns inside others, in spawn order; behaviours waiting
+-- on a condition (`whenever`), a bank's and a deadlock's; and the
+-- steps the queues take, as many again for as many behaviours again.
+-- Each run on its store and nothing else (`runBoc`), in the language.
 
 module test.programs.boc
 
@@ -15,6 +17,7 @@ import co
 import green
 import std.boc
 import std.store
+import state
 
 -- (the `i`th of the list)
 nth : {a : Type} -> List a -> Int -> a
@@ -402,3 +405,246 @@ held =
        _ <- recv ch
        pure n)
      when cell (\n -> pure (n + 1))))
+
+-- Cowns inside others
+--------------------------------------------------------------------------------
+
+-- | A pair and a part of it each.
+type Nest = ((Int, Int), Int)
+
+pairOf : Cown Nest (Int, Int)
+pairOf = left
+
+leftOf : Cown Nest Int
+leftOf = fstOf left
+
+rightOf : Cown Nest Int
+rightOf = sndOf left
+
+-- (the digit `d` after `n`'s)
+digit : Int -> Int -> Int
+digit d n = n * 10 + d
+
+-- | One on the pair's left, slow; one on the pair, spawned after; one
+-- | on its right, after that: apart from the first, but not from the
+-- | second, so it runs after both, and each digit is written in turn.
+-- | >>> nestedOrder
+-- | "12 23"
+nestedOrder : String
+nestedOrder =
+  endedAs
+    (\((a, b), c) -> show a ^ " " ^ show b)
+    (runBoc
+       ((0, 0), 0) (do
+     when leftOf (\a -> do
+       yields 5
+       pure (digit 1 a))
+     when pairOf (\(a, b) -> pure (digit 2 a, digit 2 b))
+     when rightOf (\b -> pure (digit 3 b))))
+
+-- | Of the pair's two parts, the right's behaviour, spawned after the
+-- | left's, runs while that one waits on it: they are apart.
+-- | >>> apartInside
+-- | "1 1"
+apartInside : String
+apartInside =
+  endedAs
+    (\((a, b), c) -> show a ^ " " ^ show b)
+    (runBoc
+       ((0, 0), 0) (do
+     ch <- newChan
+     when leftOf (\a -> do
+       _ <- recv ch
+       pure (a + 1))
+     when rightOf (\b -> do
+       send ch 0
+       pure (b + 1))))
+
+-- Waiting on a condition
+--------------------------------------------------------------------------------
+
+-- | Four accounts, whether the payroll ran, and the audits that found
+-- | the total wrong.
+type Ledger = (Accounts, Bool, Int)
+
+ledger : List (Cown Ledger Int)
+ledger =
+  [ fstOf (fstOf (fstOf first))
+  , sndOf (fstOf (fstOf first))
+  , sndOf (fstOf first)
+  , sndOf first
+  ]
+
+books : Cown Ledger Accounts
+books = first
+
+payrollRan : Cown Ledger Bool
+payrollRan = second
+
+badAudits : Cown Ledger Int
+badAudits = third
+
+-- | `n` moved from `from` to `to`, once `from` has it: waiting, not
+-- | spinning, until it has.
+paidOnce : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{bc : boc Ledger <: e}}
+         -> Cown Ledger Int
+         -> Cown Ledger Int
+         -> Int
+         -> Co e Unit
+paidOnce from to n =
+  whenever (from, to) (\(a, b) -> a >= n) (\(a, b) -> do
+  yield
+  pure (a - n, b + n))
+
+-- (the accounts' total sound: 400, none below 0)
+soundBooks : Accounts -> Bool
+soundBooks (a, b, c, d) = a + b + c + d == 400 && a >= 0 && b >= 0 && c >= 0 && d >= 0
+
+-- (an audit: one behaviour on the four accounts, counting where they
+-- were not sound)
+audited : {e : HFunctor} -> {{gr : green <: e}} -> {{bc : boc Ledger <: e}} -> Co e Unit
+audited = when (books, badAudits) (\(qs, bad) -> pure (qs, if soundBooks qs then bad else bad + 1))
+
+-- (`k` transfers drawn from `seed`, waiting for their money, an audit
+-- every tenth)
+waitingTransfers : {e : HFunctor}
+                 -> {{gr : green <: e}}
+                 -> {{bc : boc Ledger <: e}}
+                 -> Int
+                 -> Int
+                 -> Co e Unit
+waitingTransfers seed 0 = pure ()
+waitingTransfers seed k = do
+  let r = nextRandom seed
+  let from = r % 4
+  let to = (from + 1 + (r / 4) % 3) % 4
+  paidOnce (nth ledger from) (nth ledger to) ((r / 16) % 30)
+  if k % 10 == 0 then audited else pure ()
+  waitingTransfers r (k - 1)
+
+-- | The payroll, spawned first: 200 from the first account to the last,
+-- | once the first has it, which it has not at first; one behaviour,
+-- | never spawned again.
+payroll : {e : HFunctor} -> {{gr : green <: e}} -> {{bc : boc Ledger <: e}} -> Co e Unit
+payroll =
+  whenever (nth ledger 0, nth ledger 3, payrollRan) (\((a, b), p) -> a >= 200) (\((a, b), p) ->
+    pure ((a - 200, b + 200), True))
+
+-- (the ledger, said)
+showLedger : Ledger -> String
+showLedger (qs, p, bad) =
+  "total "
+  ^ show (totalOf qs)
+  ^ (if soundBooks qs then " sound" else " unsound")
+  ^ ", bad audits "
+  ^ show bad
+  ^ (if p then ", payroll ran" else ", payroll waits")
+
+-- | 200 transfers, each waiting until its account has the amount, and
+-- | the payroll waiting until the first has 200: every one made (where
+-- | one waited for good, `runBoc` would say every thread waits), the
+-- | total sound at every audit.
+-- | >>> waitingBank
+-- | "total 400 sound, bad audits 0, payroll ran"
+waitingBank : String
+waitingBank =
+  endedAs
+    showLedger
+    (runBoc ((100, 100, 100, 100), False, 0) (do
+     payroll
+     waitingTransfers 7 200))
+
+-- | ... and 1000 of them: in the end every transfer left waits on an
+-- | account another would have to fill, and none will, so every thread
+-- | waits; nothing spins.
+-- | >>> stuckBank
+-- | "every thread waits"
+stuckBank : String
+stuckBank =
+  endedAs
+    showLedger
+    (runBoc ((100, 100, 100, 100), False, 0) (do
+     payroll
+     waitingTransfers 7 1000))
+
+-- | A behaviour waiting until the cell holds more than 5, and none to
+-- | write it: every thread waits.
+-- | >>> waitedForGood
+-- | "every thread waits"
+waitedForGood : String
+waitedForGood =
+  endedAs show (runBoc 0 (whenever cell (\n -> n > 5) (\n -> pure (n - 5))))
+
+-- | ... and once another writes it, it runs: written to 3, then 9 (it
+-- | tries again after each), then 9 less 5.
+-- | >>> waitedFor
+-- | "4"
+waitedFor : String
+waitedFor =
+  endedAs
+    show
+    (runBoc
+       0 (do
+     whenever cell (\n -> n > 5) (\n -> pure (n - 5))
+     when cell (\n -> pure 3)
+     when cell (\n -> pure 9)))
+
+-- | Two behaviours, each waiting for what the other writes once it has
+-- | run: every thread waits.
+-- | >>> eachWaiting
+-- | "every thread waits"
+eachWaiting : String
+eachWaiting =
+  endedAs
+    showTwo
+    (runBoc
+       (0, 0) (do
+     whenever (one, other) (\(a, b) -> a > 0) (\(a, b) -> pure (a, 1))
+     whenever (one, other) (\(a, b) -> b > 0) (\(a, b) -> pure (1, b))))
+
+-- | ... and where a third writes one, each runs in turn.
+-- | >>> eachWaited
+-- | "2 1"
+eachWaited : String
+eachWaited =
+  endedAs
+    showTwo
+    (runBoc
+       (0, 0) (do
+     whenever (one, other) (\(a, b) -> a > 0) (\(a, b) -> pure (a + 1, 1))
+     whenever (one, other) (\(a, b) -> b > 0) (\(a, b) -> pure (a, b))
+     when one (\a -> pure 1)))
+
+-- Steps
+--------------------------------------------------------------------------------
+
+-- (teller `t`'s `k` transfers, and those of the tellers before it)
+tellers : {e : HFunctor} -> {{gr : green <: e}} -> {{bc : boc Accounts <: e}} -> Int -> Int -> Co e Unit
+tellers 0 k = pure ()
+tellers t k = do
+  transfers t k
+  tellers (t - 1) k
+
+-- (the steps the queues took for `t` tellers' 4 transfers each, all
+-- spawned before any runs)
+stepsFor : Int -> Int
+stepsFor t =
+  steps
+    (snd
+       (greenWith
+          (opening (100, 100, 100, 100)) (do
+        tellers t 4
+        drained (s := Accounts))))
+
+-- | The steps the queues take for 64 tellers and for 256, all waiting at
+-- | once: four times as many behaviours, about four times the steps (a
+-- | queue rescanned at each end would take sixteen).
+-- | >>> stepsGrow
+-- | "linear"
+stepsGrow : String
+stepsGrow =
+  let few = stepsFor 64
+  in let many = stepsFor 256
+  in if many * 2 <= few * 9 && many * 2 >= few * 7 then "linear" else show few ^ " then " ^ show many

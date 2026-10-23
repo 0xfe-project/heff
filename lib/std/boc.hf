@@ -52,8 +52,10 @@
 -- Operation | What it does
 -- --- | ---
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
+-- `whenever c cond body` | ... that runs once `cond` holds of what they hold, waiting for a write until it does
 -- `drained` | waits until no behaviour is left to run
 -- `runBoc st c` | `c` and its behaviours run on the store `st`, in the language
+-- `steps bs` | how many steps the queues of the behaviours `bs` have taken
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
@@ -68,6 +70,34 @@
 --
 -- The cowns of one `when` are apart: the same cown twice, or one inside
 -- another (`whole` and `first`), is abandoned when the `when` runs.
+-- Cowns of two behaviours may be one inside the other: the two overlap.
+--
+-- Each part of the store a behaviour is on has a queue, as each cown
+-- has in the paper: a behaviour comes to the queue of each of its cowns
+-- at once when it is spawned, and to the queue of each part they are
+-- inside, for a part inside it (behaviours for parts inside one part do
+-- not wait for each other there, but one for all of it waits for them,
+-- and they for it).  It counts the queues it waits in, and its turn
+-- comes when none is left; when it ends, only the queues it was in are
+-- looked at, their fronts let in.  So a behaviour costs as many steps as
+-- it has parts (`steps`), however many others wait.
+--
+-- `whenever c cond body` is a conditional critical region (Hoare's and
+-- Brinch Hansen's, 1972) over cowns, as std.stm's `check` is over
+-- transactional variables.  Its turn comes as a `when`'s does; where
+-- `cond` does not hold of what its cowns hold then, it lets them go,
+-- having written nothing, and waits, taking no turn, until another
+-- behaviour that has one of them -- or a part inside one, or one they
+-- are inside -- ends, which writes them.  Then it comes to their queues
+-- again, at the back, those woken by one write in the order they were
+-- spawned, and tries again.  A behaviour that gives up writes nothing,
+-- so two waiting do not wake each other: where every behaviour left
+-- waits so, nothing is left to write, and `runBoc` says every thread
+-- waits (`Nothing`), as std.stm's `runGreen` does.  It comes back at
+-- the back, not where it was, for a place among behaviours already let
+-- in at some of their cowns could close a cycle: it is never passed by
+-- a behaviour spawned after the write that woke it, but one before it
+-- may make `cond` false again.
 --
 -- Behaviours are green threads, the store and the queue of behaviours
 -- the world's state (`boc s`, handled in the language, as std.state's
@@ -85,28 +115,58 @@ module std.boc
   , Behaviours
   , boc
   , when
+  , whenever
   , drained
   , opening
+  , steps
   , runBoc
   )
 
 import co
 import green
 import state
+import std.ordmap as OrdMap
 import std.store
 
 -- | A cown holding an `a`, in a store of shape `s`: a position in it.
 type Cown s a = Position s a
 
--- (a behaviour spawned and not yet done: the parts of the store it
--- holds, the channel it is told on that its turn has come, and whether
--- it has come)
-type Pending = { parts : List Part, chan : Int, running : Bool }
+-- The queues
+--------------------------------------------------------------------------------
 
--- | The store behaviours share; those spawned and not yet done, in the
--- | order they were spawned; and the channels of those waiting until
--- | none is left.
-type Behaviours s = { now : s, pending : List Pending, idle : List Int }
+-- (a behaviour waiting in a part's queue: its key, and whether it is for
+-- all of the part, or for a part inside it)
+type Entry = { key : Int, here : Bool }
+
+-- (a part of the store, as behaviours have it: whether one holds all of
+-- it; how many hold parts inside it; those waiting for it, in the order
+-- they came; and the keys of those waiting until it is written, on all
+-- of it, and on a part inside it)
+type Slot =
+  { held : Bool
+  , within : Int
+  , queue : Queue Entry
+  , watchedHere : OrdMap.OrdMap Int Unit
+  , watchedWithin : OrdMap.OrdMap Int Unit
+  }
+
+-- (a behaviour not yet done: how many of its parts' queues it still
+-- waits in, and its parts, each whether it is for all of it -- its
+-- cowns' own -- or for a part inside it)
+type Waiting = { left : Int, nodes : List (Pair Part Bool) }
+
+-- (the queue of each part behaviours are on, the behaviours not yet
+-- done by their keys, and how many steps the queues have taken)
+type Queues =
+  { slots : OrdMap.OrdMap Part Slot
+  , waiting : OrdMap.OrdMap Int Waiting
+  , taken : Int
+  }
+
+-- | The store behaviours share; the queues of its parts and the
+-- | behaviours waiting in them; how many behaviours are not yet done;
+-- | and the keys of those waiting until none is left.
+type Behaviours s = { now : s, queues : Queues, live : Int, idle : List Int }
 
 -- | ... as the world's state.
 boc : Type -> HFunctor
@@ -114,16 +174,251 @@ boc s = state (Behaviours s)
 
 -- | The store `st`, no behaviour spawned.
 opening : {s : Type} -> s -> Behaviours s
-opening st = { now = st, pending = Nil, idle = Nil }
+opening st =
+  { now = st
+  , queues = { slots = OrdMap.empty, waiting = OrdMap.empty, taken = 0 }
+  , live = 0
+  , idle = Nil
+  }
 
--- (does any of `ps` overlap any of `qs`)
-anyOverlap : List Part -> List Part -> Bool
-anyOverlap ps qs = List.any (\p -> List.any (\q -> overlaps p q) qs) ps
+-- | How many steps the queues have taken, from `opening` on: a
+-- | behaviour's coming to a part's queue, its being let in there, its
+-- | leaving, its waiting for a write and being woken by one.  What
+-- | behaviours cost to schedule, as many for each as it has parts,
+-- | however many others wait.
+steps : {s : Type} -> Behaviours s -> Int
+steps bs = bs.queues.taken
 
 -- (none of the parts overlaps another)
 apart : List Part -> Bool
 apart Nil = True
 apart (p :: ps) = not (List.any (\q -> overlaps p q) ps) && apart ps
+
+-- (the part, for all of it, and the parts it is inside, for a part
+-- inside them)
+withEnclosing : OrdMap.OrdMap Part Bool -> Part -> OrdMap.OrdMap Part Bool
+withEnclosing m p =
+  OrdMap.insert
+    (List.foldl (\n q -> OrdMap.insert n q False) m (enclosing p))
+    p
+    True
+
+-- (the queues a behaviour on the parts waits in: each of its parts, for
+-- all of it, and each part those are inside, for a part inside it, once
+-- each; of parts apart, none is inside another)
+nodesOf : List Part -> List (Pair Part Bool)
+nodesOf ps = OrdMap.toList (List.foldl withEnclosing OrdMap.empty ps)
+
+-- (a part no behaviour is on)
+emptySlot : Slot
+emptySlot =
+  { held = False
+  , within = 0
+  , queue = emptyQ
+  , watchedHere = OrdMap.empty
+  , watchedWithin = OrdMap.empty
+  }
+
+-- (none)
+noKeys : OrdMap.OrdMap Int Unit -> Bool
+noKeys m = case OrdMap.findMin m of
+  Just kv -> False
+  Nothing -> True
+
+-- (nothing held, waiting or watching)
+unused : Slot -> Bool
+unused sl =
+  not sl.held
+  && sl.within == 0
+  && isEmptyQ sl.queue
+  && noKeys sl.watchedHere
+  && noKeys sl.watchedWithin
+
+slotOf : Queues -> Part -> Slot
+slotOf qs p = fromMaybe emptySlot (OrdMap.lookup qs.slots p)
+
+-- (... the part's slot `sl` now, `n` steps taken; a slot no behaviour
+-- is on let go of)
+withSlot : Queues -> Part -> Slot -> Int -> Queues
+withSlot qs p sl n =
+  { qs
+  | slots =
+      if unused sl then OrdMap.delete qs.slots p
+      else OrdMap.insert qs.slots p sl
+  , taken = qs.taken + n
+  }
+
+-- (whether a behaviour can be let in at the part now: for all of it,
+-- where none holds any of it; for a part inside it, where none holds
+-- all of it)
+fits : Slot -> Bool -> Bool
+fits sl True = not sl.held && sl.within == 0
+fits sl False = not sl.held
+
+-- (... let in)
+granted : Slot -> Bool -> Slot
+granted sl True = { sl | held = True }
+granted sl False = { sl | within = sl.within + 1 }
+
+-- (... gone)
+released : Slot -> Bool -> Slot
+released sl True = { sl | held = False }
+released sl False = { sl | within = sl.within - 1 }
+
+-- (the behaviour `k` come to the part's queue: let in at once, where
+-- none waits before it and it fits; else at the back, waiting)
+joined : Int -> Bool -> Slot -> Pair Slot Bool
+joined k here sl =
+  if isEmptyQ sl.queue && fits sl here then MkPair (granted sl here) False
+  else MkPair { sl | queue = putQ { key = k, here = here } sl.queue } True
+
+-- (those at the front of the part's queue that fit, let in, in turn:
+-- one for all of it, or those for parts inside it up to the next for
+-- all; the slot after, its queue's front turned round once, and their
+-- keys, `ks` those let in so far)
+letIn : Slot -> List Int -> Pair Slot (List Int)
+letIn sl ks = case takeQ sl.queue of
+  Just (MkPair en rest) ->
+    if fits sl en.here
+    then letIn (granted { sl | queue = rest } en.here) (en.key :: ks)
+    else MkPair
+        { sl | queue = { rest | front = en :: rest.front } }
+        (List.reverse ks)
+  Nothing -> MkPair sl (List.reverse ks)
+
+-- (the behaviour `k` come to each of its parts' queues, `n` those it
+-- waits in so far: the queues after, and in how many it waits)
+joinedAll : Int -> List (Pair Part Bool) -> Int -> Queues -> Pair Queues Int
+joinedAll k Nil n qs = MkPair qs n
+joinedAll k (MkPair p here :: rest) n qs =
+  let (sl, waits) = joined k here (slotOf qs p)
+  in joinedAll k rest (if waits then n + 1 else n) (withSlot qs p sl 1)
+
+-- (the behaviour `k` waiting so)
+waitingIn : Int -> Waiting -> Queues -> Queues
+waitingIn k w qs = { qs | waiting = OrdMap.insert qs.waiting k w }
+
+-- (... and so waiting, or, waiting in none, let in: whether it was)
+queuedAs : Int -> List (Pair Part Bool) -> Queues -> Pair Queues Bool
+queuedAs k nodes qs =
+  let (after, n) = joinedAll k nodes 0 qs
+  in MkPair (waitingIn k { left = n, nodes = nodes } after) (n == 0)
+
+-- (the behaviours `ks` each let in at one more of its parts: the queues
+-- after, and `woken` with those let in at the last of theirs, to be
+-- woken)
+counted : Queues -> List Int -> List Int -> Pair Queues (List Int)
+counted qs Nil woken = MkPair qs woken
+counted qs (k :: ks) woken = case OrdMap.lookup qs.waiting k of
+  Just w ->
+    counted
+      (waitingIn k { w | left = w.left - 1 } qs)
+      ks
+      (if w.left == 1 then k :: woken else woken)
+  Nothing -> abandon
+
+-- (the behaviour gone from each of its parts, those waiting behind it
+-- let in where they fit now: the queues after, and `woken` with those
+-- to be woken)
+leftAll : List (Pair Part Bool) -> Queues -> List Int -> Pair Queues (List Int)
+leftAll Nil qs woken = MkPair qs woken
+leftAll (MkPair p here :: rest) qs woken =
+  let (sl, ks) = letIn (released (slotOf qs p) here) Nil
+  in let (after, more) =
+    counted (withSlot qs p sl (1 + List.length ks)) ks woken
+  in leftAll rest after more
+
+-- (the behaviour `k` watching the slot, or no longer, by `f`: on all of
+-- it, or on a part inside it)
+watchedAt : (Int -> OrdMap.OrdMap Int Unit -> OrdMap.OrdMap Int Unit)
+          -> Int
+          -> Bool
+          -> Slot
+          -> Slot
+watchedAt f k True sl = { sl | watchedHere = f k sl.watchedHere }
+watchedAt f k False sl = { sl | watchedWithin = f k sl.watchedWithin }
+
+-- (... each of its parts)
+watchedBy : (Int -> OrdMap.OrdMap Int Unit -> OrdMap.OrdMap Int Unit)
+          -> Int
+          -> List (Pair Part Bool)
+          -> Queues
+          -> Queues
+watchedBy f k Nil qs = qs
+watchedBy f k (MkPair p here :: rest) qs =
+  watchedBy f k rest (withSlot qs p (watchedAt f k here (slotOf qs p)) 1)
+
+watching : Int -> List (Pair Part Bool) -> Queues -> Queues
+watching k nodes qs = watchedBy (\key m -> OrdMap.insert m key ()) k nodes qs
+
+unwatched : Int -> List (Pair Part Bool) -> Queues -> Queues
+unwatched k nodes qs = watchedBy (\key m -> OrdMap.delete m key) k nodes qs
+
+-- (the keys of the map, among `ks`)
+withKeys : OrdMap.OrdMap Int Unit
+         -> OrdMap.OrdMap Int Unit
+         -> OrdMap.OrdMap Int Unit
+withKeys ks m =
+  List.foldl (\acc key -> OrdMap.insert acc key ()) ks (OrdMap.keys m)
+
+-- (... those watching a part a behaviour wrote, all of it: on all of
+-- it, on a part inside it, and on all of a part it is inside)
+watchersAt : Queues -> OrdMap.OrdMap Int Unit -> Part -> OrdMap.OrdMap Int Unit
+watchersAt qs ks p =
+  List.foldl
+    (\acc q -> withKeys acc (slotOf qs q).watchedHere)
+    (withKeys
+       (withKeys ks (slotOf qs p).watchedHere)
+       (slotOf qs p).watchedWithin)
+    (enclosing p)
+
+-- (those watching any part of `nodes` written: the parts for all of
+-- which it was, a behaviour's cowns)
+watchersOf : Queues -> List (Pair Part Bool) -> List Int
+watchersOf qs nodes =
+  OrdMap.keys
+    (List.foldl
+       (\acc n -> case n of
+        MkPair p True -> watchersAt qs acc p
+        MkPair p False -> acc)
+       OrdMap.empty
+       nodes)
+
+-- (each of the behaviours `ks`, watching, woken by a write: no longer
+-- watching, come to its parts' queues again, at the back, in the order
+-- they were spawned; `woken` with those let in at once)
+retried : List Int -> Queues -> List Int -> Pair Queues (List Int)
+retried Nil qs woken = MkPair qs woken
+retried (k :: ks) qs woken = case OrdMap.lookup qs.waiting k of
+  Just w ->
+    let (after, n) = joinedAll k w.nodes 0 (unwatched k w.nodes qs)
+    in retried
+      ks
+      (waitingIn k { w | left = n } after)
+      (if n == 0 then k :: woken else woken)
+  Nothing -> abandon
+
+-- (the behaviour `k` done, having written its cowns: gone from its
+-- parts' queues, and those watching them come to the queues again)
+done : Int -> Queues -> Pair Queues (List Int)
+done k qs = case OrdMap.lookup qs.waiting k of
+  Just w ->
+    let (after, woken) =
+      leftAll w.nodes { qs | waiting = OrdMap.delete qs.waiting k } Nil
+    in retried (watchersOf after w.nodes) after woken
+  Nothing -> abandon
+
+-- (the behaviour `k` given up for now, having written nothing: gone
+-- from its parts' queues, and watching them)
+declined : Int -> Queues -> Pair Queues (List Int)
+declined k qs = case OrdMap.lookup qs.waiting k of
+  Just w ->
+    let (after, woken) = leftAll w.nodes qs Nil
+    in MkPair (watching k w.nodes after) woken
+  Nothing -> abandon
+
+-- Behaviours
+--------------------------------------------------------------------------------
 
 -- (each woken at its key)
 wakeAll : {e : HFunctor} -> {{gr : green <: e}} -> List Int -> Co e Unit
@@ -131,35 +426,6 @@ wakeAll Nil = pure ()
 wakeAll (ch :: rest) = do
   wake ch
   wakeAll rest
-
--- (a behaviour, `go` where its turn has come, before the rest as they
--- were set)
-startedOne : Pending
-           -> Bool
-           -> (List Pending, List Int)
-           -> (List Pending, List Int)
-startedOne b True (rest, woken) =
-  ({ b | running = True } :: rest, b.chan :: woken)
-startedOne b False (rest, woken) = (b :: rest, woken)
-
--- (the behaviours, `held` the parts of those spawned before them: each
--- waiting one none of those overlaps set running; and the channels of
--- those set so)
-started : List Part -> List Pending -> (List Pending, List Int)
-started held Nil = (Nil, Nil)
-started held (b :: bs) =
-  startedOne
-    b
-    (not b.running && not (anyOverlap b.parts held))
-    (started (held ++ b.parts) bs)
-
--- (none of the behaviours overlapping the parts)
-clear : List Part -> List Pending -> Bool
-clear ps bs = not (List.any (\(b : Pending) -> anyOverlap b.parts ps) bs)
-
--- (all but the behaviour told on `ch`)
-without : Int -> List Pending -> List Pending
-without ch bs = List.keepIf (\(b : Pending) -> b.chan /= ch) bs
 
 -- (waiting for its turn, unless it has come)
 turn : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Bool -> Co e Unit
@@ -174,55 +440,47 @@ nowOf bs = bs.now
 
 -- (behaviours left to run)
 busy : {s : Type} -> Behaviours s -> Bool
-busy bs = not (List.null bs.pending)
+busy bs = bs.live > 0
+
+-- (... its queues `qs` now)
+withQueues : {s : Type} -> Queues -> Behaviours s -> Behaviours s
+withQueues qs bs = { bs | queues = qs }
 
 -- (... and the channel `ch` waiting until none is)
 idling : {s : Type} -> Int -> Behaviours s -> Behaviours s
 idling ch bs = { bs | idle = ch :: bs.idle }
 
--- (... the behaviour on the channel `ch`, on the cowns `c`, spawned
--- behind them: whether its turn has come at once)
+-- (... the behaviour on the key `ch`, on the cowns `c`, come to their
+-- queues: whether its turn has come at once)
 spawned : {s t : Type}
         -> Int
         -> Cown s t
         -> Behaviours s
-        -> (Behaviours s, Bool)
+        -> Pair (Behaviours s) Bool
 spawned ch c bs =
-  let ready = clear (parts c) bs.pending
-  in ( { bs
-       | pending =
-           bs.pending ++ [{ parts = parts c, chan = ch, running = ready }]
-       }
-     , ready
-     )
+  let (qs, ready) = queuedAs ch (nodesOf (parts c)) bs.queues
+  in MkPair { bs | queues = qs, live = bs.live + 1 } ready
 
--- (the store `now`, those waiting until no behaviour is left `idle`,
--- and the behaviours left with the channels of those whose turn has
--- come: the state after, and whom to tell)
-endedWith : {s : Type}
-          -> s
-          -> List Int
-          -> (List Pending, List Int)
-          -> (Behaviours s, List Int)
-endedWith now idle (Nil, woken) =
-  ({ now = now, pending = Nil, idle = Nil }, woken ++ idle)
-endedWith now idle (rest, woken) =
-  ({ now = now, pending = rest, idle = idle }, woken)
-
--- (... the behaviour on the channel `ch` done, its cowns `c` holding
--- `v`)
+-- (... the behaviour on the key `ch` done, its cowns `c` holding `v`:
+-- the state after, and whom to tell -- those whose turn it lets come,
+-- and, where none is left, those waiting until then)
 afterEnd : {s t : Type}
          -> Int
          -> Cown s t
          -> t
          -> Behaviours s
-         -> (Behaviours s, List Int)
+         -> Pair (Behaviours s) (List Int)
 afterEnd ch c v bs =
-  endedWith (replaced c v bs.now) bs.idle (started Nil (without ch bs.pending))
+  let (qs, woken) = done ch bs.queues
+  in if bs.live == 1
+  then MkPair
+      { now = replaced c v bs.now, queues = qs, live = 0, idle = Nil }
+      (woken ++ bs.idle)
+  else MkPair
+      { bs | now = replaced c v bs.now, queues = qs, live = bs.live - 1 }
+      woken
 
--- (the behaviour on its channel `ch` done, its cowns `c` holding `v`:
--- those whose turn it lets come told, and, where none is left, those
--- waiting until then)
+-- (the behaviour on its key `ch` done, its cowns `c` holding `v`)
 ended : {s t : Type}
       -> {e : HFunctor}
       -> {{gr : green <: e}}
@@ -237,39 +495,65 @@ ended ch c v = do
   put (ev := bc) next
   wakeAll woken
 
--- (a behaviour: its turn waited for, its body given what its cowns hold
--- then, and what it gives back written)
-behaviour : {s t : Type}
-          -> {e : HFunctor}
-          -> {{gr : green <: e}}
-          -> {{bc : boc s <: e}}
-          -> Int
-          -> Bool
-          -> Cown s t
-          -> (t -> Co e t)
-          -> Co e Unit
-behaviour ch ready c body = do
-  turn ch ready
+-- (the behaviour on its key `ch`, its condition false, its cowns let
+-- go of, unwritten, until another writes one)
+givenUp : {s : Type}
+        -> {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{bc : boc s <: e}}
+        -> Int
+        -> Co e Unit
+givenUp ch = do
   bs <- get (ev := bc)
-  v <- body (contents c (nowOf bs))
-  ended ch c v
+  let (qs, woken) = declined ch bs.queues
+  put (ev := bc) (withQueues qs bs)
+  wakeAll woken
 
--- (a behaviour on the cowns at the position `c`, spawned)
+-- (a behaviour, its turn come: where `cond` holds of what its cowns
+-- hold, its body given that and what it gives back written; else its
+-- cowns let go of, and its turn waited for again, which comes once
+-- another behaviour has written one of them)
+attempt : {s t : Type}
+        -> {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{bc : boc s <: e}}
+        -> Int
+        -> Cown s t
+        -> (t -> Bool)
+        -> (t -> Co e t)
+        -> Co e Unit
+attempt ch c cond body = do
+  bs <- get (ev := bc)
+  let v = contents c (nowOf bs)
+  if cond v
+  then do
+    w <- body v
+    ended ch c w
+  else do
+    givenUp (s := s) ch
+    park ch
+    attempt (bc := bc) ch c cond body
+
+-- (a behaviour on the cowns at the position `c`, spawned, to run where
+-- `cond` holds)
 spawnedOn : {s t : Type}
           -> {e : HFunctor}
           -> {{gr : green <: e}}
           -> {{bc : boc s <: e}}
           -> Cown s t
+          -> (t -> Bool)
           -> (t -> Co e t)
           -> Co e Unit
-spawnedOn c body =
+spawnedOn c cond body =
   if apart (parts c)
   then do
     ch <- newKey
     bs <- get (ev := bc)
     let (next, ready) = spawned ch c bs
     put (ev := bc) next
-    spawn (behaviour ch ready c body)
+    spawn (do
+      turn ch ready
+      attempt ch c cond body)
   else abandon
 
 -- | What a behaviour can be on, in a store of shape `s`: a cown, or a
@@ -309,7 +593,26 @@ when : {c : Type}
      -> {{bc : boc cw.Store <: e}}
      -> (cw.Contents -> Co e cw.Contents)
      -> Co e Unit
-when cs body = spawnedOn (cw.position cs) body
+when cs body = spawnedOn (cw.position cs) (\v -> True) body
+
+-- | A behaviour on the cowns `cs` that waits until `cond` holds of what
+-- | they hold, spawned; this one goes on.  Its turn comes as a `when`'s
+-- | does; where `cond` holds then, `body` runs as a `when`'s.  Where it
+-- | does not, the behaviour lets its cowns go, writing nothing, and
+-- | waits, taking no turn, until another behaviour has written one of
+-- | them; then it comes to their queues again, at the back, before any
+-- | spawned after that write, and tries again.  Where every behaviour
+-- | left waits so, and none can write, `runBoc` says so (`Nothing`).
+whenever : {c : Type}
+         -> {e : HFunctor}
+         -> c
+         -> {{cw : Cowns c}}
+         -> {{gr : green <: e}}
+         -> {{bc : boc cw.Store <: e}}
+         -> (cw.Contents -> Bool)
+         -> (cw.Contents -> Co e cw.Contents)
+         -> Co e Unit
+whenever cs cond body = spawnedOn (cw.position cs) cond body
 
 -- | Waiting until no behaviour is left to run: every one spawned, and
 -- | every one they spawn, done.
@@ -334,7 +637,9 @@ endOf (Nothing, bs) = Nothing
 
 -- | `c` and the behaviours it spawns, on the store `st` and nothing
 -- | else, in the language, the last of them waited for: main's answer
--- | and the store they leave, or `Nothing` where every thread waits.
+-- | and the store they leave, or `Nothing` where every thread waits --
+-- | a behaviour holding its cowns while it waits for good, or every
+-- | behaviour left a `whenever`'s waiting for a write none will make.
 runBoc : {s a : Type}
        -> s
        -> ({e : HFunctor}
