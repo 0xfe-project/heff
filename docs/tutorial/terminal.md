@@ -37,7 +37,7 @@ act _ = pure MkUnit
 
 step : Widget.Key -> Zipper Todo -> Widget.Step (Zipper Todo) (List Todo)
 step (Char 'q') z = Done (toList z)
-step k z = Continue (runCursor (act (cur := here cursor) k) z)
+step k z = Continue (runCursor (act (cur := _) k) z)
 ```
 
 `act` says what each key does with the cursor: the arrows move it, and

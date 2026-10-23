@@ -24,7 +24,7 @@ printTodos (t :: ts) = do
 main : Co stdio Unit
 main =
   printTodos
-    (io := here stdio)
+    (io := _)
     [ todo "write"
     , finish (todo "read")
     ]
@@ -46,8 +46,8 @@ Read `printTodos`'s type from the left:
   when it is done.
 
 `do` runs its lines one after another. `main` runs in the world `stdio`
-alone, and gives `printTodos` what it asks for: `here stdio` shows that
-stdio is part of `stdio`.
+alone, and gives `printTodos` what it asks for: `(io := _)` asks heff
+for the evidence that stdio is part of `stdio`, and heff finds it.
 
 ## Reading a file
 
@@ -108,8 +108,8 @@ and gives back `Left` what was thrown, or `Right` what `program` gave
 [`attempt`](../api/exception.md#attempt)). Where nothing heard a throw,
 `main` prints it.
 
-`(io := _)` asks heff for the evidence: it finds where stdio is in the
-world, here in `attempt`'s, and shows it so (see
+Here `(io := _)` finds where stdio is in the world, in `attempt`'s, and
+shows it so (see
 [giving the evidence](../reference/language/effects.md#giving-the-evidence)).
 
 ```sh
