@@ -51,6 +51,7 @@
 - In threads mode, a shared object whose count is back to one is reused in place again, as an owned one is. A fold over a shared 16M-node tree: 0.54 s to 0.39 s.
 - A stack overflow is an error, not a crash: a C program says `heff: stack overflow` and exits with 2, from any thread heff starts. Where a failure is caught, so is an overflow, as "stack overflow": a std.thread worker hands it to the thread that joins it, and a language server request fails alone. `heff check` on a file nested too deep says so, and the language server reports it on the file and keeps serving. Catching a failure no longer saves the signal mask.
 - A program using threads built as parts (`heff build`, `heff compile DIR/`) no longer crashes: every C file now sees threads mode, not only the one with `main`.
+- The continuations a recursive copy is handed by its own group are tags, not closures, where every one that may reach a call is known and goes nowhere else: their free variables the fields, a call of one a call of a function choosing its body by the tag (defunctionalization, within the group alone), a call of itself last a loop. tree_explore 4.4 s to 3.3 s.
 - A rune and its width read at the same byte, as `runeAt s i` reads them, are decoded once, by a primitive giving both; an ASCII byte is read where it is, not by a call. In C, str_runes 17.8 G to 9.8 G instructions, graphemes 25.3 G to 23.3 G; in JavaScript, str_runes 7.2 s to 6.0 s. `ofRunes` counts its bytes without encoding each rune twice.
 
 ### Compiler and tools

@@ -1,0 +1,1161 @@
+-- Continuations of a copy as tags: Reynolds' defunctionalization, of
+-- the lambdas a recursive copy (heff.compile.spec's) is handed by its
+-- own group.  A copy of a computation handled in a continuation monad
+-- takes its continuations as parameters, and builds the next ones as
+-- lambdas: each step a closure built, and each call of a continuation a
+-- call not known (in C, `heff_apply`'s).  Where every lambda that may
+-- flow to a variable is known, and goes nowhere else, the lambdas are
+-- made tags instead, their free variables the fields, and a call of the
+-- variable a call of a function of its own, choosing the lambda's body
+-- by the tag:
+--
+--   go Leaf k = k 0                       go Leaf k = go$apply0 k 0
+--   go (Node l r) k =                     go (Node l r) k = go l (L0 r k)
+--     go l (\x -> go r (\y -> k (x + y)))
+--                                         go$apply0 c v = case c of
+--                                           L0 r k -> go r (L1 v k)
+--                                           L1 x k -> go$apply0 k (x + v)
+--
+-- (`go`'s first call, from outside, hands it a lambda of its own, made a
+-- tag too); a call of itself last a loop, and calls of one another last
+-- made one loop (heff.compile.cycles).
+--
+-- Only a group of copies of one definition that name one another, one
+-- of them calling itself and one handed a lambda, is looked at, and
+-- nothing outside it: a copy whose every use is a call in the group,
+-- given all it takes, has its parameters known by what the group hands
+-- it; any other's are not known.  What flows where is found as 0-CFA
+-- does, within the group: a lambda flows to a variable it is bound to
+-- or given as, by a call of a copy, or by a call of a variable to which
+-- it flows, to the lambda's parameter.  A lambda escapes where it goes
+-- anywhere else -- a field, a call not known, a value given back -- or
+-- flows to a variable called that something not a known lambda may flow
+-- to (a match's field, say); a lambda that escapes is a closure, and
+-- each variable it may flow to is called as one.
+--
+-- A tag's `apply` takes all its call gives, so each lambda of one is
+-- first made to take as many (as heff.compile.callarity makes a lambda
+-- take more), round by round: making one take more gives what its body
+-- calls more too.  So is a copy every call of which gives it more than
+-- it takes -- of a known copy, in the group; of another, in the program
+-- -- what it gives back called with the rest.  The program is changed
+-- only if, made so, every lambda made to take more is a tag, each of an
+-- `apply` whose lambdas all take as many as every call of it gives, each
+-- copy is given all it takes by every call (no closure is made that
+-- would have been called with less), and within the bounds below; else
+-- the group is left as it was.
+--
+-- This runs on what is fused (heff.compile.fuse), before the calls are
+-- made at their arity (heff.compile.callarity), for both backends.
+
+module heff.compile.defun
+
+import heff.compile.callarity as CallArity
+import heff.compile.ir as IR
+import heff.compile.lift as Lift
+import heff.compile.spec as Spec
+import heff.compile.supply
+import std.ordmap as OrdMap
+
+-- Bounds
+--------------------------------------------------------------------------------
+
+-- | the most lambdas one `apply` chooses among
+lamsMost : Int
+lamsMost = 16
+
+-- | the most `apply`s of a group
+appliesMost : Int
+appliesMost = 4
+
+-- | the biggest an `apply` may be: its lambdas' bodies, moved there
+applyMost : Int
+applyMost = 4000
+
+-- | the biggest a group may be, all its copies, to be looked at
+groupMost : Int
+groupMost = 20000
+
+-- | the most rounds of lambdas made to take more
+roundsMost : Int
+roundsMost = 6
+
+-- | the most steps finding what flows where
+stepsMost : Int
+stepsMost = 60
+
+-- Names
+--------------------------------------------------------------------------------
+
+type Names = OrdMap.OrdMap String Unit
+
+addName : Names -> String -> Names
+addName s x = OrdMap.insert s x MkUnit
+
+namesOf : List String -> Names
+namesOf xs = List.foldl addName OrdMap.empty xs
+
+hasName : Names -> String -> Bool
+hasName s x = OrdMap.member s x
+
+unionNames : Names -> Names -> Names
+unionNames a b = List.foldl addName a (OrdMap.keys b)
+
+-- (whether the two have a name in common)
+meets : Names -> Names -> Bool
+meets a b = List.any (\x -> hasName b x) (OrdMap.keys a)
+
+-- (whether every name of `a` is one of `b`)
+within : Names -> Names -> Bool
+within a b = List.all (\x -> hasName b x) (OrdMap.keys a)
+
+numberedGo : {a : Type} -> Int -> List a -> List (Pair Int a)
+numberedGo i Nil = Nil
+numberedGo i (Cons x xs) = Cons (MkPair i x) (numberedGo (i + 1) xs)
+
+-- | each with its place, from 0
+-- | >>> numbered ["a", "b"]
+-- | [MkPair 0 "a", MkPair 1 "b"]
+numbered : {a : Type} -> List a -> List (Pair Int a)
+numbered xs = numberedGo 0 xs
+
+-- The groups
+--------------------------------------------------------------------------------
+
+-- | copies of one definition, in the program's order, those of them
+-- | whose parameters are known by what the group hands them: each use of
+-- | it a call in the group, given all it takes; and those, not known,
+-- | every call of which in the program gives more than they take, with
+-- | the fewest any gives
+type Group =
+  { keys : List String
+  , known : OrdMap.OrdMap String (List String)
+  , entries : OrdMap.OrdMap String Int
+  }
+
+-- (the copy a definition is, under the definition it is of)
+addCopy : OrdMap.OrdMap String (List String)
+        -> IR.Def
+        -> OrdMap.OrdMap String (List String)
+addCopy m d =
+  if strEq (Spec.rootOf d.key) d.key then m
+  else OrdMap.insert
+      m
+      (Spec.rootOf d.key)
+      (Cons d.key (fromMaybe Nil (OrdMap.lookup m (Spec.rootOf d.key))))
+
+-- | the copies, by the definition each is of, in the program's order
+copiesBy : List IR.Def -> OrdMap.OrdMap String (List String)
+copiesBy defs = List.foldr (\(d : IR.Def) m -> addCopy m d) OrdMap.empty defs
+
+bodyOf : OrdMap.OrdMap String IR.Expr -> String -> IR.Expr
+bodyOf bodies k = fromMaybe EAbandon (OrdMap.lookup bodies k)
+
+-- (the sets that meet `n` made one with it)
+joinNames : List Names -> Names -> List Names
+joinNames cs n =
+  Cons
+    (List.foldl unionNames n (List.keepIf (meets n) cs))
+    (List.keepIf (\c -> not (meets n c)) cs)
+
+-- | copies of one definition, by which name one another: each group of
+-- | them, in the program's order
+componentsOf : OrdMap.OrdMap String IR.Expr -> List String -> List (List String)
+componentsOf bodies ks =
+  let set = namesOf ks
+  in List.map
+    (\c -> List.keepIf (hasName c) ks)
+    (List.foldl
+       (\cs k ->
+          joinNames
+            cs
+            (namesOf
+               (Cons
+                  k
+                  (List.keepIf
+                     (hasName set)
+                     (IR.globalsIn (bodyOf bodies k))))))
+       Nil
+       ks)
+
+-- | the fewest and the most arguments each copy is given
+type Given = OrdMap.OrdMap String (Pair Int Int)
+
+givenWith : Int -> Maybe (Pair Int Int) -> Pair Int Int
+givenWith k (Just (MkPair lo hi)) = MkPair (min lo k) (max hi k)
+givenWith k Nothing = MkPair k k
+
+givenUse : Names -> String -> Int -> Given -> Given
+givenUse ks g k m =
+  if hasName ks g then OrdMap.insert m g (givenWith k (OrdMap.lookup m g))
+  else m
+
+spineGiven : Names
+           -> Pair IR.Expr (List IR.Expr)
+           -> List IR.Expr
+           -> Given
+           -> Pair (List IR.Expr) Given
+spineGiven ks (MkPair (EGlobal g) args) rest m =
+  MkPair (IR.appendI args rest) (givenUse ks g (List.length args) m)
+spineGiven ks (MkPair h args) rest m = MkPair (Cons h (IR.appendI args rest)) m
+
+givenW : Names -> Pair (List IR.Expr) Given -> Given
+givenW ks (MkPair Nil m) = m
+givenW ks (MkPair (Cons (EGlobal g) rest) m) =
+  givenW ks (MkPair rest (givenUse ks g 0 m))
+givenW ks (MkPair (Cons (EApp f args) rest) m) =
+  givenW ks (spineGiven ks (IR.spine (EApp f args)) rest m)
+givenW ks (MkPair (Cons (ECall g args) rest) m) =
+  givenW ks (MkPair (IR.appendI args rest) (givenUse ks g (List.length args) m))
+givenW ks (MkPair (Cons e rest) m) = givenW ks (MkPair (IR.partsOnto e rest) m)
+
+callsItself : OrdMap.OrdMap String IR.Expr -> String -> Bool
+callsItself bodies k = List.elemBy strEq k (IR.globalsIn (bodyOf bodies k))
+
+-- (whether a lambda is among the arguments)
+lamAmong : List IR.Expr -> Bool
+lamAmong Nil = False
+lamAmong (Cons (ELam _ _) _) = True
+lamAmong (Cons _ es) = lamAmong es
+
+-- (an application: its arguments, and its head if it is no copy of `ks`
+-- given a lambda, to walk on -- or nothing more: it is)
+handsStep : Names
+          -> Pair IR.Expr (List IR.Expr)
+          -> List IR.Expr
+          -> Maybe (List IR.Expr)
+handsStep ks (MkPair (EGlobal g) args) rest =
+  if hasName ks g && lamAmong args then Nothing
+  else Just (IR.appendI args rest)
+handsStep ks (MkPair h args) rest = Just (Cons h (IR.appendI args rest))
+
+-- | whether a copy of `ks` is handed a lambda, in the worklist
+handsW : Names -> List IR.Expr -> Bool
+handsW ks Nil = False
+handsW ks (Cons (EApp f args) rest) =
+  maybe True (handsW ks) (handsStep ks (IR.spine (EApp f args)) rest)
+handsW ks (Cons (ECall g args) rest) =
+  maybe True (handsW ks) (handsStep ks (MkPair (EGlobal g) args) rest)
+handsW ks (Cons e rest) = handsW ks (IR.partsOnto e rest)
+
+-- (copies to look at: one calling itself, one handed a lambda by
+-- another or by itself, all of them not too big)
+worthIt : OrdMap.OrdMap String IR.Expr -> List String -> Bool
+worthIt bodies ks =
+  List.any (callsItself bodies) ks
+  && handsW (namesOf ks) (List.map (bodyOf bodies) ks)
+  && List.foldl (\n k -> n + IR.size (bodyOf bodies k)) 0 ks <= groupMost
+
+-- | the copies looked at: by which definition each is of, and how many
+-- | parameters each takes (if it is a function)
+type Cands =
+  { group : OrdMap.OrdMap String String
+  , arity : OrdMap.OrdMap String Int
+  }
+
+arityIn : IR.Expr -> Int
+arityIn (ELam xs _) = List.length xs
+arityIn _ = 1000000
+
+candsAdd : OrdMap.OrdMap String IR.Expr -> Cands -> List String -> Cands
+candsAdd bodies c ks =
+  List.foldl
+    (\(c2 : Cands) k ->
+       { group = OrdMap.insert c2.group k (fromMaybe "" (List.head ks))
+       , arity = OrdMap.insert c2.arity k (arityIn (bodyOf bodies k))
+       })
+    c
+    ks
+
+candsOf : OrdMap.OrdMap String IR.Expr -> List (List String) -> Cands
+candsOf bodies groups =
+  List.foldl
+    (candsAdd bodies)
+    { group = OrdMap.empty, arity = OrdMap.empty }
+    groups
+
+isOf : Maybe String -> String -> Bool
+isOf (Just r) r2 = strEq r r2
+isOf Nothing r2 = False
+
+-- (a use of the copy `g`, in `user`, given `k` arguments (none: as a
+-- value): one that is not a call in its group, given all it takes, noted)
+useIn : Cands -> String -> String -> Int -> Maybe String -> Names -> Names
+useIn c user g k (Just r) bad =
+  if isOf (OrdMap.lookup c.group user) r
+     && k >= fromMaybe 1000000 (OrdMap.lookup c.arity g)
+  then bad
+  else addName bad g
+useIn c user g k Nothing bad = bad
+
+-- | how the copies looked at are used: those used otherwise than by a
+-- | call in their group, given all they take; and the fewest and the most
+-- | arguments each is given
+type Uses = { bad : Names, given : Given }
+
+useOf : Cands -> String -> String -> Int -> Uses -> Uses
+useOf c user g k u =
+  if OrdMap.member c.group g
+  then { bad = useIn c user g k (OrdMap.lookup c.group g) u.bad
+       , given = OrdMap.insert u.given g (givenWith k (OrdMap.lookup u.given g))
+       }
+  else u
+
+-- (an application, its head a global or not: what is left to walk)
+spineUse : Cands
+         -> String
+         -> Pair IR.Expr (List IR.Expr)
+         -> List IR.Expr
+         -> Uses
+         -> Pair (List IR.Expr) Uses
+spineUse c user (MkPair (EGlobal g) args) rest u =
+  MkPair (IR.appendI args rest) (useOf c user g (List.length args) u)
+spineUse c user (MkPair h args) rest u =
+  MkPair (Cons h (IR.appendI args rest)) u
+
+-- | how the copies are used, in the worklist, by `user`
+usesW : Cands -> String -> Pair (List IR.Expr) Uses -> Uses
+usesW c user (MkPair Nil u) = u
+usesW c user (MkPair (Cons (EGlobal g) rest) u) =
+  usesW c user (MkPair rest (useOf c user g 0 u))
+usesW c user (MkPair (Cons (EApp f args) rest) u) =
+  usesW c user (spineUse c user (IR.spine (EApp f args)) rest u)
+usesW c user (MkPair (Cons (ECall g args) rest) u) =
+  usesW
+    c
+    user
+    (MkPair (IR.appendI args rest) (useOf c user g (List.length args) u))
+usesW c user (MkPair (Cons e rest) u) =
+  usesW c user (MkPair (IR.partsOnto e rest) u)
+
+paramsIn : IR.Expr -> List String
+paramsIn (ELam xs _) = xs
+paramsIn _ = Nil
+
+knownOf : OrdMap.OrdMap String IR.Expr
+        -> Names
+        -> List String
+        -> OrdMap.OrdMap String (List String)
+knownOf bodies bad ks =
+  List.foldl
+    (\m k ->
+       if hasName bad k || List.null (paramsIn (bodyOf bodies k)) then m
+       else OrdMap.insert m k (paramsIn (bodyOf bodies k)))
+    OrdMap.empty
+    ks
+
+-- (a copy not known, every call of which gives it more than it takes)
+entryAdd : OrdMap.OrdMap String Int
+         -> OrdMap.OrdMap String (List String)
+         -> String
+         -> Int
+         -> Maybe (Pair Int Int)
+         -> OrdMap.OrdMap String Int
+entryAdd m known k n (Just (MkPair lo hi)) =
+  if OrdMap.member known k || n == 0 || lo <= n then m
+  else OrdMap.insert m k lo
+entryAdd m known k n Nothing = m
+
+groupOf : OrdMap.OrdMap String IR.Expr -> Names -> Given -> List String -> Group
+groupOf bodies bad given ks =
+  let known = knownOf bodies bad ks
+  in { keys = ks
+     , known = known
+     , entries =
+         List.foldl
+           (\m k ->
+              entryAdd
+                m
+                known
+                k
+                (List.length (paramsIn (bodyOf bodies k)))
+                (OrdMap.lookup given k))
+           OrdMap.empty
+           ks
+     }
+
+-- | the groups to look at, of the program
+groupsOf : OrdMap.OrdMap String IR.Expr -> List IR.Def -> List Group
+groupsOf bodies defs =
+  let gs =
+    List.keepIf
+      (worthIt bodies)
+      (List.concatMap (componentsOf bodies) (OrdMap.values (copiesBy defs)))
+  in let c = candsOf bodies gs
+  in let u =
+    List.foldl
+      (\u (d : IR.Def) -> usesW c d.key (MkPair (Cons d.body Nil) u))
+      { bad = OrdMap.empty, given = OrdMap.empty }
+      (if List.null gs then Nil else defs)
+  in List.keepIf
+    (\(g : Group) -> OrdMap.size g.known > 0)
+    (List.map (groupOf bodies u.bad u.given) gs)
+
+-- What flows where
+--------------------------------------------------------------------------------
+
+-- | what flows: a lambda (by its first parameter's name, its own), what
+-- | a variable holds, or what is not a known lambda
+data Src = FromLam String | FromVar String | FromNone
+
+-- | where a value goes: to a variable, or anywhere else
+data Ctx = ToVar String | ToOut
+
+-- | a variable called, each argument given as a variable of its own
+type Call = { head : String, args : List String }
+
+type Lam = { params : List String, body : IR.Expr }
+
+-- | what is noted of a group: what flows to a variable, what goes
+-- | anywhere else, the calls of variables, the lambdas; and the names
+-- | drawn for the arguments
+type Col =
+  { n : Int
+  , flows : List (Pair Src String)
+  , outs : List Src
+  , calls : List Call
+  , lams : OrdMap.OrdMap String Lam
+  }
+
+withFlow : Src -> String -> Col -> Col
+withFlow s x c =
+  { n = c.n
+  , flows = Cons (MkPair s x) c.flows
+  , outs = c.outs
+  , calls = c.calls
+  , lams = c.lams
+  }
+
+withOut : Src -> Col -> Col
+withOut s c =
+  { n = c.n
+  , flows = c.flows
+  , outs = Cons s c.outs
+  , calls = c.calls
+  , lams = c.lams
+  }
+
+withCall : String -> List String -> Col -> Col
+withCall x xs c =
+  { n = c.n
+  , flows = c.flows
+  , outs = c.outs
+  , calls = Cons { head = x, args = xs } c.calls
+  , lams = c.lams
+  }
+
+withLam : String -> List String -> IR.Expr -> Col -> Col
+withLam y ps b c =
+  { n = c.n
+  , flows = c.flows
+  , outs = c.outs
+  , calls = c.calls
+  , lams = OrdMap.insert c.lams y { params = ps, body = b }
+  }
+
+drawn : Col -> Col
+drawn c =
+  { n = c.n + 1
+  , flows = c.flows
+  , outs = c.outs
+  , calls = c.calls
+  , lams = c.lams
+  }
+
+into : Ctx -> Src -> Col -> Col
+into (ToVar x) s c = withFlow s x c
+into ToOut FromNone c = c
+into ToOut s c = withOut s c
+
+type Go = Ctx -> IR.Expr -> Col -> Col
+
+-- (the arguments of a call of a variable, each given as a variable of
+-- its own, `%n`: no name of the program's)
+argsAs : Go -> List IR.Expr -> List String -> Col -> Pair (List String) Col
+argsAs go Nil acc c = MkPair (List.reverse acc) c
+argsAs go (Cons a es) acc c =
+  argsAs
+    go
+    es
+    (Cons ("%" ^ show c.n) acc)
+    (go (ToVar ("%" ^ show c.n)) a (drawn c))
+
+calledWith : String -> Pair (List String) Col -> Col
+calledWith x (MkPair xs c) = withCall x xs c
+
+-- (arguments given to the parameters, those past them anywhere)
+argsTo : Go -> List IR.Expr -> List String -> Col -> Col
+argsTo go (Cons a es) (Cons p ps) c = argsTo go es ps (go (ToVar p) a c)
+argsTo go (Cons a es) Nil c = argsTo go es Nil (go ToOut a c)
+argsTo go Nil ps c = c
+
+argsOfGlobal : Go -> List IR.Expr -> Maybe (List String) -> Col -> Col
+argsOfGlobal go args (Just ps) c = argsTo go args ps c
+argsOfGlobal go args Nothing c = argsTo go args Nil c
+
+-- (an application, by its head; what it gives is no known lambda)
+appCol : Go
+       -> OrdMap.OrdMap String (List String)
+       -> Ctx
+       -> Pair IR.Expr (List IR.Expr)
+       -> Col
+       -> Col
+appCol go known ctx (MkPair (EVar x) args) c =
+  into ctx FromNone (calledWith x (argsAs go args Nil c))
+appCol go known ctx (MkPair (EGlobal g) args) c =
+  into ctx FromNone (argsOfGlobal go args (OrdMap.lookup known g) c)
+appCol go known ctx (MkPair h args) c =
+  into ctx FromNone (argsTo go args Nil (go ToOut h c))
+
+-- (variables bound to what is not a known lambda: a match's fields, the
+-- values a way out gives)
+noneTo : List String -> Col -> Col
+noneTo xs c = List.foldl (\acc x -> withFlow FromNone x acc) c xs
+
+-- | what is noted of an expression, its value going to `ctx`
+colE : OrdMap.OrdMap String (List String) -> Ctx -> IR.Expr -> Col -> Col
+colE known ctx (EVar x) c = into ctx (FromVar x) c
+colE known ctx (ELam (Cons y ys) b) c =
+  colE known ToOut b (into ctx (FromLam y) (withLam y (Cons y ys) b c))
+colE known ctx (ELet x a b) c = colE known ctx b (colE known (ToVar x) a c)
+colE known ctx (EMatch s arms) c =
+  List.foldl
+    (\acc a -> colE known ctx (IR.armBody a) (noneTo (IR.armVars a) acc))
+    (colE known ToOut s c)
+    arms
+colE known ctx (ESet xs a b) c =
+  colE known ctx b (colE known ToOut a (noneTo xs c))
+colE known ctx (EApp f args) c =
+  appCol (colE known) known ctx (IR.spine (EApp f args)) c
+colE known ctx (ECall g args) c =
+  appCol (colE known) known ctx (MkPair (EGlobal g) args) c
+colE known ctx EAbandon c = c
+colE known ctx e c =
+  into
+    ctx
+    FromNone
+    (IR.foldParts (\xs p acc -> colE known ToOut p (noneTo xs acc)) e c)
+
+-- (a copy: its parameters, if it is not known, given what is not known)
+colTop : OrdMap.OrdMap String (List String) -> Bool -> IR.Expr -> Col -> Col
+colTop known True (ELam _ b) c = colE known ToOut b c
+colTop known False (ELam ps b) c = colE known ToOut b (noneTo ps c)
+colTop known k e c = colE known ToOut e c
+
+-- (the known copies' parameters, as they are now)
+knownNow : Group
+         -> OrdMap.OrdMap String IR.Expr
+         -> OrdMap.OrdMap String (List String)
+knownNow g bodies =
+  OrdMap.fromList
+    (List.map
+       (\k -> MkPair k (paramsIn (bodyOf bodies k)))
+       (OrdMap.keys g.known))
+
+givenOf : Group -> OrdMap.OrdMap String IR.Expr -> Given
+givenOf g bodies =
+  givenW
+    (namesOf g.keys)
+    (MkPair (List.map (bodyOf bodies) g.keys) OrdMap.empty)
+
+collect : OrdMap.OrdMap String (List String)
+        -> Group
+        -> OrdMap.OrdMap String IR.Expr
+        -> Col
+collect known g bodies =
+  List.foldl
+    (\c k -> colTop known (OrdMap.member known k) (bodyOf bodies k) c)
+    { n = 0, flows = Nil, outs = Nil, calls = Nil, lams = OrdMap.empty }
+    g.keys
+
+-- | what is found: the lambdas that may flow to each variable, the
+-- | variables something else may flow to, the variables whose lambdas
+-- | escape, and the lambdas that escape; how often something was found,
+-- | and the lambdas
+type St =
+  { fl : OrdMap.OrdMap String Names
+  , op : Names
+  , bad : Names
+  , esc : Names
+  , grew : Int
+  , lams : OrdMap.OrdMap String Lam
+  }
+
+labelsOf : St -> String -> Names
+labelsOf st x = fromMaybe OrdMap.empty (OrdMap.lookup st.fl x)
+
+-- (something not a known lambda flowing to `x`)
+opaque : St -> String -> St
+opaque st x =
+  if hasName st.op x then st
+  else { fl = st.fl
+       , op = addName st.op x
+       , bad = st.bad
+       , esc = st.esc
+       , grew = st.grew + 1
+       , lams = st.lams
+       }
+
+-- (a lambda escaping: its parameters given what is not known)
+escape : St -> String -> St
+escape st l =
+  if hasName st.esc l then st
+  else List.foldl
+      opaque
+      { fl = st.fl
+      , op = st.op
+      , bad = st.bad
+      , esc = addName st.esc l
+      , grew = st.grew + 1
+      , lams = st.lams
+      }
+      (maybe Nil (\(lam : Lam) -> lam.params) (OrdMap.lookup st.lams l))
+
+-- (a lambda flowing to `x`: escaping, if what `x` holds escapes)
+addLabel : String -> St -> String -> St
+addLabel x st l =
+  if hasName (labelsOf st x) l then st
+  else if hasName st.bad x
+  then escape
+      { fl = OrdMap.insert st.fl x (addName (labelsOf st x) l)
+      , op = st.op
+      , bad = st.bad
+      , esc = st.esc
+      , grew = st.grew + 1
+      , lams = st.lams
+      }
+      l
+  else { fl = OrdMap.insert st.fl x (addName (labelsOf st x) l)
+       , op = st.op
+       , bad = st.bad
+       , esc = st.esc
+       , grew = st.grew + 1
+       , lams = st.lams
+       }
+
+-- (what `x` holds escaping: each lambda that flows to it)
+markBad : String -> St -> St
+markBad x st =
+  if hasName st.bad x then st
+  else List.foldl
+      escape
+      { fl = st.fl
+      , op = st.op
+      , bad = addName st.bad x
+      , esc = st.esc
+      , grew = st.grew + 1
+      , lams = st.lams
+      }
+      (OrdMap.keys (labelsOf st x))
+
+flowInto : String -> Names -> Bool -> St -> St
+flowInto x ls o st =
+  List.foldl (addLabel x) (if o then opaque st x else st) (OrdMap.keys ls)
+
+flowStep : St -> Pair Src String -> St
+flowStep st (MkPair (FromLam l) x) = addLabel x st l
+flowStep st (MkPair (FromVar y) x) =
+  flowInto x (labelsOf st y) (hasName st.op y) st
+flowStep st (MkPair FromNone x) = opaque st x
+
+outStep : St -> Src -> St
+outStep st (FromLam l) = escape st l
+outStep st (FromVar y) = markBad y st
+outStep st FromNone = st
+
+-- (the arguments of a call given to a lambda's parameters; past them,
+-- given to what it gives -- anywhere, `strict`, else not looked at)
+argsStep : Bool -> List String -> List String -> St -> St
+argsStep strict (Cons a es) (Cons p ps) st =
+  argsStep strict es ps (flowInto p (labelsOf st a) (hasName st.op a) st)
+argsStep strict (Cons a es) Nil st =
+  if strict then argsStep strict es Nil (markBad a st) else st
+argsStep strict Nil ps st = st
+
+-- (a call of a variable to which the lambda `l` may flow: if it escapes,
+-- or -- `strict` -- takes more than the call gives, the variable is
+-- called as a closure)
+lamAt : Bool -> Call -> St -> String -> Maybe Lam -> St
+lamAt strict c st l (Just lam) =
+  argsStep
+    strict
+    c.args
+    lam.params
+    (if hasName st.esc l
+        || strict && List.length c.args < List.length lam.params
+     then markBad c.head st
+     else st)
+lamAt strict c st l Nothing = markBad c.head st
+
+callStep : Bool -> St -> Call -> St
+callStep strict st c =
+  List.foldl
+    (\s l -> lamAt strict c s l (OrdMap.lookup s.lams l))
+    (if hasName st.op c.head then markBad c.head st else st)
+    (OrdMap.keys (labelsOf st c.head))
+
+stepAll : Bool -> Col -> St -> St
+stepAll strict c st =
+  List.foldl
+    (callStep strict)
+    (List.foldl outStep (List.foldl flowStep st c.flows) c.outs)
+    c.calls
+
+-- | each step until none finds more (nothing, past the steps given)
+solve : Bool -> Col -> Int -> St -> Maybe St
+solve strict c left st =
+  let st2 = stepAll strict c st
+  in if st2.grew == st.grew then Just st2
+  else if left <= 0 then Nothing
+  else solve strict c (left - 1) st2
+
+-- The tags
+--------------------------------------------------------------------------------
+
+-- | lambdas made tags of one `apply`, and the variables called to which
+-- | they flow
+type Class = { labels : Names, vars : Names }
+
+-- (a variable called whose calls choose among known lambdas alone)
+goodHead : St -> String -> Bool
+goodHead st x =
+  not (hasName st.bad x)
+  && not (hasName st.op x)
+  && OrdMap.size (labelsOf st x) > 0
+  && not (meets (labelsOf st x) st.esc)
+
+unionClass : Class -> Class -> Class
+unionClass a b =
+  { labels = unionNames a.labels b.labels, vars = unionNames a.vars b.vars }
+
+joinClass : List Class -> Class -> List Class
+joinClass cls c =
+  Cons
+    (List.foldl
+       unionClass
+       c
+       (List.keepIf (\(k : Class) -> meets k.labels c.labels) cls))
+    (List.keepIf (\(k : Class) -> not (meets k.labels c.labels)) cls)
+
+headsOf : Col -> Names
+headsOf c =
+  List.foldl (\s (call : Call) -> addName s call.head) OrdMap.empty c.calls
+
+classesOf : St -> Col -> List Class
+classesOf st c =
+  List.foldl
+    (\cls x ->
+       if goodHead st x
+       then joinClass
+           cls
+           { labels = labelsOf st x, vars = namesOf (Cons x Nil) }
+       else cls)
+    Nil
+    (OrdMap.keys (headsOf c))
+
+-- (the most any call of the variables gives)
+arityOfClass : Col -> Class -> Int
+arityOfClass c k =
+  List.foldl
+    (\n (call : Call) ->
+       if hasName k.vars call.head then max n (List.length call.args) else n)
+    0
+    c.calls
+
+paramsCount : Col -> String -> Int
+paramsCount c l =
+  maybe 0 (\(lam : Lam) -> List.length lam.params) (OrdMap.lookup c.lams l)
+
+-- | a group, as looked at: what flows where, the lambdas made tags,
+-- | what the known copies take and are given
+type Seen =
+  { col : Col
+  , st : St
+  , classes : List Class
+  , known : OrdMap.OrdMap String (List String)
+  , given : Given
+  }
+
+seenWith : OrdMap.OrdMap String (List String)
+         -> Given
+         -> Col
+         -> Maybe St
+         -> Maybe Seen
+seenWith known given col (Just st) =
+  Just
+    { col = col
+    , st = st
+    , classes = classesOf st col
+    , known = known
+    , given = given
+    }
+seenWith known given col Nothing = Nothing
+
+analyse : Bool -> Group -> OrdMap.OrdMap String IR.Expr -> Maybe Seen
+analyse strict g bodies =
+  let known = knownNow g bodies
+  in let col = collect known g bodies
+  in seenWith
+    known
+    (givenOf g bodies)
+    col
+    (solve
+       strict
+       col
+       stepsMost
+       { fl = OrdMap.empty
+       , op = OrdMap.empty
+       , bad = OrdMap.empty
+       , esc = OrdMap.empty
+       , grew = 0
+       , lams = col.lams
+       })
+
+-- Taking more
+--------------------------------------------------------------------------------
+
+-- (the lambdas of a class taking fewer than its calls give, each with
+-- how many it is to take)
+classWants : Col -> Class -> Int -> List (Pair String Int)
+classWants c k n =
+  List.concatMap
+    (\l -> if paramsCount c l < n then Cons (MkPair l n) Nil else Nil)
+    (OrdMap.keys k.labels)
+
+wantsOf : Seen -> List (Pair String Int)
+wantsOf s =
+  List.concatMap
+    (\(k : Class) -> classWants s.col k (arityOfClass s.col k))
+    s.classes
+
+-- (a known copy every call of which gives it more than it takes, by its
+-- first parameter's name: to take as many as the most a call gives)
+topWants : Given -> Pair String (List String) -> List (Pair String Int)
+topWants given (MkPair k (Cons p ps)) =
+  if maybe 0 snd (OrdMap.lookup given k) > 1 + List.length ps
+  then Cons (MkPair p (maybe 0 snd (OrdMap.lookup given k))) Nil
+  else Nil
+topWants given kp = Nil
+
+entryOf : Int -> List String -> List (Pair String Int)
+entryOf n (Cons p ps) =
+  if n > 1 + List.length ps then Cons (MkPair p n) Nil else Nil
+entryOf n Nil = Nil
+
+-- (... and a copy not known every call of which, in the program, gives
+-- it more than it takes)
+entryWants : Group
+           -> OrdMap.OrdMap String IR.Expr
+           -> Pair String Int
+           -> List (Pair String Int)
+entryWants g bodies (MkPair k n) = entryOf n (paramsIn (bodyOf bodies k))
+
+topsOf : Group -> OrdMap.OrdMap String IR.Expr -> Seen -> List (Pair String Int)
+topsOf g bodies s =
+  List.append
+    (List.concatMap (topWants s.given) (OrdMap.toList s.known))
+    (List.concatMap (entryWants g bodies) (OrdMap.toList g.entries))
+
+-- (each known copy given, by every call, all it takes; each other
+-- made to take more given that much by every call in the group)
+allGiven : Group -> OrdMap.OrdMap String IR.Expr -> Seen -> Bool
+allGiven g bodies s =
+  List.all
+    (\kp ->
+       maybe 0 fst (OrdMap.lookup s.given (fst kp)) >= List.length (snd kp))
+    (OrdMap.toList s.known)
+  && List.all
+    (\k ->
+       maybe 1000000 fst (OrdMap.lookup s.given k)
+       >= List.length (paramsIn (bodyOf bodies k)))
+    (OrdMap.keys g.entries)
+
+extLam : String -> List String -> IR.Expr -> Maybe Int -> S IR.Expr
+extLam y ys b (Just n) =
+  if n > 1 + List.length ys
+  then do
+    zs <- CallArity.freshMany (n - 1 - List.length ys)
+    pure (ELam (Cons y (List.append ys zs)) (CallArity.extend zs b))
+  else pure (ELam (Cons y ys) b)
+extLam y ys b Nothing = pure (ELam (Cons y ys) b)
+
+-- | the lambdas named, each taking as many as said
+extGo : OrdMap.OrdMap String Int -> IR.Expr -> S IR.Expr
+extGo w (ELam (Cons y ys) b) = do
+  b2 <- extGo w b
+  extLam y ys b2 (OrdMap.lookup w y)
+extGo w e = IR.traverseParts (\_ p -> extGo w p) e
+
+-- | a group's copies, as they are made, the lambdas made to take more,
+-- | and where fresh names go on from
+type Grown =
+  { bodies : OrdMap.OrdMap String IR.Expr
+  , grown : Names
+  , supply : Int
+  }
+
+extKey : OrdMap.OrdMap String Int
+       -> OrdMap.OrdMap String IR.Expr
+       -> String
+       -> S (Pair String IR.Expr)
+extKey w bodies k = do
+  b <- extGo w (bodyOf bodies k)
+  pure (MkPair k b)
+
+grownWith : Grown
+          -> List (Pair String Int)
+          -> Pair (List (Pair String IR.Expr)) Int
+          -> Grown
+grownWith gr w (MkPair kbs n) =
+  { bodies = OrdMap.fromList kbs
+  , grown = unionNames gr.grown (namesOf (List.map fst w))
+  , supply = n
+  }
+
+grownBy : Group
+        -> Grown
+        -> List (Pair String Int)
+        -> List (Pair String Int)
+        -> Grown
+grownBy g gr w tops =
+  grownWith
+    gr
+    w
+    (traverseS
+       (extKey (OrdMap.fromList (List.append w tops)) gr.bodies)
+       g.keys
+       gr.supply)
+
+-- | round by round, until no lambda is to take more (nothing, past the
+-- | rounds given)
+grow : Group -> Int -> Grown -> Maybe Grown
+grow g left gr = case analyse False g gr.bodies of
+  Nothing -> Nothing
+  Just s ->
+    let w = wantsOf s
+    in let tops = topsOf g gr.bodies s
+    in if List.null s.classes then Nothing
+    else if List.null w && List.null tops then Just gr
+    else if left <= 0 then Nothing
+    else grow g (left - 1) (grownBy g gr w tops)
+
+-- The program
+--------------------------------------------------------------------------------
+
+-- | an `apply`: its key, how many it takes past the tag, its lambdas
+type Apply = { key : String, n : Int, labels : List String }
+
+-- | a lambda made a tag: the tag, and its free variables, the fields
+type LabInfo = { tag : String, fvs : List String }
+
+type Plan =
+  { labs : OrdMap.OrdMap String LabInfo
+  , vars : OrdMap.OrdMap String Apply
+  , applies : List Apply
+  , lams : OrdMap.OrdMap String Lam
+  }
+
+applyOf : String -> Col -> Pair Int Class -> Apply
+applyOf base c (MkPair i k) =
+  { key = base ^ "$apply" ^ show i
+  , n = arityOfClass c k
+  , labels = OrdMap.keys k.labels
+  }
+
+-- (an `apply` as it may be: each lambda taking as many as its calls
+-- give, not too many lambdas, not too big)
+fits : Col -> Apply -> Bool
+fits c a =
+  a.n > 0
+  && List.length a.labels <= lamsMost
+  && List.all (\l -> paramsCount c l == a.n) a.labels
+  && List.foldl
+    (\n l ->
+       n + maybe 0 (\(lam : Lam) -> IR.size lam.body) (OrdMap.lookup c.lams l))
+    0
+    a.labels
+  <= applyMost
+
+labInfo : Col -> Apply -> Pair Int String -> Pair String LabInfo
+labInfo c a (MkPair j l) =
+  MkPair
+    l
+    { tag = "Lam" ^ show j ^ "$" ^ a.key
+    , fvs =
+        maybe
+          Nil
+          (\(lam : Lam) -> Lift.freeVars lam.params lam.body)
+          (OrdMap.lookup c.lams l)
+    }
+
+varsOfPair : Pair Apply Class -> List (Pair String Apply)
+varsOfPair (MkPair a k) = List.map (\x -> MkPair x a) (OrdMap.keys k.vars)
+
+planWith : Seen -> List Apply -> List (Pair Apply Class) -> Plan
+planWith s es pairs =
+  { labs =
+      OrdMap.fromList
+        (List.concatMap
+           (\(a : Apply) -> List.map (labInfo s.col a) (numbered a.labels))
+           es)
+  , vars = OrdMap.fromList (List.concatMap varsOfPair pairs)
+  , applies = es
+  , lams = s.col.lams
+  }
+
+-- | what is to be done of a group, as looked at, its lambdas made to
+-- | take more (`grown`): nothing, unless each `apply` fits and each
+-- | lambda made to take more is a tag
+planOf : Group -> Names -> OrdMap.OrdMap String IR.Expr -> Seen -> Maybe Plan
+planOf g grown bodies s =
+  let es =
+    List.map
+      (applyOf (fromMaybe "" (List.head g.keys)) s.col)
+      (numbered s.classes)
+  in if List.null es
+        || List.length es > appliesMost
+        || not (allGiven g bodies s)
+        || not (List.all (fits s.col) es)
+        || not
+          (within
+             grown
+             (List.foldl
+                (\n (k : Class) -> unionNames n k.labels)
+                OrdMap.empty
+                s.classes))
+  then Nothing
+  else Just (planWith s es (List.zip es s.classes))
+
+applied : String -> List IR.Expr -> List IR.Expr -> IR.Expr
+applied key es Nil = EApp (EGlobal key) es
+applied key es rest = EApp (EApp (EGlobal key) es) rest
+
+type RwGo = IR.Expr -> IR.Expr
+
+rwLam : RwGo -> String -> List String -> IR.Expr -> Maybe LabInfo -> IR.Expr
+rwLam go y ys b (Just i) =
+  ETag i.tag (List.map (\v -> EVar v) i.fvs) (IR.anyTys i.fvs)
+rwLam go y ys b Nothing = ELam (Cons y ys) (go b)
+
+rwCall : RwGo -> String -> List IR.Expr -> Maybe Apply -> IR.Expr -> IR.Expr
+rwCall go x args (Just a) e =
+  applied
+    a.key
+    (Cons (EVar x) (List.map go (List.take a.n args)))
+    (List.map go (List.drop a.n args))
+rwCall go x args Nothing e = IR.mapParts (\_ q -> go q) e
+
+rwApp : RwGo -> Plan -> IR.Expr -> Pair IR.Expr (List IR.Expr) -> IR.Expr
+rwApp go p e (MkPair (EVar x) args) =
+  rwCall go x args (OrdMap.lookup p.vars x) e
+rwApp go p e sp = IR.mapParts (\_ q -> go q) e
+
+-- | the lambdas made tags, each call of a variable to which they flow a
+-- | call of their `apply`
+rw : Plan -> IR.Expr -> IR.Expr
+rw p (ELam (Cons y ys) b) = rwLam (rw p) y ys b (OrdMap.lookup p.labs y)
+rw p (EApp f args) = rwApp (rw p) p (EApp f args) (IR.spine (EApp f args))
+rw p e = IR.mapParts (\_ q -> rw p q) e
+
+-- (a lambda's arm of its `apply`, given its parameters `zs`: its fields
+-- named afresh)
+armWith : Plan -> List String -> Maybe Lam -> Maybe LabInfo -> S IR.Arm
+armWith p zs (Just lam) (Just i) = do
+  ws <- traverseS (\v -> freshS (IR.baseOf v)) i.fvs
+  pure
+      (MkArm
+         i.tag
+         ws
+         (IR.subst
+            (CallArity.zipTo (List.append lam.params i.fvs) (List.append zs ws))
+            (rw p lam.body)))
+armWith p zs lam i = pure (MkArm IR.defaultTag Nil EAbandon)
+
+applyDef : Plan -> Apply -> S IR.Def
+applyDef p a = do
+  k <- freshS "k"
+  zs <- CallArity.freshMany a.n
+  arms <-
+    traverseS
+      (\l -> armWith p zs (OrdMap.lookup p.lams l) (OrdMap.lookup p.labs l))
+      a.labels
+  pure (IR.mkDef a.key a.key (ELam (Cons k zs) (EMatch (EVar k) arms)))
+
+-- | what is done so far: the copies made anew, the `apply`s to follow
+-- | each copy, and where fresh names go on from
+type Done =
+  { bodies : OrdMap.OrdMap String IR.Expr
+  , after : OrdMap.OrdMap String (List IR.Def)
+  , supply : Int
+  }
+
+finishWith : Done -> Group -> Plan -> Pair (List IR.Def) Int -> Done
+finishWith d g p (MkPair ads n) =
+  { bodies =
+      List.foldl
+        (\m k -> OrdMap.insert m k (rw p (bodyOf m k)))
+        d.bodies
+        g.keys
+  , after = OrdMap.insert d.after (fromMaybe "" (List.last g.keys)) ads
+  , supply = n
+  }
+
+finish : Done -> Group -> Grown -> Maybe Plan -> Done
+finish d g gr (Just p) =
+  finishWith
+    { bodies = OrdMap.insertAll d.bodies (OrdMap.toList gr.bodies)
+    , after = d.after
+    , supply = d.supply
+    }
+    g
+    p
+    (traverseS (applyDef p) p.applies gr.supply)
+finish d g gr Nothing = d
+
+planned : Done -> Group -> Grown -> Maybe Seen -> Done
+planned d g gr (Just s) = finish d g gr (planOf g gr.grown gr.bodies s)
+planned d g gr Nothing = d
+
+grownDone : Done -> Group -> Maybe Grown -> Done
+grownDone d g (Just gr) = planned d g gr (analyse True g gr.bodies)
+grownDone d g Nothing = d
+
+groupDone : Done -> Group -> Done
+groupDone d g =
+  grownDone
+    d
+    g
+    (grow
+       g
+       roundsMost
+       { bodies =
+           OrdMap.fromList
+             (List.map (\k -> MkPair k (bodyOf d.bodies k)) g.keys)
+       , grown = OrdMap.empty
+       , supply = d.supply
+       })
+
+defOut : Done -> IR.Def -> List IR.Def
+defOut d def =
+  Cons
+    (IR.mkDef def.key def.name (bodyOf d.bodies def.key))
+    (fromMaybe Nil (OrdMap.lookup d.after def.key))
+
+-- | the program, the lambdas each group of copies is handed made tags
+-- | where they can be; where fresh names go on from
+defunProgram : Int -> List IR.Def -> Pair (List IR.Def) Int
+defunProgram n defs =
+  let bodies =
+    List.foldl
+      (\m (d : IR.Def) -> OrdMap.insert m d.key d.body)
+      OrdMap.empty
+      defs
+  in let gs = groupsOf bodies defs
+  in if List.null gs then MkPair defs n
+  else let d =
+         List.foldl
+           groupDone
+           { bodies = bodies, after = OrdMap.empty, supply = n }
+           gs
+       in if OrdMap.size d.after == 0 then MkPair defs n
+       else MkPair (List.concatMap (defOut d) defs) d.supply
