@@ -14,6 +14,12 @@
 //                                   node:http, bytes written to sockets,
 //                                   curl, then /stop; says what each got,
 //                                   a line of JSON, `{ what, got }`
+//   node test/peers.mjs burst PORT M N
+//                                   a server's clients: M one after
+//                                   another, then N, their connections
+//                                   opened at once, a request each, then
+//                                   /stop; says how many of the N were
+//                                   answered
 import { spawnSync } from "node:child_process";
 import { Agent, createServer, request } from "node:http";
 import { connect } from "node:net";
@@ -175,4 +181,31 @@ if (mode === "client") {
   }
   const stop = await ask("GET", "/stop", undefined, {}, false);
   said("stop", `${stop.status} ${stop.body}`);
+}
+
+if (mode === "burst") {
+  const port = Number(arg), before = Number(process.argv[4]), n = Number(process.argv[5]);
+  // (a request on a connection of its own, closed after: what came back,
+  // or the error)
+  const got = (target) => new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    let back = "";
+    const timer = setTimeout(() => { s.destroy(); ok(`${back}(no end)`); }, 20000);
+    s.setEncoding("latin1");
+    s.on("connect", () => s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`));
+    s.on("data", (d) => { back += d; });
+    s.on("error", (e) => { back += `(${e.code})`; });
+    s.on("close", () => { clearTimeout(timer); ok(back); });
+  });
+  // (the server up: a connection made, closed at once)
+  for (let i = 0; i < 600 && !(await new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    s.on("connect", () => { s.destroy(); ok(true); });
+    s.on("error", () => ok(false));
+  })); i++) await new Promise((ok) => setTimeout(ok, 50));
+  for (let i = 0; i < before; i++) await got(`/before/${i}`);
+  const all = await Promise.all(Array.from({ length: n }, (_, i) => got(`/${i}`)));
+  const answered = all.filter((b, i) => b.startsWith("HTTP/1.1 200 ") && b.endsWith(`\r\n\r\n/${i}`)).length;
+  console.log(`answered ${answered} of ${n}`);
+  await got("/stop");
 }
