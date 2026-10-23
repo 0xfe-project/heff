@@ -1,7 +1,8 @@
 -- The command line: `promote` writes each watch's and doc test's value
 -- under it, `test` runs the tests and shrinks what fails, `fmt` lays
 -- files out in place (with `--check`, only names them), `version` says
--- which heff runs, and the usage, the completions and an unknown command
+-- which heff runs, `compile` runs `main` without `--name` and says where
+-- it cannot write, and the usage, the completions and an unknown command
 -- say what they should, on the right stream, with the right exit status.
 -- The heff run is the one that runs the tests (`HEFF`), each test in a
 -- directory of its own; the project's files (`HEFF_TEST_ROOT`) are read,
@@ -1018,7 +1019,7 @@ completed : List (Pair (List String) String)
 completed =
   [ MkPair
     ["co"]
-    "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`)\ncompletions\ta completion script for SHELL\n"
+    "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`); NAME is main, without --name\ncompletions\ta completion script for SHELL\n"
   , MkPair ["compile", "a.hf", "--b"] "--backend\twhat it is compiled to\n"
   , MkPair ["compile", "a.hf", "-b", ""] "esm\npage\nc\n"
   , MkPair ["compile", "a.hf", "--backend=p"] "--backend=page\n"
@@ -1531,6 +1532,79 @@ belowRoot name =
       (succeeded fromSrc && contains "module a.b" fromSrc.out)
       [fromSrc])
 
+-- (a program that says hi, and one with no `main`)
+helloText : String
+helloText =
+  "module hello\n\nimport co\nimport std.io\n\nmain : Co stdio Unit\nmain = print (ev := _) \"hi\"\n"
+
+-- (compiled by each backend into a directory that is not there: refused,
+-- the directory named, a subtest each)
+noDirectory : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> List String
+            -> Co e Unit
+noDirectory Nil = pure MkUnit
+noDirectory (Cons b rest) = do
+  subtest ("no directory, " ^ b) (do
+    r <- heffSays ["compile", "hello.hf", "nodir/hello.out", "--backend=" ^ b]
+    holds
+        ("no directory, " ^ b)
+        (exitedWith 1 r
+         && strEq r.out ""
+         && strEq r.err "heff compile: nodir: no such directory\n")
+        [r])
+  noDirectory rest
+
+-- | compile: a C program runs `main` without `--name`, built as the
+-- | line it writes says; a file with no `main` is refused, naming it;
+-- | OUT in a directory that is not there is refused, for each backend
+compiled : String -> Test
+compiled name =
+  integration name (do
+  working <- workingDir
+  let here = toString working
+  write "hello.hf" helloText
+  write
+      "nomain.hf"
+      "module nomain\n\nimport co\nimport std.io\n\nhi : Co stdio Unit\nhi = print (ev := _) \"hi\"\n"
+  c <- heffSays ["compile", "hello.hf", "hello.c", "--backend=c"]
+  holds
+      "c without --name"
+      (succeeded c && startsWith "wrote hello.c: build it with" c.out)
+      [c]
+  rt <-
+    run
+      { command = "zig"
+      , args =
+          [ "build-obj"
+          , "-O"
+          , "ReleaseSafe"
+          , "hello.zig"
+          , "-femit-bin=runtime.o"
+          ]
+      , timeout = 300000
+      }
+  cc <-
+    run
+      { command = "zig"
+      , args = ["cc", "-O2", "hello.c", "runtime.o", "-o", "hello", "-lm"]
+      , timeout = 300000
+      }
+  ran <- run { command = here ^ "/hello", args = Nil }
+  holds
+      "c without --name runs main"
+      (succeeded rt && succeeded cc && strEq ran.out "hi\n")
+      [rt, cc, ran]
+  noMain <- heffSays ["compile", "nomain.hf", "nomain.c", "--backend=c"]
+  holds
+      "no main"
+      (exitedWith 1 noMain
+       && strEq noMain.out ""
+       && contains "nomain.hf: no definition main" noMain.err)
+      [noMain]
+  noDirectory ["c", "page", "esm"])
+
 cli : Test
 cli =
   group
@@ -1550,6 +1624,7 @@ cli =
     , formatting "fmt"
     , fixities "fmt by imported fixities"
     , docPages "doc"
+    , compiled "compile"
     , usage "usage"
     , version "version"
     , completes "complete"
