@@ -38,22 +38,37 @@
 -- --- | ---
 -- `spawn c` | `c` is a thread of its own; this one goes on
 -- `yield` | the next thread's turn
--- `newChan` | a new channel, of `Int`s
+-- `newKey` | a new key, for threads to park on
+-- `park k` | this thread parked on `k` until it is woken there
+-- `wake k` | the thread parked longest on `k` woken; none there, the wake-up kept
+-- `newChan` | a new channel, of `Int`s: a key, whose wake-ups carry them
 -- `send ch x` | `x` put on `ch`; never waits
 -- `recv ch` | the first value on `ch`, waiting for one if there is none
 --
--- A thread gives up its turn at `yield`, at a `recv` with nothing to take,
--- and where it ends; turns go round robin.  `scheduled e c` runs `c` and
--- the threads it spawns, in `Co e`: `Just` the main thread's answer, or
--- `Nothing` if every thread waits on a channel; the other threads are
--- dropped when the main one ends.
+-- Green threads are threads alone, and what they wait on: a key,
+-- parked on and woken at, its wake-ups kept in order until a thread
+-- parks there.  A channel of `Int`s is a key whose wake-ups carry
+-- values; a channel of anything else is std.chan's, its values kept by a
+-- handler of its own outside the scheduler, its threads parking here.
+--
+-- A thread gives up its turn at `yield`, at a `park` or a `recv` with
+-- nothing to take, and where it ends; turns go round robin.  `scheduled
+-- e c` runs `c` and the threads it spawns, in `Co e`: `Just` the main
+-- thread's answer, or `Nothing` if every thread is parked; the other
+-- threads are dropped when the main one ends.  `together c` joins them
+-- instead: `Just` main's answer once every thread has ended, `Nothing`
+-- where every one left is parked -- the scheduler of the body of a
+-- `with` that holds what the threads share, as std.chan's, which must
+-- outlive every one of them.
 --
 -- A thread's operations of the rest of the world (`e`, outside the
 -- scheduler) are done as the scheduler's `Outside` says: by `scheduled`,
 -- one at a time, each waited for there, every thread with it (a pure
 -- world's, or JavaScript's, whose providers do not wait); by std.reactor's,
 -- on the C backend, begun, the other threads going on while it is pending,
--- and its thread going on once it is done.
+-- and its thread going on once it is done.  Either way a handler between
+-- the scheduler and the world -- a state, std.chan's channels -- sees
+-- each as it sees any other operation, and what it does there is kept.
 
 module green
 
@@ -63,9 +78,9 @@ import std.ordmap as OrdMap
 data GreenF (m : Type -> Type) x
   = Spawn (m Unit) x
   | Yield x
-  | NewChan (Int -> x)
-  | Send Int Int x
-  | Recv Int (Int -> x)
+  | NewKey (Int -> x)
+  | Wake Int Int x
+  | Park Int (Int -> x)
 
 -- | Green threads, as an effect.
 green : HFunctor
@@ -74,15 +89,15 @@ green =
   , hfmap = \m g p -> case p of
       Spawn c x -> Spawn c (g x)
       Yield x -> Yield (g x)
-      NewChan k -> NewChan (\n -> g (k n))
-      Send ch v x -> Send ch v (g x)
-      Recv ch k -> Recv ch (\v -> g (k v))
+      NewKey k -> NewKey (\n -> g (k n))
+      Wake ch v x -> Wake ch v (g x)
+      Park ch k -> Park ch (\v -> g (k v))
   , hmap = \m n nt p -> case p of
       Spawn c x -> Spawn (nt c) x
       Yield x -> Yield x
-      NewChan k -> NewChan k
-      Send ch v x -> Send ch v x
-      Recv ch k -> Recv ch k
+      NewKey k -> NewKey k
+      Wake ch v x -> Wake ch v x
+      Park ch k -> Park ch k
   }
 
 -- | `c`, a thread of its own; this one goes on.
@@ -93,19 +108,34 @@ spawn c = op (ev (Spawn c MkUnit)) val
 yield : {e : HFunctor} -> {{ev : green <: e}} -> Co e Unit
 yield = op (ev (Yield MkUnit)) val
 
--- | A channel of Ints, new.
+-- | A key, new: what threads park on and are woken at.
+newKey : {e : HFunctor} -> {{ev : green <: e}} -> Co e Int
+newKey = op (ev (NewKey (\n -> n))) val
+
+-- | This thread parked on the key `k`, the others going on, until it is
+-- | woken there; at once, where a wake-up at `k` is kept for it.
+park : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Unit
+park k = op (ev (Park k (\v -> MkUnit))) val
+
+-- | The thread parked longest on the key `k` woken, its turn to come;
+-- | where none is, the wake-up kept for the next to park there.  This
+-- | one goes on.
+wake : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Unit
+wake k = op (ev (Wake k 0 MkUnit)) val
+
+-- | A channel of Ints, new: a key, whose wake-ups carry the values.
 newChan : {e : HFunctor} -> {{ev : green <: e}} -> Co e Int
-newChan = op (ev (NewChan (\n -> n))) val
+newChan = op (ev (NewKey (\n -> n))) val
 
 -- | `v` put on the channel: a thread waiting there takes it, its turn
 -- | to come; this one goes on.
 send : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Unit
-send ch v = op (ev (Send ch v MkUnit)) val
+send ch v = op (ev (Wake ch v MkUnit)) val
 
 -- | The first value on the channel, waiting for one, the others going
 -- | on, if there is none.
 recv : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
-recv ch = op (ev (Recv ch (\v -> v))) val
+recv ch = op (ev (Park ch (\v -> v))) val
 
 -- Outside operations
 --------------------------------------------------------------------------------
@@ -145,18 +175,18 @@ data Res (e : HFunctor) a
   = RDone a
   | RYield (Unit -> Res e a)
   | RSpawn (Res e Unit) (Unit -> Res e a)
-  | RNew (Int -> Res e a)
-  | RSend Int Int (Unit -> Res e a)
-  | RRecv Int (Int -> Res e a)
+  | RKey (Int -> Res e a)
+  | RWake Int Int (Unit -> Res e a)
+  | RPark Int (Int -> Res e a)
   | RAct (Co e (Res e a))
 
 thenRes : {e : HFunctor} -> {a b : Type} -> Res e a -> (a -> Res e b) -> Res e b
 thenRes (RDone x) f = f x
 thenRes (RYield k) f = RYield (\u -> thenRes (k u) f)
 thenRes (RSpawn c k) f = RSpawn c (\u -> thenRes (k u) f)
-thenRes (RNew k) f = RNew (\n -> thenRes (k n) f)
-thenRes (RSend ch v k) f = RSend ch v (\u -> thenRes (k u) f)
-thenRes (RRecv ch k) f = RRecv ch (\v -> thenRes (k v) f)
+thenRes (RKey k) f = RKey (\n -> thenRes (k n) f)
+thenRes (RWake ch v k) f = RWake ch v (\u -> thenRes (k u) f)
+thenRes (RPark ch k) f = RPark ch (\v -> thenRes (k v) f)
 thenRes (RAct m) f = RAct (bind m (\r -> pure (thenRes r f)))
 
 -- (a thread run alone to its end: what an operation of `e` holding
@@ -165,9 +195,9 @@ alone : {e : HFunctor} -> {a : Type} -> Res e a -> Co e a
 alone (RDone x) = pure x
 alone (RYield k) = alone (k MkUnit)
 alone (RSpawn c k) = alone (k MkUnit)
-alone (RNew k) = alone (k 0)
-alone (RSend ch v k) = alone (k MkUnit)
-alone (RRecv ch k) = alone (k 0)
+alone (RKey k) = alone (k 0)
+alone (RWake ch v k) = alone (k MkUnit)
+alone (RPark ch k) = alone (k 0)
 alone (RAct m) = bind m alone
 
 -- | Each operation, a thread stopped there; one of `e`'s, to be done in
@@ -175,9 +205,9 @@ alone (RAct m) = bind m alone
 greenAlg : (e : HFunctor) -> {a : Type} -> (green <+> e).f (Res e) a -> Res e a
 greenAlg e (InL (Spawn c x)) = RSpawn c (\u -> RDone x)
 greenAlg e (InL (Yield x)) = RYield (\u -> RDone x)
-greenAlg e (InL (NewChan k)) = RNew (\n -> RDone (k n))
-greenAlg e (InL (Send ch v x)) = RSend ch v (\u -> RDone x)
-greenAlg e (InL (Recv ch k)) = RRecv ch (\v -> RDone (k v))
+greenAlg e (InL (NewKey k)) = RKey (\n -> RDone (k n))
+greenAlg e (InL (Wake ch v x)) = RWake ch v (\u -> RDone x)
+greenAlg e (InL (Park ch k)) = RPark ch (\v -> RDone (k v))
 greenAlg e (InR q) =
   RAct
     (op
@@ -209,9 +239,9 @@ data Step (e : HFunctor) a
   | SEnd
   | SYield (Unit -> Thread e a)
   | SSpawn (Res e Unit) (Unit -> Thread e a)
-  | SNew (Int -> Thread e a)
-  | SSend Int Int (Unit -> Thread e a)
-  | SRecv Int (Int -> Thread e a)
+  | SKey (Int -> Thread e a)
+  | SWake Int Int (Unit -> Thread e a)
+  | SPark Int (Int -> Thread e a)
   | SAct (Co e (Thread e a))
   | SNext
 
@@ -219,16 +249,16 @@ view : {e : HFunctor} -> {a : Type} -> Thread e a -> Step e a
 view (Main (RDone x)) = SFinal x
 view (Main (RYield k)) = SYield (\u -> Main (k u))
 view (Main (RSpawn c k)) = SSpawn c (\u -> Main (k u))
-view (Main (RNew k)) = SNew (\n -> Main (k n))
-view (Main (RSend ch v k)) = SSend ch v (\u -> Main (k u))
-view (Main (RRecv ch k)) = SRecv ch (\v -> Main (k v))
+view (Main (RKey k)) = SKey (\n -> Main (k n))
+view (Main (RWake ch v k)) = SWake ch v (\u -> Main (k u))
+view (Main (RPark ch k)) = SPark ch (\v -> Main (k v))
 view (Main (RAct m)) = SAct (bind m (\r -> pure (Main r)))
 view (Other (RDone _)) = SEnd
 view (Other (RYield k)) = SYield (\u -> Other (k u))
 view (Other (RSpawn c k)) = SSpawn c (\u -> Other (k u))
-view (Other (RNew k)) = SNew (\n -> Other (k n))
-view (Other (RSend ch v k)) = SSend ch v (\u -> Other (k u))
-view (Other (RRecv ch k)) = SRecv ch (\v -> Other (k v))
+view (Other (RKey k)) = SKey (\n -> Other (k n))
+view (Other (RWake ch v k)) = SWake ch v (\u -> Other (k u))
+view (Other (RPark ch k)) = SPark ch (\v -> Other (k v))
 view (Other (RAct m)) = SAct (bind m (\r -> pure (Other r)))
 
 -- | A queue: taken from the front, put at the back (two lists).
@@ -250,18 +280,27 @@ takeQ { front = x :: rest, back = b } =
   Just (MkPair x { front = rest, back = b })
 takeQ { back = b } = fromBack (List.reverse b)
 
--- | What the scheduler holds: the threads ready, each channel's values
--- | and the threads waiting on it, the next channel's number, how many
+-- | What the scheduler holds: the threads ready, each key's wake-ups
+-- | kept and the threads parked on it, the next key, how many
 -- | threads' outside operations are pending, and how many turns since
 -- | it last asked which are done.
 type Sched (e : HFunctor) a =
   { ready : Queue (Unit -> Thread e a)
-  , chans : OrdMap.OrdMap Int (Queue Int)
-  , waiting : OrdMap.OrdMap Int (Queue (Int -> Thread e a))
+  , woken : OrdMap.OrdMap Int (Queue Int)
+  , parked : OrdMap.OrdMap Int (Queue (Int -> Thread e a))
   , next : Int
   , pending : Int
   , turns : Int
   }
+
+-- | Whether a scheduler joins its threads: not, main's answer ending it
+-- | all; or so, main's answer kept (once it has one) until every thread
+-- | has ended.
+data Joined a = Alone | Joining (Maybe a)
+
+isEmptyQ : {a : Type} -> Queue a -> Bool
+isEmptyQ { front = Nil, back = Nil } = True
+isEmptyQ q = False
 
 -- (how many turns are taken, threads ready and outside operations
 -- pending, before it asks which of those are done, not waiting)
@@ -293,6 +332,14 @@ ended : {e : HFunctor}
       -> Co e (Maybe a)
 ended o g r = bind (o.close g) (\u -> pure r)
 
+-- (what a joining schedule with no thread ready and none pending came
+-- to: main's answer, where it has one and no thread is parked; else a
+-- deadlock)
+outcome : {e : HFunctor} -> {a : Type} -> Joined a -> Sched e a -> Maybe a
+outcome (Joining r) s =
+  if List.all (\q -> isEmptyQ q) (OrdMap.values s.parked) then r else Nothing
+outcome Alone s = Nothing
+
 -- | A thread's step, then the others', until main is done: its answer;
 -- | or Nothing, where every thread waits on a channel (a deadlock).  The
 -- | next thread's turn: the one at the front of those ready; where none
@@ -303,68 +350,86 @@ go : {e : HFunctor}
    -> {a : Type}
    -> (o : Outside e)
    -> o.Group (Thread e a)
+   -> Joined a
    -> Sched e a
    -> Step e a
    -> Co e (Maybe a)
-go o g s (SFinal x) = ended o g (Just x)
-go o g s SEnd = go o g s SNext
-go o g s (SYield k) = go o g { s | ready = putQ k s.ready } SNext
-go o g s (SSpawn c k) =
-  go o g { s | ready = putQ (\u -> Other c) s.ready } (view (k MkUnit))
-go o g s (SNew k) = go o g { s | next = s.next + 1 } (view (k s.next))
-go o g s (SSend ch v k) = case takeQ (queueOf ch s.waiting) of
+go o g Alone s (SFinal x) = ended o g (Just x)
+go o g (Joining r) s (SFinal x) = go o g (Joining (Just x)) s SNext
+go o g j s SEnd = go o g j s SNext
+go o g j s (SYield k) = go o g j { s | ready = putQ k s.ready } SNext
+go o g j s (SSpawn c k) =
+  go o g j { s | ready = putQ (\u -> Other c) s.ready } (view (k MkUnit))
+go o g j s (SKey k) = go o g j { s | next = s.next + 1 } (view (k s.next))
+go o g j s (SWake ch v k) = case takeQ (queueOf ch s.parked) of
   Just (MkPair w ws) ->
     go
       o
       g
+      j
       { s
       | ready = putQ (\u -> w v) s.ready
-      , waiting = OrdMap.insert s.waiting ch ws
+      , parked = OrdMap.insert s.parked ch ws
       }
       (view (k MkUnit))
   Nothing ->
     go
       o
       g
+      j
       { s
-      | chans = OrdMap.insert s.chans ch (putQ v (queueOf ch s.chans))
+      | woken = OrdMap.insert s.woken ch (putQ v (queueOf ch s.woken))
       }
       (view (k MkUnit))
-go o g s (SRecv ch k) = case takeQ (queueOf ch s.chans) of
+go o g j s (SPark ch k) = case takeQ (queueOf ch s.woken) of
   Just (MkPair v vs) ->
-    go o g { s | chans = OrdMap.insert s.chans ch vs } (view (k v))
+    go o g j { s | woken = OrdMap.insert s.woken ch vs } (view (k v))
   Nothing ->
     go
       o
       g
+      j
       { s
-      | waiting = OrdMap.insert s.waiting ch (putQ k (queueOf ch s.waiting))
+      | parked = OrdMap.insert s.parked ch (putQ k (queueOf ch s.parked))
       }
       SNext
-go o g s (SAct m) =
+go o g j s (SAct m) =
   bind (o.start g m) (\r -> case r of
-  Just t -> go o g s (view t)
-  Nothing -> go o g { s | pending = s.pending + 1 } SNext)
-go o g s SNext =
+  Just t -> go o g j s (view t)
+  Nothing -> go o g j { s | pending = s.pending + 1 } SNext)
+go o g Alone s SNext =
   if s.pending > 0 && s.turns >= turnsBetween
-  then bind (o.finished g False) (\ts -> go o g (withDone ts s) SNext)
+  then bind (o.finished g False) (\ts -> go o g Alone (withDone ts s) SNext)
   else case takeQ s.ready of
     Just (MkPair t q) ->
-      go o g { s | ready = q, turns = s.turns + 1 } (view (t MkUnit))
+      go o g Alone { s | ready = q, turns = s.turns + 1 } (view (t MkUnit))
     Nothing ->
       if s.pending == 0 then ended o g Nothing
       else bind
           (o.finished g True)
           (\ts ->
              if List.length ts == 0 then ended o g Nothing
-             else go o g (withDone ts s) SNext)
+             else go o g Alone (withDone ts s) SNext)
+go o g j s SNext =
+  if s.pending > 0 && s.turns >= turnsBetween
+  then bind (o.finished g False) (\ts -> go o g j (withDone ts s) SNext)
+  else case takeQ s.ready of
+    Just (MkPair t q) ->
+      go o g j { s | ready = q, turns = s.turns + 1 } (view (t MkUnit))
+    Nothing ->
+      if s.pending == 0 then ended o g (outcome j s)
+      else bind
+          (o.finished g True)
+          (\ts ->
+             if List.length ts == 0 then ended o g (outcome j s)
+             else go o g j (withDone ts s) SNext)
 
 -- | Nothing scheduled yet.
 begun : {e : HFunctor} -> {a : Type} -> Sched e a
 begun =
   { ready = emptyQ
-  , chans = OrdMap.empty
-  , waiting = OrdMap.empty
+  , woken = OrdMap.empty
+  , parked = OrdMap.empty
   , next = 0
   , pending = 0
   , turns = 0
@@ -381,7 +446,9 @@ scheduledWith : (e : HFunctor)
               -> Co (green <+> e) a
               -> Co e (Maybe a)
 scheduledWith e o c =
-  bind o.group (\g -> go o g begun (view (Main (handle (greenHandler e) c))))
+  bind
+    o.group
+    (\g -> go o g Alone begun (view (Main (handle (greenHandler e) c))))
 
 -- | `c` and the threads it spawns, round robin, in `Co e`: `Just` main's
 -- | answer, or `Nothing` where every thread waits on a channel; the
@@ -398,4 +465,34 @@ scheduledNow : (e : HFunctor)
              -> Co (green <+> e) a
              -> Co e (Maybe a)
 scheduledNow e c =
-  go (blocking e) MkUnit begun (view (Main (handle (greenHandler e) c)))
+  go (blocking e) MkUnit Alone begun (view (Main (handle (greenHandler e) c)))
+
+-- | `c` and the threads it spawns, round robin, in `Co e`, their
+-- | operations of `e` done as `o` says, every thread joined: main's
+-- | answer once every thread has ended, or Nothing where every thread
+-- | left is parked (a deadlock).  No thread is let go of while it can
+-- | still run, so what the threads share outside the scheduler -- a
+-- | `with` around it, std.chan's -- outlives every one of them.
+togetherWith : (e : HFunctor)
+             -> (o : Outside e)
+             -> {a : Type}
+             -> Co (green <+> e) a
+             -> Co e (Maybe a)
+togetherWith e o c =
+  bind
+    o.group
+    (\g ->
+       go
+         o
+         g
+         (Joining Nothing)
+         begun
+         (view (Main (handle (greenHandler e) c))))
+
+-- | `c` and the threads it spawns, in the world around it, whichever
+-- | that is, every thread joined (`togetherWith`), each operation of
+-- | `e` done where it is started (`blocking`): the scheduler of the
+-- | body of a `with` whose world is not named there, such as
+-- | std.chan's.
+together : {e : HFunctor} -> {a : Type} -> Co (green <+> e) a -> Co e (Maybe a)
+together c = togetherWith e (blocking e) c

@@ -41,6 +41,13 @@
 -- waits where it is, the whole program with it.  Each thread of the system
 -- has its own reactor, so green threads inside a std.thread thread are
 -- that thread's own.
+--
+-- A computation is started between a `Begin` and an `End` of its group,
+-- in the world's own course, not held by an operation: a handler between
+-- the scheduler and the world -- a state, std.chan's channels -- sees
+-- what it does as it sees any other operation, and keeps it.
+-- `Reactor.together c` is `Reactor.scheduled` joining every thread, as
+-- green's `together`.
 
 module std.reactor
 
@@ -50,27 +57,27 @@ import green
 -- | A group of computations started, each of which comes to a `t`.
 data Group t = MkGroup Int
 
--- | A computation started, whatever it comes to: done, its value, or
--- | pending, none, given to what comes after.
-type Begun (m : Type -> Type) x =
-  (r : Type) -> ((t : Type) -> m t -> (Maybe t -> x) -> r) -> r
+-- | A computation started come to its end: its value, given to what
+-- | comes after its start, whatever it is.
+type Ending x = (r : Type) -> ((t : Type) -> t -> (Maybe t -> x) -> r) -> r
 
 -- | What a group's finished are given to, whatever they are.
 type Finished x = (r : Type) -> ((t : Type) -> (List t -> x) -> r) -> r
 
-begunWith : {m : Type -> Type}
-          -> {t x : Type}
-          -> m t
-          -> (Maybe t -> x)
-          -> Begun m x
-begunWith c k = \r use -> use t c k
+endingWith : {t x : Type} -> t -> (Maybe t -> x) -> Ending x
+endingWith v k = \r use -> use t v k
 
 finishedWith : {t x : Type} -> (List t -> x) -> Finished x
 finishedWith k = \r use -> use t k
 
+-- (no operation holds a computation: a computation started is run
+-- between its `Begin` and its `End`, in the world's own course, so that
+-- a handler between the scheduler and the world sees it as it sees any
+-- other, what it does there kept)
 data ReactorF (m : Type -> Type) x
   = Open (Int -> x)
-  | Start Int (Begun m x)
+  | Begin Int (Bool -> x)
+  | End Int (Ending x)
   | Finish Int Bool (Finished x)
   | Close Int x
 
@@ -80,12 +87,14 @@ reactor =
   { f = ReactorF
   , hfmap = \m g p -> case p of
       Open k -> Open (\i -> g (k i))
-      Start i b -> Start i (\r use -> b r (\t c k -> use t c (\v -> g (k v))))
+      Begin i k -> Begin i (\b -> g (k b))
+      End i b -> End i (\r use -> b r (\t v k -> use t v (\w -> g (k w))))
       Finish i w f -> Finish i w (\r use -> f r (\t k -> use t (\l -> g (k l))))
       Close i x -> Close i (g x)
   , hmap = \m n nt p -> case p of
       Open k -> Open k
-      Start i b -> Start i (\r use -> b r (\t c k -> use t (nt c) k))
+      Begin i k -> Begin i k
+      End i b -> End i b
       Finish i w f -> Finish i w f
       Close i x -> Close i x
   }
@@ -96,14 +105,23 @@ open = bind (op (rx (Open (\i -> i))) val) (\i -> pure (MkGroup i))
 
 -- | `c` started in the group: run until it is done, `Just` its value;
 -- | or until an operation of it would wait, `Nothing`, its value to be
--- | one of the group's `finished`.
+-- | one of the group's `finished`.  Begun (`True`), `c` is run, and
+-- | ended with its value; where it waits, its start is told so
+-- | (`False`), and what comes after its wait is run once that is done,
+-- | up to its end, its value then one of the group's finished.
 start : {e : HFunctor}
       -> {{rx : reactor <: e}}
       -> {t : Type}
       -> Group t
       -> Co e t
       -> Co e (Maybe t)
-start (MkGroup i) c = op (rx (Start i (begunWith c (\r -> r)))) val
+start (MkGroup i) c =
+  bind
+    (op (rx (Begin i (\b -> b))) val)
+    (\trying ->
+       if trying
+       then bind c (\v -> op (rx (End i (endingWith v (\r -> r)))) val)
+       else pure Nothing)
 
 -- | The group's computations finished since it was last asked, in the
 -- | order they were: where `wait`, waiting for one at least, while any
@@ -146,3 +164,16 @@ scheduled : (e : HFunctor)
           -> Co (green <+> e) a
           -> Co e (Maybe a)
 scheduled e c = scheduledWith e outside c
+
+-- | `c` and the threads it spawns, in the world around it, whichever
+-- | that is, each thread's outside operations pending while the others
+-- | go on, and every thread joined (green's `togetherWith`): main's
+-- | answer once every thread has ended, or Nothing where every one left
+-- | is parked.  The scheduler of the body of a `with` whose world is not
+-- | named there, such as std.chan's.
+together : {e : HFunctor}
+         -> {{rx : reactor <: e}}
+         -> {a : Type}
+         -> Co (green <+> e) a
+         -> Co e (Maybe a)
+together c = togetherWith e outside c
