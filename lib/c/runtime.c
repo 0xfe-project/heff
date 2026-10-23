@@ -3232,8 +3232,15 @@ HEFF_FN V heff_strRuneCount(V a) {
 // lowers the length, the room kept.  Held elsewhere too, it is copied first,
 // with room to grow.
 
+// (the most elements an array has room for: more than memory holds, and
+// few enough that their bytes are counted without overflowing -- an
+// array asked to be longer fails, as memory running out does, not a
+// block too small for it written past)
+#define HEFF_ARR_MAX ((int64_t)1 << 56)
+
 // (an array of `n` elements, its room `n`)
 HEFF_FN Arr *heff_arr_alloc(int64_t n, unsigned kind) {
+  if (n > HEFF_ARR_MAX) heff_fail("out of memory");
   Arr *r = heff_obj_alloc(sizeof(Arr) + (size_t)n * heff_arr_width[kind]);
   r->h.rc = 1; r->h.kind = K_ARR; r->h.tag = (uint16_t)kind; r->n = n;
   return r;
@@ -3349,6 +3356,7 @@ HEFF_FN __attribute__((noinline)) Arr *heff_arr_copy(V a) {
 // (the bits of the room grown to, to hold `need` elements: the power of
 // 2 at least `need`, at least 4)
 HEFF_FN unsigned heff_arr_room(int64_t need) {
+  if (need > HEFF_ARR_MAX) heff_fail("out of memory");
   unsigned e = 2;
   while (((int64_t)1 << e) < need) e++;
   return e;
