@@ -120,3 +120,22 @@ $ rm todos.txt
 $ heff run app/hello/main.hf
 ENOENT: No such file or directory
 ```
+
+## Output, bytes and time
+
+What `print` and `write` send to a file or a pipe is kept and written a
+buffer at a time, and all of it by the time the program ends; to a
+terminal, a line at a time. A program that runs for long, such as a
+server writing a log, calls [`flush`](../api/std/io.md#flush) to have
+what it printed written now. The standard error keeps nothing.
+
+`readFile` gives a file's text; [`readBytes`](../api/std/filesystem.md#readBytes)
+gives its `Bytes`, as they are. A string is written as its bytes are, so
+`write (Bytes.asString b)` writes the bytes `b` to the output unchanged,
+and so does std.filesystem's `withStdout` with `writeBytes`.
+`Bytes.toString` is for text: it reads the bytes as UTF-8, and what is
+not UTF-8 becomes U+FFFD, which is not what a PNG wants.
+
+std.time has [`sleep`](../api/std/time.md#sleep) and two clocks, both in
+nanoseconds: `now`, the time of day since the epoch, and `monotonic`,
+which only goes forward and measures how long something took.

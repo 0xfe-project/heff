@@ -36,6 +36,7 @@ import state
 import std.filesystem
 import std.path as Path
 import std.process
+import uint8 as UInt8
 import resource
 
 -- (what the tests run by is given, else the test fails)
@@ -1780,6 +1781,63 @@ sleep : {e : HFunctor}
       -> Co e Unit
 sleep = ran "test/node/timed.hf" "timed" Nil { out = Just "slept\n" }
 
+-- | the clocks: the time of day after 2026-01-01, the monotonic clock
+-- | over a sleep of 10 ms; every byte, 0 to 255, written to a file and
+-- | read back by `readBytes`
+clocks : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> Co e Unit
+clocks = do
+  working <- workingDir
+  let here = toString working
+  made <- makeDirectory (here ^ "/basics")
+  ran
+      "test/node/basics.hf"
+      "main"
+      ["clocks", here ^ "/basics"]
+      { out =
+          Just
+            (linesOf
+               [ "the time of day after 2026-01-01: True"
+               , "monotonic, not fewer: True"
+               , "monotonic, over a sleep of 10 ms, at least 9 ms more: True"
+               , "read back: 256 bytes, the same: True"
+               ])
+      }
+
+-- | every byte, 0 to 255, written to the output by std.io's `write` and
+-- | by std.filesystem's `withStdout`: as they are, each time
+binaryOut : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> Co e Unit
+binaryOut = do
+  let every = Bytes.asString (Bytes.fromList (List.map UInt8.fromInt (List.range 0 255)))
+  ran "test/node/basics.hf" "main" ["binary"] { out = Just (every ^ every) }
+
+-- | a line printed and flushed, to a pipe: read while the program
+-- | sleeps, long before its end
+flushedOut : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{ex : exception ProcessError <: e}}
+           -> Co e Unit
+flushedOut = do
+  bin <- built "test/node/basics.hf" "main" Nil ""
+  withProcess
+      { command = bin, args = ["flushed"], output = Piped, timeout = 60000 }
+      (\p -> do
+    line <- readOutput p (Through "\n") 3000
+    kill p
+    case line of
+      Got b ->
+        if strEq (Bytes.asString b) "before the sleep\n" then pure MkUnit
+        else failure ("flushed: got " ^ show (Bytes.asString b))
+      _ -> failure "flushed: nothing read within 3 s")
+
 -- | a line of what the HTTP client says: as it is, or its start (curl's
 -- | to say the rest)
 data Line = Exactly String | Starting String
@@ -3148,6 +3206,9 @@ backends =
       , integration "heff run" heffRun
       , integration "commands" commands
       , integration "sleep" sleep
+      , integration "clocks, a file's bytes" clocks
+      , integration "bytes to the output" binaryOut
+      , integration "the output flushed" flushedOut
       , integration "http" http
       , integration "files" files
       , integration "stdin a line at a time" stdinLines

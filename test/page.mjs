@@ -8,8 +8,8 @@
 // wants.  (An app is JavaScript: only a JavaScript engine runs it.)
 //
 //   node test/page.mjs APP SCRIPT...   counter, clock, finder, aliased,
-//                                      slept, painted, texts, names,
-//                                      greet, two (counter's and
+//                                      slept, clocked, painted, texts,
+//                                      names, greet, two (counter's and
 //                                      clock's), vecadd, pixels
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
@@ -169,6 +169,12 @@ const apps = {
     said("before the time has passed", page.children[0].text);
     tick();
     said("after", page.children[0].text);
+  },
+  clocked: () => {
+    const page = loaded(files[0], withOut, { performance });
+    if (!page) return;
+    tick();
+    said("out", page.children[0].text);
   },
   painted: () => {
     const page = loaded(files[0], withOut);

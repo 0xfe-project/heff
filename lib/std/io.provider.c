@@ -45,6 +45,12 @@ static V heff_provider_stdio(V p, V k) {
     heff_drop(p);
     return heff_tail(k, 1, &x);
   }
+  case TAG_Flush: {
+    fflush(stdout);
+    V x = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+    return heff_tail(k, 1, &x);
+  }
   case TAG_ReadStdin: {
     V f = heff_dup(heff_field(p, 0));
     heff_drop(p);

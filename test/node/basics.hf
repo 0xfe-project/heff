@@ -1,0 +1,107 @@
+-- The clocks (std.time), a file's bytes (std.filesystem's `readBytes`),
+-- bytes written to the standard output, and the output flushed
+-- (std.io's `flush`), by C.
+--
+--   main clocks DIR   the clocks: the time of day after 2026-01-01,
+--                     the monotonic clock over a sleep of 10 ms; every
+--                     byte, 0 to 255, written to a file in DIR and read
+--                     back
+--   main binary       every byte, 0 to 255, written to the output
+--                     twice: by `write`, and by std.filesystem's
+--                     `withStdout`
+--   main flushed      a line printed and flushed, then a long sleep
+
+module test.node.basics
+
+import bytes as Bytes
+import co
+import exception
+import std.filesystem
+import std.io
+import std.path as Path
+import std.process
+import std.time
+import uint8 as UInt8
+import resource
+
+world : HFunctor
+world = stdio <+> (filesystem <+> (time <+> process))
+
+-- (every byte, 0 to 255)
+everyByte : Bytes
+everyByte = Bytes.fromList (List.map UInt8.fromInt (List.range 0 255))
+
+-- (the clocks read and said)
+clocks : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{clock : time <: e}}
+       -> Co e Unit
+clocks = do
+  t <- now
+  -- (2026-01-01T00:00:00Z, in nanoseconds since the epoch)
+  print ("the time of day after 2026-01-01: " ^ show (t > 1767225600000000000))
+  start <- monotonic
+  sleep 10
+  end <- monotonic
+  print ("monotonic, not fewer: " ^ show (end >= start))
+  print
+      ("monotonic, over a sleep of 10 ms, at least 9 ms more: "
+       ^ show (end - start >= 9000000))
+
+-- (every byte written to a file, then read back by `readBytes`)
+bytesBack : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
+          -> String
+          -> Co e Unit
+bytesBack dir = do
+  let path = dir ^ "/every-byte.bin"
+  written <- withFile path { access = Write } (\h -> writeBytes h everyByte)
+  back <- readBytes path
+  print
+      ("read back: "
+       ^ show (Bytes.length back)
+       ^ " bytes, the same: "
+       ^ show (Bytes.eq back everyByte))
+
+-- (a throw no one heard: said)
+unheard : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> Either FileError Unit
+        -> Co e Unit
+unheard (Left err) = print ("not heard: " ^ showFileError err)
+unheard (Right u) = pure MkUnit
+
+-- (every byte written to the output twice: as a string, and as bytes
+-- to the output held as a file)
+binary : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Co e Unit
+binary = do
+  write (Bytes.asString everyByte)
+  withStdout (\o -> bind (writeBytes o everyByte) (\w -> pure MkUnit))
+
+-- (a line printed and flushed, then a long sleep)
+flushed : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{clock : time <: e}}
+        -> Co e Unit
+flushed = do
+  print "before the sleep"
+  flush
+  sleep 5000
+  print "after the sleep"
+
+main : Co world Unit
+main = do
+  argv <- args (ev := _)
+  case argv of
+    ["clocks", dir] -> do
+      clocks (io := _) (clock := _)
+      r <- attempt FileError (bytesBack (io := _) (disk := _) (fx := _) dir)
+      unheard (io := _) r
+    ["binary"] -> binary (io := _) (disk := _)
+    ["flushed"] -> flushed (io := _) (clock := _)
+    _ -> printErr (ev := _) "main clocks DIR | main binary | main flushed"
