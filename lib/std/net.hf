@@ -41,6 +41,20 @@
 -- to read), and the whole program with it, as the rest of a program's
 -- outside operations -- unless it runs in a green thread scheduled by
 -- std.reactor: then only that thread waits.
+--
+-- A connection made, a read and a write may be given a time limit, in
+-- milliseconds, by name: `Net.withConnection (timeout := 3000) address
+-- body`, `Net.read (timeout := 500) c 4096`.  Where it passes first, the
+-- operation fails `ETIMEDOUT` -- a connection not made thrown, a read or
+-- a write a `Left` -- and what it began is let go of: the socket being
+-- connected closed, the read or the write abandoned (a write may have
+-- sent part of its bytes).  The connection itself stays as it was, to be
+-- read again.  0, the default, is no limit.  The limit is the same with a
+-- scheduler of std.reactor's or without one, kept by the poll the
+-- operation waits in.  One difference: without a scheduler a host's name
+-- is resolved where the program is, by getaddrinfo, which is not cut
+-- short -- the time it takes is counted, but it is not given up on --
+-- where under one the lookup is given up on with the rest.
 
 module std.net
   ( TcpStream
@@ -88,11 +102,11 @@ type Address = { host : String, port : Int }
 type NetError = { code : Int, name : String, message : String }
 
 data NetF (m : Type -> Type) x
-  = Connect String Int (Either NetError TcpStream -> x)
+  = Connect String Int Int (Either NetError TcpStream -> x)
   | Listen String Int Int (Either NetError TcpListener -> x)
   | Accept TcpListener (Either NetError TcpStream -> x)
-  | Read TcpStream Int (Either NetError Bytes -> x)
-  | Write TcpStream Bytes (Either NetError Unit -> x)
+  | Read TcpStream Int Int (Either NetError Bytes -> x)
+  | Write TcpStream Bytes Int (Either NetError Unit -> x)
   | Shutdown TcpStream (Either NetError Unit -> x)
   | Peer TcpStream (Either NetError Address -> x)
   | ThisSide TcpStream (Either NetError Address -> x)
@@ -105,11 +119,11 @@ net : HFunctor
 net =
   { f = NetF
   , hfmap = \m g p -> case p of
-      Connect h port k -> Connect h port (\r -> g (k r))
+      Connect h port ms k -> Connect h port ms (\r -> g (k r))
       Listen h port n k -> Listen h port n (\r -> g (k r))
       Accept l k -> Accept l (\r -> g (k r))
-      Read c n k -> Read c n (\r -> g (k r))
-      Write c b k -> Write c b (\r -> g (k r))
+      Read c n ms k -> Read c n ms (\r -> g (k r))
+      Write c b ms k -> Write c b ms (\r -> g (k r))
       Shutdown c k -> Shutdown c (\r -> g (k r))
       Peer c k -> Peer c (\r -> g (k r))
       ThisSide c k -> ThisSide c (\r -> g (k r))
@@ -117,11 +131,11 @@ net =
       Release c k -> Release c (\r -> g (k r))
       ReleaseListener l k -> ReleaseListener l (\r -> g (k r))
   , hmap = \m n nt p -> case p of
-      Connect h port k -> Connect h port k
+      Connect h port ms k -> Connect h port ms k
       Listen h port b k -> Listen h port b k
       Accept l k -> Accept l k
-      Read c b k -> Read c b k
-      Write c b k -> Write c b k
+      Read c n ms k -> Read c n ms k
+      Write c b ms k -> Write c b ms k
       Shutdown c k -> Shutdown c k
       Peer c k -> Peer c k
       ThisSide c k -> ThisSide c k
@@ -134,13 +148,14 @@ net =
 --------------------------------------------------------------------------------
 
 -- (a connection to `host`'s `port`, the host's own, or why none was
--- made)
+-- made, within `ms` milliseconds where it is not 0)
 connected : {e : HFunctor}
           -> {{ev : net <: e}}
           -> String
           -> Int
+          -> Int
           -> Co e (Either NetError TcpStream)
-connected host port = op (ev (Connect host port (\r -> r))) val
+connected host port ms = op (ev (Connect host port ms (\r -> r))) val
 
 -- (a connection shut down and closed, or why it did not close)
 released : {e : HFunctor}
@@ -159,37 +174,46 @@ released c = op (ev (Release c (\r -> r))) val
 -- | Should `body` be left otherwise -- a throw heard outside it, a
 -- | handler between that drops the continuation -- the connection is
 -- | closed where the program drops its last reference to it: at once,
--- | in C, as it is counted.
+-- | in C, as it is counted.  `timeout`, where it is not 0: the
+-- | connection not made in that many milliseconds, `ETIMEDOUT` is
+-- | thrown, the socket being connected closed.
 withConnection : {e : HFunctor}
                -> {a : Type}
+               -> {timeout : Int := 0}
                -> {{ev : net <: e}}
                -> {{ex : exception NetError <: e}}
                -> Address
                -> ({s : Type} -> With s TcpStream -> Co e a)
                -> Co e a
 withConnection address body =
-  scoped (connected address.host address.port) released body
+  scoped (connected address.host address.port timeout) released body
 
 -- | Up to `n` bytes of what the other side sent, as many as have come,
 -- | waiting for one at least; none at its end, where it has closed its
 -- | side (or shut it down).  At most a mebibyte at a time.  After the
--- | `with` closed the connection, `EBADF`.
+-- | `with` closed the connection, `EBADF`.  `timeout`, where it is not
+-- | 0: nothing come in that many milliseconds, `ETIMEDOUT`, the
+-- | connection as it was.
 read : {e : HFunctor}
      -> {s : Type}
+     -> {timeout : Int := 0}
      -> {{ev : net <: e}}
      -> With s TcpStream
      -> Int
      -> Co e (Either NetError Bytes)
-read c n = op (ev (Read (inside c) n (\r -> r))) val
+read c n = op (ev (Read (inside c) n timeout (\r -> r))) val
 
 -- | All the bytes written, waiting until the system has taken them.
+-- | `timeout`, where it is not 0: not all taken in that many
+-- | milliseconds, `ETIMEDOUT`, some of them perhaps sent.
 write : {e : HFunctor}
       -> {s : Type}
+      -> {timeout : Int := 0}
       -> {{ev : net <: e}}
       -> With s TcpStream
       -> Bytes
       -> Co e (Either NetError Unit)
-write c b = op (ev (Write (inside c) b (\r -> r))) val
+write c b = op (ev (Write (inside c) b timeout (\r -> r))) val
 
 -- | This side done writing: the other side reads to its end, and may
 -- | still write, which this side reads.

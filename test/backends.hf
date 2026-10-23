@@ -2410,6 +2410,95 @@ greenHttp : {e : HFunctor}
           -> Co e Unit
 greenHttp = withPeer ["slow", "500"] greenHttpTo
 
+-- | time limits on what waits, by C alone: std.net's connection to an
+-- | address nothing answers and its read of a side that writes nothing,
+-- | each given 300 ms, ETIMEDOUT in about that time, the connection read
+-- | again after; a silent client closed by std.http.server's idle limit;
+-- | by one thread, and by green threads of std.reactor's, the scheduler
+-- | done after, nothing pending; the descriptors open as before
+timeouts : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Co e Unit
+timeouts = do
+  one <- built "test/node/timeouts.hf" "main" Nil ""
+  greens <- built "test/node/timeouts.hf" "green" Nil ""
+  r <- run { command = one, timeout = 60000 }
+  g <- run { command = greens, timeout = 60000 }
+  failingWith
+      (List.append
+         (against
+            "timeouts"
+            { out =
+                Just
+                  (linesOf
+                     [ "a connection given 300 ms: ETIMEDOUT, in time"
+                     , "a read given 300 ms: ETIMEDOUT, in time"
+                     , "read again: b[\"late\"]"
+                     , "a silent client, served with an idle limit of 300 ms: b[], in time"
+                     , "descriptors: as before"
+                     ])
+            , err = Just ""
+            }
+            r)
+         (against
+            "timeouts, green"
+            { out =
+                Just
+                  (linesOf
+                     [ "a connection given 300 ms: ETIMEDOUT, in time"
+                     , "a read given 300 ms: ETIMEDOUT, in time"
+                     , "read again: b[\"late\"]"
+                     , "a silent client, the server's idle limit 300 ms: b[], in time"
+                     , "scheduler done"
+                     , "descriptors: as before"
+                     ])
+            , err = Just ""
+            }
+            g))
+
+-- | std.http's time to connect apart from its time in all, by C alone:
+-- | a request to an address nothing answers given 300 ms to connect,
+-- | curl's code 28 in about that time; one of a server of Node.js's
+-- | that takes 500 ms over it, given 300 ms to connect and 10 s in all,
+-- | answered -- by libcurl, by the curl spawned and by libcurl's multi
+-- | interface, a green thread's.  The programs are built before the
+-- | server starts, and it is ended by its `with`, the test failing or not.
+httpTimeouts : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{ex : exception ProcessError <: e}}
+             -> Co e Unit
+httpTimeouts = do
+  libcurl <- built "test/node/timeouts.hf" "http" Nil ""
+  spawned <-
+    built "test/node/timeouts.hf" "http" ["-DHEFF_HTTP_SPAWN"] "-spawned"
+  multi <- built "test/node/timeouts.hf" "multi" Nil ""
+  want <-
+    pure
+      (linesOf
+         [ "a connection given 300 ms: code 28, in time"
+         , "slow, connected in time: 200 \"item 1\\n\", past the time to connect: yes"
+         ])
+  withPeer
+      ["slow", "500"]
+      (\started port -> do
+        let base = "http://127.0.0.1:" ^ port
+        a <- run { command = libcurl, args = [base], timeout = 60000 }
+        b <- run { command = spawned, args = [base], timeout = 60000 }
+        c <- run { command = multi, args = [base], timeout = 60000 }
+        closeInput started
+        ended <- wait started
+        failingWith
+            (List.append
+               (against "http timeouts, libcurl" { out = Just want, err = Just "" } a)
+               (List.append
+                  (against "http timeouts, spawned" { out = Just want, err = Just "" } b)
+                  (against
+                     "http timeouts, multi"
+                     { out = Just (want ^ "scheduler done\n"), err = Just "" }
+                     c))))
+
 -- | std.http.server's `serveConcurrently`, by C alone: a green thread a
 -- | connection, forty clients holding theirs open at once, each
 -- | answered, then asked again on the same connection
@@ -3294,6 +3383,8 @@ backends =
       , integration "sockets" sockets
       , integration "green sockets" greenSockets
       , integration "green http" greenHttp
+      , integration "timeouts" timeouts
+      , integration "http timeouts" httpTimeouts
       , integration "green server" greenServer
       , integration "green channels" greenChan
       , integration "green server, a burst" greenBurst

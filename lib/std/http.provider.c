@@ -14,7 +14,8 @@
 // `Expect: 100-continue` (`Expect:`), unless the request has one; a
 // header whose value is empty sent so (`Name;`, where `Name:` would take
 // it away); redirects followed, fifty at most, where it says so (`-L`);
-// its time in all bounded where it says so (`--max-time`).  The
+// its time in all bounded where it says so (`--max-time`), and the time
+// its connection takes to be made (`--connect-timeout`).  The
 // response's headers are those of the last response, as written before
 // its body (`-D`): a status line starts the headers again.
 
@@ -31,6 +32,7 @@ typedef struct {
   const uint8_t *body;
   int64_t nbody;
   int64_t timeout;    // (milliseconds; 0, none)
+  int64_t connect;    // (the connection's, milliseconds; 0, curl's own)
   int follow;
   int head;           // (a `HEAD`)
   int send_body;      // (`--data-binary`)
@@ -90,13 +92,14 @@ static void http_req_free(HttpReq *q) {
 }
 
 // (the request `rq`, a `Request` (its fields in its type's order: url,
-// method, headers, body, timeout, follow), as curl is to be given it,
+// method, headers, body, timeout, connectTimeout, follow), as curl is to be given it,
 // its body where `rq` keeps it, so `rq` held while it is used: 0 where
 // a string of it has a NUL in it)
 static int http_req(V rq, HttpReq *q) {
   memset(q, 0, sizeof *q);
   V url = heff_rget_v(rq, 0), method = heff_rget_v(rq, 1), hl = heff_rget_v(rq, 2);
-  V body = heff_rget_v(rq, 3), timeout = heff_rget_v(rq, 4), follow = heff_rget_v(rq, 5);
+  V body = heff_rget_v(rq, 3), timeout = heff_rget_v(rq, 4), connect = heff_rget_v(rq, 5);
+  V follow = heff_rget_v(rq, 6);
   int ok = 1;
   q->url = heff_cstr_text(url);
   q->method = heff_cstr(method);
@@ -112,6 +115,7 @@ static int http_req(V rq, HttpReq *q) {
   }
   q->body = heff_bytes_data(body, &q->nbody);
   q->timeout = IS_INT(timeout) && INT_OF(timeout) > 0 ? INT_OF(timeout) : 0;
+  q->connect = IS_INT(connect) && INT_OF(connect) > 0 ? INT_OF(connect) : 0;
   q->follow = follow == NTAG(TAG_True);
   if (ok) {
     q->head = strcmp(q->method, "HEAD") == 0;
@@ -129,6 +133,7 @@ static int http_req(V rq, HttpReq *q) {
   // (the body's bytes are `rq`'s, held by the caller)
   heff_drop(body);
   heff_drop(timeout);
+  heff_drop(connect);
   heff_drop(follow);
   return ok;
 }
@@ -235,7 +240,7 @@ static int http_temp(char *path, size_t room) {
 
 // (the request, by a `curl` spawned)
 static void http_spawned(HttpReq *q, HttpGot *g) {
-  char headf[4096], bodyf[4096], secs[32];
+  char headf[4096], bodyf[4096], secs[32], csecs[32];
   int hd = http_temp(headf, sizeof headf), bd = -1;
   if (hd >= 0) http_close(hd);
   int ok = hd >= 0;
@@ -268,6 +273,11 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
     snprintf(secs, sizeof secs, "%lld.%03lld", (long long)(q->timeout / 1000), (long long)(q->timeout % 1000));
     as[n++] = "--max-time";
     as[n++] = secs;
+  }
+  if (q->connect > 0) {
+    snprintf(csecs, sizeof csecs, "%lld.%03lld", (long long)(q->connect / 1000), (long long)(q->connect % 1000));
+    as[n++] = "--connect-timeout";
+    as[n++] = csecs;
   }
   as[n++] = "-D";
   as[n++] = headf;
@@ -350,6 +360,7 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
 #define HTTP_OPT_BUFFERSIZE 98
 #define HTTP_OPT_NOSIGNAL 99
 #define HTTP_OPT_TIMEOUT_MS 155
+#define HTTP_OPT_CONNECTTIMEOUT_MS 156
 #define HTTP_OPT_TCP_KEEPALIVE 213
 #define HTTP_OPT_WRITEDATA 10001
 #define HTTP_OPT_URL 10002
@@ -567,7 +578,8 @@ static int http_setup(void *h, HttpReq *q, HttpGot *g, HttpSink *sink, void *lis
     || (q->custom && http_lc.setopt(h, HTTP_OPT_CUSTOMREQUEST, q->method) != 0)
     || (q->send_body && (http_lc.setopt(h, HTTP_OPT_POSTFIELDSIZE_LARGE, (int64_t)q->nbody) != 0
                          || http_lc.setopt(h, HTTP_OPT_POSTFIELDS, q->nbody ? (const void *)q->body : "") != 0))
-    || (q->timeout > 0 && http_lc.setopt(h, HTTP_OPT_TIMEOUT_MS, (long)q->timeout) != 0);
+    || (q->timeout > 0 && http_lc.setopt(h, HTTP_OPT_TIMEOUT_MS, (long)q->timeout) != 0)
+    || (q->connect > 0 && http_lc.setopt(h, HTTP_OPT_CONNECTTIMEOUT_MS, (long)q->connect) != 0);
   if (bad) {
     http_lc.easy_reset(h);
     return 1;
