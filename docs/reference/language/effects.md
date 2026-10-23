@@ -22,44 +22,23 @@ look = do
   print (if there then "hello.txt is there" else "no hello.txt")
 
 main : Co (stdio <+> filesystem) Unit
-main =
-  look
-    (io := inl stdio filesystem)
-    (disk := inr stdio filesystem)
+main = look (io := _) (disk := _)
 ```
 
 - `Co e a` is a computation in the world `e` that gives back an `a`.
 - A world is an `HFunctor`: one effect, such as `stdio`, or several
-  joined by `<+>`.
+  joined by `<+>`, flat: `stdio <+> filesystem <+> process`.
 - `h <: e` says the effect `h` is part of the world `e`. A computation
   asks for each effect it uses as an instance argument, and can use
   nothing else.
 - Write computations for any world `e`, asking only for what they use.
-  Only `main` names a world.
+  Only `main` names a world, in its type.
 
 ### Giving the evidence
 
-A value of `h <: e` shows where `h` is in `e`:
-
-| Evidence | Shows |
-|---|---|
-| `here h` | `h <: h` |
-| `inl h k` | `h <: h <+> k` |
-| `inr h k` | `k <: h <+> k` |
-| `\p -> InR (InL p)` | the second of three, `k <: h <+> (k <+> j)` |
-
-Evidence is a function, so deeper places are written with `InL` and
-`InR` directly. `<+>` groups to the left, and `<:` binds looser than it:
-`h <: h <+> k` is `h <: (h <+> k)`.
-
 `(x := _)` lets heff find the evidence: where the world is a sum by
 `<+>`, known at the call (`main`'s, say), the one place of `h` in it,
-put there by `InL`s and `InR`s:
-
-```haskell
-main : Co (stdio <+> filesystem) Unit
-main = look (io := _) (disk := _)
-```
+put there by `InL`s and `InR`s.
 
 A part of the world that is a world of its own, `e`, is reached through
 the evidence in scope that says where `h` is in `e`: in `attempt
@@ -69,6 +48,20 @@ is `\p -> InR (io p)`, through the `io` in scope. An effect in no place
 of the world is E0355; in more than one, E0356 (give the evidence
 there); an argument that is no `h <: e`, or a world not known where the
 call is, E0357.
+
+A value of `h <: e` is a function, and shows where `h` is in `e`:
+
+| Evidence | Shows |
+|---|---|
+| `here h` | `h <: h` |
+| `inl h k` | `h <: h <+> k` |
+| `inr h k` | `k <: h <+> k` |
+| `\p -> InL (InR p)` | the second of three, `k <: h <+> k <+> j` |
+
+`<+>` groups to the left, and `<:` binds looser than it: `h <+> k <+> j`
+is `(h <+> k) <+> j`, and `h <: h <+> k` is `h <: (h <+> k)`. Give it
+by hand only where `_` cannot choose: an effect in two places of the
+world.
 
 ## Defining an effect
 
@@ -147,7 +140,7 @@ thrice = do
 -- | >>> ticks
 -- | 3
 ticks : Int
-ticks = snd (handle counted (thrice (ev := here tick)) 0)
+ticks = snd (handle counted (thrice (ev := _)) 0)
 ```
 
 A `Handler h` is a monad, `M`, `ret` and `bind`, and `malg`, which says
@@ -216,7 +209,7 @@ every =
       Choose k -> c (k True) ++ c (k False)
   }
 
--- | >>> handle every (heads (ev := here choice) 2) (\n -> [n])
+-- | >>> handle every (heads (ev := _) 2) (\n -> [n])
 -- | [2, 1, 1, 0]
 ```
 
@@ -234,8 +227,8 @@ handler outside. For a handler of `choice <+> state Int`, `M` is `\a ->
 val (xs ++ ys)))`, and does each operation of the state again:
 
 ```haskell
-InR (Get k) -> bind (get (ev := here (state Int))) (\s -> c (k s))
-InR (Put s x) -> bind (put (ev := here (state Int)) s) (\u -> c x)
+InR (Get k) -> bind (get (ev := _)) (\s -> c (k s))
+InR (Put s x) -> bind (put (ev := _) s) (\u -> c x)
 ```
 
 The state, handled outside, is not restored between the two ways.

@@ -154,8 +154,8 @@ start =
 main : Co stdio Unit
 main =
   printTodos
-    (io := here stdio)
-    (toList (runCursor (program (cur := here cursor)) start))
+    (io := _)
+    (toList (runCursor (program (cur := _)) start))
 ```
 
 `program` moves to the second todo and marks it done. It says nothing of
