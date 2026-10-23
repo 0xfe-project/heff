@@ -17,7 +17,7 @@ title: Commands
 | `heff check FILE` | print a file's interface and its errors |
 | `heff doc [FILE...] [--out DIR]` | write each module's reference page; no FILE: `src/` |
 | `heff promote FILE` | write each doc test's and watch's value as its expectation |
-| `heff compile FILE OUT --backend=MODE` | compile a file to `page`, `esm` or `c` |
+| `heff compile FILE OUT --backend=MODE [--name NAME]` | compile a file to `page`, `esm` or `c`; `page` and `c` run `main`, or NAME |
 | `heff explain FILE` | print the type checker's trace |
 | `heff type-at FILE OFFSET...` | print what the name at each offset is, and its type |
 | `heff lsp` | run the language server on stdin and stdout |
@@ -42,6 +42,12 @@ Enter again to run it.
 - The backends are `page` and `esm` (JavaScript, for the browser) and
   `c` (everything else). A program imports the library for its backend,
   `lib/browser/` or `lib/std/`.
+- `heff compile --backend=c` and `--backend=page` build a program that
+  runs the file's `main`, or the definition `--name` gives; a file
+  without it is refused. `--backend=esm` exports every definition and
+  runs none, so it takes no `--name`.
+- OUT's directory must be there. For `c`, an OUT ending in `/` is a
+  directory of C files, a file a module, and is made if it is not there.
 
 ## Testing
 

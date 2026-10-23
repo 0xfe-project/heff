@@ -5309,7 +5309,7 @@ HEFF_FN V heff_nomatch(V s) {
   return 0;
 }
 
-// Values, shown (`heff compile` without `--name`: each definition of
+// Values, shown (`heff dump-c`: each definition of
 // the file printed as the tests print JavaScript's)
 // ---------------------------------------------------------------------
 

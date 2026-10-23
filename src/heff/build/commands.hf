@@ -1198,6 +1198,7 @@ compileJsOut : {e : HFunctor}
 compileJsOut outPath bad o = do
   ok <- Files.writeFile outPath o.source
   emitErrs o.errors
+  if ok then pure MkUnit else printErr ("cannot write " ^ outPath)
   if ok && not bad && List.null o.errors then pure MkUnit else exit 1
 
 compileJsDiags : {e : HFunctor}
@@ -1373,6 +1374,8 @@ compileLastC bi sources file name outPath failed done cs = case Driver.lastCheck
       -- (no computation named: each of the file's definitions, shown)
       Nothing -> do
         ok <- Files.writeFile (zigBeside outPath) rt.zig
+        if ok then pure MkUnit
+        else printErr ("cannot write " ^ zigBeside outPath)
         compileJsOut
             outPath
             (not ok)
@@ -1492,6 +1495,18 @@ cCmd name outPath file =
         ^ " -femit-bin=runtime.o` and `zig cc -O2 "
         ^ (if endsWith "/" outPath then outPath ^ "*.c" else outPath)
         ^ " runtime.o -o PROGRAM -lm`"))
+
+-- | `heff dump-c FILE OUT`: one C file that shows each of FILE's
+-- | definitions, as the tests hold it to the interpreter's values
+dumpCCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{rep : Report.report <: e}}
+         -> String
+         -> String
+         -> Co e Unit
+dumpCCmd file outPath = cThen Nothing outPath file (pure MkUnit)
 
 ranOut : Ran -> String
 ranOut r = r.out
@@ -2409,7 +2424,47 @@ installCmd dir = do
 type CompileOpts =
   { file : String, outPath : String, name : Maybe String, backend : String }
 
--- | `heff compile`, by its backend
+-- (the directory OUT is to be written in, if it is not there; a C
+-- program's `DIR/`, its parts, is made, the directories above it too)
+missingOutDir : {e : HFunctor}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> CompileOpts
+              -> Co e (Maybe String)
+missingOutDir o =
+  if strEq o.backend "c" && endsWith "/" o.outPath then pure Nothing
+  else do
+    st <- styleNow
+    dir <- pure (HostPath.dirname st o.outPath)
+    there <- Files.readDirectory (if strEq dir "" then "." else dir)
+    pure (case there of
+      Just _ -> Nothing
+      Nothing -> Just dir)
+
+-- (`heff compile` of a program, its OUT's directory there: the
+-- computation run is NAME, else `main`)
+compileThere : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> {{rep : Report.report <: e}}
+             -> CompileOpts
+             -> Co e Unit
+compileThere o = do
+  missing <- missingOutDir o
+  case missing of
+    Just dir -> do
+      printErr ("heff compile: " ^ dir ^ ": no such directory")
+      exit 1
+    Nothing ->
+      if strEq o.backend "page"
+      then appCmd (Just (fromMaybe "main" o.name)) o.outPath o.file
+      else if strEq o.backend "esm" then compileJsCmd o.file o.outPath
+      else cCmd (Just (fromMaybe "main" o.name)) o.outPath o.file
+
+-- | `heff compile`, by its backend: a page's script or a C program runs
+-- | NAME, `main` without `--name`; an ES module runs nothing, each
+-- | definition exported
 compileTo : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{sys : process <: e}}
@@ -2418,15 +2473,14 @@ compileTo : {e : HFunctor}
           -> CompileOpts
           -> Co e Unit
 compileTo o =
-  if strEq o.backend "page" then appCmd o.name o.outPath o.file
-  else if strEq o.backend "esm"
+  if strEq o.backend "esm"
   then case o.name of
-    Nothing -> compileJsCmd o.file o.outPath
+    Nothing -> compileThere o
     Just n -> do
       printErr
           "heff compile: an ES module runs nothing: no --name with --backend=esm"
       exit 1
-  else if strEq o.backend "c" then cCmd o.name o.outPath o.file
+  else if strEq o.backend "page" || strEq o.backend "c" then compileThere o
   else do
     printErr ("heff compile: no backend " ^ o.backend ^ ": esm, page or c")
     exit 1
@@ -2489,7 +2543,10 @@ promoteDiags file badL cs = do
       if badL || anyErrors cs then exit 1
       else do
         ok <- Files.writeFile file (Driver.promote c)
-        if ok then pure MkUnit else exit 1
+        if ok then pure MkUnit
+        else do
+          printErr ("heff promote: cannot write " ^ file)
+          exit 1
 
 -- | write each watch's and doc test's value under it as its expectation
 promoteCmd : {e : HFunctor}
@@ -2597,7 +2654,10 @@ fmtSrc checkOnly f src fix = case Format.formatIn fix src of
       pure 1
     else do
       ok <- Files.writeFile f out
-      pure 0
+      if ok then pure 0
+      else do
+        printErr ("heff fmt: cannot write " ^ f)
+        pure 1
 
 -- | 1 if the file is not formatted (with `--check`) or cannot be; its
 -- | operators cut as the fixities of what it imports say
