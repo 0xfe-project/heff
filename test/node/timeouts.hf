@@ -1,0 +1,306 @@
+-- Time limits on what waits, by C alone: std.net's connection made and
+-- read, std.http.server's idle connection, std.http's connection made.
+-- Each says what it came to and whether it took about its limit -- no
+-- less, and not much more (a slow machine given a second over) -- and
+-- the descriptors the program has open after are those it had before:
+-- nothing it began is left behind.
+--
+--   main          no scheduler: a connection to an address nothing
+--                 answers (10.255.255.1) given 300 ms, ETIMEDOUT; a read
+--                 of a connection whose other side writes nothing given
+--                 300 ms, ETIMEDOUT, and the connection read again after,
+--                 as it was; and a client that sends nothing, its
+--                 connection served by `serveConnection` given an idle
+--                 limit of 300 ms, closed by it
+--   green         the same, by green threads scheduled by std.reactor,
+--                 the scheduler ending once they are done; and a client
+--                 that sends nothing to a server of `serveConcurrently`
+--                 given an idle limit of 300 ms, closed by it
+--   http BASE     std.http, the connection to 10.255.255.1 given 300 ms,
+--                 curl's code 28; and BASE/item/1, of a server that
+--                 takes 500 ms over it, given 300 ms to connect and 10 s
+--                 in all, answered (built with `-DHEFF_HTTP_SPAWN` too,
+--                 the curl spawned)
+--   multi BASE    the same, by a green thread: libcurl's multi interface
+
+module test.node.timeouts
+
+import co
+import exception
+import green
+import std.filesystem
+import std.http as HTTP
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.path as Path
+import std.process
+import std.reactor as Reactor
+import std.time
+import resource
+
+world : HFunctor
+world =
+  stdio <+> (Net.net <+> (time <+> (filesystem <+> (HTTP.http <+> process))))
+
+greenWorld : HFunctor
+greenWorld =
+  stdio
+  <+> (Net.net
+       <+> (time
+            <+> (filesystem <+> (HTTP.http <+> (Reactor.reactor <+> process)))))
+
+-- (an address nothing answers: no connection is refused, none made)
+nowhere : Net.Address
+nowhere = { host = "10.255.255.1", port = 9 }
+
+-- (127.0.0.1's `port`)
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
+
+-- (whether `ms` milliseconds is about the limit `want`: not before it,
+-- and not a second and more past it)
+inTime : Int -> Int -> String
+inTime want ms =
+  if ms >= want - 20 && ms < want + 1200 then "in time"
+  else "took " ^ show ms ^ " ms"
+
+-- (what `c` came to, and how long it took, in milliseconds)
+timed : {e : HFunctor}
+      -> {a : Type}
+      -> {{clock : time <: e}}
+      -> Co e a
+      -> Co e (Int, a)
+timed c = do
+  start <- monotonic
+  x <- c
+  end <- monotonic
+  pure ((end - start) / 1000000, x)
+
+showRead : Either Net.NetError Bytes -> String
+showRead (Left err) = err.name
+showRead (Right b) = show b
+
+-- (the value of a `Right`; where there is none, the program abandoned:
+-- the test's own sockets, which do not fail)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+-- (how many descriptors the program has open; -1 where that is not to
+-- be known)
+openFds : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e Int
+openFds = do
+  r <-
+    attempt
+      FileError
+      (readDirectory
+         (ev := \p -> InR (disk p))
+         (ex := \p -> InL p)
+         (Path.parse "/dev/fd"))
+  pure (either (\err -> 0 - 1) (\l -> List.length l) r)
+
+sameFds : Int -> Int -> String
+sameFds before after =
+  if before == after && before > 0 then "descriptors: as before"
+  else "descriptors: " ^ show before ^ " before, " ^ show after ^ " after"
+
+-- std.net
+--------------------------------------------------------------------------------
+
+-- | A connection to an address nothing answers, given 300 ms: thrown,
+-- | ETIMEDOUT, in about that time.
+connectLimited : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> {{nt : Net.net <: e}}
+               -> {{clock : time <: e}}
+               -> {{ex : exception Net.NetError <: e}}
+               -> Co e Unit
+connectLimited = do
+  (ms, r) <-
+    timed
+      (recover
+         (bind
+            (Net.withConnection
+               (timeout := 300)
+               nowhere
+               (\c -> (pure MkUnit : Co e Unit)))
+            (\u -> pure "connected"))
+         (\(err : Net.NetError) -> pure err.name))
+  print ("a connection given 300 ms: " ^ r ^ ", " ^ inTime 300 ms)
+
+-- (the client's side `c` read, nothing written to it, given 300 ms:
+-- ETIMEDOUT; then the server's side `s` writes, and `c` read again)
+silentRead : {e : HFunctor}
+           -> {s t : Type}
+           -> {{io : stdio <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : time <: e}}
+           -> With s Net.TcpStream
+           -> With t Net.TcpStream
+           -> Co e Unit
+silentRead c s = do
+  (ms, r) <- timed (Net.read (timeout := 300) c 100)
+  print ("a read given 300 ms: " ^ showRead r ^ ", " ^ inTime 300 ms)
+  w <- Net.write (timeout := 5000) s b["late"]
+  again <- Net.read (timeout := 5000) c 100
+  print ("read again: " ^ showRead again)
+
+-- | A read of a connection whose other side writes nothing, given 300
+-- | ms: ETIMEDOUT, the connection read again after.
+readLimited : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{nt : Net.net <: e}}
+            -> {{clock : time <: e}}
+            -> {{ex : exception Net.NetError <: e}}
+            -> Co e Unit
+readLimited =
+  Net.withListener (here 0) 4 (\l -> do
+    at <- Net.local l
+    Net.withConnection
+        (here (must at).port)
+        (\c -> Net.accept l (\s -> silentRead c s)))
+
+-- (a server's answer)
+hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
+hello r = pure (Server.plain 200 "hello\n")
+
+-- | A client that sends nothing to a server of `serveConcurrently`,
+-- | given an idle limit of 300 ms: its connection closed by the server
+-- | in about that time, its read at the end, `b[]`.
+idleClosed : {e : HFunctor}
+           -> {{gr : green <: e}}
+           -> {{io : stdio <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : time <: e}}
+           -> {{ex : exception Net.NetError <: e}}
+           -> Co e Unit
+idleClosed =
+  Net.withListener (here 0) 16 (\l -> do
+    at <- Net.local l
+    spawn (Server.serveConcurrently (idle := 300) l hello)
+    (ms, r) <-
+      timed
+        (Net.withConnection
+           (here (must at).port)
+           (\c -> Net.read (timeout := 5000) c 100))
+    print ("a silent client, the server's idle limit 300 ms: " ^ showRead r ^ ", " ^ inTime 300 ms))
+
+-- | A client that sends nothing, its connection served by
+-- | `serveConnection` given an idle limit of 300 ms, by one thread: the
+-- | server done with it in about that time, the client's read then at
+-- | the end, `b[]`.
+idleServed : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : time <: e}}
+           -> {{ex : exception Net.NetError <: e}}
+           -> Co e Unit
+idleServed =
+  Net.withListener (here 0) 4 (\l -> do
+    at <- Net.local l
+    Net.withConnection
+        (here (must at).port)
+        (\c -> do
+          (ms, stop) <-
+            timed
+              (Net.accept
+                 l
+                 (Server.serveConnection (idle := 300) (\r -> False) hello))
+          r <- Net.read (timeout := 5000) c 100
+          print ("a silent client, served with an idle limit of 300 ms: " ^ showRead r ^ ", " ^ inTime 300 ms)))
+
+-- (what a scheduler's main came to)
+said : Maybe (Either Net.NetError Unit) -> String
+said Nothing = "a deadlock"
+said (Just (Left err)) = "not heard: " ^ Net.showError err
+said (Just (Right u)) = "scheduler done"
+
+unheard : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> Either Net.NetError Unit
+        -> Co e Unit
+unheard (Left err) = print ("not heard: " ^ Net.showError err)
+unheard (Right u) = pure MkUnit
+
+main : Co world Unit
+main = do
+  before <- openFds (disk := _)
+  r <-
+    attempt
+      Net.NetError
+      (bind
+         (connectLimited (io := _) (nt := _) (clock := _) (ex := _))
+         (\u -> do
+            readLimited (io := _) (nt := _) (clock := _) (ex := _)
+            idleServed (io := _) (nt := _) (clock := _) (ex := _)))
+  unheard (io := _) r
+  after <- openFds (disk := _)
+  print (ev := _) (sameFds before after)
+
+green : Co greenWorld Unit
+green = do
+  before <- openFds (disk := _)
+  r <-
+    Reactor.scheduled
+      greenWorld
+      (rx := _)
+      (attempt
+         Net.NetError
+         (do
+           connectLimited (io := _) (nt := _) (clock := _) (ex := _)
+           readLimited (io := _) (nt := _) (clock := _) (ex := _)
+           idleClosed (gr := _) (io := _) (nt := _) (clock := _) (ex := _)))
+  print (ev := _) (said r)
+  after <- openFds (disk := _)
+  print (ev := _) (sameFds before after)
+
+-- std.http
+--------------------------------------------------------------------------------
+
+showGot : Either HTTP.HttpError HTTP.Response -> String
+showGot (Left err) = "code " ^ show err.code
+showGot (Right res) = show res.status ^ " " ^ show (HTTP.text res)
+
+-- | A request to an address nothing answers, given 300 ms to connect:
+-- | code 28, in about that time; and one of a server that takes 500 ms
+-- | over it, given 300 ms to connect and 10 s in all, answered, past
+-- | the time to connect.
+requests : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> {{clock : time <: e}}
+         -> String
+         -> Co e Unit
+requests base = do
+  (ms, r) <- timed (HTTP.send { url = "http://10.255.255.1:9/", connectTimeout = 300 })
+  print ("a connection given 300 ms: " ^ showGot r ^ ", " ^ inTime 300 ms)
+  (slow, got) <-
+    timed
+      (HTTP.send
+         { url = base ^ "/item/1", timeout = 10000, connectTimeout = 300 })
+  print
+      ("slow, connected in time: "
+       ^ showGot got
+       ^ ", past the time to connect: "
+       ^ (if slow >= 400 then "yes" else "no, " ^ show slow ^ " ms"))
+
+-- (the base URL, the first argument)
+baseOf : List String -> String
+baseOf (b :: _) = b
+baseOf Nil = "http://127.0.0.1:1"
+
+http : Co world Unit
+http = do
+  argv <- args (ev := _)
+  requests (io := _) (web := _) (clock := _) (baseOf argv)
+
+multi : Co greenWorld Unit
+multi = do
+  argv <- args (ev := _)
+  r <-
+    Reactor.scheduled
+      greenWorld
+      (rx := _)
+      (requests (io := _) (web := _) (clock := _) (baseOf argv))
+  print (ev := _) (maybe "a deadlock" (\u -> "scheduler done") r)

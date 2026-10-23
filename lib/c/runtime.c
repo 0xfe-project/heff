@@ -4889,7 +4889,12 @@ HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
 // (`heff_wait_done`).  A wait may have a deadline instead of, or as
 // well as, a descriptor (`until`, by `heff_now_ms`): a sleep of
 // std.time's is one with no descriptor, done when its time has passed,
-// the reactor waiting no longer than the nearest deadline.
+// the reactor waiting no longer than the nearest deadline.  A wait whose
+// deadline passes before it is done is done so, its `err` ETIMEDOUT:
+// the time limit of an operation of std.net's, its answer that it timed
+// out, what it began undone by it (a socket being connected closed).
+// Where no group is being started in, the same deadline bounds the poll
+// that waits for it there.
 //
 // Each thread of the system has a reactor of its own (`HEFF_TLS`): its
 // waits are its own, waited for by it alone, driven by the scheduler
@@ -4930,8 +4935,9 @@ struct HeffWait {
   short events;                  // (POLLIN, POLLOUT)
   int64_t until;                 // (when it is done regardless, by
                                  //  `heff_now_ms`; 0, never)
-  int err;                       // (why waiting failed -- errno, poll's, or
-                                 //  EBADF, its socket closed -- its answer's to say)
+  int err;                       // (why waiting failed -- errno, poll's,
+                                 //  EBADF, its socket closed, or ETIMEDOUT,
+                                 //  its deadline passed -- its answer's to say)
   int (*step)(HeffWait *);       // (its next step: HEFF_STEP_DONE, or HEFF_STEP_WAIT,
                                  //  its `fd` and `events` again)
   V (*answer)(HeffWait *);       // (its answer, made, the wait let go of)
@@ -5057,7 +5063,10 @@ HEFF_FN V heff_outside(HeffWait *w, V f, V k) {
       break;
     }
     if (r == 0) {
-      if (w->until && heff_now_ms() >= w->until) break;
+      if (w->until && heff_now_ms() >= w->until) {
+        w->err = ETIMEDOUT;
+        break;
+      }
       continue;
     }
     if (w->step(w) == HEFF_STEP_DONE) break;
@@ -5160,11 +5169,15 @@ HEFF_FN void heff_reactor_wake(void) {
   }
 }
 
-// (the waits whose deadline has passed: done)
+// (the waits whose deadline has passed: done, timed out -- a sleep's
+// answer minds it not)
 HEFF_FN void heff_reactor_expire(void) {
   int64_t now = heff_now_ms();
   for (HeffWait *w = heff_waits_first; w; w = w->next)
-    if (!w->done && w->until && now >= w->until) w->done = 1;
+    if (!w->done && w->until && now >= w->until) {
+      if (!w->err) w->err = ETIMEDOUT;
+      w->done = 1;
+    }
 }
 
 #ifndef _WIN32

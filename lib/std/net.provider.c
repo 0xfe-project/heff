@@ -15,9 +15,13 @@
 // program waiting with it; where std.reactor's green threads run, the
 // op pending, the other threads going on, and its own once it is done.
 // The heff side is the same either way: each operation gives its
-// answer to a function.  A name resolved by getaddrinfo waits with no
+// answer to a function.  A connection made, a read and a write may have
+// a time limit: their wait's deadline, kept either way (the reactor's,
+// or the poll's where there is none), the op done `ETIMEDOUT` where it
+// passes first.  A name resolved by getaddrinfo waits with no
 // descriptor: under a scheduler, a host that is no address is resolved
-// by a thread of its own, which says it is done by a descriptor written.
+// by a thread of its own, which says it is done by a descriptor written;
+// without one, it is resolved where the program is, not cut short.
 
 #ifdef _WIN32
 
@@ -199,11 +203,14 @@ struct NetOp {
                        //  write's bytes)
 };
 
-static NetOp *net_op(int what) {
+// (an op, done within `ms` milliseconds from now where they are more
+// than 0)
+static NetOp *net_op(int what, int64_t ms) {
   NetOp *o = heff_alloc(sizeof *o);
   memset(o, 0, sizeof *o);
   o->what = what;
   o->w.fd = -1;
+  o->w.until = ms > 0 ? heff_now_ms() + ms : 0;
   o->n = -1;
   return o;
 }
@@ -501,12 +508,14 @@ static V net_answer(HeffWait *w) {
   switch (o->what) {
   case NET_CONNECT:
   case NET_LISTEN:
-    if (w->err && w->fd >= 0) {
-      // (a connection begun, not made)
+    if (w->err && w->fd >= 0 && !o->lookup) {
+      // (a connection begun, not made: timed out, or polled in vain; a
+      // name being resolved is its lookup's, let go of below)
       close(w->fd);
       w->fd = -1;
     }
     if (o->gai && !w->err) r = net_left(err, o->gai);
+    else if (w->err) r = net_left(w->err, 0);
     else if (w->fd >= 0) r = net_value(w->fd);
     else r = net_left(err ? err : EADDRNOTAVAIL, 0);
     break;
@@ -576,11 +585,12 @@ static V net_closed(V p, V f, V k) {
 static V heff_provider_net(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Connect: {
-    V f = heff_dup(heff_field(p, 2));
+    V f = heff_dup(heff_field(p, 3));
     V host = heff_dup(heff_field(p, 0));
     int64_t port = net_int(heff_field(p, 1));
+    int64_t ms = net_int(heff_field(p, 2));
     heff_drop(p);
-    NetOp *o = net_op(NET_CONNECT);
+    NetOp *o = net_op(NET_CONNECT, ms);
     V r = net_made(o, host, port, 0, net_connect_step, f, k);
     heff_drop(host);
     return r;
@@ -591,7 +601,7 @@ static V heff_provider_net(V p, V k) {
     int64_t port = net_int(heff_field(p, 1));
     int64_t backlog = net_int(heff_field(p, 2));
     heff_drop(p);
-    NetOp *o = net_op(NET_LISTEN);
+    NetOp *o = net_op(NET_LISTEN, 0);
     o->backlog = backlog < 1 ? 1 : backlog > 65535 ? 65535 : (int)backlog;
     V r = net_made(o, host, port, 1, net_listen_step, f, k);
     heff_drop(host);
@@ -603,7 +613,7 @@ static V heff_provider_net(V p, V k) {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     if (s->fd < 0) return net_closed(p, f, k);
-    NetOp *o = net_op(NET_ACCEPT);
+    NetOp *o = net_op(NET_ACCEPT, 0);
     o->held = p;
     o->w.fd = s->fd;
     o->w.step = net_accept_step;
@@ -612,14 +622,15 @@ static V heff_provider_net(V p, V k) {
   case TAG_Read: {
     NetSock *s = net_sock(heff_field(p, 0));
     int64_t n = net_int(heff_field(p, 1));
-    V f = heff_dup(heff_field(p, 2));
+    int64_t ms = net_int(heff_field(p, 2));
+    V f = heff_dup(heff_field(p, 3));
     if (s->fd < 0) return net_closed(p, f, k);
     if (n <= 0) {
       heff_drop(p);
       V x = heff_answer(f, net_right(heff_bytes_in("", 0)));
       return heff_tail(k, 1, &x);
     }
-    NetOp *o = net_op(NET_READ);
+    NetOp *o = net_op(NET_READ, ms);
     o->n = n > NET_READ_MAX ? NET_READ_MAX : n;
     o->buf = heff_alloc((size_t)o->n);
     o->held = p;
@@ -629,9 +640,10 @@ static V heff_provider_net(V p, V k) {
   }
   case TAG_Write: {
     NetSock *s = net_sock(heff_field(p, 0));
-    V f = heff_dup(heff_field(p, 2));
+    int64_t ms = net_int(heff_field(p, 2));
+    V f = heff_dup(heff_field(p, 3));
     if (s->fd < 0) return net_closed(p, f, k);
-    NetOp *o = net_op(NET_WRITE);
+    NetOp *o = net_op(NET_WRITE, ms);
     // (the bytes are `p`'s, held until they are written)
     o->data = heff_bytes_data(heff_field(p, 1), &o->n);
     o->held = p;
