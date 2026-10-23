@@ -2,15 +2,33 @@
 // over the runtime's reactor, whose groups it
 // opens, starts computations in, asks for what is finished and closes.
 //
-// A `Begun` and a `Finished` are each a function given what to do with
-// what they hold, their types erased: `rx_open` takes it -- a begun's
-// computation `c` and its function `k`, a finished's function `k` -- so
-// that the provider has each apart, as std.thread's provider takes
-// a work.  A computation `c` is the world's: a function of its
-// continuation, which the reactor runs.
+// A computation is started between a `Begin` and an `End`, in the
+// world's own course, not handed to an operation: `Begin` runs what
+// comes after it -- the computation, to its `End` -- there and then, in
+// its group (`heff_group`), as `heff_reactor_start` runs a computation;
+// the `End` of that run gives back its value and what comes after it,
+// not running it, and `Begin` goes on from there, with `Just` the
+// value.  Where the computation waits instead, `HEFF_PENDING` comes
+// back, and `Begin` goes on from itself again, told `False`; once the
+// wait is done, the rest is run by the reactor, and its `End`, not of a
+// run of a `Begin`'s, gives back the value alone, one of the group's
+// finished.
+//
+// An `End` and a `Finished` are each a function given what to do with
+// what they hold, their types erased: `rx_open` takes it -- an end's
+// value and its function `k`, a finished's function `k` -- so that the
+// provider has each apart, as std.thread's provider takes a work.
 
-// (what a begun or a finished holds, where `rx_open` puts it)
+// (what an end or a finished holds, where `rx_open` puts it)
 static HEFF_TLS V rx_held[2];
+
+// (the group whose `Begin` is running what comes after it, 0 none; and
+// what its `End` gave back: the value, its function and what comes
+// after it)
+static HEFF_TLS int64_t rx_trying;
+static HEFF_TLS V rx_ended[3];
+static Obj rx_ended_obj = { IMMORTAL, K_STR, 0 };
+#define RX_ENDED ((V)&rx_ended_obj)
 
 static V rx_open_fn(V self, V *a) {
   int n = ((Clo *)self)->arity;
@@ -33,15 +51,49 @@ static V heff_provider_reactor(V p, V k) {
     V x = heff_answer(f, heff_int(heff_reactor_open()));
     return heff_tail(k, 1, &x);
   }
-  case TAG_Start: {
+  case TAG_Begin: {
+    int64_t g = INT_OF(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    int64_t up = heff_group, upTrying = rx_trying;
+    heff_group = g;
+    rx_trying = g;
+    V x = heff_answer(heff_dup(f), NTAG(TAG_True));
+    V r = heff_tr(heff_app1(heff_dup(k), x));
+    heff_group = up;
+    rx_trying = upTrying;
+    if (r == RX_ENDED) {
+      heff_drop(f);
+      heff_drop(k);
+      V v = rx_ended[0], ef = rx_ended[1], ek = rx_ended[2];
+      V y = heff_answer(ef, heff_just(v));
+      return heff_tail(ek, 1, &y);
+    }
+    if (r == HEFF_PENDING) {
+      V y = heff_answer(f, NTAG(TAG_False));
+      return heff_tail(k, 1, &y);
+    }
+    // (the program came to its end within: what started was left
+    // otherwise than by its `End`, a throw heard outside the scheduler)
+    heff_drop(f);
+    heff_drop(k);
+    return r;
+  }
+  case TAG_End: {
     int64_t g = INT_OF(heff_field(p, 0));
     V b = heff_dup(heff_field(p, 1));
     heff_drop(p);
     rx_open(b, 2);
-    V c = rx_held[0], f = rx_held[1];
-    V r = heff_reactor_start(g, c);
-    V x = heff_answer(f, r == HEFF_PENDING ? heff_nothing : heff_just(r));
-    return heff_tail(k, 1, &x);
+    V v = rx_held[0], f = rx_held[1];
+    if (g == rx_trying) {
+      rx_ended[0] = v;
+      rx_ended[1] = f;
+      rx_ended[2] = k;
+      return RX_ENDED;
+    }
+    heff_drop(f);
+    heff_drop(k);
+    return v;
   }
   case TAG_Finish: {
     int64_t g = INT_OF(heff_field(p, 0));

@@ -1,0 +1,494 @@
+-- std.chan's typed channels among green threads, each held by a `with`
+-- of its own outside the scheduler: records, strings and lists sent
+-- between threads, three element types in one program; a worker's sum
+-- and count sent as one pair; five hundred senders and five hundred
+-- receivers on one channel; a value taken without waiting, and none;
+-- every thread waiting (a deadlock); values handed to the receivers in
+-- the order they came to wait; channels made as they are wanted; and
+-- green's Int channels beside them.  A `with` outlives every thread
+-- that can use its channel: producers still sending when main is done
+-- deliver every value, and a receiver left waiting for ever is a
+-- deadlock.  Scheduled by green's `together`,
+-- in the language.
+
+module test.programs.chan
+
+import co
+import green
+import state
+import std.chan as Chan
+
+-- (no other effect: what a computation of none comes to)
+data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
+
+nothingElse : HFunctor
+nothingElse =
+  { f = NoneF
+  , hfmap = \m g p -> case p of
+      NoneOf q -> abandon
+  , hmap = \m n nt p -> case p of
+      NoneOf q -> abandon
+  }
+
+noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
+noneAlg (NoneOf q) = noneAlg q
+
+ranAlone : Handler nothingElse
+ranAlone =
+  { M = \x -> x
+  , ret = \x -> x
+  , bind = \m k -> k m
+  , malg = \p -> noneAlg p
+  }
+
+-- (a computation of nothing else, run in the language)
+ran : {a : Type} -> Co nothingElse a -> a
+ran c = handle ranAlone c
+
+-- (`n` times)
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure ()
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- Records, strings and lists: three types in one program
+--------------------------------------------------------------------------------
+
+type Order = { item : String, count : Int }
+
+-- (each order said back, its counts kept)
+clerk : {e : HFunctor}
+      -> {o w l : Type}
+      -> {{gr : green <: e}}
+      -> {{co : Chan.chan o Order <: e}}
+      -> {{cw : Chan.chan w String <: e}}
+      -> {{cl : Chan.chan l (List Int) <: e}}
+      -> Chan.Chan o Order
+      -> Chan.Chan w String
+      -> Chan.Chan l (List Int)
+      -> List Int
+      -> Int
+      -> Co e Unit
+clerk orders said counts got 0 = Chan.send counts (List.reverse got)
+clerk orders said counts got n = do
+  o <- Chan.recv orders
+  Chan.send said (show o.count ^ " " ^ o.item)
+  clerk orders said counts (o.count :: got) (n - 1)
+
+shopped : {e : HFunctor}
+        -> {o w l : Type}
+        -> {{gr : green <: e}}
+        -> {{co : Chan.chan o Order <: e}}
+        -> {{cw : Chan.chan w String <: e}}
+        -> {{cl : Chan.chan l (List Int) <: e}}
+        -> Chan.Chan o Order
+        -> Chan.Chan w String
+        -> Chan.Chan l (List Int)
+        -> Co e (List String, List Int)
+shopped orders said counts = do
+  spawn (clerk orders said counts Nil 2)
+  Chan.send orders { item = "tea", count = 2 }
+  a <- Chan.recv said
+  Chan.send orders { item = "cake", count = 1 }
+  b <- Chan.recv said
+  cs <- Chan.recv counts
+  pure ([a, b], cs)
+
+-- | an order a record, each said back a string, the counts a list
+-- | >>> shop
+-- | Just (MkPair (Cons "2 tea" (Cons "1 cake" Nil)) (Cons 2 (Cons 1 Nil)))
+shop : Maybe (List String, List Int)
+shop =
+  ran (do
+    with Chan.channel as orders do
+      with Chan.channel as said do
+        with Chan.channel as counts do
+          together
+            (shopped (gr := _) (co := _) (cw := _) (cl := _) orders said counts))
+
+-- Workers: jobs, and a sum and count sent as one pair
+--------------------------------------------------------------------------------
+
+worker : {e : HFunctor}
+       -> {j r : Type}
+       -> {{gr : green <: e}}
+       -> {{cj : Chan.chan j (Maybe Int) <: e}}
+       -> {{cr : Chan.chan r (Int, Int) <: e}}
+       -> Chan.Chan j (Maybe Int)
+       -> Chan.Chan r (Int, Int)
+       -> Int
+       -> Int
+       -> Co e Unit
+worker jobs out acc count = do
+  x <- Chan.recv jobs
+  case x of
+    Just v -> worker jobs out (acc + v * v) (count + 1)
+    Nothing -> Chan.send out (acc, count)
+
+-- (the jobs from `i` to `n`, then an end for each of `w` workers)
+jobsFrom : {e : HFunctor}
+         -> {j : Type}
+         -> {{gr : green <: e}}
+         -> {{cj : Chan.chan j (Maybe Int) <: e}}
+         -> Chan.Chan j (Maybe Int)
+         -> Int
+         -> Int
+         -> Int
+         -> Co e Unit
+jobsFrom jobs i n w =
+  if i <= n then do
+    Chan.send jobs (Just i)
+    yield
+    jobsFrom jobs (i + 1) n w
+  else repeatG w (Chan.send jobs Nothing)
+
+collected : {e : HFunctor}
+          -> {r : Type}
+          -> {{gr : green <: e}}
+          -> {{cr : Chan.chan r (Int, Int) <: e}}
+          -> Chan.Chan r (Int, Int)
+          -> Int
+          -> Co e (List (Int, Int))
+collected out 0 = pure Nil
+collected out w = do
+  p <- Chan.recv out
+  rest <- collected out (w - 1)
+  pure (p :: rest)
+
+squares : {e : HFunctor}
+        -> {j r : Type}
+        -> {{gr : green <: e}}
+        -> {{cj : Chan.chan j (Maybe Int) <: e}}
+        -> {{cr : Chan.chan r (Int, Int) <: e}}
+        -> Chan.Chan j (Maybe Int)
+        -> Chan.Chan r (Int, Int)
+        -> Int
+        -> Int
+        -> Co e (List (Int, Int))
+squares jobs out w n = do
+  repeatG w (spawn (worker jobs out 0 0))
+  spawn (jobsFrom jobs 1 n w)
+  collected out w
+
+sumBoth : List (Int, Int) -> (Int, Int)
+sumBoth ps = (List.sum (List.map fst ps), List.sum (List.map snd ps))
+
+-- | four workers squaring 1 to 100, each sending its sum and count
+-- | once, as one pair: 338350 in all, 100 jobs, 25 each -- the jobs
+-- | handed round, each to the worker waiting longest
+-- | >>> squared
+-- | Just (MkPair (MkPair 338350 100) (Cons 25 (Cons 25 (Cons 25 (Cons 25 Nil)))))
+squared : Maybe ((Int, Int), List Int)
+squared =
+  ran (do
+    with Chan.channel as jobs do
+      with Chan.channel as out do
+        together (do
+          ps <- squares (gr := _) (cj := _) (cr := _) jobs out 4 100
+          pure (sumBoth ps, List.map snd ps)))
+
+-- Many on one channel
+--------------------------------------------------------------------------------
+
+sumOf : {e : HFunctor}
+      -> {c : Type}
+      -> {{gr : green <: e}}
+      -> {{cs : Chan.chan c String <: e}}
+      -> Chan.Chan c String
+      -> Int
+      -> Co e Int
+sumOf back 0 = pure 0
+sumOf back n = do
+  w <- Chan.recv back
+  rest <- sumOf back (n - 1)
+  pure (strLength w + rest)
+
+-- (`n` receivers waiting, then `n` senders of "ab", each receiver
+-- sending it back with a "!")
+crowd : {e : HFunctor}
+      -> {c : Type}
+      -> {{gr : green <: e}}
+      -> {{cs : Chan.chan c String <: e}}
+      -> Chan.Chans c String
+      -> Int
+      -> Co e Int
+crowd cs n = do
+  there <- Chan.newChan cs
+  back <- Chan.newChan cs
+  repeatG
+    n
+    (spawn (do
+       w <- Chan.recv there
+       Chan.send back (w ^ "!")))
+  repeatG n (spawn (Chan.send there "ab"))
+  sumOf back n
+
+-- | 500 receivers waiting before 500 senders, two channels of one
+-- | `with`'s: each "ab!"
+-- | >>> crowded
+-- | Just 1500
+crowded : Maybe Int
+crowded =
+  ran (do
+    with Chan.channels as cs do
+      together (crowd (gr := _) (cs := _) cs 500))
+
+-- Without waiting, a deadlock
+--------------------------------------------------------------------------------
+
+tried : {e : HFunctor}
+      -> {c : Type}
+      -> {{gr : green <: e}}
+      -> {{ci : Chan.chan c Int <: e}}
+      -> Chan.Chan c Int
+      -> Co e (Maybe Int, Maybe Int, Maybe Int)
+tried ch = do
+  a <- Chan.tryRecv ch
+  Chan.send ch 7
+  b <- Chan.tryRecv ch
+  c <- Chan.tryRecv ch
+  pure (a, b, c)
+
+-- | nothing on it yet, then 7, then nothing again
+-- | >>> triedRun
+-- | Just (MkPair (MkPair Nothing (Just 7)) Nothing)
+triedRun : Maybe (Maybe Int, Maybe Int, Maybe Int)
+triedRun =
+  ran (do
+    with Chan.channel as ch do
+      together (tried (gr := _) (ci := _) ch))
+
+stuck : {e : HFunctor}
+      -> {j r : Type}
+      -> {{gr : green <: e}}
+      -> {{cj : Chan.chan j (Maybe Int) <: e}}
+      -> {{cr : Chan.chan r (Int, Int) <: e}}
+      -> Chan.Chan j (Maybe Int)
+      -> Chan.Chan r (Int, Int)
+      -> Co e (Int, Int)
+stuck jobs out = do
+  spawn (worker jobs out 0 0)
+  Chan.send jobs (Just 3)
+  Chan.recv out
+
+-- | the worker waiting for a job, main for its answer: every thread
+-- | waits
+-- | >>> deadlocked
+-- | Nothing
+deadlocked : Maybe (Int, Int)
+deadlocked =
+  ran (do
+    with Chan.channel as jobs do
+      with Chan.channel as out do
+        together (stuck (gr := _) (cj := _) (cr := _) jobs out))
+
+-- Fairness: the receiver waiting longest first
+--------------------------------------------------------------------------------
+
+-- (receiver `i`: two values taken, each said as `i:v` on `said`)
+taker : {e : HFunctor}
+      -> {c w : Type}
+      -> {{gr : green <: e}}
+      -> {{ci : Chan.chan c Int <: e}}
+      -> {{cw : Chan.chan w String <: e}}
+      -> Chan.Chan c Int
+      -> Chan.Chan w String
+      -> Int
+      -> Co e Unit
+taker ch said i = do
+  a <- Chan.recv ch
+  Chan.send said (show i ^ ":" ^ show a)
+  b <- Chan.recv ch
+  Chan.send said (show i ^ ":" ^ show b)
+
+spawnTakers : {e : HFunctor}
+            -> {c w : Type}
+            -> {{gr : green <: e}}
+            -> {{ci : Chan.chan c Int <: e}}
+            -> {{cw : Chan.chan w String <: e}}
+            -> Chan.Chan c Int
+            -> Chan.Chan w String
+            -> Int
+            -> Int
+            -> Co e Unit
+spawnTakers ch said i n =
+  if i < n then do
+    spawn (taker ch said i)
+    spawnTakers ch said (i + 1) n
+  else pure ()
+
+sendFrom : {e : HFunctor}
+         -> {c : Type}
+         -> {{gr : green <: e}}
+         -> {{ci : Chan.chan c Int <: e}}
+         -> Chan.Chan c Int
+         -> Int
+         -> Int
+         -> Co e Unit
+sendFrom ch i n =
+  if i < n then do
+    Chan.send ch i
+    sendFrom ch (i + 1) n
+  else pure ()
+
+saidN : {e : HFunctor}
+      -> {w : Type}
+      -> {{gr : green <: e}}
+      -> {{cw : Chan.chan w String <: e}}
+      -> Chan.Chan w String
+      -> Int
+      -> Co e (List String)
+saidN said 0 = pure Nil
+saidN said n = do
+  x <- Chan.recv said
+  rest <- saidN said (n - 1)
+  pure (x :: rest)
+
+fairly : {e : HFunctor}
+       -> {c w : Type}
+       -> {{gr : green <: e}}
+       -> {{ci : Chan.chan c Int <: e}}
+       -> {{cw : Chan.chan w String <: e}}
+       -> Chan.Chan c Int
+       -> Chan.Chan w String
+       -> Co e (List String)
+fairly ch said = do
+  spawnTakers ch said 0 4
+  yield
+  sendFrom ch 0 8
+  saidN said 8
+
+-- | four receivers waiting, eight values sent at once: the first four
+-- | handed to them in the order they came to wait, the receiver `i`
+-- | taking `i`; the next four left on the channel, taken by each as its
+-- | turn comes, in the same order
+-- | >>> fair
+-- | Just ["0:0", "0:4", "1:1", "1:5", "2:2", "2:6", "3:3", "3:7"]
+fair : Maybe (List String)
+fair =
+  ran (do
+    with Chan.channel as ch do
+      with Chan.channel as said do
+        together (fairly (gr := _) (ci := _) (cw := _) ch said))
+
+-- Channels made as they are wanted, and green's own beside them
+--------------------------------------------------------------------------------
+
+-- (a request: a channel of its own for its answer, made now, and a
+-- thread answering on it)
+asked : {e : HFunctor}
+      -> {c : Type}
+      -> {{gr : green <: e}}
+      -> {{cs : Chan.chan c String <: e}}
+      -> Chan.Chans c String
+      -> Int
+      -> Int
+      -> Co e Unit
+asked cs done i = do
+  reply <- Chan.newChan cs
+  spawn (Chan.send reply ("answer " ^ show i))
+  w <- Chan.recv reply
+  send done (strLength w)
+
+requests : {e : HFunctor}
+         -> {c : Type}
+         -> {{gr : green <: e}}
+         -> {{cs : Chan.chan c String <: e}}
+         -> Chan.Chans c String
+         -> Co e Int
+requests cs = do
+  done <- newChan
+  repeatG 3 (spawn (asked cs done 7))
+  a <- recv done
+  b <- recv done
+  c <- recv done
+  pure (a + b + c)
+
+-- | three requests at once, each its own channel of a `with`'s, made as
+-- | it is wanted, and green's Int channel counting them: 8 each
+-- | >>> answered
+-- | Just 24
+answered : Maybe Int
+answered =
+  ran (do
+    with Chan.channels as cs do
+      together (requests (gr := _) (cs := _) cs))
+
+-- A with outlives its threads
+--------------------------------------------------------------------------------
+
+-- (`n` values taken, each added to the state outside)
+consume : {e : HFunctor}
+        -> {c : Type}
+        -> {{gr : green <: e}}
+        -> {{ci : Chan.chan c Int <: e}}
+        -> {{st : state Int <: e}}
+        -> Chan.Chan c Int
+        -> Int
+        -> Co e Unit
+consume ch 0 = pure ()
+consume ch n = do
+  v <- Chan.recv ch
+  t <- get (ev := st)
+  put (ev := st) (t + v)
+  consume ch (n - 1)
+
+-- (`i` down to 1 sent, a turn given up after each)
+produce : {e : HFunctor}
+        -> {c : Type}
+        -> {{gr : green <: e}}
+        -> {{ci : Chan.chan c Int <: e}}
+        -> Chan.Chan c Int
+        -> Int
+        -> Co e Unit
+produce ch 0 = pure ()
+produce ch i = do
+  Chan.send ch i
+  yield
+  produce ch (i - 1)
+
+-- (main done at once, two producers and a consumer still to run)
+leaving : {e : HFunctor}
+        -> {c : Type}
+        -> {{gr : green <: e}}
+        -> {{ci : Chan.chan c Int <: e}}
+        -> {{st : state Int <: e}}
+        -> Chan.Chan c Int
+        -> Co e String
+leaving ch = do
+  spawn (consume ch 100)
+  spawn (produce ch 50)
+  spawn (produce ch 50)
+  pure "main done"
+
+-- | main done before its threads are: the `with` waits for them, every
+-- | value delivered -- 2 * (1 + ... + 50) in the state outside
+-- | >>> outlived
+-- | MkPair (Just "main done") 2550
+outlived : Pair (Maybe String) Int
+outlived =
+  ran
+    (runState
+       0
+       (do
+         with Chan.channel as ch do
+           together (leaving (gr := _) (ci := _) (st := _) ch)))
+
+-- (main done, a receiver left on a channel nobody sends on)
+forgot : {e : HFunctor}
+       -> {c : Type}
+       -> {{gr : green <: e}}
+       -> {{ci : Chan.chan c Int <: e}}
+       -> Chan.Chan c Int
+       -> Co e Int
+forgot ch = do
+  spawn (bind (Chan.recv ch) (\v -> pure ()))
+  pure 5
+
+-- | main's answer had, but a receiver waits for ever: a deadlock
+-- | >>> forgotten
+-- | Nothing
+forgotten : Maybe Int
+forgotten =
+  ran (do
+    with Chan.channel as ch do
+      together (forgot (gr := _) (ci := _) ch))
