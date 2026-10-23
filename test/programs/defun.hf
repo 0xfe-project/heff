@@ -1,0 +1,201 @@
+-- Continuations a recursive copy is handed by its own group, made tags
+-- (heff.compile.defun): every root-to-leaf path of a small tree, a
+-- choice resumed twice at each node (multi-shot), under a state not
+-- restored between the branches, what the branches collect appended;
+-- the queens counted, each pick resumed for every row.  And copies left
+-- as they are: one whose continuations escape, kept in what it gives
+-- back; one used as a value, its calls not known; one handed a
+-- continuation not known, taken from a list.
+
+module test.programs.defun
+
+import co
+import state
+
+data Tree = Leaf | Node Tree Int Tree
+
+make : Int -> Tree
+make k =
+  if k == 0 then Leaf
+  else let t : Tree = make (k - 1) in Node t k t
+
+mix : Int -> Int -> Int
+mix x y = let d = x - 7 * y + 3 in (if d < 0 then 0 - d else d) % 101
+
+data ChooseF (m : Type -> Type) x = Choose (Bool -> x)
+
+choice : HFunctor
+choice =
+  { f = ChooseF
+  , hfmap = \m g p -> case p of
+      Choose k -> Choose (\b -> g (k b))
+  , hmap = \m n nt p -> case p of
+      Choose k -> Choose k
+  }
+
+choose : {e : HFunctor} -> {{ch : choice <: e}} -> Co e Bool
+choose = op (ch (Choose (\b -> b))) val
+
+explore : {e : HFunctor}
+        -> {{ch : choice <: e}}
+        -> {{st : state Int <: e}}
+        -> Tree
+        -> Co e Int
+explore Leaf = get
+explore (Node l v r) = do
+  b <- choose
+  s <- get
+  put (mix s v)
+  x <- explore (if b then l else r)
+  pure (mix v x)
+
+W : HFunctor
+W = choice <+> state Int
+
+S : HFunctor
+S = state Int
+
+getS : Co S Int
+getS = get (ev := here S)
+
+putS : Int -> Co S Unit
+putS s = put (ev := here S) s
+
+-- (choose resumed with True, then with False, the two lists appended)
+paths : Handler W
+paths =
+  { M = \a -> (a -> Co S (List Int)) -> Co S (List Int)
+  , ret = \x c -> c x
+  , bind = \m k c -> m (\x -> k x c)
+  , malg = \p c -> case p of
+      InL t -> case t of
+        Choose k -> bind (c (k True)) (\xs -> bind (c (k False)) (\ys -> val (xs ++ ys)))
+      InR q -> case q of
+        Get k -> bind getS (\s -> c (k s))
+        Put s x -> bind (putS s) (\u -> c x)
+  }
+
+data Out a = MkOut a Int
+
+passing : Handler S
+passing =
+  { M = \a -> Int -> Out a
+  , ret = \x s -> MkOut x s
+  , bind = \m k s -> case m s of
+      MkOut x s2 -> k x s2
+  , malg = \p s -> case p of
+      Get k -> MkOut (k s) s
+      Put st x -> MkOut x st
+  }
+
+-- | every path's result of the tree of depth `n`, from the state `s0`,
+-- | and the state left
+explored : Int -> Int -> Out (List Int)
+explored n s0 =
+  handle
+    passing
+    (handle paths (explore (ch := \p -> InL p) (st := \p -> InR p) (make n)) (\x -> val [x]))
+    s0
+
+treePaths : List Int
+treePaths = case explored 3 5 of
+  MkOut xs s -> xs ++ [s]
+
+-- (the sum of the paths' results, round after round, each from the last)
+roundsFrom : Int -> Int -> Int -> Int
+roundsFrom n 0 s = s
+roundsFrom n k s = case explored n s of
+  MkOut xs s2 -> roundsFrom n (k - 1) (List.foldl (\a x -> a + x) s2 xs % 1000)
+
+treeRounds : Int
+treeRounds = roundsFrom 6 4 1
+
+-- the queens ----------------------------------------------------------------------
+
+data AmbF (m : Type -> Type) x = Pick Int (Int -> x) | Fail
+
+amb : HFunctor
+amb =
+  { f = AmbF
+  , hfmap = \m g p -> case p of
+      Pick size k -> Pick size (\i -> g (k i))
+      Fail -> Fail
+  , hmap = \m n nt p -> case p of
+      Pick size k -> Pick size k
+      Fail -> Fail
+  }
+
+pick : {e : HFunctor} -> {{ev : amb <: e}} -> Int -> Co e Int
+pick size = op (ev (Pick size (\i -> i))) val
+
+failed : {e : HFunctor} -> {{ev : amb <: e}} -> {a : Type} -> Co e a
+failed = op (ev Fail) val
+
+safe : Int -> Int -> List Int -> Bool
+safe queen diag Nil = True
+safe queen diag (q :: qs) =
+  queen /= q && queen /= q + diag && queen /= q - diag && safe queen (diag + 1) qs
+
+place : {e : HFunctor} -> {{ev : amb <: e}} -> Int -> Int -> Co e (List Int)
+place size column =
+  if column == 0 then pure Nil
+  else do
+    rest <- place size (column - 1)
+    next <- pick size
+    if safe next 1 rest then pure (next :: rest) else failed
+
+resumeAll : (Int -> Int) -> Int -> Int -> Int -> Int
+resumeAll c size i acc =
+  if i > size then acc else resumeAll c size (i + 1) (acc + c i)
+
+counting : Handler amb
+counting =
+  { M = \a -> (a -> Int) -> Int
+  , ret = \x c -> c x
+  , bind = \m k c -> m (\x -> k x c)
+  , malg = \p c -> case p of
+      Pick size k -> resumeAll (\i -> c (k i)) size 1 0
+      Fail -> 0
+  }
+
+queens : List Int
+queens =
+  List.map
+    (\size -> handle counting (place (ev := here amb) size size) (\qs -> 1))
+    [1, 4, 5, 6]
+
+-- left as they are ----------------------------------------------------------------
+
+-- (each continuation kept, a closure: they escape into the list given
+-- back)
+keptK : {a : Type} -> {{ord : Order a}} -> List a -> (a -> Int) -> List (a -> Int)
+keptK Nil k = [k]
+keptK (x :: xs) k = k :: keptK xs (\y -> if ord.le x y then k y + 1 else k y)
+
+escaped : List Int
+escaped = List.map (\k -> k 3) (keptK [1, 5, 2, 4] (\y -> y * 10))
+
+-- (a copy given to `map`, its calls not known)
+sumK : {a : Type} -> {{ord : Order a}} -> a -> List a -> (Int -> Int) -> Int
+sumK m Nil k = k 0
+sumK m (x :: xs) k = sumK m xs (\s -> k (if ord.le x m then s + 1 else s))
+
+unknown : List Int
+unknown = List.map (sumK 3 [1, 4, 2, 5, 3]) [\s -> s, \s -> s * 2]
+
+-- (a continuation taken from a list, not known, handed on with known
+-- ones)
+pickK : {a : Type} -> {{ord : Order a}} -> a -> List a -> List (Int -> Int) -> (Int -> Int) -> Int
+pickK m Nil ks k = k 0
+pickK m (x :: xs) Nil k = pickK m xs Nil (\s -> k (s + 1))
+pickK m (x :: xs) (k2 :: ks) k =
+  pickK m xs ks (if ord.le x m then k2 else \s -> k (s * 2))
+
+picked : List Int
+picked =
+  [ pickK 2 [1, 3, 2, 4] [\s -> s + 100] (\s -> s)
+  , pickK 2 [5, 3, 2, 4] [\s -> s + 100, \s -> s] (\s -> s)
+  ]
+
+-- >>> (MkPair (MkPair treePaths treeRounds) (MkPair queens (MkPair escaped (MkPair unknown picked))) : Pair (Pair (List Int) Int) (Pair (List Int) (Pair (List Int) (Pair (List Int) (List Int)))))
+-- MkPair (MkPair [45, 45, 64, 5, 45, 45, 64, 5, 1] 77) (MkPair [1, 2, 10, 4] (MkPair [30, 31, 31, 32, 32] (MkPair [3, 6] [103, 8])))
