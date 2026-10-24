@@ -22,7 +22,6 @@ import bytes as Bytes
 import std.adler32 as Adler32
 import std.flate as Flate
 import uint32 as UInt32
-import uint8 as UInt8
 
 -- | The zlib stream the bytes begin with, decompressed, its checksum
 -- | checked; any bytes after it are not looked at.  Where it is wrong, the
@@ -56,31 +55,31 @@ import uint8 as UInt8
 -- | >>> decompress b["x"]
 -- | Left { offset = 1, message = "unexpected end of input" }
 decompress : Bytes -> Either Flate.CorruptInput Bytes
-decompress input =
-  if Bytes.length input < 2
-  then failure (Bytes.length input) "unexpected end of input"
-  else if (256 * byteOf 0 + byteOf 1) % 31 /= 0
-  then failure 0 "incorrect header check"
-  else if byteOf 0 % 16 /= 8 then failure 0 "unknown compression method"
-  else if byteOf 0 / 16 > 7 then failure 0 "invalid window size"
-  else if byteOf 1 / 32 % 2 == 1
-  then failure 1 "preset dictionary not supported"
-  else case Flate.decompressAt input 2 of
-    Left e -> Left e
-    Right (MkPair out end) ->
-      if end + 4 > Bytes.length input
-      then failure (Bytes.length input) "unexpected end of input"
-      else if UInt32.toInt (Adler32.checksum out)
-              /= 16777216 * byteOf end
-              + 65536 * byteOf (end + 1)
-              + 256 * byteOf (end + 2)
-              + byteOf (end + 3)
-      then failure end "incorrect data check"
-      else Right out
+decompress input = case input of
+  b[header::16, _::binary] ->
+    if header % 31 /= 0 then failure 0 "incorrect header check"
+    else case input of
+      b[window::4, method::4, _::2, dictionary::1, _::5, _::binary] ->
+        if method /= 8 then failure 0 "unknown compression method"
+        else if window > 7 then failure 0 "invalid window size"
+        else if dictionary == 1 then failure 1 "preset dictionary not supported"
+        else streamed
+      _ -> ended
+  _ -> ended
   where
-  -- (the input's byte at `i`)
-  byteOf : Int -> Int
-  byteOf i = UInt8.toInt (Bytes.bytesAt input i)
   -- (the input found wrong at byte `offset`, by `message`)
   failure : Int -> String -> Either Flate.CorruptInput Bytes
   failure offset message = Left { offset = offset, message = message }
+  -- (the input ended where more was wanted)
+  ended : Either Flate.CorruptInput Bytes
+  ended = failure (Bytes.length input) "unexpected end of input"
+  -- (the DEFLATE data after the header, and the Adler-32 after it)
+  streamed : Either Flate.CorruptInput Bytes
+  streamed = case Flate.decompressAt input 2 of
+    Left e -> Left e
+    Right (MkPair out end) -> case Bytes.slice input end (end + 4) of
+      b[sum::32] ->
+        if UInt32.toInt (Adler32.checksum out) /= sum
+        then failure end "incorrect data check"
+        else Right out
+      _ -> ended

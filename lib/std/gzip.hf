@@ -80,10 +80,6 @@ decompress input = membersFrom 0 Nil
   -- (the input's byte at `i`)
   byteOf : Int -> Int
   byteOf i = UInt8.toInt (Bytes.bytesAt input i)
-  -- (the little-endian number of the `k` bytes from `i`)
-  littleEndian : Int -> Int -> Int
-  littleEndian i k =
-    if k == 0 then 0 else byteOf i + 256 * littleEndian (i + 1) (k - 1)
   -- (the input found wrong at byte `offset`, by `message`)
   failure : {a : Type} -> Int -> String -> Either Flate.CorruptInput a
   failure offset message = Left { offset = offset, message = message }
@@ -100,43 +96,50 @@ decompress input = membersFrom 0 Nil
   -- (the byte after the extra field at `i`, its length first, or -1 where
   -- the input ends first)
   afterExtra : Int -> Int
-  afterExtra i =
-    if i + 2 > Bytes.length input then 0 - 1 else i + 2 + littleEndian i 2
-  -- (the member at `start`: the bytes it holds, and the byte after it)
+  afterExtra i = case Bytes.slice input i (i + 2) of
+    b[size::16-little] -> i + 2 + size
+    _ -> 0 - 1
+  -- (whether the header from `start` to `end` has the CRC-16 at `end`
+  -- written after it: the low half of its CRC-32)
+  headerChecks : Int -> Int -> Bool
+  headerChecks start end = case Bytes.slice input end (end + 2) of
+    b[sum::16-little] ->
+      UInt32.toInt (CRC32.checksum (Bytes.slice input start end)) % 65536 == sum
+    _ -> False
+  -- (the member at `start`: its header, ten bytes, then the fields its
+  -- flags say are there, the DEFLATE data, and the CRC-32 and the length
+  -- of what it holds; the bytes it holds, and the byte after it)
   member : Int -> Either Flate.CorruptInput (Pair Bytes Int)
-  member start =
-    if start + 10 > Bytes.length input then ended
-    else if byteOf start /= 31 || byteOf (start + 1) /= 139
-    then failure start "incorrect header check"
-    else if byteOf (start + 2) /= 8
-    then failure (start + 2) "unknown compression method"
-    else if byteOf (start + 3) >= 32
-    then failure (start + 3) "unknown header flags set"
-    else let flags : Int = byteOf (start + 3)
-         in let extraEnd : Int =
-           if flags / 4 % 2 == 1 then afterExtra (start + 10) else start + 10
-         in let nameEnd : Int =
-           if flags / 8 % 2 == 1 then afterZero extraEnd else extraEnd
-         in let fieldsEnd : Int =
-           if flags / 16 % 2 == 1 then afterZero nameEnd else nameEnd
-         in let at : Int =
-           if flags / 2 % 2 == 1 then fieldsEnd + 2 else fieldsEnd
-         in if fieldsEnd < 0 || at > Bytes.length input then ended
-         else if flags / 2 % 2 == 1
-                 && UInt32.toInt
-                   (CRC32.checksum (Bytes.slice input start fieldsEnd))
-                 % 65536
-                 /= littleEndian fieldsEnd 2
-         then failure fieldsEnd "header crc mismatch"
-         else case Flate.decompressAt input at of
-           Left e -> Left e
-           Right (MkPair out end) ->
-             if end + 8 > Bytes.length input then ended
-             else if UInt32.toInt (CRC32.checksum out) /= littleEndian end 4
-             then failure end "incorrect data check"
-             else if Bytes.length out % 4294967296 /= littleEndian (end + 4) 4
-             then failure (end + 4) "incorrect length check"
-             else Right (MkPair out (end + 8))
+  member start = case Bytes.slice input start (start + 10) of
+    b[first::8, second::8, method::8, reserved::3, comment::1, name::1, extra::1, headerSum::1, _::1, _::binary-size(6)] ->
+      if first /= 31 || second /= 139
+      then failure start "incorrect header check"
+      else if method /= 8
+      then failure (start + 2) "unknown compression method"
+      else if reserved /= 0
+      then failure (start + 3) "unknown header flags set"
+      else (let extraEnd : Int =
+              if extra == 1 then afterExtra (start + 10) else start + 10
+            in let nameEnd : Int =
+              if name == 1 then afterZero extraEnd else extraEnd
+            in let fieldsEnd : Int =
+              if comment == 1 then afterZero nameEnd else nameEnd
+            in let at : Int =
+              if headerSum == 1 then fieldsEnd + 2 else fieldsEnd
+            in if fieldsEnd < 0 || at > Bytes.length input then ended
+            else if headerSum == 1 && not (headerChecks start fieldsEnd)
+            then failure fieldsEnd "header crc mismatch"
+            else case Flate.decompressAt input at of
+              Left e -> Left e
+              Right (MkPair out end) -> case Bytes.slice input end (end + 8) of
+                b[sum::32-little, size::32-little] ->
+                  if UInt32.toInt (CRC32.checksum out) /= sum
+                  then failure end "incorrect data check"
+                  else if Bytes.length out % 4294967296 /= size
+                  then failure (end + 4) "incorrect length check"
+                  else Right (MkPair out (end + 8))
+                _ -> ended)
+    _ -> ended
   -- (the members from `at` on, after those of `outs`, the last first)
   membersFrom : Int -> List Bytes -> Either Flate.CorruptInput Bytes
   membersFrom at outs = case member at of
