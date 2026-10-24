@@ -23,7 +23,31 @@
 -- in a pair is U+FFFD, as what is not UTF-8 is in a string heff reads.
 
 module json
-
+  ( Json(..)
+  , stringify
+  , repr
+  , instanceShowJson
+  , instanceToStringJson
+  , Miss(..)
+  , ParseError
+  , showParseError
+  , instanceShowParseError
+  , describe
+  , instanceToStringParseError
+  , Frame(..)
+  , Step(..)
+  , parse
+  , field
+  , at
+  , str
+  , int
+  , bool
+  , arr
+  , obj
+  , kv
+  , num
+  , jstr
+  )
 import rune as Rune
 
 -- | A JSON value: a number without a fraction or an exponent a `JInt`,
@@ -88,34 +112,22 @@ escapedText s i =
 escapedWidth : String -> Int -> Int
 escapedWidth s i = if byteAt s i < 128 then 1 else (runeAt s i).width
 
--- (`acc`, then `s` from `i` on: from 0, `s` itself, not a copy)
-tailInto : String -> String -> Int -> String
-tailInto acc s i = if i == 0 then acc ^ s else acc ^ strSlice s i (strLength s)
-
--- (`acc`, then the text of `s` from `i` on as the inside of a JSON string:
--- what is written as it is a run of bytes at a time)
-escapeInto : String -> String -> Int -> String
-escapeInto acc s i =
-  let j : Int = plainEnd s i
-  in if j >= strLength s then tailInto acc s i
-  else escapeInto
-      (acc ^ strSlice s i j ^ escapedText s j)
-      s
-      (j + escapedWidth s j)
-
 -- (`acc`, then a string as JSON writes it)
 quotedInto : String -> String -> String
-quotedInto acc s = escapeInto (acc ^ "\"") s 0 ^ "\""
-
--- (`acc`, then each element after the first, `sep` before it)
-restInto : {a : Type}
-         -> String
-         -> (String -> a -> String)
-         -> String
-         -> List a
-         -> String
-restInto sep write acc Nil = acc
-restInto sep write acc (Cons x xs) = restInto sep write (write (acc ^ sep) x) xs
+quotedInto acc s = escapeInto (acc ^ "\"") 0 ^ "\""
+  where
+  -- (`acc`, then `s` from `i` on: from 0, `s` itself, not a copy)
+  tailInto : String -> Int -> String
+  tailInto acc i = if i == 0 then acc ^ s else acc ^ strSlice s i (strLength s)
+  -- (`acc`, then the text of `s` from `i` on as the inside of a JSON string:
+  -- what is written as it is a run of bytes at a time)
+  escapeInto : String -> Int -> String
+  escapeInto acc i =
+    let j : Int = plainEnd s i
+    in if j >= strLength s then tailInto acc i
+    else escapeInto
+        (acc ^ strSlice s i j ^ escapedText s j)
+        (j + escapedWidth s j)
 
 -- (`acc`, then the elements, `sep` between them)
 joinInto : {a : Type}
@@ -125,11 +137,12 @@ joinInto : {a : Type}
          -> List a
          -> String
 joinInto sep write acc Nil = acc
-joinInto sep write acc (Cons x xs) = restInto sep write (write acc x) xs
-
--- (`acc`, then a field as JSON writes it, its value by `write`)
-fieldInto : (String -> Json -> String) -> String -> Pair String Json -> String
-fieldInto write acc (MkPair k v) = write (quotedInto acc k ^ ":") v
+joinInto sep write acc (Cons x xs) = restInto (write acc x) xs
+  where
+  -- (`acc`, then each element after the first, `sep` before it)
+  restInto : String -> List a -> String
+  restInto acc Nil = acc
+  restInto acc (Cons x xs) = restInto (write (acc ^ sep) x) xs
 
 -- (an exponent's digits, a `+` before them unless they are below 0)
 signedExponent : String -> String
@@ -157,18 +170,6 @@ floatText x = if not (x - x == 0.0) then "null" else numberTextFrom (show x) 0
       ^ signedExponent (strSlice t (i + 1) (strLength t))
     else numberTextFrom t (i + 1)
 
--- (`acc`, then a value as `stringify` writes it: each part appended to
--- the one text, not made apart and joined)
-writeInto : String -> Json -> String
-writeInto acc JNull = acc ^ "null"
-writeInto acc (JBool b) = acc ^ (if b then "true" else "false")
-writeInto acc (JInt i) = acc ^ show i
-writeInto acc (JFloat x) = acc ^ floatText x
-writeInto acc (JString s) = quotedInto acc s
-writeInto acc (JArray xs) = joinInto "," writeInto (acc ^ "[") xs ^ "]"
-writeInto acc (JObject fs) =
-  joinInto "," (fieldInto writeInto) (acc ^ "{") fs ^ "}"
-
 -- | The text of a value, as JavaScript's `JSON.stringify` writes it: no
 -- | space, an object's fields in their order.
 -- | >>> stringify (JObject [MkPair "a" (JInt 1), MkPair "b" (JArray [JString "x\n", JNull, JBool True])])
@@ -188,32 +189,44 @@ writeInto acc (JObject fs) =
 -- | "\"é😀\u{FFFD}\\t\""
 stringify : Json -> String
 stringify j = writeInto "" j
-
--- (`acc`, then a field as the source writes it)
-reprFieldInto : (String -> Json -> String)
-              -> String
-              -> Pair String Json
-              -> String
-reprFieldInto repr acc (MkPair k v) =
-  repr (acc ^ "MkPair " ^ show k ^ " (") v ^ ")"
-
--- (`acc`, then a value as the source writes it)
-reprInto : String -> Json -> String
-reprInto acc JNull = acc ^ "JNull"
-reprInto acc (JBool b) = acc ^ "JBool " ^ show b
-reprInto acc (JInt i) =
-  acc ^ "JInt " ^ (if i < 0 then "(" ^ show i ^ ")" else show i)
-reprInto acc (JFloat x) =
-  acc
-  ^ "JFloat "
-  ^ (if startsWith "-" (show x) then "(" ^ show x ^ ")" else show x)
-reprInto acc (JString s) = acc ^ "JString " ^ show s
-reprInto acc (JArray xs) = joinInto ", " reprInto (acc ^ "JArray [") xs ^ "]"
-reprInto acc (JObject fs) =
-  joinInto ", " (reprFieldInto reprInto) (acc ^ "JObject [") fs ^ "]"
+  where
+  -- (`acc`, then a value as `stringify` writes it: each part appended to
+  -- the one text, not made apart and joined)
+  writeInto : String -> Json -> String
+  writeInto acc JNull = acc ^ "null"
+  writeInto acc (JBool b) = acc ^ (if b then "true" else "false")
+  writeInto acc (JInt i) = acc ^ show i
+  writeInto acc (JFloat x) = acc ^ floatText x
+  writeInto acc (JString s) = quotedInto acc s
+  writeInto acc (JArray xs) = joinInto "," writeInto (acc ^ "[") xs ^ "]"
+  writeInto acc (JObject fs) = joinInto "," fieldInto (acc ^ "{") fs ^ "}"
+    where
+    -- (`acc`, then a field as JSON writes it)
+    fieldInto : String -> Pair String Json -> String
+    fieldInto acc (MkPair k v) = writeInto (quotedInto acc k ^ ":") v
 
 repr : Json -> String
 repr j = reprInto "" j
+  where
+  -- (`acc`, then a value as the source writes it)
+  reprInto : String -> Json -> String
+  reprInto acc JNull = acc ^ "JNull"
+  reprInto acc (JBool b) = acc ^ "JBool " ^ show b
+  reprInto acc (JInt i) =
+    acc ^ "JInt " ^ (if i < 0 then "(" ^ show i ^ ")" else show i)
+  reprInto acc (JFloat x) =
+    acc
+    ^ "JFloat "
+    ^ (if startsWith "-" (show x) then "(" ^ show x ^ ")" else show x)
+  reprInto acc (JString s) = acc ^ "JString " ^ show s
+  reprInto acc (JArray xs) = joinInto ", " reprInto (acc ^ "JArray [") xs ^ "]"
+  reprInto acc (JObject fs) =
+    joinInto ", " reprFieldInto (acc ^ "JObject [") fs ^ "]"
+    where
+    -- (`acc`, then a field as the source writes it)
+    reprFieldInto : String -> Pair String Json -> String
+    reprFieldInto acc (MkPair k v) =
+      reprInto (acc ^ "MkPair " ^ show k ^ " (") v ^ ")"
 
 -- | A value as the source writes it.
 -- | >>> show (JArray [JInt -1, JString "a", JObject [MkPair "b" JNull]] : Json)
@@ -495,15 +508,15 @@ gotIn s v i (InObject fs k) frames =
   then Got (JObject (List.reverse (Cons (MkPair k v) fs))) (i + 1) frames
   else Failed (Expected i "',' or '}'")
 
--- (a value read, `v`, up to `i`)
-gotAt : String -> Json -> Int -> List Frame -> Step
-gotAt s v i Nil =
-  if i >= strLength s then Finished v else Failed (Expected i "the end")
-gotAt s v i (Cons f frames) = gotIn s v i f frames
-
 steps : String -> Step -> Either ParseError Json
 steps s (Value i frames) = steps s (valueAt s (skipSpace s i) frames)
-steps s (Got v i frames) = steps s (gotAt s v (skipSpace s i) frames)
+steps s (Got v i frames) = steps s (gotAt v (skipSpace s i) frames)
+  where
+  -- (a value read, `v`, up to `i`)
+  gotAt : Json -> Int -> List Frame -> Step
+  gotAt v i Nil =
+    if i >= strLength s then Finished v else Failed (Expected i "the end")
+  gotAt v i (Cons f frames) = gotIn s v i f frames
 steps s (Finished v) = Right v
 steps s (Failed e) = Left (located s e)
 

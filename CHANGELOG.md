@@ -65,6 +65,9 @@
 - std.adler32, RFC 1950's checksum, as std.crc32 is CRC-32's.
 - std.flate: DEFLATE data decompressed (RFC 1951), stored, fixed and dynamic blocks, what is wrong said with its offset: `decompress`, and `decompressAt b (from := i)`, which also gives where the data ends.
 - std.zlib and std.gzip: `decompress` of a zlib stream (RFC 1950, its Adler-32 checked) and of gzip members (RFC 1952, their headers' fields skipped, CRC-32 and length checked, members one after another).
+- list and array: `sortBy le` is `sortOn key`, sorted stably by the key's `Order` (Haskell's `sortOn`): `List.sortOn (\(s : Span) -> s.start) spans`; `sort` is as before. Both modules have an export list, their sorting's helpers no longer exposed.
+- bytes: `foldl` and `map`, as a list's; rune: `foldr`, from the last rune, as its `foldl` from the first. Both modules have an export list.
+- generator, json, remote, std.cli, std.cli.interactive, std.doc, std.http.server, std.terminal.widget, std.hashmap, std.hashtable and std.math have export lists: what only builds what they expose is theirs alone. scripts/aliases.hf names the new modules' aliases, the short ones in capitals (`CRC32`, `CSV`, `HMAC`, `MD5`, `MIME`, `SHA1`, `SHA256`).
 
 ### Backends and performance
 
