@@ -24,7 +24,7 @@
 --      -> BOC.Cown w Int
 --      -> Int
 --      -> Co e Unit
--- paid from to n = BOC.when (from, to) (\p -> pure (fst p - n, snd p + n))
+-- paid from to n = BOC.when (from, to) (\(x, y) -> pure (x - n, y + n))
 --
 -- -- | alice given 10, then 5 paid to bob: what bob has, 5
 -- bobs : {e w : HFunctor}
@@ -99,13 +99,15 @@ import std.domain as Domain
 data Behaviour (w : HFunctor) = MkBehaviour (Domain.Atomic Int) (Co w Unit)
 
 -- (a behaviour's request for one cown: the behaviour linked behind it,
--- once one is, and whether it has come to all its cowns' queues)
+-- once one is, and whether it has come to all its cowns' queues; or
+-- none, what a cown's queue holds while no behaviour waits for it)
 data Request (w : HFunctor)
   = MkRequest (Domain.Atomic (Maybe (Behaviour w))) (Domain.Atomic Bool)
+  | NoRequest
 
 -- (a cown, as its queue: its number, which orders the cowns of a
--- behaviour, and the last request for it, if any)
-data Handle (w : HFunctor) = MkHandle Int (Domain.Atomic (Maybe (Request w)))
+-- behaviour, and the last request for it, `NoRequest` while none is)
+data Handle (w : HFunctor) = MkHandle Int (Domain.Atomic (Request w))
 
 -- | A cown holding an `a`, of behaviours run in the world `w`.
 data Cown (w : HFunctor) a = MkCown (Handle w) (Domain.Atomic a)
@@ -320,11 +322,15 @@ swapped at v = do
   ok <- Domain.cas at old v
   if ok then pure old else swapped at v
 
--- (waiting until the request has come to all its behaviour's queues)
-come : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Request w -> Co w Unit
-come (MkRequest next flag) = do
+-- (waiting until the request whose flag this is has come to all its
+-- behaviour's queues)
+come : {w : HFunctor}
+     -> {{dm : Domain.domain <: w}}
+     -> Domain.Atomic Bool
+     -> Co w Unit
+come flag = do
   b <- Domain.get flag
-  if b then pure () else come (MkRequest next flag)
+  if b then pure () else come flag
 
 -- (the behaviour linked behind the request, waiting until one is)
 linkedBehind : {w : HFunctor}
@@ -338,8 +344,9 @@ linkedBehind next = do
     Nothing -> linkedBehind next
 
 -- (a request, as a behaviour holds it: its cown's queue, and the very
--- value swapped in as the last request, which only it takes out again)
-type Held (w : HFunctor) = Pair (Handle w) (Maybe (Request w))
+-- request swapped in as the last, which only it takes out again -- the
+-- request itself, compared by identity, no box round it)
+type Held (w : HFunctor) = Pair (Handle w) (Request w)
 
 -- (a new request for the cown)
 requested : {w : HFunctor}
@@ -349,7 +356,7 @@ requested : {w : HFunctor}
 requested h = do
   next <- Domain.newAtomic Nothing
   flag <- Domain.newAtomic False
-  pure (MkPair h (Just (MkRequest next flag)))
+  pure (MkPair h (MkRequest next flag))
 
 requestedAll : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
@@ -371,12 +378,12 @@ queued : {w : HFunctor}
        -> List (Held w)
        -> Co w Unit
 queued st b Nil = pure ()
-queued st b (MkPair (MkHandle n last) mr :: rest) = do
-  prev <- swapped last mr
+queued st b (MkPair (MkHandle n last) r :: rest) = do
+  prev <- swapped last r
   case prev of
-    Nothing -> resolved st b
-    Just (MkRequest next flag) -> do
-      come (MkRequest next flag)
+    NoRequest -> resolved st b
+    MkRequest next flag -> do
+      come flag
       Domain.set next (Just b)
   queued st b rest
 
@@ -386,10 +393,10 @@ markedCome : {w : HFunctor}
            -> List (Held w)
            -> Co w Unit
 markedCome Nil = pure ()
-markedCome (MkPair h (Just (MkRequest next flag)) :: rest) = do
+markedCome (MkPair h (MkRequest next flag) :: rest) = do
   Domain.set flag True
   markedCome rest
-markedCome (MkPair h Nothing :: rest) = markedCome rest
+markedCome (MkPair h NoRequest :: rest) = markedCome rest
 
 -- (the behaviour done with the cown: handed to the one linked behind
 -- it; where none is, the request taken out as the last, unless one has
@@ -399,18 +406,18 @@ released : {w : HFunctor}
          -> Sched w
          -> Held w
          -> Co w Unit
-released st (MkPair (MkHandle n last) mr) = case mr of
-  Just (MkRequest next flag) -> do
+released st (MkPair (MkHandle n last) r) = case r of
+  MkRequest next flag -> do
     nb <- Domain.get next
     case nb of
       Just b -> resolved st b
       Nothing -> do
-        out <- Domain.cas last mr Nothing
+        out <- Domain.cas last r NoRequest
         if out then pure ()
         else do
           b <- linkedBehind next
           resolved st b
-  Nothing -> pure ()
+  NoRequest -> pure ()
 
 releasedAll : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
@@ -476,7 +483,7 @@ madeCown : {w : HFunctor}
          -> Co w x
 madeCown st (MkMaking v k) = do
   n <- Domain.fetchAdd st.numbers 1
-  last <- Domain.newAtomic Nothing
+  last <- Domain.newAtomic (NoRequest : Request w)
   cell <- Domain.newAtomic v
   pure (k (MkCown (MkHandle n last) cell))
 
