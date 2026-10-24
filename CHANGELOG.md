@@ -61,6 +61,7 @@
 - std.mime: a type by its extension and the extensions of a type (Go's table, and the common others), and a media type read and written as Go's `ParseMediaType` and `FormatMediaType` do, RFC 2231's parameters too. std.multipart: a body's parts read and written by a boundary (RFC 2046, 7578), raw as Go's `NextRawPart` gives them, and a form part's name and file name.
 - std.random: random numbers of a seed, xoshiro256** seeded by SplitMix64, the state passed along: `next`, `below r (bound := n)` (no bias, any bound), `between`, `float`, `shuffle`, `pick`, and `split` into two streams.
 - std.base32, RFC 4648's, both alphabets (the standard and the extended hex), read strictly, as std.base64.
+- std.html: `escape` as Go's `EscapeString`, and `unescape` of every HTML5 named reference (2231, the older ones without their `;` too) and of numeric ones, as Go's `UnescapeString`.
 
 ### Backends and performance
 
