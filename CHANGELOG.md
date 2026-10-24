@@ -59,6 +59,7 @@
 - Names made alike: the prelude's `indexOf` takes the byte to look from, `indexOf needle s from` (`from` can be given by name, `(from := i)`), and `indexFrom` is gone; `ofRunes` is `fromRunes`, and bits' `ofBytes` and `ofInt` are `fromBytes` and `fromInt`. list: `elem` and `lookup`, by the elements' `Equality`, in place of `elemBy` and `lookupBy` and the comparison they were given.
 - std.filesystem: `walk root visit`, a tree depth first in name order, links not followed (Go's `WalkDir`), each entry's `Visit` saying whether to go into it, skip the rest, or stop; `findFiles root keep`, the paths it keeps (Racket's `find-files`). std.glob: `*`, `?`, classes and `**` across directories, compiled once; `matches` a path and `glob root g` the paths under a root.
 - std.mime: a type by its extension and the extensions of a type (Go's table, and the common others), and a media type read and written as Go's `ParseMediaType` and `FormatMediaType` do, RFC 2231's parameters too. std.multipart: a body's parts read and written by a boundary (RFC 2046, 7578), raw as Go's `NextRawPart` gives them, and a form part's name and file name.
+- std.random: random numbers of a seed, xoshiro256** seeded by SplitMix64, the state passed along: `next`, `below r (bound := n)` (no bias, any bound), `between`, `float`, `shuffle`, `pick`, and `split` into two streams.
 
 ### Backends and performance
 

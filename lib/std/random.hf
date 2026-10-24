@@ -1,0 +1,258 @@
+-- Random numbers, pure: a generator is a value, `Random`, and each draw
+-- gives what it drew and the generator to draw the next from -- the same
+-- generator always draws the same.  The generator is xoshiro256**
+-- (Blackman and Vigna), its state four 64-bit words, seeded, as its
+-- authors advise, by SplitMix64.  It is no cryptographic generator: what
+-- it draws can be foretold from what it drew.  Import it by a name,
+-- `import std.random as Random`, as the prelude has a `split`.
+--
+-- ```haskell
+-- import std.random as Random
+--
+-- -- | a die thrown `n` times from the seed 7, the throws first first
+-- -- | >>> throws 5
+-- -- | [5, 2, 6, 6, 6]
+-- throws : Int -> List Int
+-- throws n = thrown n (Random.seeded 7) Nil
+--   where
+--   thrown : Int -> Random.Random -> List Int -> List Int
+--   thrown k r acc =
+--     if k <= 0 then List.reverse acc
+--     else (case Random.between r 1 6 of
+--           (x, next) -> thrown (k - 1) next (Cons x acc))
+-- ```
+
+module std.random
+  ( Random
+  , seeded
+  , split
+  , next
+  , below
+  , between
+  , float
+  , shuffle
+  , pick
+  )
+
+import array as Array
+import uint64 as UInt64
+
+-- | A generator: xoshiro256**'s state, four words, never all 0.
+data Random = MkRandom UInt64 UInt64 UInt64 UInt64
+
+-- (what `draw` draws `n` times from `r`, the first first: for the
+-- examples)
+draws : {a : Type} -> (Random -> (a, Random)) -> Int -> Random -> List a
+draws draw n r = drawn n r Nil
+  where
+  drawn : Int -> Random -> List a -> List a
+  drawn k s acc =
+    if k <= 0 then List.reverse acc
+    else (case draw s of
+          (x, t) -> drawn (k - 1) t (Cons x acc))
+
+-- | The generator's next output, all 64 bits, and the generator after
+-- | it.  From the state 1, 2, 3, 4, the outputs of its authors' code:
+-- | >>> List.map UInt64.toInt (draws next 4 (MkRandom 1 2 3 4))
+-- | [11520, 0, 1509978240, 1215971899390074240]
+next : Random -> (UInt64, Random)
+next (MkRandom s0 s1 s2 s3) =
+  let third : UInt64 = xor s2 s0
+  in let fourth : UInt64 = xor s3 s1
+  in let second : UInt64 = xor s1 third
+  in let first : UInt64 = xor s0 fourth
+  in ( UInt64.rotateLeft (s1 * 5) 7 * 9
+     , MkRandom
+       first
+       second
+       (xor third (shiftL s1 17))
+       (UInt64.rotateLeft fourth 45)
+     )
+
+-- (SplitMix64's increment of its counter, 2^64 over the golden ratio)
+golden : UInt64
+golden = 0x9e3779b97f4a7c15
+
+-- (SplitMix64's output for its counter `z`: the word mixed, each of its
+-- bits by every other, no two words to the same)
+splitMix : UInt64 -> UInt64
+splitMix z =
+  let a : UInt64 = xor z (shiftR z 30) * 0xbf58476d1ce4e5b9
+  in let b : UInt64 = xor a (shiftR a 27) * 0x94d049bb133111eb
+  in xor b (shiftR b 31)
+
+-- | The generator seeded by `n`: its four words SplitMix64's first four
+-- | outputs from the counter `n`, `n` taken modulo 2^64 (as
+-- | `UInt64.fromInt` takes it: -1 is 2^64 - 1, and 2^64 is 0).  From 0,
+-- | they are the outputs SplitMix64's authors give, 0xe220a8397b1dcdaf,
+-- | 0x6e789e6aa1b965f4, 0x06c45d188009454f and 0xf88bb8a8724c81ec.
+-- | >>> seeded 0
+-- | MkRandom 16294208416658607535 7960286522194355700 487617019471545679 17909611376780542444
+-- | >>> draws next 3 (seeded 42)
+-- | [1546998764402558742, 6990951692964543102, 12544586762248559009]
+-- | >>> List.map (\n -> draws next 1 (seeded n)) [-1, 18446744073709551615, 18446744073709551616, 0]
+-- | [[10328197420357168392], [10328197420357168392], [11091344671253066420], [11091344671253066420]]
+seeded : Int -> Random
+seeded n =
+  let x : UInt64 = UInt64.fromInt n
+  in MkRandom
+    (splitMix (x + golden))
+    (splitMix (x + golden * 2))
+    (splitMix (x + golden * 3))
+    (splitMix (x + golden * 4))
+
+-- | Two generators from one, to draw from apart: the first is the one
+-- | after four outputs, the second is seeded by them, each mixed by
+-- | SplitMix64 (so that its words are not outputs the first drew) -- as
+-- | `seeded` is, but from 256 bits, not 64.  (Were all four 0, the
+-- | second would be `seeded 0`.)
+-- | >>> draws next 2 (fst (split (seeded 0)))
+-- | [13521403990117723737, 18442103541295991498]
+-- | >>> draws next 2 (snd (split (seeded 0)))
+-- | [4854737294095960316, 9524419330683365375]
+split : Random -> (Random, Random)
+split r = case next r of
+  (a, r1) ->
+    (case next r1 of
+     (b, r2) ->
+       (case next r2 of
+        (c, r3) ->
+          (case next r3 of
+           (d, r4) -> (r4, seededBy a b c d))))
+  where
+  -- (the generator of the four outputs, each mixed)
+  seededBy : UInt64 -> UInt64 -> UInt64 -> UInt64 -> Random
+  seededBy a b c d =
+    let first : UInt64 = splitMix (a + golden)
+    in let second : UInt64 = splitMix (b + golden)
+    in let third : UInt64 = splitMix (c + golden)
+    in let fourth : UInt64 = splitMix (d + golden)
+    in if first == 0 && second == 0 && third == 0 && fourth == 0 then seeded 0
+    else MkRandom first second third fourth
+
+-- | An integer from 0 up to `bound`, `bound` not among them, each as
+-- | likely as the others; `bound` at most 0, abandoned (as Go's
+-- | `rand.IntN` panics).  A bound up to 2^32 takes Lemire's way, the top
+-- | 32 bits of an output times the bound, the high half of the product
+-- | its answer -- an output thrown away only where the low half falls in
+-- | the few that would make some answers likelier.  A greater bound
+-- | (however great: an `Int` has no bound) takes as many outputs as it
+-- | needs as one number, thrown away where it falls past the greatest
+-- | multiple of the bound below the numbers they can make (fewer than
+-- | half of them), and its remainder.
+-- | >>> draws (\r -> below r 10) 12 (seeded 1)
+-- | [7, 5, 5, 3, 6, 1, 0, 3, 8, 5, 9, 9]
+-- | >>> List.all (\x -> 0 <= x && x < 7) (draws (\r -> below r 7) 10000 (seeded 2))
+-- | True
+-- | >>> List.map (\v -> List.count (\x -> x == v) (draws (\r -> below r 3) 3000 (seeded 3))) [0, 1, 2]
+-- | [992, 984, 1024]
+-- | >>> draws (\r -> below r 1) 3 (seeded 4)
+-- | [0, 0, 0]
+-- | >>> List.all (\x -> 0 <= x && x < 4294967296) (draws (\r -> below r 4294967296) 1000 (seeded 5))
+-- | True
+-- |
+-- | (bounds past 2^64: every draw below, and most of them past 2^64)
+-- | >>> List.all (\x -> 0 <= x && x < 1267650600228229401496703205376) (draws (\r -> below r 1267650600228229401496703205376) 1000 (seeded 6))
+-- | True
+-- | >>> List.count (\x -> x >= 18446744073709551616) (draws (\r -> below r 1267650600228229401496703205376) 1000 (seeded 6))
+-- | 1000
+-- | >>> List.all (\x -> 0 <= x && x < 18446744073709551617) (draws (\r -> below r 18446744073709551617) 1000 (seeded 7))
+-- | True
+below : Random -> (bound : Int) -> (Int, Random)
+below r bound =
+  if bound <= 0 then abandon
+  else if bound <= 4294967296 then lemire r (UInt64.fromInt bound)
+  else rejected r (wordsOver 1 18446744073709551616)
+  where
+  -- (by Lemire's way, below `b`, at most 2^32)
+  lemire : Random -> UInt64 -> (Int, Random)
+  lemire s b = case next s of
+    (x, t) ->
+      (let product : UInt64 = shiftR x 32 * b
+       in let low : UInt64 = and product 4294967295
+       in if low < b && low < (4294967296 - b) % b then lemire t b
+       else (UInt64.toInt (shiftR product 32), t))
+  -- (how many words make a number of at least `bound`, from `k` words,
+  -- making numbers up to `span`)
+  wordsOver : Int -> Int -> Int
+  wordsOver k span =
+    if span >= bound then k else wordsOver (k + 1) (span * 18446744073709551616)
+  -- (`k` outputs as one number, after `acc`, the first highest)
+  joined : Int -> Int -> Random -> (Int, Random)
+  joined k acc s =
+    if k <= 0 then (acc, s)
+    else (case next s of
+          (x, t) ->
+            joined (k - 1) (acc * 18446744073709551616 + UInt64.toInt x) t)
+  -- (2^(64 k), times `acc`)
+  spanOf : Int -> Int -> Int
+  spanOf k acc =
+    if k <= 0 then acc else spanOf (k - 1) (acc * 18446744073709551616)
+  -- (from `k` outputs as one number, below the greatest multiple of
+  -- `bound` that they can make, its remainder)
+  rejected : Random -> Int -> (Int, Random)
+  rejected s k = case joined k 0 s of
+    (x, t) ->
+      (let span : Int = spanOf k 1
+       in if x < span - span % bound then (x % bound, t)
+       else rejected t k)
+
+-- | An integer from `lo` to `hi`, both among them, each as likely as the
+-- | others (`below` of how many there are, from `lo`); `lo` past `hi`,
+-- | abandoned.
+-- | >>> draws (\r -> between r 1 6) 10 (seeded 8)
+-- | [5, 4, 4, 6, 3, 2, 3, 4, 6, 6]
+-- | >>> List.all (\x -> -3 <= x && x <= 3) (draws (\r -> between r (-3) 3) 1000 (seeded 9))
+-- | True
+-- | >>> draws (\r -> between r 5 5) 2 (seeded 10)
+-- | [5, 5]
+between : Random -> Int -> Int -> (Int, Random)
+between r lo hi =
+  if lo > hi then abandon
+  else (case below r (hi - lo + 1) of
+        (x, s) -> (lo + x, s))
+
+-- | A float from 0 up to 1, 1 not among them: an output's top 53 bits
+-- | over 2^53, each of the 2^53 floats so made as likely as the others.
+-- | >>> List.all (\x -> 0.0 <= x && x < 1.0) (draws float 1000 (seeded 11))
+-- | True
+-- | >>> draws float 2 (seeded 0)
+-- | [0.6012629994179048, 0.7477740925472398]
+float : Random -> (Float64, Random)
+float r = case next r of
+  (x, s) -> (toFloat (UInt64.toInt (shiftR x 11)) /. 9007199254740992.0, s)
+
+-- | The list in an order drawn, each of its orders as likely as the
+-- | others: Fisher and Yates's shuffle, in an array, from the last place
+-- | down, each place's element swapped with one drawn from it and those
+-- | before it.
+-- | >>> fst (shuffle (seeded 12) ["a", "b", "c", "d", "e"])
+-- | ["a", "e", "c", "d", "b"]
+-- | >>> List.sort (fst (shuffle (seeded 13) (List.range 1 100))) == List.range 1 100
+-- | True
+-- | >>> fst (shuffle (seeded 14) ([] : List Int))
+-- | []
+shuffle : {a : Type} -> Random -> List a -> (List a, Random)
+shuffle r xs =
+  let items : Array a = Array.fromList xs
+  in shuffled (Array.length items - 1) items r
+  where
+  -- (the places from `i` down shuffled)
+  shuffled : Int -> Array a -> Random -> (List a, Random)
+  shuffled i items s =
+    if i <= 0 then (Array.toList items, s)
+    else (case below s (i + 1) of
+          (j, t) -> shuffled (i - 1) (Array.swap items i j) t)
+
+-- | An element of the list, each as likely as the others; of none,
+-- | `Nothing`.
+-- | >>> maybe Nothing (\p -> (Just (fst p) : Maybe String)) (pick (seeded 15) ["x", "y", "z"])
+-- | Just "z"
+-- | >>> maybe Nothing (\p -> (Just (fst p) : Maybe String)) (pick (seeded 15) ([] : List String))
+-- | Nothing
+pick : {a : Type} -> Random -> List a -> Maybe (a, Random)
+pick r xs = case xs of
+  Nil -> Nothing
+  _ ->
+    (case below r (List.length xs) of
+     (i, s) -> maybe Nothing (\x -> Just (x, s)) (List.index xs i))
