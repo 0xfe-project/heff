@@ -62,6 +62,7 @@
 - std.random: random numbers of a seed, xoshiro256** seeded by SplitMix64, the state passed along: `next`, `below r (bound := n)` (no bias, any bound), `between`, `float`, `shuffle`, `pick`, and `split` into two streams.
 - std.base32, RFC 4648's, both alphabets (the standard and the extended hex), read strictly, as std.base64.
 - std.html: `escape` as Go's `EscapeString`, and `unescape` of every HTML5 named reference (2231, the older ones without their `;` too) and of numeric ones, as Go's `UnescapeString`.
+- std.adler32, RFC 1950's checksum, as std.crc32 is CRC-32's.
 
 ### Backends and performance
 
