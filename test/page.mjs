@@ -10,7 +10,7 @@
 //   node test/page.mjs APP SCRIPT...   counter, clock, finder, aliased,
 //                                      slept, clocked, painted, texts,
 //                                      names, greet, two (counter's and
-//                                      clock's), vecadd, pixels
+//                                      clock's), vecadd, pixels, domains
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -163,6 +163,15 @@ const apps = {
     said("elements", page.children.length);
   },
   aliased: () => { const page = loaded(files[0], withOut); if (page) said("out", page.children[0].text); },
+  // (std.domain's one domain: its turns go on after the stack is let go
+  // of, every so often, so time is passed until it has written)
+  domains: () => {
+    const page = loaded(files[0], withOut);
+    if (!page) return;
+    const out = page.children[0];
+    for (let i = 0; i < 100000 && out.text === "" && timers.length > 0; i++) tick();
+    said("out", out.text);
+  },
   slept: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;

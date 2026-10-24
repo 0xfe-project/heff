@@ -1,0 +1,248 @@
+-- What the domains' tests run, on every backend: the same program, by
+-- std.domain alone, on the C backend's threads (test/node/domains.hf)
+-- and in JavaScript's one domain (test/apps/domains.hf), the same
+-- lines said.  A counter several domains add to by `fetchAdd`; one they
+-- add to by a `cas` retried, and a list they push onto so, compared by
+-- identity; values handed over under a mutex, waited for on a
+-- condition; answers joined.
+
+module test.node.domains-program
+
+import co
+import std.domain as Domain
+
+-- (domains `i` to `n - 1`, each running `c` of its number)
+spawnedFrom : {e : HFunctor}
+            -> {a : Type}
+            -> {{dm : Domain.domain <: e}}
+            -> Int
+            -> Int
+            -> (Int -> Co e a)
+            -> Co e (List (Domain.Domain a))
+spawnedFrom i n c =
+  if i >= n then pure Nil
+  else do
+    d <- Domain.spawn (c i)
+    rest <- spawnedFrom (i + 1) n c
+    pure (d :: rest)
+
+-- (`n` domains, each running `c i`, `i` its number from 0)
+spawned : {e : HFunctor}
+        -> {a : Type}
+        -> {{dm : Domain.domain <: e}}
+        -> Int
+        -> (Int -> Co e a)
+        -> Co e (List (Domain.Domain a))
+spawned n c = spawnedFrom 0 n c
+
+joined : {e : HFunctor}
+       -> {a : Type}
+       -> {{dm : Domain.domain <: e}}
+       -> List (Domain.Domain a)
+       -> Co e (List a)
+joined Nil = pure Nil
+joined (d :: ds) = do
+  v <- Domain.join d
+  vs <- joined ds
+  pure (v :: vs)
+
+-- A counter, by fetchAdd ---------------------------------------------------------------
+
+adding : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Atomic Int
+       -> Int
+       -> Co e Unit
+adding counter 0 = pure ()
+adding counter k = do
+  _ <- Domain.fetchAdd counter 1
+  adding counter (k - 1)
+
+-- | 4 domains adding 1 each 100000 times
+counted : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+counted = do
+  counter <- Domain.newAtomic 0
+  ds <- spawned 4 (\i -> adding counter 100000)
+  _ <- joined ds
+  Domain.get counter
+
+-- By cas, retried ----------------------------------------------------------------------
+
+-- (1 added by a cas, again until no other domain came between; how many
+-- tries it took)
+bumped : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Atomic Int
+       -> Co e Int
+bumped counter = do
+  v <- Domain.get counter
+  ok <- Domain.cas counter v (v + 1)
+  if ok then pure 1
+  else do
+    n <- bumped counter
+    pure (n + 1)
+
+bumping : {e : HFunctor}
+        -> {{dm : Domain.domain <: e}}
+        -> Domain.Atomic Int
+        -> Int
+        -> Co e Unit
+bumping counter 0 = pure ()
+bumping counter k = do
+  _ <- bumped counter
+  bumping counter (k - 1)
+
+-- | 4 domains adding 1 each 50000 times, by cas
+casCounted : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+casCounted = do
+  counter <- Domain.newAtomic 0
+  ds <- spawned 4 (\i -> bumping counter 50000)
+  _ <- joined ds
+  Domain.get counter
+
+-- (`x` pushed onto the list the cell holds, by a cas of the list read:
+-- compared by identity, an equal list built again would not do)
+pushed : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Atomic (List Int)
+       -> Int
+       -> Co e Unit
+pushed stack x = do
+  xs <- Domain.get stack
+  ok <- Domain.cas stack xs (x :: xs)
+  if ok then pure () else pushed stack x
+
+pushing : {e : HFunctor}
+        -> {{dm : Domain.domain <: e}}
+        -> Domain.Atomic (List Int)
+        -> Int
+        -> Int
+        -> Co e Unit
+pushing stack i 0 = pure ()
+pushing stack i k = do
+  pushed stack (i * 1000 + k)
+  pushing stack i (k - 1)
+
+-- | 4 domains pushing 1000 each: how many, and their sum
+stacked : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Int, Int)
+stacked = do
+  stack <- Domain.newAtomic Nil
+  ds <- spawned 4 (\i -> pushing stack i 1000)
+  _ <- joined ds
+  xs <- Domain.get stack
+  pure (List.length xs, List.sum xs)
+
+-- | a cas of a value equal to the one held, but not it, fails
+notTheSame : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Bool
+notTheSame = do
+  cell <- Domain.newAtomic [1, 2, 3]
+  Domain.cas cell (List.map (\x -> x + 0) [1, 2, 3]) [4]
+
+-- Handed over under a mutex ------------------------------------------------------------
+
+-- (the values given, waited for until there are `n`, the mutex held)
+awaited : {e : HFunctor}
+        -> {{dm : Domain.domain <: e}}
+        -> Domain.Mutex
+        -> Domain.Condition
+        -> Domain.Atomic (List Int)
+        -> Int
+        -> Co e (List Int)
+awaited mu cd box n = do
+  xs <- Domain.get box
+  if List.length xs >= n then pure xs
+  else do
+    Domain.wait cd mu
+    awaited mu cd box n
+
+-- (`x` given: put in the box, the mutex held, and the waiter woken)
+given : {e : HFunctor}
+      -> {{dm : Domain.domain <: e}}
+      -> Domain.Mutex
+      -> Domain.Condition
+      -> Domain.Atomic (List Int)
+      -> Int
+      -> Co e Unit
+given mu cd box x = do
+  Domain.lock mu
+  xs <- Domain.get box
+  Domain.set box (x :: xs)
+  Domain.signal cd
+  Domain.unlock mu
+
+-- | 6 domains each giving its square; the sum, once all are given
+handed : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+handed = do
+  mu <- Domain.newMutex
+  cd <- Domain.newCondition
+  box <- Domain.newAtomic Nil
+  ds <- spawned 6 (\i -> given mu cd box (i * i))
+  Domain.lock mu
+  xs <- awaited mu cd box 6
+  Domain.unlock mu
+  _ <- joined ds
+  pure (List.sum xs)
+
+-- Waiting on one another ------------------------------------------------------------
+
+-- (read again until the cell holds True: a domain waiting so, by its
+-- reads alone, lets another set it)
+spun : {e : HFunctor}
+     -> {{dm : Domain.domain <: e}}
+     -> Domain.Atomic Bool
+     -> Co e Unit
+spun flag = do
+  b <- Domain.get flag
+  if b then pure () else spun flag
+
+-- | a domain sets a flag main reads again and again until it is set
+spinning : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Bool
+spinning = do
+  flag <- Domain.newAtomic False
+  d <- Domain.spawn (Domain.set flag True)
+  spun flag
+  Domain.join d
+  pure True
+
+-- | a mutex main holds, a domain spawned then locking it: it waits
+-- | until main lets go, and adds once
+parentFirst : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+parentFirst = do
+  mu <- Domain.newMutex
+  box <- Domain.newAtomic 0
+  Domain.lock mu
+  d <-
+    Domain.spawn (do
+    Domain.lock mu
+    _ <- Domain.fetchAdd box 1
+    Domain.unlock mu)
+  Domain.unlock mu
+  Domain.join d
+  Domain.get box
+
+-- The lines ---------------------------------------------------------------------------
+
+-- | what the program says, line by line
+said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
+said = do
+  n <- counted
+  c <- casCounted
+  s <- stacked
+  b <- notTheSame
+  h <- handed
+  answers <- spawned 3 (\i -> pure (show i ^ "!"))
+  ws <- joined answers
+  sp <- spinning
+  pf <- parentFirst
+  k <- Domain.cores
+  pure
+      [ "fetchAdd by 4: " ^ show n
+      , "cas by 4: " ^ show c
+      , "pushed by 4: " ^ show (fst s) ^ ", their sum " ^ show (snd s)
+      , "an equal list, not the same: " ^ (if b then "swapped" else "kept")
+      , "handed over by 6: " ^ show h
+      , "answers: " ^ unwords ws
+      , "a flag read until set: " ^ (if sp then "set" else "not set")
+      , "locked after main let go: " ^ show pf
+      , "cores: " ^ (if k >= 1 then "at least one" else "none")
+      ]
