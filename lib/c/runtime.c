@@ -2380,6 +2380,38 @@ HEFF_FN Str *heff_str_grow(Str *x, int64_t n) {
   return g;
 }
 
+// (`n` bytes, at most 64, from `q` to `p`, apart, by no call: a string
+// grown in place grows by a byte or a few, most often -- a byte of
+// `fromByte`, a digit, a rune, a copy back in an inflated stream -- and
+// a call to `memcpy` for each was much of what that cost.  Below 8, a
+// byte at a time, as cases, which a compiler does not turn back into the
+// call as it would a loop; from 8, two copies of a fixed size, the second
+// ending where the bytes end, overlapping the first: a fixed size is
+// copied by loads and stores where it is)
+HEFF_FAST void heff_copy_short(uint8_t *p, const uint8_t *q, int64_t n) {
+  if (n < 8) {
+    switch (n) {
+    case 7: p[6] = q[6]; __attribute__((fallthrough));
+    case 6: p[5] = q[5]; __attribute__((fallthrough));
+    case 5: p[4] = q[4]; __attribute__((fallthrough));
+    case 4: p[3] = q[3]; __attribute__((fallthrough));
+    case 3: p[2] = q[2]; __attribute__((fallthrough));
+    case 2: p[1] = q[1]; __attribute__((fallthrough));
+    case 1: p[0] = q[0]; __attribute__((fallthrough));
+    default: break;
+    }
+  } else if (n < 16) {
+    memcpy(p, q, 8);
+    memcpy(p + n - 8, q + n - 8, 8);
+  } else if (n < 32) {
+    memcpy(p, q, 16);
+    memcpy(p + n - 16, q + n - 16, 16);
+  } else {
+    memcpy(p, q, 32);
+    memcpy(p + n - 32, q + n - 32, 32);
+  }
+}
+
 // (the first string, its last reference and not a view, grown in place,
 // as above; `Bytes` too, a new one of the kind `kind`)
 HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
@@ -2392,7 +2424,8 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
       if (x->len == 0 && y->h.kind == kind) { heff_drop(a); return b; }
       x = heff_str_grow(x, n);
     }
-    memcpy(x->s + x->len, y->p, (size_t)y->len);
+    if (y->len <= 64) heff_copy_short(x->s + x->len, y->p, y->len);
+    else memcpy(x->s + x->len, y->p, (size_t)y->len);
     x->len = n;
     heff_drop(b);
     return (V)x;
