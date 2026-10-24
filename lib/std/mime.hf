@@ -1,0 +1,393 @@
+-- Media types (MIME types, RFC 2045 and RFC 6838): the type of a file
+-- by its extension (`typeByExtension`), the extensions of a type
+-- (`extensionsByType`), and a type with its parameters read from its
+-- text (`parseMediaType`, RFC 2045 §5.1 and RFC 2231's continuations
+-- and encodings) and written back (`renderMediaType`).  Go's `mime` is
+-- the model.  A `Content-Disposition` (RFC 2183) has the same shape, a
+-- disposition and its parameters, and is read the same way.  Import it
+-- by a name, `import std.mime as Mime`.
+--
+-- ```haskell
+-- import std.mime as Mime
+--
+-- -- | >>> charset "text/html; charset=\"UTF-8\""
+-- -- | Just "UTF-8"
+-- charset : String -> Maybe String
+-- charset text = case Mime.parseMediaType text of
+--   Nothing -> Nothing
+--   Just m -> List.lookup "charset" m.parameters
+-- ```
+
+module std.mime
+  ( MediaType
+  , typeByExtension
+  , extensionsByType
+  , parseMediaType
+  , renderMediaType
+  )
+
+import std.url as URL
+
+-- | A media type as `parseMediaType` reads it: the type and its subtype,
+-- | `text/html`, or a disposition, `form-data` -- in lower case -- and
+-- | its parameters in their order, each a name, in lower case, and its
+-- | value, unquoted and unescaped.
+type MediaType = { mediaType : String, parameters : List (String, String) }
+
+-- (the table of `typeByExtension`: each extension, with its dot and in
+-- lower case, and its type)
+types : List (String, String)
+types =
+  [ (".avif", "image/avif")
+  , (".css", "text/css; charset=utf-8")
+  , (".csv", "text/csv; charset=utf-8")
+  , (".gif", "image/gif")
+  , (".gz", "application/gzip")
+  , (".htm", "text/html; charset=utf-8")
+  , (".html", "text/html; charset=utf-8")
+  , (".ico", "image/vnd.microsoft.icon")
+  , (".jpeg", "image/jpeg")
+  , (".jpg", "image/jpeg")
+  , (".js", "text/javascript; charset=utf-8")
+  , (".json", "application/json")
+  , (".md", "text/markdown; charset=utf-8")
+  , (".mjs", "text/javascript; charset=utf-8")
+  , (".mp3", "audio/mpeg")
+  , (".mp4", "video/mp4")
+  , (".ogg", "audio/ogg")
+  , (".otf", "font/otf")
+  , (".pdf", "application/pdf")
+  , (".png", "image/png")
+  , (".svg", "image/svg+xml")
+  , (".tar", "application/x-tar")
+  , (".toml", "application/toml")
+  , (".ttf", "font/ttf")
+  , (".txt", "text/plain; charset=utf-8")
+  , (".wasm", "application/wasm")
+  , (".wav", "audio/wav")
+  , (".webm", "video/webm")
+  , (".webp", "image/webp")
+  , (".woff", "font/woff")
+  , (".woff2", "font/woff2")
+  , (".xml", "text/xml; charset=utf-8")
+  , (".yaml", "application/yaml")
+  , (".yml", "application/yaml")
+  , (".zip", "application/zip")
+  ]
+
+-- (`s` with each of `A` to `Z` in lower case, every other byte as it is)
+lowerAscii : String -> String
+lowerAscii s = mapBytes (\c -> if 65 <= c && c <= 90 then c + 32 else c) s
+
+-- | The type of a file by its extension, its dot before it, its case not
+-- | minded, as Go's `TypeByExtension` has it from its own table: `.avif`
+-- | `.css` `.gif` `.htm` `.html` `.jpeg` `.jpg` `.js` `.json` `.mjs`
+-- | `.pdf` `.png` `.svg` `.wasm` `.webp` `.xml`; and `.csv` `.gz` `.ico`
+-- | `.md` `.mp3` `.mp4` `.ogg` `.otf` `.tar` `.toml` `.ttf` `.txt` `.wav`
+-- | `.webm` `.woff` `.woff2` `.yaml` `.yml` `.zip`, as IANA registers
+-- | them (`.ico` `image/vnd.microsoft.icon`, `.tar` `application/x-tar`,
+-- | `.wav` `audio/wav`, as browsers name it).  A text type has
+-- | `charset=utf-8`; no file is read, as Go reads the system's.
+-- | >>> List.map typeByExtension [".html", ".PNG", ".Woff2", ".yml"]
+-- | [Just "text/html; charset=utf-8", Just "image/png", Just "font/woff2", Just "application/yaml"]
+-- | >>> List.map typeByExtension ["html", ".exe", ""]
+-- | [Nothing, Nothing, Nothing]
+typeByExtension : String -> Maybe String
+typeByExtension extension = List.lookup (lowerAscii extension) types
+
+-- (a byte of RFC 2045's tspecials, `()<>@,;:\"/[]?=`)
+isSpecial : Int -> Bool
+isSpecial c = 0 <= c && c < 128 && contains (byteString c) "()<>@,;:\\\"/[]?="
+
+-- (a byte of a token: ASCII, not a space, a control or a tspecial)
+isTokenByte : Int -> Bool
+isTokenByte c = 32 < c && c < 127 && not (isSpecial c)
+
+-- (the first byte of `s` from `i` on that is not of a token, or the end)
+tokenEnd : String -> Int -> Int
+tokenEnd s i = if isTokenByte (byteAt s i) then tokenEnd s (i + 1) else i
+
+-- (whether `s` is a token, not empty)
+isToken : String -> Bool
+isToken s = strLength s > 0 && tokenEnd s 0 == strLength s
+
+-- (whether `t` is a type and its subtype, a token, `/` and a token, or
+-- a disposition, a token)
+isTypeName : String -> Bool
+isTypeName t =
+  isToken t
+  || (case indexOf "/" t 0 of
+      Nothing -> False
+      Just slash ->
+        isToken (strSlice t 0 slash)
+        && isToken (strSlice t (slash + 1) (strLength t)))
+
+-- (a byte of a space, as Go's `unicode.IsSpace` says of ASCII)
+isSpaceByte : Int -> Bool
+isSpaceByte c = c == 32 || 9 <= c && c <= 13
+
+-- (the first byte of `s` from `i` on that is not a space, or the end)
+spacesEnd : String -> Int -> Int
+spacesEnd s i = if isSpaceByte (byteAt s i) then spacesEnd s (i + 1) else i
+
+-- (the value of an RFC 2231 encoded parameter, `charset'language'text`,
+-- if its charset is `us-ascii` or `utf-8` and its escapes read)
+decodeExtended : String -> Maybe String
+decodeExtended v = case indexOf "'" v 0 of
+  Nothing -> Nothing
+  Just first -> case indexOf "'" v (first + 1) of
+    Nothing -> Nothing
+    Just second ->
+      if strEq (lowerAscii (strSlice v 0 first)) "utf-8"
+         || strEq (lowerAscii (strSlice v 0 first)) "us-ascii"
+      then URL.unescape (strSlice v (second + 1) (strLength v))
+      else Nothing
+
+-- (the parameters `raw`, read in their order, with the RFC 2231 ones --
+-- `name*`, `name*0`, `name*1*`... -- each one parameter `name`, at the
+-- first of its pieces; one whose pieces do not read is left out, its
+-- plain `name` kept, as Go leaves it)
+stitched : List (String, String) -> List (String, String)
+stitched raw = stitchFrom raw Nil Nil
+  where
+  -- (the name a parameter's is a piece of: before its first `*`)
+  baseOf : String -> String
+  baseOf key = case indexOf "*" key 0 of
+    Nothing -> key
+    Just star -> strSlice key 0 star
+
+  -- (the pieces of `name` from the `n`th on after `acc`, each `name*n`
+  -- as it is or `name*n*` unescaped -- the first decoded, a piece that
+  -- does not read empty, as Go reads them -- if there is a first)
+  piecesFrom : String -> Int -> String -> Maybe String
+  piecesFrom name n acc = case List.lookup (name ^ "*" ^ showInt n) raw of
+    Just v -> piecesFrom name (n + 1) (acc ^ v)
+    Nothing -> case List.lookup (name ^ "*" ^ showInt n ^ "*") raw of
+      Nothing -> if n == 0 then Nothing else Just acc
+      Just v ->
+        piecesFrom
+          name
+          (n + 1)
+          (acc
+           ^ fromMaybe
+             ""
+             (if n == 0 then decodeExtended v else URL.unescape v))
+
+  -- (the value of `name` the RFC 2231 parameters give it, if they do)
+  extendedValue : String -> Maybe String
+  extendedValue name = case List.lookup (name ^ "*") raw of
+    Just v -> decodeExtended v
+    Nothing -> piecesFrom name 0 ""
+
+  -- (the parameters `rest` stitched after `acc`, last first, the names
+  -- in `done` already there)
+  stitchFrom : List (String, String)
+             -> List String
+             -> List (String, String)
+             -> List (String, String)
+  stitchFrom Nil done acc = List.reverse acc
+  stitchFrom (MkPair key value :: rest) done acc =
+    let name : String = baseOf key
+    in if List.elem name done then stitchFrom rest done acc
+    else case extendedValue name of
+      Just v -> stitchFrom rest (name :: done) (MkPair name v :: acc)
+      Nothing ->
+        if strEq name key
+        then stitchFrom rest (name :: done) (MkPair key value :: acc)
+        else stitchFrom rest done acc
+
+-- | A media type read from its text, as Go's `ParseMediaType` reads it:
+-- | a token, `/` and a token -- or a token alone, a disposition -- in
+-- | either case, then `;` and a parameter each, a token, `=` and a value,
+-- | a token or a quoted string, spaces around them all.  In a quoted
+-- | string a `\` escapes the tspecial after it, any other it is itself
+-- | (as Internet Explorer writes a path, `"C:\dir\a.txt"`); a line break
+-- | in one is none.  A `;` at the end is no parameter.  A name may be
+-- | there twice with the same value, kept once; with another, nothing.
+-- | RFC 2231's are read: `name*=utf-8''%E2%82%AC` (its charset `utf-8` or
+-- | `us-ascii`, the language not kept), and `name*0`, `name*1`... in
+-- | pieces, any of them `*`-encoded, each one parameter `name`; one that
+-- | does not read is left out.
+-- | >>> parseMediaType "Text/HTML; Charset=\"utf-8\"; format=fixed"
+-- | Just { mediaType = "text/html", parameters = [MkPair "charset" "utf-8", MkPair "format" "fixed"] }
+-- | >>> parseMediaType " form-data ; name=foo ;"
+-- | Just { mediaType = "form-data", parameters = [MkPair "name" "foo"] }
+-- | >>> parseMediaType "text/plain"
+-- | Just { mediaType = "text/plain", parameters = [] }
+-- |
+-- | (quoted strings: escapes, a `\` before what is no tspecial, empty)
+-- | >>> parseMediaType "attachment; filename=\"C:\\dev\\go\\robots.txt\""
+-- | Just { mediaType = "attachment", parameters = [MkPair "filename" "C:\\dev\\go\\robots.txt"] }
+-- | >>> parseMediaType "attachment; filename=\"C:\\\\dev\\\\go\\\\robots.txt\""
+-- | Just { mediaType = "attachment", parameters = [MkPair "filename" "C:\\dev\\go\\robots.txt"] }
+-- | >>> parseMediaType "foo; a=\"say \\\"hi\\\"; ok\"; b=\"\""
+-- | Just { mediaType = "foo", parameters = [MkPair "a" "say \"hi\"; ok", MkPair "b" ""] }
+-- |
+-- | (a name twice: once with the same value, nothing with another)
+-- | >>> parseMediaType "foo; key=val; KEY=\"val\""
+-- | Just { mediaType = "foo", parameters = [MkPair "key" "val"] }
+-- | >>> parseMediaType "foo; key=val1; key=the-key-appears-again-which-is-bogus"
+-- | Nothing
+-- |
+-- | (RFC 2231's examples)
+-- | >>> parseMediaType "message/external-body; access-type=URL; URL*0=\"ftp://\"; URL*1=\"cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar\""
+-- | Just { mediaType = "message/external-body", parameters = [MkPair "access-type" "URL", MkPair "url" "ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar"] }
+-- | >>> parseMediaType "application/x-stuff; title*=us-ascii'en-us'This%20is%20%2A%2A%2Afun%2A%2A%2A"
+-- | Just { mediaType = "application/x-stuff", parameters = [MkPair "title" "This is ***fun***"] }
+-- | >>> parseMediaType "application/x-stuff; title*0*=us-ascii'en'This%20is%20even%20more%20; title*1*=%2A%2A%2Afun%2A%2A%2A%20; title*2=\"isn't it!\""
+-- | Just { mediaType = "application/x-stuff", parameters = [MkPair "title" "This is even more ***fun*** isn't it!"] }
+-- | >>> parseMediaType "attachment; filename=\"EURO rates\"; filename*=utf-8''%e2%82%ac%20rates"
+-- | Just { mediaType = "attachment", parameters = [MkPair "filename" "\u{20ac} rates"] }
+-- | >>> parseMediaType "attachment; filename=plain; filename*=iso-8859-1''%A3"
+-- | Just { mediaType = "attachment", parameters = [MkPair "filename" "plain"] }
+-- |
+-- | (what is not one: no type, no subtype, two slashes, a space in it, a
+-- | parameter without `=` or a value, a quote not closed, a line break in
+-- | one, text after one, a `;` alone)
+-- | >>> (List.map (\s -> maybe True (\_ -> False) (parseMediaType s)) ["", "/html", "text/", "text/html/x", "text html", "foo; bar", "foo; bar=", "foo; =x", "foo; a=\"b", "foo; a=\"b\nc\"", "foo; a=\"b\"c", "foo; a=b c", "foo; ; a=b", "bogus ;========="] : List Bool)
+-- | [True, True, True, True, True, True, True, True, True, True, True, True, True, True]
+parseMediaType : String -> Maybe MediaType
+parseMediaType text =
+  let baseEnd : Int = fromMaybe (strLength text) (indexOf ";" text 0)
+  in let mediaType : String = lowerAscii (trim (strSlice text 0 baseEnd))
+  in if not (isTypeName mediaType) then Nothing
+  else case parametersFrom text baseEnd Nil of
+    Nothing -> Nothing
+    Just raw -> Just { mediaType = mediaType, parameters = stitched raw }
+  where
+  -- (the quoted string of `s` from `i` on, after its opening quote: what
+  -- is read so far `acc`, then the bytes from `start` up to `i`; its text
+  -- and the byte after its closing quote)
+  quotedFrom : String -> Int -> Int -> String -> Maybe (Pair String Int)
+  quotedFrom s start i acc =
+    let c : Int = byteAt s i
+    in if c < 0 || c == 13 || c == 10 then Nothing
+    else if c == 34 then Just (MkPair (acc ^ strSlice s start i) (i + 1))
+    else if c == 92 && isSpecial (byteAt s (i + 1))
+    then quotedFrom
+        s
+        (i + 2)
+        (i + 2)
+        (acc ^ strSlice s start i ^ strSlice s (i + 1) (i + 2))
+    else quotedFrom s start (i + 1) acc
+
+  -- (the value of `s` at `i`, a token or a quoted string, and the byte
+  -- after it)
+  valueAt : String -> Int -> Maybe (Pair String Int)
+  valueAt s i =
+    if byteAt s i == 34 then quotedFrom s (i + 1) (i + 1) ""
+    else if tokenEnd s i > i
+    then Just (MkPair (strSlice s i (tokenEnd s i)) (tokenEnd s i))
+    else Nothing
+
+  -- (the parameter of `s` at `i`, its `;` there: its name in lower case,
+  -- its value, and the byte after it)
+  parameterAt : String -> Int -> Maybe (Pair (String, String) Int)
+  parameterAt s i =
+    let start : Int = spacesEnd s (i + 1)
+    in let nameEnd : Int = tokenEnd s start
+    in let equals : Int = spacesEnd s nameEnd
+    in if byteAt s i /= 59 || nameEnd == start || byteAt s equals /= 61
+    then Nothing
+    else case valueAt s (spacesEnd s (equals + 1)) of
+      Nothing -> Nothing
+      Just (MkPair value next) ->
+        Just
+          (MkPair (MkPair (lowerAscii (strSlice s start nameEnd)) value) next)
+
+  -- (the parameters of `s` from `i` on, after `acc`, the last first: a
+  -- name there again with another value, nothing)
+  parametersFrom : String
+                 -> Int
+                 -> List (String, String)
+                 -> Maybe (List (String, String))
+  parametersFrom s i acc =
+    let j : Int = spacesEnd s i
+    in if j >= strLength s then Just (List.reverse acc)
+    else case parameterAt s j of
+      Nothing ->
+        if strEq (trim (strSlice s j (strLength s))) ";"
+        then Just (List.reverse acc)
+        else Nothing
+      Just (MkPair (MkPair name value) next) -> case List.lookup name acc of
+        Nothing -> parametersFrom s next (MkPair name value :: acc)
+        Just old ->
+          if strEq old value then parametersFrom s next acc else Nothing
+
+-- | The extensions of a media type, its parameters not minded, in their
+-- | order: those `typeByExtension` has of it.
+-- | >>> extensionsByType "text/html; charset=utf-8"
+-- | [".htm", ".html"]
+-- | >>> List.map extensionsByType ["IMAGE/JPEG", "application/yaml", "text/x-nothing", "not a type"]
+-- | [[".jpeg", ".jpg"], [".yaml", ".yml"], [], []]
+extensionsByType : String -> List String
+extensionsByType text = case parseMediaType text of
+  Nothing -> Nil
+  Just m ->
+    List.sort
+      (List.map
+         fst
+         (List.keepIf (\entry -> sameType m.mediaType (snd entry)) types))
+  where
+  -- (whether the type `t`, a table's, is `wanted`, its parameters not
+  -- minded)
+  sameType : String -> String -> Bool
+  sameType wanted t =
+    maybe
+      False
+      (\(n : MediaType) -> strEq n.mediaType wanted)
+      (parseMediaType t)
+
+-- | The text of a media type, as Go's `FormatMediaType` writes it, but in
+-- | the parameters' order: the type, then `; ` and a parameter each, the
+-- | type and the names in lower case, a value a token as it is, any
+-- | other quoted, a `"` and a `\` in it escaped -- one with a control
+-- | byte or one not ASCII (a tab is neither) written `name*=utf-8''`
+-- | and its bytes, those not of a token or `*'%` escaped `%XX`, as RFC
+-- | 2231 writes it.  Of a type or a name that is not one, `""`.
+-- | >>> renderMediaType { mediaType = "Text/HTML", parameters = [("Charset", "utf-8"), ("title", "say \"hi\"\t\\o/")] }
+-- | "text/html; charset=utf-8; title=\"say \\\"hi\\\"\t\\\\o/\""
+-- | >>> renderMediaType { mediaType = "attachment", parameters = [("filename", "\u{20ac} 100%.txt"), ("empty", "")] }
+-- | "attachment; filename*=utf-8''%E2%82%AC%20100%25.txt; empty=\"\""
+-- | >>> List.map renderMediaType [{ mediaType = "text/", parameters = [] }, { mediaType = "text/plain", parameters = [("a b", "c")] }]
+-- | ["", ""]
+-- |
+-- | (what it writes, `parseMediaType` reads back)
+-- | >>> parseMediaType (renderMediaType { mediaType = "form-data", parameters = [("name", "a;b"), ("filename", "\u{e9}t\u{e9} \"x\".txt"), ("x", "\\")] })
+-- | Just { mediaType = "form-data", parameters = [MkPair "name" "a;b", MkPair "filename" "\u{e9}t\u{e9} \"x\".txt", MkPair "x" "\\"] }
+renderMediaType : MediaType -> String
+renderMediaType m =
+  if isTypeName m.mediaType && List.all (\p -> isToken (fst p)) m.parameters
+  then List.foldl parameterInto (lowerAscii m.mediaType) m.parameters
+  else ""
+  where
+  -- (whether a value is written RFC 2231's way: a control byte in it, not
+  -- a tab, or one not ASCII)
+  needsEncoding : String -> Bool
+  needsEncoding v =
+    foldBytes (\yes c -> yes || (c < 32 || c > 126) && c /= 9) False v
+
+  -- (a byte of a value written RFC 2231's way: as it is, or `%XX`)
+  encodedByte : Int -> String
+  encodedByte c =
+    if isTokenByte c && c /= 42 && c /= 39 && c /= 37 then byteString c
+    else "%"
+      ^ strSlice "0123456789ABCDEF" (c / 16) (c / 16 + 1)
+      ^ strSlice "0123456789ABCDEF" (c % 16) (c % 16 + 1)
+
+  -- (a byte of a quoted string: a `"` and a `\` escaped)
+  quotedByte : Int -> String
+  quotedByte c =
+    if c == 34 || c == 92 then "\\" ^ byteString c else byteString c
+
+  -- (`acc`, then `; ` and the parameter)
+  parameterInto : String -> (String, String) -> String
+  parameterInto acc (MkPair name v) =
+    acc
+    ^ "; "
+    ^ lowerAscii name
+    ^ (if needsEncoding v
+       then "*=utf-8''" ^ foldBytes (\out c -> out ^ encodedByte c) "" v
+       else if isToken v
+       then "=" ^ v
+       else "=\"" ^ foldBytes (\out c -> out ^ quotedByte c) "" v ^ "\"")

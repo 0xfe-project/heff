@@ -1,0 +1,362 @@
+-- Multipart bodies (RFC 2046 §5.1), and forms sent as one, `form-data`
+-- (RFC 7578): a body read into its parts (`parse`) and written of them
+-- (`render`), each part its headers and its body.  The boundary is a
+-- `Content-Type`'s (`boundaryOf`); a part's form name and file name are
+-- its `Content-Disposition`'s (`formName`, `fileName`).  Go's
+-- `mime/multipart` is the model: its `NextRawPart`, as a body is kept as
+-- it is written, whatever its `Content-Transfer-Encoding`.  Import it by
+-- a name, `import std.multipart as Multipart`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.multipart as Multipart
+--
+-- -- | >>> fields "multipart/form-data; boundary=X" (Bytes.fromString "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--X--\r\n")
+-- -- | [MkPair "a" "1"]
+-- fields : String -> Bytes -> List (String, String)
+-- fields contentType body = case Multipart.boundaryOf contentType of
+--   Nothing -> Nil
+--   Just b -> case Multipart.parse body (boundary := b) of
+--     Left e -> Nil
+--     Right parts ->
+--       List.mapMaybe
+--         (\(p : Multipart.Part) ->
+--            maybe Nothing (\n -> Just (n, Bytes.asString p.body)) (Multipart.formName p))
+--         parts
+-- ```
+
+module std.multipart
+  ( Part
+  , ParseError
+  , boundaryOf
+  , parse
+  , render
+  , formName
+  , fileName
+  )
+
+import bytes as Bytes
+import std.mime as Mime
+import string as String
+
+-- | A part: its headers, a name and a value each, in their order and as
+-- | they are written (a header is looked for by its name, its case not
+-- | minded), and its body.
+type Part = { headers : List (String, String), body : Bytes }
+
+-- | Where a body is not a multipart one: its byte there, and what is
+-- | wrong.
+type ParseError = { offset : Int, message : String }
+
+-- | The boundary of a `Content-Type` of a multipart body (`multipart/`
+-- | and any subtype), as `std.mime` reads it, if it has one, not empty.
+-- | >>> boundaryOf "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"
+-- | Just "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+-- | >>> boundaryOf "Multipart/Mixed; boundary=\"simple boundary\""
+-- | Just "simple boundary"
+-- | >>> List.map boundaryOf ["text/plain; boundary=x", "multipart/mixed", "multipart/mixed; boundary=\"\"", "multipart/mixed; boundary="]
+-- | [Nothing, Nothing, Nothing, Nothing]
+boundaryOf : String -> Maybe String
+boundaryOf contentType = case Mime.parseMediaType contentType of
+  Nothing -> Nothing
+  Just m ->
+    if startsWith "multipart/" m.mediaType
+    then (case List.lookup "boundary" m.parameters of
+          Just "" -> Nothing
+          found -> found)
+    else Nothing
+
+-- | The parts of a multipart body of the boundary, as Go's `Reader`
+-- | reads them: its preamble, before the first delimiter, and its
+-- | epilogue, after the close delimiter, not read; each part after a
+-- | delimiter line, `--` and the boundary, its header lines up to an
+-- | empty one, and its body up to the line break before the next
+-- | delimiter.  A delimiter line may have spaces and tabs before its
+-- | line break; the close delimiter, `--` after it, ends at a line break
+-- | or the end.  Lines end with a carriage return and a line feed, or a
+-- | line feed alone, as the first delimiter line ends (in the headers,
+-- | either); a header line beginning with a space or a tab goes on the
+-- | one before it, the two joined by a space.
+-- | >>> parse (Bytes.fromString "--AaB03x\r\ncontent-disposition: form-data; name=\"field1\"\r\n\r\nJoe Blow\r\n--AaB03x\r\ncontent-disposition: form-data; name=\"pics\"; filename=\"file1.txt\"\r\nContent-Type: text/plain\r\n\r\n ... contents of file1.txt ...\r\n--AaB03x--\r\n") (boundary := "AaB03x")
+-- | Right [{ headers = [MkPair "content-disposition" "form-data; name=\"field1\""], body = b["Joe Blow"] }, { headers = [MkPair "content-disposition" "form-data; name=\"pics\"; filename=\"file1.txt\"", MkPair "Content-Type" "text/plain"], body = b[" ... contents of file1.txt ..."] }]
+-- |
+-- | (RFC 2046's example: a preamble, a part of no headers, a body ended
+-- | by a line break, an epilogue)
+-- | >>> parse (Bytes.fromString "This is the preamble.\r\n--simple boundary\r\n\r\nThis is implicitly typed plain US-ASCII text.\r\n--simple boundary\r\nContent-type: text/plain; charset=us-ascii\r\n\r\nThis DOES end with a linebreak.\r\n\r\n--simple boundary--\r\n\r\nThis is the epilogue.\r\n") (boundary := "simple boundary")
+-- | Right [{ headers = [], body = b["This is implicitly typed plain US-ASCII text."] }, { headers = [MkPair "Content-type" "text/plain; charset=us-ascii"], body = b["This DOES end with a linebreak.", 13, 10] }]
+-- |
+-- | (line feeds alone; spaces after a delimiter; a header line folded;
+-- | an empty body, and one where a delimiter line would follow at once;
+-- | a boundary's text in a body, not after a line break or before
+-- | another byte; no parts)
+-- | >>> parse (Bytes.fromString "--b \t\nA: 1\n  and 2\n\nx\n--b\nB:2\r\n\r\n\n--b--") (boundary := "b")
+-- | Right [{ headers = [MkPair "A" "1 and 2"], body = b["x"] }, { headers = [MkPair "B" "2"], body = b[] }]
+-- | >>> List.map (\(r : Either ParseError (List Part)) -> either (\_ -> Nil) (List.map (\(p : Part) -> Bytes.asString p.body)) r) [parse (Bytes.fromString "--b\r\n\r\n--b\r\n\r\n--b--") (boundary := "b"), parse (Bytes.fromString "--b\r\n\r\nx--b\r\n--bc\r\n--b-\r\n--b--") (boundary := "b"), parse (Bytes.fromString "preamble\r\n--b--\r\n") (boundary := "b")]
+-- | [["", ""], ["x--b\r\n--bc\r\n--b-"], []]
+-- |
+-- | (where it is not one: no delimiter, no close delimiter, a header
+-- | line not one, a delimiter line with more after it)
+-- | >>> parse (Bytes.fromString "no parts here\r\n") (boundary := "b")
+-- | Left { offset = 15, message = "missing close delimiter" }
+-- | >>> parse (Bytes.fromString "--b\r\n\r\nbody\r\n--b\r\n") (boundary := "b")
+-- | Left { offset = 18, message = "missing close delimiter" }
+-- | >>> parse (Bytes.fromString "--b\r\nA: 1\r\nno colon\r\n\r\n\r\n--b--") (boundary := "b")
+-- | Left { offset = 11, message = "malformed MIME header line" }
+-- | >>> List.map (\s -> parse (Bytes.fromString s) (boundary := "b")) ["--b\r\n A: 1\r\n\r\n\r\n--b--", "--b\r\nA B: 1\r\n\r\n\r\n--b--"]
+-- | [Left { offset = 5, message = "malformed MIME header initial line" }, Left { offset = 5, message = "malformed MIME header line" }]
+-- | >>> List.map (\s -> parse (Bytes.fromString s) (boundary := "b")) ["--b\r\n\r\nx\r\n--b x\r\n", "--b\r\n\r\nx\r\n--b--x", "--b\n\nx\n--b\r\n\n--b--"]
+-- | [Left { offset = 14, message = "malformed delimiter line" }, Left { offset = 15, message = "malformed delimiter line" }, Left { offset = 10, message = "malformed delimiter line" }]
+parse : Bytes -> (boundary : String) -> Either ParseError (List Part)
+parse body boundary = partsIn (Bytes.asString body) ("--" ^ boundary)
+  where
+  -- (the parts of `s`, `body` as a string, its delimiter `dash`)
+  partsIn : String -> String -> Either ParseError (List Part)
+  partsIn s dash = preambleFrom 0
+    where
+    -- (the error at byte `i`)
+    errorAt : Int -> String -> Either ParseError (List Part)
+    errorAt i message = Left { offset = i, message = message }
+
+    -- (the first byte from `i` on that is not a space or a tab)
+    blanksEnd : Int -> Int
+    blanksEnd i =
+      if byteAt s i == 32 || byteAt s i == 9 then blanksEnd (i + 1) else i
+
+    -- (whether `s` has `t` at `i`)
+    hasAt : String -> Int -> Bool
+    hasAt t i = strEq (strSlice s i (i + strLength t)) t
+
+    -- (the start of the line after the one `i` is in, or the end)
+    nextLine : Int -> Int
+    nextLine i =
+      let j : Int = strFind "\n" s i
+      in if j < 0 then strLength s else j + 1
+
+    -- (whether a delimiter's `dash` ends at `i`: before a space, a tab, a
+    -- line break, `--` or the end, as Go's `matchAfterPrefix` says)
+    dashEnds : Int -> Bool
+    dashEnds i =
+      let c : Int = byteAt s i
+      in c < 0
+      || c == 32
+      || c == 9
+      || c == 13
+      || c == 10
+      || c == 45 && byteAt s (i + 1) == 45
+
+    -- (whether a close delimiter's line, after its `--`, ends at `i`
+    -- after its spaces and tabs: at a line break or the end)
+    closes : Int -> Bool
+    closes i =
+      let j : Int = blanksEnd i
+      in byteAt s j < 0 || byteAt s j == 10 || hasAt "\r\n" j
+
+    -- (the header lines from `i` on, after `acc`, the last first, up to an
+    -- empty line: the headers, and the byte after that line)
+    headersFrom : Int
+                -> List (String, String)
+                -> Either ParseError (Pair (List (String, String)) Int)
+    headersFrom i acc =
+      let j : Int = strFind "\n" s i
+      in let line : String =
+        if j > i && byteAt s (j - 1) == 13 then strSlice s i (j - 1)
+        else strSlice s i (max i j)
+      in if j < 0
+      then Left { offset = strLength s, message = "missing close delimiter" }
+      else if strEq line "" then Right (MkPair (List.reverse acc) (j + 1))
+      else if byteAt line 0 == 32 || byteAt line 0 == 9
+      then (case acc of
+            Nil ->
+              Left
+                { offset = i, message = "malformed MIME header initial line" }
+            MkPair name value :: rest ->
+              headersFrom
+                (j + 1)
+                (MkPair name (value ^ " " ^ trimBlanks line) :: rest))
+      else case indexOf ":" line 0 of
+        Nothing -> Left { offset = i, message = "malformed MIME header line" }
+        Just colon ->
+          if colon > 0
+             && foldBytes
+               (\ok c -> ok && isNameByte c)
+               True
+               (strSlice line 0 colon)
+          then headersFrom
+              (j + 1)
+              (MkPair
+                 (strSlice line 0 colon)
+                 (trimBlanks (strSlice line (colon + 1) (strLength line)))
+               :: acc)
+          else Left { offset = i, message = "malformed MIME header line" }
+      where
+      -- (a byte of a header's name: RFC 9110's `tchar`)
+      isNameByte : Int -> Bool
+      isNameByte c =
+        48 <= c && c <= 57
+        || 65 <= c && c <= 90
+        || 97 <= c && c <= 122
+        || 0 <= c && c < 128 && contains (byteString c) "!#$%&'*+-.^_`|~"
+
+      -- (from `i`, the first index of `t` not a space or a tab, by `step`)
+      blanksFrom : String -> Int -> Int -> Int
+      blanksFrom t i step =
+        if byteAt t i == 32 || byteAt t i == 9 then blanksFrom t (i + step) step
+        else i
+
+      -- (`t` without the spaces and tabs at either end)
+      trimBlanks : String -> String
+      trimBlanks t =
+        strSlice
+          t
+          (blanksFrom t 0 1)
+          (blanksFrom t (strLength t - 1) (0 - 1) + 1)
+
+    -- (the start of the delimiter line ending a body from `i` on: the
+    -- first `nl`, `dash` there, that a delimiter's `dash` ends; one right
+    -- at the start of the body too, where a part's empty line was the one
+    -- before it; -1 where there is none)
+    delimiterFrom : String -> Int -> Int
+    delimiterFrom nl i =
+      if hasAt dash i && dashEnds (i + strLength dash) then i
+      else searchFrom i
+      where
+      -- (the first `nl`, `dash` from `j` on that a delimiter's `dash` ends)
+      searchFrom : Int -> Int
+      searchFrom j =
+        let k : Int = strFind (nl ^ dash) s j
+        in if k < 0 then 0 - 1
+        else if dashEnds (k + strLength nl + strLength dash)
+        then k + strLength nl
+        else searchFrom (k + 1)
+
+    -- (the parts from the part at `i` on, after a delimiter line, after
+    -- `parts`, the last first, its lines ended by `nl`)
+    partFrom : String -> Int -> List Part -> Either ParseError (List Part)
+    partFrom nl i parts = case headersFrom i Nil of
+      Left e -> Left e
+      Right (MkPair headers start) ->
+        let d : Int = delimiterFrom nl start
+        in if d < 0 then errorAt (strLength s) "missing close delimiter"
+        else (let part : Part =
+                { headers = headers
+                , body =
+                    Bytes.slice
+                      body
+                      start
+                      (if d == start then d else d - strLength nl)
+                }
+              in let after : Int = d + strLength dash
+              in if hasAt "--" after
+              then (if closes (after + 2)
+                    then Right (List.reverse (part :: parts))
+                    else errorAt
+                        (blanksEnd (after + 2))
+                        "malformed delimiter line")
+              else if blanksEnd after >= strLength s
+              then errorAt (strLength s) "missing close delimiter"
+              else if hasAt nl (blanksEnd after)
+              then partFrom nl (blanksEnd after + strLength nl) (part :: parts)
+              else errorAt (blanksEnd after) "malformed delimiter line")
+
+    -- (the parts after the preamble's line at `i` and those after it: the
+    -- first delimiter line ends the preamble, the close delimiter all)
+    preambleFrom : Int -> Either ParseError (List Part)
+    preambleFrom i =
+      let after : Int = i + strLength dash
+      in if i >= strLength s then errorAt i "missing close delimiter"
+      else if not (hasAt dash i) then preambleFrom (nextLine i)
+      else if hasAt "--" after && closes (after + 2)
+      then Right Nil
+      else if hasAt "\r\n" (blanksEnd after)
+      then partFrom "\r\n" (blanksEnd after + 2) Nil
+      else if byteAt s (blanksEnd after) == 10
+      then partFrom "\n" (blanksEnd after + 1) Nil
+      else preambleFrom (nextLine i)
+
+-- | A multipart body of the parts and the boundary, as Go's `Writer`
+-- | writes one: each part after a delimiter line, `--` and the boundary,
+-- | its headers in their order, `Name: value`, an empty line and its
+-- | body, a line break after it; then the close delimiter, `--` after
+-- | the boundary, and a line break -- each line break a carriage return
+-- | and a line feed.  A header's value is written as it is: one with a
+-- | line break in it, or a body with a delimiter line, does not read back.
+-- | >>> Bytes.asString (render [{ headers = [("Content-Disposition", "form-data; name=\"a\"")], body = Bytes.fromString "1" }, { headers = Nil, body = Bytes.empty }] (boundary := "X"))
+-- | "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--X\r\n\r\n\r\n--X--\r\n"
+-- | >>> Bytes.asString (render Nil (boundary := "X"))
+-- | "--X--\r\n"
+-- |
+-- | (what it writes, `parse` reads back)
+-- | >>> parse (render [{ headers = [("Content-Disposition", "form-data; name=\"f\"; filename=\"a.bin\""), ("Content-Type", "application/octet-stream")], body = Bytes.fromList [0, 13, 10, 45, 45, 255] }, { headers = [("X", "")], body = Bytes.fromString "\r\n" }] (boundary := "b0und")) (boundary := "b0und")
+-- | Right [{ headers = [MkPair "Content-Disposition" "form-data; name=\"f\"; filename=\"a.bin\"", MkPair "Content-Type" "application/octet-stream"], body = b[0, 13, 10, "--", 255] }, { headers = [MkPair "X" ""], body = b[13, 10] }]
+render : List Part -> (boundary : String) -> Bytes
+render parts boundary =
+  Bytes.concat
+    (List.foldr
+       (\(part : Part) rest ->
+          Bytes.fromString
+            (List.foldl
+               (\acc header -> acc ^ fst header ^ ": " ^ snd header ^ "\r\n")
+               ("--" ^ boundary ^ "\r\n")
+               part.headers
+             ^ "\r\n")
+          :: part.body
+          :: Bytes.fromString "\r\n"
+          :: rest)
+       [Bytes.fromString ("--" ^ boundary ^ "--\r\n")]
+       parts)
+
+-- (a part's `Content-Disposition`, as `std.mime` reads it, if it has
+-- one that reads)
+dispositionOf : Part -> Maybe Mime.MediaType
+dispositionOf part = case List.find
+    (\header -> String.equalIgnoringCase (fst header) "Content-Disposition")
+    part.headers of
+  Nothing -> Nothing
+  Just header -> Mime.parseMediaType (snd header)
+
+-- | The name of a part of a form, its `Content-Disposition`'s `name`,
+-- | where it is `form-data`.
+-- | >>> formName { headers = [("content-disposition", "form-data; name=\"user\"")], body = Bytes.empty }
+-- | Just "user"
+-- | >>> List.map (\h -> formName { headers = [h], body = Bytes.empty }) [("Content-Disposition", "attachment; name=x"), ("Content-Disposition", "form-data"), ("Content-Type", "form-data; name=x")]
+-- | [Nothing, Nothing, Nothing]
+formName : Part -> Maybe String
+formName part = case dispositionOf part of
+  Nothing -> Nothing
+  Just m ->
+    if strEq m.mediaType "form-data" then List.lookup "name" m.parameters
+    else Nothing
+
+-- | The file name of a part, its `Content-Disposition`'s `filename`, not
+-- | empty, and of it only what is after its last `/`, as RFC 7578 §4.2
+-- | asks and Go's `FileName` takes it (by `filepath.Base` on a Unix: a
+-- | `\` kept, a `/` at the end not minded).
+-- | >>> fileName { headers = [("Content-Disposition", "form-data; name=\"f\"; filename=\"file1.txt\"")], body = Bytes.empty }
+-- | Just "file1.txt"
+-- | >>> List.map (\d -> fileName { headers = [("Content-Disposition", d)], body = Bytes.empty }) ["attachment; filename=\"../../etc/passwd\"", "form-data; filename=\"dir/\"", "form-data; filename*=utf-8''%E2%82%AC.txt", "form-data; filename=\"C:\\dev\\a.txt\"", "form-data; filename=\"\"", "form-data; name=f"]
+-- | [Just "passwd", Just "dir", Just "\u{20ac}.txt", Just "C:\\dev\\a.txt", Nothing, Nothing]
+fileName : Part -> Maybe String
+fileName part = case dispositionOf part of
+  Nothing -> Nothing
+  Just m -> case List.lookup "filename" m.parameters of
+    Nothing -> Nothing
+    Just "" -> Nothing
+    Just name -> Just (baseName (withoutSlashesFrom name (strLength name)))
+  where
+  -- (`name` up to `i`, without the `/`s at the end of that; `/` if it is
+  -- all of them)
+  withoutSlashesFrom : String -> Int -> String
+  withoutSlashesFrom name i =
+    if i == 0 then "/"
+    else if byteAt name (i - 1) == 47
+    then withoutSlashesFrom name (i - 1)
+    else strSlice name 0 i
+
+  -- (what is after the last `/` of `name`, if it is not `/`)
+  baseName : String -> String
+  baseName name =
+    if strEq name "/" then name
+    else maybe
+        name
+        (\slash -> strSlice name (slash + 1) (strLength name))
+        (String.lastIndexOf "/" name)
