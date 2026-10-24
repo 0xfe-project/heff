@@ -1,0 +1,171 @@
+-- What the tests of `boc` run, on every backend: the same program, by
+-- boc on std.domain, on the C backend's threads (test/node/cowns.hf)
+-- and in JavaScript's one domain (test/apps/cowns.hf), the same lines
+-- said.  A counter many behaviours add to; money moved round accounts,
+-- two cowns a behaviour; behaviours on one cown in the order they were
+-- spawned; a behaviour spawned in a behaviour's body, on its cown and
+-- another; what is read out by a behaviour of its own.
+
+module test.node.cowns-program
+
+import boc as BOC
+import co
+import std.domain as Domain
+
+-- (what the cowns hold, once every behaviour before is done: read out
+-- by a behaviour of its own)
+readOut : {c : Type}
+        -> {e : HFunctor}
+        -> c
+        -> {{cw : BOC.Cowns c}}
+        -> {{bc : BOC.boc cw.World <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> cw.Contents
+        -> Co e cw.Contents
+readOut cs first = do
+  out <- Domain.newAtomic first
+  BOC.when cs (\v -> do
+    Domain.set out v
+    pure v)
+  BOC.drained (bc := bc)
+  Domain.get out
+
+-- (`k` behaviours, each adding 1)
+adding : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> BOC.Cown w Int
+       -> Int
+       -> Co e Unit
+adding c 0 = pure ()
+adding c k = do
+  BOC.when c (\n -> pure (n + 1))
+  adding c (k - 1)
+
+-- | 1000 behaviours on one cown, each adding 1
+counted : {e w : HFunctor}
+        -> {{bc : BOC.boc w <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> Co e Int
+counted = do
+  c <- BOC.newCown (bc := bc) 0
+  adding c 1000
+  readOut c 0
+
+-- (`n` moved from one account to the next: a behaviour on both)
+moved : {e w : HFunctor}
+      -> {{bc : BOC.boc w <: e}}
+      -> BOC.Cown w Int
+      -> BOC.Cown w Int
+      -> Int
+      -> Co e Unit
+moved from to n = BOC.when (from, to) (\p -> pure (fst p - n, snd p + n))
+
+-- (`k` rounds of moves round the four accounts, `i` from the round
+-- number)
+rounds : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> BOC.Cown w Int
+       -> BOC.Cown w Int
+       -> BOC.Cown w Int
+       -> BOC.Cown w Int
+       -> Int
+       -> Co e Unit
+rounds a b c d 0 = pure ()
+rounds a b c d k = do
+  moved a b 1
+  moved b c 2
+  moved c d 3
+  moved d a 4
+  moved a c 1
+  rounds a b c d (k - 1)
+
+-- | four accounts of 100, 250 rounds of moves among them: what each
+-- | has, and all of them
+accounts : {e w : HFunctor}
+         -> {{bc : BOC.boc w <: e}}
+         -> {{dm : Domain.domain <: e}}
+         -> Co e (List Int)
+accounts = do
+  a <- BOC.newCown (bc := bc) 100
+  b <- BOC.newCown (bc := bc) 100
+  c <- BOC.newCown (bc := bc) 100
+  d <- BOC.newCown (bc := bc) 100
+  rounds a b c d 250
+  xs <- readOut (((a, b), c), d) (((0, 0), 0), 0)
+  let n = xs
+  pure
+      [ fst (fst (fst n))
+      , snd (fst (fst n))
+      , snd (fst n)
+      , snd n
+      , fst (fst (fst n)) + snd (fst (fst n)) + snd (fst n) + snd n
+      ]
+
+-- (behaviours `i` to `n`, each putting its number on the list)
+logged : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> BOC.Cown w (List Int)
+       -> Int
+       -> Int
+       -> Co e Unit
+logged c i n =
+  if i > n then pure ()
+  else do
+    BOC.when c (\xs -> pure (i :: xs))
+    logged c (i + 1) n
+
+-- | 100 behaviours on one cown, each putting its number on a list: in
+-- | the order they were spawned
+ordered : {e w : HFunctor}
+        -> {{bc : BOC.boc w <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> Co e Bool
+ordered = do
+  c <- BOC.newCown (bc := bc) Nil
+  logged c 1 100
+  xs <- readOut c Nil
+  pure (List.reverse xs == List.range 1 100)
+
+-- (the body of a behaviour on `a`: one on `a` and `b` spawned, which
+-- comes after it on `a`; 1 added)
+spawning : {e w : HFunctor}
+         -> {{bc : BOC.boc w <: e}}
+         -> BOC.Cown w Int
+         -> BOC.Cown w Int
+         -> Int
+         -> Co e Int
+spawning a b x = do
+  BOC.when (a, b) (\p -> pure (fst p * 2, snd p + 1))
+  pure (x + 1)
+
+-- | a behaviour on `a` spawning one on `a` and `b`, which comes after
+-- | it on `a`: 1 then doubled, and 1 added to `b` of 5.  Read out once
+-- | every behaviour is done: one spawned now would come before the one
+-- | spawned in the body
+nested : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> {{dm : Domain.domain <: e}}
+       -> Co e (Int, Int)
+nested = do
+  a <- BOC.newCown (bc := bc) 0
+  b <- BOC.newCown (bc := bc) 5
+  BOC.when a (spawning a b)
+  BOC.drained (bc := bc)
+  readOut (a, b) (0, 0)
+
+-- | what the program says, line by line
+said : {e w : HFunctor}
+     -> {{bc : BOC.boc w <: e}}
+     -> {{dm : Domain.domain <: e}}
+     -> Co e (List String)
+said = do
+  n <- counted (bc := bc)
+  xs <- accounts (bc := bc)
+  o <- ordered (bc := bc)
+  p <- nested (bc := bc)
+  pure
+      [ "added by 1000: " ^ show n
+      , "accounts: " ^ unwords (List.map show xs)
+      , "in the order spawned: " ^ (if o then "yes" else "no")
+      , "nested: " ^ show (fst p) ^ " " ^ show (snd p)
+      ]

@@ -10,7 +10,8 @@
 //   node test/page.mjs APP SCRIPT...   counter, clock, finder, aliased,
 //                                      slept, clocked, painted, texts,
 //                                      names, greet, two (counter's and
-//                                      clock's), vecadd, pixels, domains
+//                                      clock's), vecadd, pixels, domains,
+//                                      cowns
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -172,6 +173,8 @@ const apps = {
     for (let i = 0; i < 100000 && out.text === "" && timers.length > 0; i++) tick();
     said("out", out.text);
   },
+  // (boc's behaviours, on std.domain's one domain: as `domains`)
+  cowns: () => apps.domains(),
   slept: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;
