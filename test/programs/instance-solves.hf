@@ -1,0 +1,116 @@
+-- An instance argument whose type is not determined where it is wanted
+-- -- a metavariable in it, `state ?s <: e`, `s` said by no argument --
+-- is found all the same, by the one witness in scope that fits, which
+-- solves it: under `{{st : state Int <: e}}`, `get` reads an `Int`
+-- without being told; an effect with a world parameter, `tally w`,
+-- finds `w` from its evidence alone.
+
+module test.programs.instance-solves
+
+import co
+import state
+
+data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
+
+nothingElse : HFunctor
+nothingElse =
+  { f = NoneF
+  , hfmap = \m g p -> case p of
+      NoneOf q -> abandon
+  , hmap = \m n nt p -> case p of
+      NoneOf q -> abandon
+  }
+
+noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
+noneAlg (NoneOf q) = noneAlg q
+
+ranAlone : Handler nothingElse
+ranAlone =
+  { M = \x -> x
+  , ret = \x -> x
+  , bind = \m k -> k m
+  , malg = \p -> noneAlg p
+  }
+
+ran : {a : Type} -> Co nothingElse a -> a
+ran c = handle ranAlone c
+
+-- The state's type, from the evidence
+--------------------------------------------------------------------------------
+
+-- (the count read and thrown away: `s` of `get` is said by nothing but
+-- the evidence in scope)
+peeked : {e : HFunctor} -> {{st : state Int <: e}} -> Co e Unit
+peeked = do
+  _ <- get
+  pure ()
+
+-- (one more: `n` is of the type `get`'s evidence says, and `put` takes
+-- it back)
+bumped : {e : HFunctor} -> {{st : state Int <: e}} -> Co e Unit
+bumped = do
+  n <- get
+  put (n + 1)
+
+-- | >>> twiceBumped
+-- | 7
+twiceBumped : Int
+twiceBumped =
+  snd
+    (ran
+       (runState
+          5
+          (bind
+             (peeked (st := _))
+             (\u -> bind (bumped (st := _)) (\v -> bumped (st := _))))))
+
+-- An effect with a world parameter
+--------------------------------------------------------------------------------
+
+-- (as boc's `boc w`: `w` appears in no argument of its operations)
+data TallyF (w : HFunctor) (m : Type -> Type) x = Tally Int (Int -> x)
+
+tally : HFunctor -> HFunctor
+tally w =
+  { f = TallyF w
+  , hfmap = \m g p -> case p of
+      Tally n k -> Tally n (\x -> g (k x))
+  , hmap = \m n nt p -> case p of
+      Tally i k -> Tally i k
+  }
+
+-- | `n` tallied: the total so far
+tallied : {e w : HFunctor} -> {{ty : tally w <: e}} -> Int -> Co e Int
+tallied n = op (ty (Tally n (\x -> x))) val
+
+-- (two tallies, `w` of each said by `ty` alone)
+twiceTallied : {e w : HFunctor} -> {{ty : tally w <: e}} -> Int -> Co e Int
+twiceTallied n = do
+  a <- tallied n
+  tallied a
+
+-- (the tallies summed in a state, the handler running in `w`; `s` of
+-- its `get` and `put` is `st`'s)
+tallying : (w : HFunctor) -> {{st : state Int <: w}} -> Handler (tally w <+> w)
+tallying w =
+  { M = \a -> Co w a
+  , ret = \v -> pure v
+  , bind = \m f -> bind m f
+  , malg = \p -> case p of
+      InL (Tally n k) ->
+        bind get (\t -> bind (put (t + n)) (\u -> pure (k (t + n))))
+      InR q -> op q val
+  }
+
+world : HFunctor
+world = state Int <+> nothingElse
+
+-- | 1 tallied, then the total, 1: 2 in all, and 2 given back
+-- | >>> totals
+-- | MkPair 2 2
+totals : Pair Int Int
+totals =
+  ran
+    (runState
+       0
+       (handle (tallying world (st := _)) (twiceTallied (w := world) (ty := _) 1)))

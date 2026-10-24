@@ -133,8 +133,11 @@ fails, the error says which instance wanted it.
 
 Rules:
 
-- If the type wanted is not fully known yet, the search waits until it
-  is. One never known is E0340.
+- If the type wanted is not fully known yet, the search waits until the
+  definition is elaborated. Where it is still not known then, the one
+  instance in scope that unifies with it is taken, and solves what was
+  unknown, as Agda's instance search does: under `{{st : state Int <: e}}`,
+  `get` alone reads an `Int`. None, or more than one, is E0340.
 - Searches nest at most 32 deep (E0349).
 - An instance cannot take an explicit argument (E0348).
 - Each of its implicit arguments must appear in what it is for (E0350).
@@ -249,7 +252,7 @@ where its value is wanted is forced ([Lazy values](lazy.md)).
 
 | Code | Meaning |
 |---|---|
-| E0340 | the type an instance is wanted at is never known |
+| E0340 | the type an instance is wanted at is never known, and no one instance in scope says it |
 | E0341 | no instance fits |
 | E0342 | more than one instance fits |
 | E0348 | an instance takes an explicit argument |

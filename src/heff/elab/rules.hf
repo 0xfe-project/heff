@@ -505,6 +505,27 @@ cloNameOr c = case Value.cloName c of
 metasLeft : ElabEnv -> Value.MetaCtx -> Value.Ty -> List Int
 metasLeft e mc goal = Unify.metasTy mc 20 e.scope.len goal
 
+-- (`k h w` is `co.<:`'s `h <: w`)
+evidenceGoal : String -> Value.Spine Value.V -> Bool
+evidenceGoal k (SpApp (SpApp SpId h) w) = strEq k "co.<:"
+evidenceGoal k sp = False
+
+-- | whether a goal is evidence that an effect is in a world, `h <: e`,
+-- | determined or not (`boc ?w <: ?e`, in a `do` whose world is known
+-- | only once the whole of it is elaborated).  An instance argument of
+-- | evidence is found among the witnesses in scope alone, never by the
+-- | world's shape (that is `(x := _)`'s), so the one witness that fits
+-- | it is the only answer there could be, whatever the world turns out
+-- | to be: it is taken as soon as it is wanted, and says what the
+-- | effect's parameters are and which world it is in; an argument
+-- | coming after could make no other fit, only none
+isEvidence : Value.MetaCtx -> Value.Ty -> Bool
+isEvidence mc goal = case Value.forceTy mc goal of
+  VFunction level dom cod implicit dflt (Just (MkFolded (HGlobal k) spTh)) ->
+    evidenceGoal k (Params.forceTh spTh)
+  VDecode (HGlobal k) sp u described el -> evidenceGoal k sp
+  _ -> False
+
 instShown : ElabEnv -> Value.MetaCtx -> Value.Ty -> String
 instShown e mc goal =
   SurfacePrint.printTy
@@ -1027,7 +1048,16 @@ checkSettings e sp w goal found (Cons st rest) = do
 -- | checked: a goal specialised, `T args @ { x = v }`, is searched for as
 -- | `T args`, and an instance declared specialised is a candidate as one
 -- | of its theory; the one found has then its field `x` unified with `v`
--- | (E0354 where it is not).
+-- | (E0354 where it is not).  A goal not determined yet -- a
+-- | metavariable in it -- waits, but for two cases, where the one
+-- | witness that unifies with it is taken and solves it, as Agda's
+-- | instance search solves metavariables by its one candidate (solving
+-- | a metavariable only takes candidates away, so one unique now stays
+-- | so): evidence, `boc ?w <: ?e`, at once (`isEvidence`); any other
+-- | at the end, once no literal is left to
+-- | guess a type for (a literal's guess, `1 : Int`, comes before an
+-- | instance's say).  Where none or more than one fits, it waits, and
+-- | at the end is E0340.
 resolveWanted : ElabEnv
               -> Params.Span
               -> InstanceSearch
@@ -1041,21 +1071,30 @@ resolveWanted e sp search hm holeVal goal final = do
   -- (an error already said leaves what it would have solved unsolved:
   -- an instance argument it leaves undetermined is no error of its own)
   earlier <- gets (\c -> not (List.null c.recovered))
-  if not (List.null (metasLeft e mc (unspecTy mc goal)))
-  then if final && earlier
-    then failElsewhere
-        sp
-        "an instance argument's type is left undetermined by an error before"
-    else if final
-    then failWithNote
-        (a := Bool)
-        sp
-        40
-        ("an instance argument's type is not determined here: "
-         ^ goalShown e mc goal
-         ^ wantedByWhom e mc search)
-        "give the argument explicitly, or annotate so the implicits around it are solved"
-    else pure False
+  let undetermined = not (List.null (metasLeft e mc (unspecTy mc goal)))
+  can <- if undetermined && final then canGuess else pure False
+  let eager = isEvidence mc goal || (final && not can)
+  -- (a goal still waiting: at the end, refused; the message is made only
+  -- there, showing the goal being costly)
+  let undecided : Unit -> Elab Bool = \u ->
+      if final
+      then failWithNote
+          (a := Bool)
+          sp
+          40
+          ("an instance argument's type is not determined here: "
+           ^ goalShown e mc goal
+           ^ wantedByWhom e mc search)
+          "give the argument explicitly, or annotate so the implicits around it are solved"
+      else pure False
+  if undetermined && earlier && final
+  then failElsewhere
+      sp
+      "an instance argument's type is left undetermined by an error before"
+  -- (a goal still waiting is not matched against the witnesses at every
+  -- wake: the matching is the costly part, and its answer would be the
+  -- same)
+  else if undetermined && not eager then undecided MkUnit
   else if search.depth > instanceDepthLimit
   then failWithNote
       (a := Bool)
@@ -1122,7 +1161,9 @@ resolveWanted e sp search hm holeVal goal final = do
       Nil ->
         -- (not an error of its own where an instance that may have
         -- been the one wanted did not elaborate: that is reported)
-        if brokenInstanceIn e
+        if undetermined
+        then undecided MkUnit
+        else if brokenInstanceIn e
         then failElsewhere
             (a := Bool)
             sp
@@ -1139,21 +1180,22 @@ resolveWanted e sp search hm holeVal goal final = do
              ^ wantedByWhom e mc search)
             "declare one, `instance x : T`, bind one, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`"
       _ ->
-        failWithNote
-          (a := Bool)
-          sp
-          42
-          ("more than one instance for "
-           ^ goalShown e mc goal
-           ^ " in scope"
-           ^ wantedByWhom e mc search
-           ^ ": "
-           ^ joinWith
-             ", "
-             (List.map
-                (\(f : Fit) -> nameOf f.witness ^ " (" ^ f.witness.from ^ ")")
-                matches))
-          "they cannot be told apart by type (small values are statically opaque): give the argument explicitly"
+        if undetermined then undecided MkUnit
+        else failWithNote
+            (a := Bool)
+            sp
+            42
+            ("more than one instance for "
+             ^ goalShown e mc goal
+             ^ " in scope"
+             ^ wantedByWhom e mc search
+             ^ ": "
+             ^ joinWith
+               ", "
+               (List.map
+                  (\(f : Fit) -> nameOf f.witness ^ " (" ^ f.witness.from ^ ")")
+                  matches))
+            "they cannot be told apart by type (small values are statically opaque): give the argument explicitly"
 
 -- (an instance argument's search, tried where it is inserted, its goal
 -- known: where it fails, what it did is undone and it waits, as one
@@ -1176,14 +1218,16 @@ searchedNow e sp hole goal = do
     pure False)
 
 -- | an instance argument: a hole, found at once where its goal is known
--- | already (the arguments before it elaborated), so that what the
--- | instance says (its type members) is known to the arguments after
--- | it; else a `Wanted` that will find it once the goal is known
+-- | already (the arguments before it elaborated), or is evidence
+-- | (`isEvidence`), so that what the instance says (its type members)
+-- | is known to the arguments after it; else a `Wanted` that will find
+-- | it once the goal is known
 insertInstance : ElabEnv -> Params.Span -> Value.Ty -> String -> Elab Memoed.El
 insertInstance e sp goal name = do
   hole <- freshMeta e.scope.len e.scope.locals goal name sp
   mc0 <- gets (\c -> c.metas)
   ready <- pure (List.null (metasLeft e mc0 goal))
+  evidence <- pure (isEvidence mc0 goal)
   traceE
       sp
       "instance"
@@ -1191,8 +1235,9 @@ insertInstance e sp goal name = do
          "wanted "
          ^ goalShown e mc0 goal
          ^ (if ready then "  [ready at the call]"
+            else if evidence then "  [evidence: its one witness, or waits]"
             else "  [waits for implicits]"))
-  found <- if ready then searchedNow e sp hole goal else pure False
+  found <- if ready || evidence then searchedNow e sp hole goal else pure False
   if found then pure MkUnit
   else want
       sp
