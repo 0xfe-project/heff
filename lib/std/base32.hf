@@ -1,0 +1,179 @@
+-- Base32 (RFC 4648): bytes written as text, each five of them as eight
+-- digits of 32, the text padded with `=` to a multiple of eight.
+-- `encode` and `decode` take the standard digits, `A`-`Z` and `2`-`7`
+-- (Go's `base32.StdEncoding`); `encodeHex` and `decodeHex` the
+-- "extended hex" ones, `0`-`9` and `A`-`V`, which keep the bytes' order
+-- (Go's `base32.HexEncoding`), padded too.  The letters are upper case
+-- only.  Reading is strict: the padding is required, nothing but digits
+-- and it is read (no white space), and the bits left over in the last
+-- digit are 0.  Import it by a name, `import std.base32 as Base32`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.base32 as Base32
+--
+-- -- | >>> secret
+-- -- | "JBSWY3DPEE======"
+-- secret : String
+-- secret = Base32.encode (Bytes.fromString "Hello!")
+-- ```
+
+module std.base32 (encode, decode, encodeHex, decodeHex)
+
+import bytes as Bytes
+
+-- (`acc`, then the bytes of `s` from `i` on as digits among `digits`,
+-- five bytes at a time, the last one to four padded)
+encodeFrom : String -> String -> Int -> String -> String
+encodeFrom digits s i acc =
+  let left : Int = strLength s - i
+  in if left >= 5
+  then encodeFrom digits s (i + 5) (digitsFrom (valueOf 5) 34359738368 8 acc)
+  else if left > 0
+  then digitsFrom (valueOf left) 34359738368 ((left * 8 + 4) / 5) acc
+    ^ strSlice "======" 0 (8 - (left * 8 + 4) / 5)
+  else acc
+  where
+  -- (the `k` bytes from `i` as 40 bits, the high first, those after
+  -- them 0)
+  valueOf : Int -> Int
+  valueOf k = valueFrom 0 0
+    where
+    valueFrom : Int -> Int -> Int
+    valueFrom j n =
+      if j >= 5 then n
+      else valueFrom (j + 1) (n * 256 + (if j < k then byteAt s (i + j) else 0))
+  -- (`acc`, then `count` digits of the 40 bits `n`, the high first,
+  -- from the one that `place`, a power of 32, is the value of 1 in)
+  digitsFrom : Int -> Int -> Int -> String -> String
+  digitsFrom n place count acc =
+    if count <= 0 then acc
+    else (let d : Int = n / place % 32
+          in digitsFrom
+            n
+            (place / 32)
+            (count - 1)
+            (acc ^ strSlice digits d (d + 1)))
+
+-- (the bytes of `s`, digits whose values `digitValue` gives, -1 for what
+-- is none: eight at a time, only the last eight ending in `=`, after 2,
+-- 4, 5 or 7 digits, the bits left over in their last digit 0; `Nothing`
+-- where they are not so)
+decodeWith : (Int -> Int) -> String -> Maybe Bytes
+decodeWith digitValue s =
+  if strLength s % 8 /= 0 then Nothing
+  else maybe
+      Nothing
+      (\t -> Just (Bytes.fromString t))
+      (decodeFrom 0 "")
+  where
+  -- (how many digits there are from `i`, of eight at most, after `n`)
+  digitsAt : Int -> Int -> Int
+  digitsAt i n =
+    if n < 8 && digitValue (byteAt s (i + n)) >= 0 then digitsAt i (n + 1)
+    else n
+  -- (whether the bytes from `j` up to `e` are all `=`)
+  padded : Int -> Int -> Bool
+  padded j e = j >= e || byteAt s j == 61 && padded (j + 1) e
+  -- (the `n` digits from `i` as 40 bits, the high first, those after
+  -- them 0)
+  valueOf : Int -> Int -> Int
+  valueOf i n = valueFrom 0 0
+    where
+    valueFrom : Int -> Int -> Int
+    valueFrom j v =
+      if j >= 8 then v
+      else valueFrom
+          (j + 1)
+          (v * 32 + (if j < n then digitValue (byteAt s (i + j)) else 0))
+  -- (`acc`, then the high `k` bytes of the 40 bits `v`)
+  bytesOf : Int -> Int -> String -> String
+  bytesOf v k acc = bytesFrom 4294967296 k acc
+    where
+    -- (`a`, then `count` bytes of `v` from the one that `place`, a power
+    -- of 256, is the value of 1 in)
+    bytesFrom : Int -> Int -> String -> String
+    bytesFrom place count a =
+      if count <= 0 then a
+      else bytesFrom
+          (place / 256)
+          (count - 1)
+          (a ^ byteString (v / place % 256))
+  -- (2 to the `k`)
+  power2 : Int -> Int
+  power2 k = if k <= 0 then 1 else 2 * power2 (k - 1)
+  -- (`acc`, then the bytes of the digits of `s` from `i` on)
+  decodeFrom : Int -> String -> Maybe String
+  decodeFrom i acc =
+    let n : Int = digitsAt i 0
+    in if i >= strLength s then Just acc
+    else if n == 8
+    then decodeFrom (i + 8) (bytesOf (valueOf i 8) 5 acc)
+    else if i + 8 >= strLength s
+            && (n == 2 || n == 4 || n == 5 || n == 7)
+            && padded (i + n) (i + 8)
+            && valueOf i n % power2 (40 - n * 5 / 8 * 8) == 0
+    then Just (bytesOf (valueOf i n) (n * 5 / 8) acc)
+    else Nothing
+
+-- | The bytes as base32's standard digits, padded with `=` (Go's
+-- | `base32.StdEncoding`).  RFC 4648's examples:
+-- | >>> List.map (\s -> encode (Bytes.fromString s)) ["", "f", "fo", "foo", "foob", "fooba", "foobar"]
+-- | ["", "MY======", "MZXQ====", "MZXW6===", "MZXW6YQ=", "MZXW6YTB", "MZXW6YTBOI======"]
+-- | >>> encode b[0, 68, 50, 20, 199, 66, 84, 182, 53, 207, 132, 101, 58, 86, 215, 198, 117, 190, 119, 223]
+-- | "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+-- | >>> encode b[255, 255, 255, 255, 255]
+-- | "77777777"
+encode : Bytes -> String
+encode b = encodeFrom "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" (Bytes.asString b) 0 ""
+
+-- | The bytes the standard digits are, read strictly: `Nothing` where
+-- | the text is not a multiple of eight digits long, has anything but
+-- | digits and its padding (white space and lower case too), lacks its
+-- | padding, or has bits left over in its last digit that are not 0.
+-- | >>> List.map decode ["", "MY======", "MZXQ====", "MZXW6===", "MZXW6YQ=", "MZXW6YTB", "MZXW6YTBOI======"]
+-- | [Just b[], Just b["f"], Just b["fo"], Just b["foo"], Just b["foob"], Just b["fooba"], Just b["foobar"]]
+-- | >>> decode "77777777"
+-- | Just b[255, 255, 255, 255, 255]
+-- |
+-- | (no padding, padding but at the end, too much or too little of it,
+-- | white space, lower case, the hex digits, bits left over)
+-- | >>> List.map decode ["MY", "MZXW6", "MY======MZXW6YTB", "M=======", "MZX=====", "MZXW6Y==", "MZXW6YTB\n", "MZ XW6YTB", "mzxw6ytb", "CO======", "MZ======", "MZXR====", "MZXW7===", "MZXW6YR=", "========"]
+-- | [Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing]
+decode : String -> Maybe Bytes
+decode s = decodeWith digitValue s
+  where
+  -- (the value of the byte `c` as a standard digit, 0 to 31; -1 where it
+  -- is none)
+  digitValue : Int -> Int
+  digitValue c =
+    if 65 <= c && c <= 90 then c - 65
+    else if 50 <= c && c <= 55 then c - 24
+    else 0 - 1
+
+-- | The bytes as the "extended hex" digits, `0`-`9` then `A`-`V`, padded
+-- | with `=` (Go's `base32.HexEncoding`).  RFC 4648's examples:
+-- | >>> List.map (\s -> encodeHex (Bytes.fromString s)) ["", "f", "fo", "foo", "foob", "fooba", "foobar"]
+-- | ["", "CO======", "CPNG====", "CPNMU===", "CPNMUOG=", "CPNMUOJ1", "CPNMUOJ1E8======"]
+-- | >>> encodeHex b[0, 68, 50, 20, 199, 66, 84, 182, 53, 207, 132, 101, 58, 86, 215, 198, 117, 190, 119, 223]
+-- | "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+encodeHex : Bytes -> String
+encodeHex b =
+  encodeFrom "0123456789ABCDEFGHIJKLMNOPQRSTUV" (Bytes.asString b) 0 ""
+
+-- | The bytes the "extended hex" digits are, read as strictly as
+-- | `decode` reads.
+-- | >>> List.map decodeHex ["", "CO======", "CPNG====", "CPNMU===", "CPNMUOG=", "CPNMUOJ1", "CPNMUOJ1E8======"]
+-- | [Just b[], Just b["f"], Just b["fo"], Just b["foo"], Just b["foob"], Just b["fooba"], Just b["foobar"]]
+-- | >>> List.map decodeHex ["MY======", "cpnmuoj1", "CPNMUOJ1E8", "CP======", "CPNMUOJW"]
+-- | [Nothing, Nothing, Nothing, Nothing, Nothing]
+decodeHex : String -> Maybe Bytes
+decodeHex s = decodeWith digitValue s
+  where
+  -- (the value of the byte `c` as an "extended hex" digit, 0 to 31; -1
+  -- where it is none)
+  digitValue : Int -> Int
+  digitValue c =
+    if 48 <= c && c <= 57 then c - 48
+    else if 65 <= c && c <= 86 then c - 55
+    else 0 - 1
