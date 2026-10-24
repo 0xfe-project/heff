@@ -1,0 +1,160 @@
+-- Base64 (RFC 4648): bytes written as text, each three of them as four
+-- digits of 64, `A`-`Z`, `a`-`z`, `0`-`9` and two more, the text padded
+-- with `=` to a multiple of four.  `encode` and `decode` take the
+-- standard digits, `+` and `/` (Go's `base64.StdEncoding`);
+-- `encodeURL` and `decodeURL` those safe in a URL or a file name, `-`
+-- and `_` (Go's `base64.URLEncoding`), padded too.  Reading is strict,
+-- as Go's `Strict` reads: the padding is required, nothing but digits
+-- and it is read (no white space), and the bits left over in the last
+-- digit are 0.  Import it by a name, `import std.base64 as Base64`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.base64 as Base64
+--
+-- -- | >>> greeting
+-- -- | "aGk/Pz4="
+-- greeting : String
+-- greeting = Base64.encode (Bytes.fromString "hi??>")
+-- ```
+
+module std.base64 (encode, decode, encodeURL, decodeURL)
+
+import bytes as Bytes
+
+-- (`acc`, then the bytes of `s` from `i` on as digits among `digits`,
+-- three bytes at a time, the last one or two padded)
+encodeFrom : String -> String -> Int -> String -> String
+encodeFrom digits s i acc =
+  let left : Int = strLength s - i
+  in if left >= 3
+  then (let n : Int =
+          byteAt s i * 65536 + byteAt s (i + 1) * 256 + byteAt s (i + 2)
+        in encodeFrom
+          digits
+          s
+          (i + 3)
+          (acc
+           ^ digitOf (n / 262144)
+           ^ digitOf (n / 4096 % 64)
+           ^ digitOf (n / 64 % 64)
+           ^ digitOf (n % 64)))
+  else if left == 2
+  then (let n : Int = byteAt s i * 256 + byteAt s (i + 1)
+        in acc
+        ^ digitOf (n / 1024)
+        ^ digitOf (n / 16 % 64)
+        ^ digitOf (n % 16 * 4)
+        ^ "=")
+  else if left == 1
+  then acc
+    ^ digitOf (byteAt s i / 4)
+    ^ digitOf (byteAt s i % 4 * 16)
+    ^ "=="
+  else acc
+  where
+  -- (the digit of `n`, 0 to 63, among `digits`)
+  digitOf : Int -> String
+  digitOf n = strSlice digits n (n + 1)
+
+-- (the bytes of `s`, digits among which the 62nd and 63rd are `c62` and
+-- `c63`)
+decodeWith : Int -> Int -> String -> Maybe Bytes
+decodeWith c62 c63 s =
+  if strLength s % 4 /= 0 then Nothing
+  else maybe
+      Nothing
+      (\t -> Just (Bytes.fromString t))
+      (decodeFrom 0 "")
+  where
+  -- (the value of the byte `c` as a digit, 0 to 63, the 62nd and 63rd
+  -- digits `c62` and `c63`; -1 where it is none)
+  digitValue : Int -> Int
+  digitValue c =
+    if 65 <= c && c <= 90 then c - 65
+    else if 97 <= c && c <= 122 then c - 71
+    else if 48 <= c && c <= 57 then c + 4
+    else if c == c62 then 62
+    else if c == c63 then 63
+    else 0 - 1
+  -- (`acc`, then the bytes of the digits of `s` from `i` on, four at a
+  -- time, the 62nd and 63rd digits `c62` and `c63`, its length a multiple
+  -- of four: only the last four may end in `=` or `==`, the bits left over
+  -- in their last digit 0; `Nothing` where they are not so)
+  decodeFrom : Int -> String -> Maybe String
+  decodeFrom i acc =
+    let a : Int = digitValue (byteAt s i)
+    in let b : Int = digitValue (byteAt s (i + 1))
+    in let c : Int = digitValue (byteAt s (i + 2))
+    in let d : Int = digitValue (byteAt s (i + 3))
+    in let last : Bool = i + 4 >= strLength s
+    in if i >= strLength s then Just acc
+    else if a < 0 || b < 0 then Nothing
+    else if c >= 0 && d >= 0
+    then decodeFrom
+        (i + 4)
+        (acc
+         ^ byteString (a * 4 + b / 16)
+         ^ byteString (b % 16 * 16 + c / 4)
+         ^ byteString (c % 4 * 64 + d))
+    else if last
+            && byteAt s (i + 2) == 61
+            && byteAt s (i + 3) == 61
+            && b % 16 == 0
+    then Just (acc ^ byteString (a * 4 + b / 16))
+    else if last && c >= 0 && byteAt s (i + 3) == 61 && c % 4 == 0
+    then Just
+        (acc ^ byteString (a * 4 + b / 16) ^ byteString (b % 16 * 16 + c / 4))
+    else Nothing
+
+-- | The bytes as base64's standard digits, padded with `=` (Go's
+-- | `base64.StdEncoding`).  RFC 4648's examples:
+-- | >>> List.map (\s -> encode (Bytes.fromString s)) ["", "f", "fo", "foo", "foob", "fooba", "foobar"]
+-- | ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]
+-- | >>> encode b[0, 16, 131, 16, 81, 135, 32, 146, 139, 48, 211, 143, 65, 20, 147, 81, 85, 151, 97, 150, 155, 113, 215, 159, 130, 24, 163, 146, 89, 167, 162, 154, 171, 178, 219, 175, 195, 28, 179, 211, 93, 183, 227, 158, 187, 243, 223, 191]
+-- | "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+encode : Bytes -> String
+encode b = encodeFrom standardDigits (Bytes.asString b) 0 ""
+  where
+  -- (the standard digits, from 0 to 63)
+  standardDigits : String
+  standardDigits =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+-- | The bytes the standard digits are, read strictly: `Nothing` where
+-- | the text is not a multiple of four digits long, has anything but
+-- | digits and its padding (white space too), lacks its padding, or
+-- | has bits left over in its last digit that are not 0.
+-- | >>> List.map decode ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"]
+-- | [Just b[], Just b["f"], Just b["fo"], Just b["foo"], Just b["foob"], Just b["fooba"], Just b["foobar"]]
+-- | >>> decode "+/8="
+-- | Just b[251, 255]
+-- |
+-- | (no padding, padding but at the end, white space, URL's digits,
+-- | bits left over)
+-- | >>> List.map decode ["Zg", "Zm8", "Zg==Zm9v", "Zm9v\n", "Zm 9v", "-_8=", "Zh==", "Zm9=", "Z===", "===="]
+-- | [Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing]
+decode : String -> Maybe Bytes
+decode s = decodeWith 43 47 s
+
+-- | The bytes as the base64 digits safe in a URL, `-` and `_` for `+`
+-- | and `/`, padded with `=` (Go's `base64.URLEncoding`).
+-- | >>> encodeURL b[251, 255, 191]
+-- | "-_-_"
+-- | >>> encodeURL (Bytes.fromString "foob")
+-- | "Zm9vYg=="
+encodeURL : Bytes -> String
+encodeURL b = encodeFrom urlDigits (Bytes.asString b) 0 ""
+  where
+  -- (the digits safe in a URL, from 0 to 63)
+  urlDigits : String
+  urlDigits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+-- | The bytes the digits safe in a URL are, read as strictly as
+-- | `decode` reads.
+-- | >>> decodeURL "-_-_"
+-- | Just b[251, 255, 191]
+-- | >>> List.map decodeURL ["+/+/", "Zm9vYg", "Zm9vYg=="]
+-- | [Nothing, Nothing, Just b["foob"]]
+decodeURL : String -> Maybe Bytes
+decodeURL s = decodeWith 45 95 s

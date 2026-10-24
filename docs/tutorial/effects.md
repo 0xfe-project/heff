@@ -137,6 +137,7 @@ and so does std.filesystem's `withStdout` with `writeBytes`.
 `Bytes.toString` is for text: it reads the bytes as UTF-8, and what is
 not UTF-8 becomes U+FFFD, which is not what a PNG wants.
 
-std.time has [`sleep`](../api/std/time.md#sleep) and two clocks, both in
-nanoseconds: `now`, the time of day since the epoch, and `monotonic`,
-which only goes forward and measures how long something took.
+std.time has [`sleep`](../api/std/time.md#sleep), for a `Duration`
+(std.duration), and two clocks: `now`, the time of day, an `Instant`
+(std.instant), and `monotonic`, a `Duration` that only goes forward and
+measures how long something took.

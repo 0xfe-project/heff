@@ -1,36 +1,73 @@
--- Regular expressions, a small part of RE2's (Go's) syntax, matched
--- anywhere in a string as Go's `MatchString` matches: what `heff test
--- --run` selects tests by.  A pattern is read once (`compile`), and
--- what it does not have is an error, not a literal, so that a pattern
--- means the same once more of the syntax is read.
+-- Regular expressions, of RE2's (Go's) syntax, matched as Go's
+-- `regexp` matches: leftmost first, each `|` and repetition preferring
+-- what it is written to prefer, in time linear in the string (no
+-- backtracking: the threads of an NFA run side by side, as RE2's do).
+-- What `heff test --run` selects tests by.  A pattern is read once
+-- (`compile`), and what it does not have is an error, not a literal, so
+-- that a pattern means the same once more of the syntax is read.
 --
--- - a byte stands for itself; `.` for any byte;
--- - `[abc]`, `[a-z0-9]`: one byte of the class; `[^...]`: one not of it;
--- - `\` before a byte that is not a letter or a digit: that byte
---   (`\.`, `\[`, `\\`);
--- - after an atom, `*` (any number of it), `+` (one or more), `?` (one
---   or none);
--- - `^` first: at the start only; `$` last: at the end only;
--- - `a|b`: either, the whole pattern's (there are no groups).
+-- - a rune stands for itself; `.` for any rune but a line break;
+-- - `[abc]`, `[a-z0-9]`: one rune of the class; `[^...]`: one not of
+--   it (a `]` first in it is one of it, as a `-` first or last is);
+-- - `\d`, `\w`, `\s`: a digit, a word's rune (`[0-9A-Za-z_]`), a space
+--   (`[\t\n\f\r ]`), in a class too; `\D`, `\W`, `\S`: what they are not;
+-- - `\n`, `\t`, `\r`, `\f`, `\v`: those runes; `\` before a rune that is
+--   not a letter or a digit: that rune (`\.`, `\[`, `\\`);
+-- - `^`, `\A`: the start of the string; `$`, `\z`: its end; `\b`: where a
+--   word's rune is on one side only; `\B`: where it is not;
+-- - `(...)`: a group, its match kept (numbered by its `(`, from 1);
+--   `(?:...)`: a group that is not;
+-- - after an atom, `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (n and m at most
+--   1000): any number of it, one or more, one or none, n, n or more, n to
+--   m -- as many as can be; each followed by `?`, as few;
+-- - `a|b`: either, the first preferred.
 --
--- It is read by bytes: `.` and a class match one byte, not one rune of
--- UTF-8.  Groups `(...)`, counts `{n}`, `\d` and its kind are not read.
+-- Flags and named groups, `(?i)`, `(?P<name>...)`, and classes by
+-- name, `[[:alpha:]]`, `\pL`, are not read.  Positions are of bytes, as
+-- a string's are; a rune of a string that is not UTF-8 is U+FFFD, a
+-- byte wide, as `runeAt` reads it.
 
 module regex
+  ( Regex
+  , compile
+  , compileLevels
+  , matches
+  , findIndex
+  , find
+  , submatches
+  , findAllIndex
+  , findAll
+  , replaceAll
+  , replaceAllWith
+  , split
+  )
 
--- | What one byte is held to: any, one, or one of (or, `True`, not of)
--- | ranges of bytes.
-data Atom = AnyByte | Byte Int | Class Bool (List (Pair Int Int))
+import array as Array
 
--- | An atom, once, once or not, any number of times, or one or more.
-data Piece = Once Atom | Optional Atom | Many Atom | Some Atom
+-- The syntax
+--------------------------------------------------------------------------------
 
--- | One alternative: whether it is held to the start, its pieces, and
--- | whether it is held to the end.
-type Branch = { start : Bool, pieces : List Piece, end : Bool }
+-- | What holds at a place between two runes, matching none.
+data Assertion = AtStart | AtEnd | AtWordBoundary | NotAtWordBoundary
 
--- | A pattern read: its alternatives.
-data Regex = MkRegex (List Branch)
+-- | A pattern read: one rune of ranges (or, `True`, not of them), a
+-- | place, a group (its number), one after another, either of, or a
+-- | repetition (at least, at most -- -1: no most -- and whether as many
+-- | as can be).
+data Node
+  = EmptyMatch
+  | Runes Bool (List (Pair Int Int))
+  | Assert Assertion
+  | Group Int Node
+  | Concat (List Node)
+  | Alternate (List Node)
+  | Repeat Int Int Bool Node
+
+-- | What a group being read has so far: its number (-1, the whole
+-- | pattern's or one kept not), its branches before the last `|`, the
+-- | other way round, and the nodes of the branch after it, the other way
+-- | round too.
+type Frame = { group : Int, branches : List Node, current : List Node }
 
 -- Reading
 --------------------------------------------------------------------------------
@@ -43,184 +80,739 @@ isLetterOrDigit c =
 byteText : String -> Int -> String
 byteText s i = strSlice s i (i + 1)
 
--- (the string cut at each `sep` that is not escaped nor in a class)
-splitGo : Int -> String -> Int -> Int -> Bool -> List String -> List String
-splitGo sep s from i inClass acc =
-  if i >= strLength s then List.reverse (Cons (strSlice s from i) acc)
-  else if byteAt s i == 92 then splitGo sep s from (i + 2) inClass acc
-  else if inClass then splitGo sep s from (i + 1) (byteAt s i /= 93) acc
-  else if byteAt s i == 91 then splitGo sep s from (i + 1) True acc
-  else if byteAt s i == sep
-  then splitGo sep s (i + 1) (i + 1) False (Cons (strSlice s from i) acc)
-  else splitGo sep s from (i + 1) False acc
+-- (the ranges of `\d`, `\w`, `\s` -- `c` the letter -- and whether they
+-- are those of what they are not, `\D`, `\W`, `\S`)
+perlClass : Int -> Maybe (Pair Bool (List (Pair Int Int)))
+perlClass c =
+  if c == 100 then Just (MkPair False digitRanges)
+  else if c == 68 then Just (MkPair True digitRanges)
+  else if c == 119 then Just (MkPair False wordRanges)
+  else if c == 87 then Just (MkPair True wordRanges)
+  else if c == 115 then Just (MkPair False spaceRanges)
+  else if c == 83 then Just (MkPair True spaceRanges)
+  else Nothing
+  where
+  -- (the ranges of `\d`, `\w` and `\s`)
+  digitRanges : List (Pair Int Int)
+  digitRanges = [MkPair 48 57]
+  wordRanges : List (Pair Int Int)
+  wordRanges = [MkPair 48 57, MkPair 65 90, MkPair 95 95, MkPair 97 122]
+  spaceRanges : List (Pair Int Int)
+  spaceRanges = [MkPair 9 10, MkPair 12 13, MkPair 32 32]
 
--- | The pattern cut at each byte `sep` that is not escaped (`\`) nor in
--- | a class (`[...]`).
--- | >>> splitOutside 124 "a|b[|]|c\\|d"
--- | ["a", "b[|]", "c\\|d"]
-splitOutside : Int -> String -> List String
-splitOutside sep s = splitGo sep s 0 0 False Nil
+-- (the rune `\n`, `\t`, `\r`, `\f`, `\v` stand for -- `c` the letter --
+-- or -1)
+controlEscape : Int -> Int
+controlEscape c =
+  if c == 110 then 10
+  else if c == 116 then 9
+  else if c == 114 then 13
+  else if c == 102 then 12
+  else if c == 118 then 11
+  else -1
 
--- (a byte of a class at `i`, escaped or not, and where it ends)
-classByte : String -> Int -> Either String (Pair Int Int)
-classByte s i =
-  if i >= strLength s then Left "a `[` with no `]`"
-  else if byteAt s i /= 92 then Right (MkPair (byteAt s i) (i + 1))
-  else if i + 1 >= strLength s then Left "a `\\` at the end"
-  else if isLetterOrDigit (byteAt s (i + 1))
-  then Left
-      ("`\\"
-       ^ byteText s (i + 1)
-       ^ "` is not read: escape only what is not a letter or a digit")
-  else Right (MkPair (byteAt s (i + 1)) (i + 2))
+-- (the rune at `i`, and where it ends)
+literalAt : String -> Int -> Pair Int Int
+literalAt s i = MkPair (runeToInt (strRuneAt s i)) (i + strRuneWidth s i)
 
--- (a class's ranges from `i` to its `]`, backwards, and where it ends)
+notRead : String -> Int -> String
+notRead s i =
+  "`\\"
+  ^ byteText s i
+  ^ "` is not read: escape only what is not a letter or a digit"
+
+-- (a class's ranges from `i` to its `]`, the other way round, and where
+-- it ends; `first`, whether `i` is its first place, where a `]` is one
+-- of it)
 classFrom : String
           -> Int
+          -> Bool
           -> List (Pair Int Int)
           -> Either String (Pair (List (Pair Int Int)) Int)
-classFrom s i acc =
+classFrom s i first acc =
   if i >= strLength s then Left "a `[` with no `]`"
-  else if byteAt s i == 93
-  then (if List.null acc then Left "an empty class, `[]`"
-        else Right (MkPair acc (i + 1)))
-  else case classByte s i of
+  else if byteAt s i == 93 && not first then Right (MkPair acc (i + 1))
+  else if byteAt s i == 91 && i + 1 < strLength s && byteAt s (i + 1) == 58
+  then Left "classes by name, `[:alpha:]`, are not read"
+  else if byteAt s i == 92
+          && i + 1 < strLength s
+          && isLetterOrDigit (byteAt s (i + 1))
+          && controlEscape (byteAt s (i + 1)) < 0
+  then (case perlClass (byteAt s (i + 1)) of
+        Just (MkPair False rs) ->
+          classFrom s (i + 2) False (List.reverse rs ++ acc)
+        Just (MkPair True rs) ->
+          Left ("`\\" ^ byteText s (i + 1) ^ "` in a class is not read")
+        Nothing -> Left (notRead s (i + 1)))
+  else case classRune i of
     Left why -> Left why
     Right (MkPair lo j) ->
       if j + 1 < strLength s && byteAt s j == 45 && byteAt s (j + 1) /= 93
-      then (case classByte s (j + 1) of
+      then (case classRune (j + 1) of
             Left why -> Left why
             Right (MkPair hi k) ->
               if hi < lo then Left "a range of a class backwards"
-              else classFrom s k (Cons (MkPair lo hi) acc))
-      else classFrom s j (Cons (MkPair lo lo) acc)
+              else classFrom s k False (Cons (MkPair lo hi) acc))
+      else classFrom s j False (Cons (MkPair lo lo) acc)
+  where
+  -- (a rune of a class at `i`, escaped or not, and where it ends; or, of
+  -- `\d` and its kind, `-1`, the ranges to be had by `perlClass`)
+  classRune : Int -> Either String (Pair Int Int)
+  classRune i =
+    if i >= strLength s then Left "a `[` with no `]`"
+    else if byteAt s i /= 92 then Right (literalAt s i)
+    else if i + 1 >= strLength s then Left "a `\\` at the end"
+    else if controlEscape (byteAt s (i + 1)) >= 0
+    then Right (MkPair (controlEscape (byteAt s (i + 1))) (i + 2))
+    else if isLetterOrDigit (byteAt s (i + 1)) then Left (notRead s (i + 1))
+    else Right (literalAt s (i + 1))
 
--- (a class, `i` just after its `[`)
-classAt : String -> Int -> Either String (Pair Atom Int)
+-- (a class, `i` just after its `[`, and where it ends)
+classAt : String -> Int -> Either String (Pair Node Int)
 classAt s i =
   if i < strLength s && byteAt s i == 94
-  then (case classFrom s (i + 1) Nil of
+  then (case classFrom s (i + 1) True Nil of
         Left why -> Left why
-        Right (MkPair rs j) -> Right (MkPair (Class True rs) j))
-  else case classFrom s i Nil of
+        Right (MkPair rs j) -> Right (MkPair (Runes True rs) j))
+  else case classFrom s i True Nil of
     Left why -> Left why
-    Right (MkPair rs j) -> Right (MkPair (Class False rs) j)
+    Right (MkPair rs j) -> Right (MkPair (Runes False rs) j)
 
--- (the atom at `i`, and where it ends)
-atomAt : String -> Int -> Either String (Pair Atom Int)
-atomAt s i =
-  if byteAt s i == 46 then Right (MkPair AnyByte (i + 1))
-  else if byteAt s i == 91 then classAt s (i + 1)
-  else if byteAt s i == 92
-  then (case classByte s i of
-        Left why -> Left why
-        Right (MkPair b j) -> Right (MkPair (Byte b) j))
-  else if byteAt s i == 40 || byteAt s i == 41
-  then Left "groups, `(...)`, are not read"
-  else if byteAt s i == 123 || byteAt s i == 125
-  then Left "counts, `{n}`, are not read"
-  else if byteAt s i == 42 || byteAt s i == 43 || byteAt s i == 63
-  then Left ("a `" ^ byteText s i ^ "` with nothing before it to repeat")
-  else if byteAt s i == 94 then Left "a `^` not at the start"
-  else if byteAt s i == 36 then Left "a `$` not at the end"
-  else Right (MkPair (Byte (byteAt s i)) (i + 1))
+-- (an escape, `i` at its `\`, as a node, and where it ends)
+escapeAt : String -> Int -> Either String (Pair Node Int)
+escapeAt s i =
+  if i + 1 >= strLength s then Left "a `\\` at the end"
+  else (let c : Int = byteAt s (i + 1)
+        in if c == 98 then Right (MkPair (Assert AtWordBoundary) (i + 2))
+        else if c == 66 then Right (MkPair (Assert NotAtWordBoundary) (i + 2))
+        else if c == 65 then Right (MkPair (Assert AtStart) (i + 2))
+        else if c == 122 then Right (MkPair (Assert AtEnd) (i + 2))
+        else case perlClass c of
+          Just (MkPair neg rs) -> Right (MkPair (Runes neg rs) (i + 2))
+          Nothing ->
+            if controlEscape c >= 0
+            then Right
+                (MkPair
+                   (Runes False [MkPair (controlEscape c) (controlEscape c)])
+                   (i + 2))
+            else if isLetterOrDigit c then Left (notRead s (i + 1))
+            else (case literalAt s (i + 1) of
+                  MkPair r j -> Right (MkPair (Runes False [MkPair r r]) j)))
 
--- (the atom, repeated as the byte after it says, and where it ends)
-repeated : String -> Atom -> Int -> Pair Piece Int
-repeated s a i =
-  if i >= strLength s then MkPair (Once a) i
-  else if byteAt s i == 42 then MkPair (Many a) (i + 1)
-  else if byteAt s i == 43 then MkPair (Some a) (i + 1)
-  else if byteAt s i == 63 then MkPair (Optional a) (i + 1)
-  else MkPair (Once a) i
+-- (a count, `i` just after its `{`: at least, at most -- -1, no most --
+-- and where it ends; not a count, `Nothing`, the `{` a rune)
+countAt : String -> Int -> Maybe (Pair (Pair Int Int) Int)
+countAt s i = case numberAt i of
+  MkPair least j ->
+    if least < 0 || j >= strLength s then Nothing
+    else if byteAt s j == 125 then Just (MkPair (MkPair least least) (j + 1))
+    else if byteAt s j /= 44 then Nothing
+    else if j + 1 < strLength s && byteAt s (j + 1) == 125
+    then Just (MkPair (MkPair least (0 - 1)) (j + 2))
+    else (case numberAt (j + 1) of
+          MkPair most k ->
+            if most >= 0 && k < strLength s && byteAt s k == 125
+            then Just (MkPair (MkPair least most) (k + 1))
+            else Nothing)
+  where
+  -- (the digits from `i` on, the number they are and where they end; no
+  -- digit, -1)
+  numberAt : Int -> Pair Int Int
+  numberAt i = digits i (0 - 1)
+    where
+    digits : Int -> Int -> Pair Int Int
+    digits j n =
+      if j < strLength s && byteAt s j >= 48 && byteAt s j <= 57
+      then digits (j + 1) ((if n < 0 then 0 else n) * 10 + byteAt s j - 48)
+      else MkPair n j
 
--- (the pieces of a branch from `i`, backwards; and whether a `$` ends it)
-piecesFrom : String
+-- (the nodes of a branch, the other way round, as one)
+concatOf : List Node -> Node
+concatOf Nil = EmptyMatch
+concatOf (Cons x Nil) = x
+concatOf xs = Concat (List.reverse xs)
+
+-- (a group's branches, as one)
+closed : Frame -> Node
+closed f = case List.reverse (Cons (concatOf f.current) f.branches) of
+  Cons x Nil -> x
+  bs -> Alternate bs
+
+-- (the group read so far with `x` after what it has)
+withNode : Node -> Frame -> Frame
+withNode x f = { f | current = Cons x f.current }
+
+-- (the last node of the group read so far repeated -- at least, at most,
+-- the operator as written -- and whether as many as can be by what is
+-- at `i`; and where it ends)
+repeatedIn : String
            -> Int
-           -> List Piece
-           -> Either String (Pair (List Piece) Bool)
-piecesFrom s i acc =
-  if i >= strLength s then Right (MkPair acc False)
-  else if byteAt s i == 36 && i + 1 == strLength s then Right (MkPair acc True)
-  else case atomAt s i of
-    Left why -> Left why
-    Right (MkPair a j) -> case repeated s a j of
-      MkPair p k -> piecesFrom s k (Cons p acc)
+           -> Int
+           -> Int
+           -> String
+           -> Frame
+           -> Either String (Pair Frame Int)
+repeatedIn s i least most op f = case f.current of
+  Nil -> Left ("a `" ^ op ^ "` with nothing before it to repeat")
+  Cons (Repeat _ _ _ _) _ ->
+    Left
+      ("a `"
+       ^ op
+       ^ "` after a repetition: repeat a group of it, `(?:...)`")
+  Cons x rest ->
+    if least > 1000 || most > 1000 then Left "a count above 1000"
+    else if most >= 0 && most < least
+    then Left "a count backwards, `{n,m}` with m below n"
+    else if i < strLength s && byteAt s i == 63
+    then Right
+        (MkPair { f | current = Cons (Repeat least most False x) rest } (i + 1))
+    else Right (MkPair { f | current = Cons (Repeat least most True x) rest } i)
 
-branchOf : String -> Either String Branch
-branchOf b =
-  if startsWith "^" b
-  then (case piecesFrom b 1 Nil of
-        Left why -> Left why
-        Right (MkPair ps end) ->
-          Right { start = True, pieces = List.reverse ps, end = end })
-  else case piecesFrom b 0 Nil of
-    Left why -> Left why
-    Right (MkPair ps end) ->
-      Right { start = False, pieces = List.reverse ps, end = end }
+-- (the pattern read from `i`, the groups being read -- the innermost
+-- first -- and how many are numbered so far: the whole of it, and how
+-- many groups it numbers)
+readFrom : String
+         -> Int
+         -> Int
+         -> Frame
+         -> List Frame
+         -> Either String (Pair Node Int)
+readFrom s i groups top outer =
+  if i >= strLength s
+  then (if List.null outer then Right (MkPair (closed top) groups)
+        else Left "a `(` with no `)`")
+  else (let c : Int = byteAt s i
+        in if c == 40
+        then (if startsWith "(?:" (strSlice s i (i + 3))
+              then readFrom
+                  s
+                  (i + 3)
+                  groups
+                  { group = 0 - 1, branches = Nil, current = Nil }
+                  (Cons top outer)
+              else if i + 1 < strLength s && byteAt s (i + 1) == 63
+              then Left "flags and named groups, `(?...)`, are not read"
+              else readFrom
+                  s
+                  (i + 1)
+                  (groups + 1)
+                  { group = groups + 1, branches = Nil, current = Nil }
+                  (Cons top outer))
+        else if c == 41
+        then (case outer of
+              Nil -> Left "a `)` with no `(`"
+              Cons parent rest ->
+                readFrom
+                  s
+                  (i + 1)
+                  groups
+                  (withNode
+                     (if top.group < 0 then closed top
+                      else Group top.group (closed top))
+                     parent)
+                  rest)
+        else if c == 124
+        then readFrom
+            s
+            (i + 1)
+            groups
+            { top
+            | branches = Cons (concatOf top.current) top.branches
+            , current = Nil
+            }
+            outer
+        else if c == 42 || c == 43 || c == 63
+        then (case repeatedIn
+                s
+                (i + 1)
+                (if c == 43 then 1 else 0)
+                (if c == 63 then 1 else 0 - 1)
+                (byteText s i)
+                top of
+              Left why -> Left why
+              Right (MkPair f j) -> readFrom s j groups f outer)
+        else if c == 123
+        then (case countAt s (i + 1) of
+              Just (MkPair (MkPair least most) j) ->
+                (case repeatedIn s j least most "{" top of
+                 Left why -> Left why
+                 Right (MkPair f k) -> readFrom s k groups f outer)
+              Nothing ->
+                readFrom
+                  s
+                  (i + 1)
+                  groups
+                  (withNode (Runes False [MkPair 123 123]) top)
+                  outer)
+        else if c == 94
+        then readFrom s (i + 1) groups (withNode (Assert AtStart) top) outer
+        else if c == 36
+        then readFrom s (i + 1) groups (withNode (Assert AtEnd) top) outer
+        else if c == 46
+        then readFrom
+            s
+            (i + 1)
+            groups
+            (withNode (Runes True [MkPair 10 10]) top)
+            outer
+        else if c == 91
+        then (case classAt s (i + 1) of
+              Left why -> Left why
+              Right (MkPair x j) -> readFrom s j groups (withNode x top) outer)
+        else if c == 92
+        then (case escapeAt s i of
+              Left why -> Left why
+              Right (MkPair x j) -> readFrom s j groups (withNode x top) outer)
+        else (case literalAt s i of
+              MkPair r j ->
+                readFrom
+                  s
+                  j
+                  groups
+                  (withNode (Runes False [MkPair r r]) top)
+                  outer))
 
-consRead : {a : Type} -> a -> Either String (List a) -> Either String (List a)
-consRead x (Left why) = Left why
-consRead x (Right xs) = Right (Cons x xs)
+-- | The pattern read, as a node, and how many groups it numbers; or what
+-- | is wrong with it.
+parse : String -> Either String (Pair Node Int)
+parse p = readFrom p 0 0 { group = 0 - 1, branches = Nil, current = Nil } Nil
+
+-- The program
+--------------------------------------------------------------------------------
+
+-- | A step of the program a pattern is compiled to: a rune taken, of the
+-- | ranges (or, `True`, not of them); two ways on, the first preferred;
+-- | one; the place kept in a slot; a place held to; the match.
+data Instruction
+  = Take Bool (List (Pair Int Int))
+  | Fork Int Int
+  | Jump Int
+  | Keep Int
+  | Hold Assertion
+  | Done
+
+-- | A pattern compiled: its program, and how many groups it numbers.
+data Regex = MkRegex (Array Instruction) Int
+
+-- (how many steps the program of a node is)
+sizeOf : Node -> Int
+sizeOf EmptyMatch = 0
+sizeOf (Runes _ _) = 1
+sizeOf (Assert _) = 1
+sizeOf (Group _ x) = sizeOf x + 2
+sizeOf (Concat xs) = List.sum (List.map sizeOf xs)
+sizeOf (Alternate xs) = List.sum (List.map sizeOf xs) + 2 * (List.length xs - 1)
+sizeOf (Repeat least most _ x) =
+  least * sizeOf x
+  + (if most < 0 then sizeOf x + 2 else (most - least) * (sizeOf x + 1))
+
+-- (the program of a node, its first step at `at`)
+emit : Node -> Int -> List Instruction
+emit EmptyMatch at = Nil
+emit (Runes neg rs) at = [Take neg rs]
+emit (Assert a) at = [Hold a]
+emit (Group n x) at =
+  Cons (Keep (2 * n)) (emit x (at + 1) ++ [Keep (2 * n + 1)])
+emit (Concat xs) at =
+  Array.toList
+    (Array.fromList
+       (List.reverse
+          (snd
+             (List.foldl
+                (\(acc : Pair Int (List Instruction)) x ->
+                   MkPair
+                     (fst acc + sizeOf x)
+                     (List.reverse (emit x (fst acc)) ++ snd acc))
+                (MkPair at Nil)
+                xs))))
+emit (Alternate (Cons x Nil)) at = emit x at
+emit (Alternate (Cons x rest)) at =
+  Cons
+    (Fork (at + 1) (at + sizeOf x + 2))
+    (emit x (at + 1)
+     ++ Cons
+       (Jump (at + sizeOf (Alternate (Cons x rest))))
+       (emit (Alternate rest) (at + sizeOf x + 2)))
+emit (Alternate Nil) at = Nil
+emit (Repeat least most greedy x) at =
+  if least > 0
+  then emit x at
+    ++ emit
+      (Repeat (least - 1) (if most < 0 then most else most - 1) greedy x)
+      (at + sizeOf x)
+  else if most < 0
+  then Cons
+      (forked (at + 1) (at + sizeOf x + 2))
+      (emit x (at + 1) ++ [Jump at])
+  else if most == 0 then Nil
+  else Cons
+      (forked (at + 1) (at + sizeOf (Repeat 0 most greedy x)))
+      (emit x (at + 1)
+       ++ emitOptional
+         (most - 1)
+         (at + sizeOf x + 1)
+         (at + sizeOf (Repeat 0 most greedy x)))
+  where
+  -- (a fork, as many as can be first if `greedy`)
+  forked : Int -> Int -> Instruction
+  forked more fewer = if greedy then Fork more fewer else Fork fewer more
+  -- (`k` more of `x`, each but if those before it were taken skipped to
+  -- `end`)
+  emitOptional : Int -> Int -> Int -> List Instruction
+  emitOptional k from end =
+    if k <= 0 then Nil
+    else Cons
+        (forked (from + 1) end)
+        (emit x (from + 1) ++ emitOptional (k - 1) (from + sizeOf x + 1) end)
+
+-- | The pattern read, or what is wrong with it.
+-- | >>> List.map (\p -> either (\why -> why) (\r -> "read") (compile p)) ["a.c", "[a-", "x(y)", "*", "a**", "a(", "a)", "(?i)a", "a{2,1}", "\\q", "[\\D]"]
+-- | ["read", "a `[` with no `]`", "read", "a `*` with nothing before it to repeat", "a `*` after a repetition: repeat a group of it, `(?:...)`", "a `(` with no `)`", "a `)` with no `(`", "flags and named groups, `(?...)`, are not read", "a count backwards, `{n,m}` with m below n", "`\\q` is not read: escape only what is not a letter or a digit", "`\\D` in a class is not read"]
+compile : String -> Either String Regex
+compile p = case parse p of
+  Left why -> Left why
+  Right (MkPair node groups) ->
+    Right
+      (MkRegex
+         (Array.fromList
+            (Cons (Keep 0) (emit node 1 ++ [Keep 1, Done])))
+         groups)
+
+-- (the pattern cut at each `/` not escaped, nor in a class, nor in a
+-- group, as Go's `-run` cuts it)
+levelsOf : String -> List String
+levelsOf s = cut 0 0 False 0 Nil
+  where
+  cut : Int -> Int -> Bool -> Int -> List String -> List String
+  cut from i inClass depth acc =
+    if i >= strLength s then List.reverse (Cons (strSlice s from i) acc)
+    else if byteAt s i == 92 then cut from (i + 2) inClass depth acc
+    else if inClass then cut from (i + 1) (byteAt s i /= 93) depth acc
+    else if byteAt s i == 91 then cut from (i + 1) True depth acc
+    else if byteAt s i == 40 then cut from (i + 1) False (depth + 1) acc
+    else if byteAt s i == 41 then cut from (i + 1) False (depth - 1) acc
+    else if byteAt s i == 47 && depth == 0
+    then cut (i + 1) (i + 1) False depth (Cons (strSlice s from i) acc)
+    else cut from (i + 1) False depth acc
 
 -- (each read, or the first that could not be)
 allRead : {a : Type} -> List (Either String a) -> Either String (List a)
 allRead Nil = Right Nil
 allRead (Cons (Left why) rest) = Left why
-allRead (Cons (Right x) rest) = consRead x (allRead rest)
+allRead (Cons (Right x) rest) = consRead (allRead rest)
+  where
+  consRead : Either String (List a) -> Either String (List a)
+  consRead (Left why) = Left why
+  consRead (Right xs) = Right (Cons x xs)
 
--- | The pattern read, or what is wrong with it.
--- | >>> List.map (\p -> either (\why -> why) (\r -> "read") (compile p)) ["a.c", "[a-", "x(y)", "*", "a**"]
--- | ["read", "a `[` with no `]`", "groups, `(...)`, are not read", "a `*` with nothing before it to repeat", "a `*` with nothing before it to repeat"]
-compile : String -> Either String Regex
-compile p = case allRead (List.map branchOf (splitOutside 124 p)) of
-  Left why -> Left why
-  Right bs -> Right (MkRegex bs)
-
--- | The pattern read in levels, cut at each `/` that is not escaped nor
--- | in a class (Go's `-run A/B`, a level a pattern): each level read, or
--- | what is wrong with the first that is not.
+-- | The pattern read in levels, cut at each `/` that is not escaped, nor
+-- | in a class, nor in a group (Go's `-run A/B`, a level a pattern):
+-- | each level read, or what is wrong with the first that is not.
+-- | >>> either (\why -> 0 - 1) (\rs -> List.length rs) (compileLevels "a/(b/c)/[/]")
+-- | 3
 compileLevels : String -> Either String (List Regex)
-compileLevels p = allRead (List.map compile (splitOutside 47 p))
+compileLevels p = allRead (List.map compile (levelsOf p))
 
 -- Matching
 --------------------------------------------------------------------------------
 
-inRanges : Int -> List (Pair Int Int) -> Bool
-inRanges c rs = List.any (\(r : Pair Int Int) -> c >= fst r && c <= snd r) rs
+isWordByte : Int -> Bool
+isWordByte c = isLetterOrDigit c || c == 95
 
-atomMatches : Atom -> Int -> Bool
-atomMatches AnyByte c = True
-atomMatches (Byte b) c = b == c
-atomMatches (Class True rs) c = not (inRanges c rs)
-atomMatches (Class False rs) c = inRanges c rs
+-- (whether the byte before `i` is a word's, and the one at it)
+wordBefore : String -> Int -> Bool
+wordBefore s i = i > 0 && i <= strLength s && isWordByte (byteAt s (i - 1))
 
--- (the atom holds of the byte at `i`, there being one)
-atomOn : Atom -> String -> Int -> Bool
-atomOn a s i = i < strLength s && atomMatches a (byteAt s i)
+wordAt : String -> Int -> Bool
+wordAt s i = i < strLength s && isWordByte (byteAt s i)
 
--- (the pieces match from `i` on, up to the end if `end`)
-matchAt : String -> Bool -> List Piece -> Int -> Bool
-matchAt s end Nil i = not end || i == strLength s
-matchAt s end (Cons (Once a) rest) i =
-  atomOn a s i && matchAt s end rest (i + 1)
-matchAt s end (Cons (Optional a) rest) i =
-  (atomOn a s i && matchAt s end rest (i + 1)) || matchAt s end rest i
-matchAt s end (Cons (Many a) rest) i =
-  matchAt s end rest i
-  || (atomOn a s i && matchAt s end (Cons (Many a) rest) (i + 1))
-matchAt s end (Cons (Some a) rest) i =
-  atomOn a s i && matchAt s end (Cons (Many a) rest) (i + 1)
+holds : Assertion -> String -> Int -> Bool
+holds AtStart s i = i == 0
+holds AtEnd s i = i == strLength s
+holds AtWordBoundary s i = wordBefore s i /= wordAt s i
+holds NotAtWordBoundary s i = wordBefore s i == wordAt s i
 
--- (the branch matches from some place of the string, the start only if
--- it is held to it)
-branchMatches : String -> Branch -> Bool
-branchMatches s b =
-  if b.start then matchAt s b.end b.pieces 0
-  else List.any (\i -> matchAt s b.end b.pieces i) (List.range 0 (strLength s))
+-- | A thread of the program: its step, and the places its slots keep
+-- | (-1: none yet).
+type Thread = { step : Int, slots : Array Int }
+
+-- | The threads of a place being gathered: which steps have one already,
+-- | and the threads, the other way round (the first preferred last).
+type Gathered = { seen : Array Bool, threads : List Thread }
+
+-- (the threads a thread at `pc`, at the place `i`, comes to, taking no
+-- rune -- those that take one, or are done -- put after those gathered,
+-- each step once, the first there preferred)
+gather : Array Instruction
+       -> String
+       -> Int
+       -> Int
+       -> Array Int
+       -> Gathered
+       -> Gathered
+gather prog s i pc slots g =
+  if fromMaybe True (Array.index g.seen pc) then g
+  else (let h : Gathered = { g | seen = Array.set g.seen pc True }
+        in case Array.index prog pc of
+        Just (Jump t) -> gather prog s i t slots h
+        Just (Fork a b) -> gather prog s i b slots (gather prog s i a slots h)
+        Just (Keep n) -> gather prog s i (pc + 1) (Array.set slots n i) h
+        Just (Hold a) ->
+          if holds a s i then gather prog s i (pc + 1) slots h else h
+        _ -> { h | threads = Cons { step = pc, slots = slots } h.threads })
+
+-- (no thread at any step yet)
+noneGathered : Array Instruction -> Gathered
+noneGathered prog =
+  { seen = Array.replicate (Array.length prog) False, threads = Nil }
+
+-- | What one place's threads come to: those of the next place, and the
+-- | slots of the match found, if one is.
+type Stepped = { next : Gathered, found : Maybe (Array Int) }
+
+-- (each thread at a place, in order, taking the rune `c` there -- -1 at
+-- the end -- to the place `j` after it; the first done is the match, the
+-- threads after it let go)
+stepThreads : Array Instruction
+            -> String
+            -> Int
+            -> Int
+            -> List Thread
+            -> Stepped
+            -> Stepped
+stepThreads prog s j c Nil st = st
+stepThreads prog s j c (Cons t rest) st = case Array.index prog t.step of
+  Just Done -> { st | found = Just t.slots }
+  Just (Take neg rs) ->
+    if c >= 0 && inRanges rs /= neg
+    then stepThreads
+        prog
+        s
+        j
+        c
+        rest
+        { st | next = gather prog s j (t.step + 1) t.slots st.next }
+    else stepThreads prog s j c rest st
+  _ -> stepThreads prog s j c rest st
+  where
+  inRanges : List (Pair Int Int) -> Bool
+  inRanges rs = List.any (\(r : Pair Int Int) -> c >= fst r && c <= snd r) rs
+
+-- (from the place `i`, its threads those given, a match found so far or
+-- not: the match of the leftmost start, its slots)
+runFrom : Array Instruction
+        -> Array Int
+        -> String
+        -> Int
+        -> List Thread
+        -> Maybe (Array Int)
+        -> Maybe (Array Int)
+runFrom prog fresh s i threads found =
+  let atEnd : Bool = i >= strLength s
+  in let c : Int = if atEnd then 0 - 1 else runeToInt (strRuneAt s i)
+  in let j : Int = if atEnd then i else i + strRuneWidth s i
+  in let st : Stepped =
+    stepThreads prog s j c threads { next = noneGathered prog, found = found }
+  in if atEnd then st.found
+  else (let next : Gathered = case st.found of
+          Nothing -> gather prog s j 0 fresh st.next
+          Just _ -> st.next
+        in if List.null next.threads
+        then (case st.found of
+              Just m -> Just m
+              Nothing -> runFrom prog fresh s j Nil Nothing)
+        else runFrom prog fresh s j (List.reverse next.threads) st.found)
+
+-- (the slots of the leftmost match starting at `from` or after it)
+slotsFrom : Regex -> String -> Int -> Maybe (Array Int)
+slotsFrom (MkRegex prog groups) s from =
+  let fresh : Array Int = Array.replicate (2 * groups + 2) (0 - 1)
+  in runFrom
+    prog
+    fresh
+    s
+    from
+    (List.reverse (gather prog s from 0 fresh (noneGathered prog)).threads)
+    Nothing
+
+-- (a slot's place)
+slotAt : Array Int -> Int -> Int
+slotAt slots n = fromMaybe (0 - 1) (Array.index slots n)
 
 -- | Whether the pattern matches somewhere in the string.
 -- | >>> List.map (\(p : Pair String String) -> either (\why -> False) (\r -> matches r (snd p)) (compile (fst p))) [MkPair "^lsp" "lsp hover", MkPair "^lsp" "the lsp", MkPair "hover$" "lsp hover", MkPair "a.c" "xabcx", MkPair "^a[0-9]+b$" "a12b", MkPair "^a[0-9]+b$" "ab", MkPair "x|^y" "y", MkPair "" "anything", MkPair "[^a-z]" "abc", MkPair "a\\.b" "axb"]
 -- | [True, False, True, True, True, False, True, True, False, False]
+-- | >>> List.map (\(p : Pair String String) -> either (\why -> False) (\r -> matches r (snd p)) (compile (fst p))) [MkPair "^(ab)+$" "ababab", MkPair "^(ab)+$" "aba", MkPair "^a{2,3}$" "aaaa", MkPair "^\u{e9}.$" "\u{e9}\u{4e2d}", MkPair "\\bis\\b" "this is", MkPair "\\bis\\b" "this", MkPair "^\\d+\\s\\w+$" "42 heff_1", MkPair "^(a*)*$" "aaa", MkPair "^[]a]+$" "]a]"]
+-- | [True, False, False, True, True, False, True, True, True]
 matches : Regex -> String -> Bool
-matches (MkRegex bs) s = List.any (\b -> branchMatches s b) bs
+matches r s = case slotsFrom r s 0 of
+  Just _ -> True
+  Nothing -> False
+
+-- | Where the leftmost match is, from its first byte up to its end, if
+-- | there is one (Go's `FindStringIndex`).
+-- | >>> either (\why -> Nothing) (\r -> findIndex r "xx aab") (compile "a+b")
+-- | Just (MkPair 3 6)
+findIndex : Regex -> String -> Maybe (Pair Int Int)
+findIndex r s = case slotsFrom r s 0 of
+  Just m -> Just (MkPair (slotAt m 0) (slotAt m 1))
+  Nothing -> Nothing
+
+-- | The leftmost match, if there is one: as many of each repetition as
+-- | can be, or as few, as it says, each `|` its first that matches.
+-- | >>> List.map (\p -> either (\why -> Nothing) (\r -> find r "<a><b>") (compile p)) ["<.*>", "<.*?>", "x"]
+-- | [Just "<a><b>", Just "<a>", Nothing]
+find : Regex -> String -> Maybe String
+find r s = case findIndex r s of
+  Just (MkPair a b) -> Just (strSlice s a b)
+  Nothing -> Nothing
+
+-- (what slots `2n` and `2n + 1` keep, if they keep a match)
+groupText : String -> Array Int -> Int -> Maybe String
+groupText s m n =
+  if slotAt m (2 * n) < 0 || slotAt m (2 * n + 1) < 0 then Nothing
+  else Just (strSlice s (slotAt m (2 * n)) (slotAt m (2 * n + 1)))
+
+-- | The leftmost match and what each group matched in it, by its number
+-- | (the match the first, the group 0); a group that matched nothing,
+-- | not even an empty string, `Nothing` (Go's `FindStringSubmatch`).
+-- | >>> either (\why -> Nothing) (\r -> submatches r "key = value") (compile "(\\w+) = (\\w+)|(none)")
+-- | Just [Just "key = value", Just "key", Just "value", Nothing]
+-- | >>> either (\why -> Nothing) (\r -> submatches r "abab") (compile "(a|b)+")
+-- | Just [Just "abab", Just "b"]
+submatches : Regex -> String -> Maybe (List (Maybe String))
+submatches (MkRegex prog groups) s = case slotsFrom (MkRegex prog groups) s 0 of
+  Just m -> Just (List.map (groupText s m) (List.range 0 groups))
+  Nothing -> Nothing
+
+-- (the matches from `i` on, none overlapping, an empty one right after
+-- the one before it -- which ended at `last` -- left out, the other way
+-- round, after `acc`)
+allSlotsFrom : Regex
+             -> String
+             -> Int
+             -> Int
+             -> List (Array Int)
+             -> List (Array Int)
+allSlotsFrom r s i last acc =
+  if i > strLength s then List.reverse acc
+  else case slotsFrom r s i of
+    Nothing -> List.reverse acc
+    Just m ->
+      if slotAt m 0 == slotAt m 1 && slotAt m 0 == last
+      then (if slotAt m 0 >= strLength s then List.reverse acc
+            else allSlotsFrom
+                r
+                s
+                (slotAt m 0 + strRuneWidth s (slotAt m 0))
+                last
+                acc)
+      else allSlotsFrom
+          r
+          s
+          (if slotAt m 0 == slotAt m 1
+           then slotAt m 1
+             + (if slotAt m 1 < strLength s then strRuneWidth s (slotAt m 1)
+                else 1)
+           else slotAt m 1)
+          (slotAt m 1)
+          (Cons m acc)
+
+-- | Where each match is, from the left, none overlapping (an empty one
+-- | right after another left out), as Go's `FindAllStringIndex` finds
+-- | them.
+-- | >>> either (\why -> Nil) (\r -> findAllIndex r "baaab") (compile "a*")
+-- | [MkPair 0 0, MkPair 1 4, MkPair 5 5]
+findAllIndex : Regex -> String -> List (Pair Int Int)
+findAllIndex r s =
+  List.map
+    (\m -> MkPair (slotAt m 0) (slotAt m 1))
+    (allSlotsFrom r s 0 (0 - 1) Nil)
+
+-- | Each match, as `findAllIndex` finds them.
+-- | >>> either (\why -> Nil) (\r -> findAll r "a1 b22 c333") (compile "[0-9]+")
+-- | ["1", "22", "333"]
+findAll : Regex -> String -> List String
+findAll r s = List.map (\p -> strSlice s (fst p) (snd p)) (findAllIndex r s)
+
+-- (each match `f` of its slots, what is between them as it is)
+replacedBy : Regex -> (Array Int -> String) -> String -> String
+replacedBy r f s = go 0 (allSlotsFrom r s 0 (0 - 1) Nil) ""
+  where
+  go : Int -> List (Array Int) -> String -> String
+  go i Nil acc = acc ^ strSlice s i (strLength s)
+  go i (Cons m rest) acc =
+    go (slotAt m 1) rest (acc ^ strSlice s i (slotAt m 0) ^ f m)
+
+-- | Each match, as `findAll` finds them, the template, its `$n` and
+-- | `${n}` what the group `n` matched (none, or no such group, nothing),
+-- | its `$$` a `$` (Go's `ReplaceAllString`; `$1x` is the group `1x`,
+-- | which no group is, so write `${1}x`).
+-- | >>> either (\why -> "") (\r -> replaceAll r "${2}=$1 $$" "a=1, b=2") (compile "(\\w+)=(\\w+)")
+-- | "1=a $, 2=b $"
+-- | >>> either (\why -> "") (\r -> replaceAll r "-" "abc") (compile "")
+-- | "-a-b-c-"
+replaceAll : Regex -> String -> String -> String
+replaceAll r template s = replacedBy r (\m -> expandFrom m 0 "") s
+  where
+  -- (the name after a `$` at `i` -- in braces, or as many letters, digits
+  -- and `_` as there are -- and where it ends; no name, `Nothing`)
+  nameAt : Int -> Maybe (Pair String Int)
+  nameAt i =
+    if i < strLength template && byteAt template i == 123
+    then (case indexOf "}" template i of
+          Just j ->
+            if j > i + 1
+            then Just (MkPair (strSlice template (i + 1) j) (j + 1))
+            else Nothing
+          Nothing -> Nothing)
+    else (let j : Int = wordEnd i
+          in if j > i then Just (MkPair (strSlice template i j) j) else Nothing)
+    where
+    wordEnd : Int -> Int
+    wordEnd k =
+      if k < strLength template && isWordByte (byteAt template k)
+      then wordEnd (k + 1)
+      else k
+  -- (the template from `i` on, written out for the match `m` of `s`, after
+  -- `acc`)
+  expandFrom : Array Int -> Int -> String -> String
+  expandFrom m i acc = case indexOf "$" template i of
+    Nothing -> acc ^ strSlice template i (strLength template)
+    Just j ->
+      if j + 1 < strLength template && byteAt template (j + 1) == 36
+      then expandFrom m (j + 2) (acc ^ strSlice template i j ^ "$")
+      else case nameAt (j + 1) of
+        Nothing -> expandFrom m (j + 1) (acc ^ strSlice template i (j + 1))
+        Just (MkPair name k) ->
+          expandFrom
+            m
+            k
+            (acc
+             ^ strSlice template i j
+             ^ (case parseInt name of
+                Just n -> if n >= 0 then fromMaybe "" (groupText s m n) else ""
+                Nothing -> ""))
+
+-- | Each match `f` of what it is (Go's `ReplaceAllStringFunc`).
+-- | >>> either (\why -> "") (\r -> replaceAllWith r (\w -> showInt (strLength w)) "a bb ccc") (compile "[a-z]+")
+-- | "1 2 3"
+replaceAllWith : Regex -> (String -> String) -> String -> String
+replaceAllWith r f s =
+  replacedBy r (\m -> f (strSlice s (slotAt m 0) (slotAt m 1))) s
+
+-- | The pieces between the matches, as Go's `Split` with no limit cuts
+-- | them: an empty match at the start cuts no empty piece off, and an
+-- | empty match is cut at the end of none.
+-- | >>> List.map (\p -> either (\why -> Nil) (\r -> split r "a1b22c") (compile p)) ["[0-9]+", "", "x"]
+-- | [["a", "b", "c"], ["a", "1", "b", "2", "2", "c"], ["a1b22c"]]
+split : Regex -> String -> List String
+split r s = go 0 0 (findAllIndex r s) Nil
+  where
+  go : Int -> Int -> List (Pair Int Int) -> List String -> List String
+  go from last Nil acc =
+    List.reverse
+      (if last /= strLength s then Cons (strSlice s from (strLength s)) acc
+       else acc)
+  go from last (Cons (MkPair a b) rest) acc =
+    go b a rest (if b /= 0 then Cons (strSlice s from a) acc else acc)

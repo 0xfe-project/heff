@@ -1,0 +1,228 @@
+-- CSV (RFC 4180), read and written as Go's `encoding/csv` reads and
+-- writes it with its settings left as they are: a record a line, ended
+-- by a line feed or a carriage return and a line feed, its fields
+-- between commas.  A field may be quoted with `"`, a `""` in it one `"`;
+-- quoted, it may hold commas and line breaks (one written as a carriage
+-- return and a line feed read as a line feed, as Go reads it).  Reading
+-- skips an empty line, and every record must have as many fields as the
+-- first.  Import it by a name, `import std.csv as Csv`.
+--
+-- ```haskell
+-- import std.csv as Csv
+--
+-- -- | >>> names
+-- -- | Right ["Ada", "Grace"]
+-- names : Either Csv.ParseError (List String)
+-- names = case Csv.parse "name,born\nAda,1815\nGrace,1906\n" of
+--   Right (_ :: rows) -> Right (List.concatMap (List.take 1) rows)
+--   Right Nil -> Right Nil
+--   Left e -> Left e
+-- ```
+
+module std.csv (ParseError, parse, render)
+
+import rune as Rune
+
+-- | Where the text is not CSV: its line and its column there (from 1,
+-- | the column counted in bytes), and what is wrong, in Go's words.
+type ParseError = { line : Int, column : Int, message : String }
+
+-- (the error `message` at byte `i` of `s`)
+errorAt : String -> Int -> String -> ParseError
+errorAt s i message = errorFrom 0 1 0
+  where
+  -- (the error `message` at byte `i` of `s`, its line and column counted
+  -- from byte `j`, on the line `line`, which starts at byte `start`)
+  errorFrom : Int -> Int -> Int -> ParseError
+  errorFrom j line start =
+    if j >= i then { line = line, column = i - start + 1, message = message }
+    else if byteAt s j == 10 then errorFrom (j + 1) (line + 1) (j + 1)
+    else errorFrom (j + 1) line start
+
+-- | The records of a text, each a list of its fields.  A line break at
+-- | the end makes no record, nor does an empty text, nor an empty line.
+-- | >>> parse "a,b,c\n1,2,3\n"
+-- | Right [["a", "b", "c"], ["1", "2", "3"]]
+-- | >>> parse "x,,\r\n\r\n,y,\"\"\r\nlast,one,here"
+-- | Right [["x", "", ""], ["", "y", ""], ["last", "one", "here"]]
+-- | >>> parse ""
+-- | Right []
+-- |
+-- | (a quoted field: its commas, line breaks and doubled quotes; a
+-- | carriage return and a line feed in it read as a line feed)
+-- | >>> parse "\"a, b\",\"say \"\"hi\"\"\"\n\"two\nlines\",\"cr\r\nlf\"\n"
+-- | Right [["a, b", "say \"hi\""], ["two\nlines", "cr\nlf"]]
+-- |
+-- | (where it is not CSV: a quote in a field not quoted, text after a
+-- | closing quote, a quote not closed, a record of another width)
+-- | >>> parse "a,b\nc,d\"e\n"
+-- | Left { line = 2, column = 4, message = "bare \" in non-quoted-field" }
+-- | >>> parse "\"a\"b,c"
+-- | Left { line = 1, column = 4, message = "extraneous or missing \" in quoted-field" }
+-- | >>> parse "a\n\"b\nc"
+-- | Left { line = 3, column = 2, message = "extraneous or missing \" in quoted-field" }
+-- | >>> parse "a,b\nc\n"
+-- | Left { line = 2, column = 1, message = "wrong number of fields" }
+parse : String -> Either ParseError (List (List String))
+parse text =
+  let s : String =
+    if byteAt text (strLength text - 1) == 13
+    then strSlice text 0 (strLength text - 1)
+    else text
+  in recordsFrom s 0 0 Nil Nil (0 - 1)
+  where
+  -- (the records of `s` from `i` on, after `records`, the last first: the
+  -- one being read began at `start`, its fields so far `fields`, the last
+  -- first -- none, at the start of a line -- and each has as many as
+  -- `width`, unless that is below 0, before the first)
+  recordsFrom : String
+              -> Int
+              -> Int
+              -> List String
+              -> List (List String)
+              -> Int
+              -> Either ParseError (List (List String))
+  recordsFrom s i start fields records width =
+    if List.null fields && i >= strLength s then Right (List.reverse records)
+    else if List.null fields && byteAt s i == 10
+    then recordsFrom s (i + 1) (i + 1) fields records width
+    else if List.null fields && byteAt s i == 13 && byteAt s (i + 1) == 10
+    then recordsFrom s (i + 2) (i + 2) fields records width
+    else case fieldAt i of
+      Left e -> Left e
+      Right (MkPair text j) ->
+        if byteAt s j == 44
+        then recordsFrom s (j + 1) start (text :: fields) records width
+        else (let record : List String = List.reverse (text :: fields)
+              in let n : Int = List.length record
+              in if width >= 0 && n /= width
+              then Left (errorAt s start "wrong number of fields")
+              else recordsFrom
+                  s
+                  (nextLine j)
+                  (nextLine j)
+                  Nil
+                  (record :: records)
+                  n)
+    where
+    -- (the error of a quoted field not closed: just after the last byte, a
+    -- line break at the end counted as one byte of the line it ends, as Go
+    -- counts it)
+    unclosed : ParseError
+    unclosed =
+      let n : Int = strLength s
+      in let brk : Int =
+        if byteAt s (n - 1) /= 10 then n
+        else if byteAt s (n - 2) == 13 then n - 2
+        else n - 1
+      in let e : ParseError =
+        errorAt s brk "extraneous or missing \" in quoted-field"
+      in if brk == n then e
+      else { e | column = e.column + 1 }
+    -- (the text of a quoted field from `i` on, after its opening quote:
+    -- what is read so far `acc`, then the bytes from `start` up to `i`; the
+    -- text, and the byte after its closing quote)
+    quotedFrom : Int -> Int -> String -> Either ParseError (Pair String Int)
+    quotedFrom start i acc =
+      let c : Int = byteAt s i
+      in if c < 0 then Left unclosed
+      else if c == 34 && byteAt s (i + 1) == 34
+      then quotedFrom (i + 2) (i + 2) (acc ^ strSlice s start (i + 1))
+      else if c == 34 then Right (MkPair (acc ^ strSlice s start i) (i + 1))
+      else if c == 13 && byteAt s (i + 1) == 10
+      then quotedFrom (i + 1) (i + 1) (acc ^ strSlice s start i)
+      else quotedFrom start (i + 1) acc
+    -- (the end of an unquoted field from `i` on: the first comma, line
+    -- feed or quote, or the end)
+    plainEnd : Int -> Int
+    plainEnd i =
+      let c : Int = byteAt s i
+      in if c < 0 || c == 44 || c == 10 || c == 34 then i
+      else plainEnd (i + 1)
+    -- (whether a field ends at `i`: a comma, a line break, or the end)
+    endsField : Int -> Bool
+    endsField i =
+      let c : Int = byteAt s i
+      in c < 0 || c == 44 || c == 10 || c == 13 && byteAt s (i + 1) == 10
+    -- (the field at `i`: its text, and the byte that ends it -- a comma, a
+    -- line break, or the end)
+    fieldAt : Int -> Either ParseError (Pair String Int)
+    fieldAt i =
+      if byteAt s i == 34
+      then (case quotedFrom (i + 1) (i + 1) "" of
+            Right (MkPair text j) ->
+              if endsField j then Right (MkPair text j)
+              else Left (errorAt s j "extraneous or missing \" in quoted-field")
+            Left e -> Left e)
+      else (let j : Int = plainEnd i
+            in if byteAt s j == 34
+            then Left (errorAt s j "bare \" in non-quoted-field")
+            else if byteAt s j == 10 && j > i && byteAt s (j - 1) == 13
+            then Right (MkPair (strSlice s i (j - 1)) j)
+            else Right (MkPair (strSlice s i j) j))
+    -- (the start of the line after the line break at `i`, or the end)
+    nextLine : Int -> Int
+    nextLine i =
+      if byteAt s i == 10 then i + 1
+      else if byteAt s i == 13 then i + 2
+      else i
+
+-- (`acc`, then a field as it is written: quoted where it needs to be,
+-- each `"` in it doubled)
+fieldInto : String -> String -> String
+fieldInto acc f =
+  if needsQuotes then acc ^ "\"" ^ joinWith "\"\"" (split "\"" f) ^ "\""
+  else acc ^ f
+  where
+  -- (whether the code is a space, as Go's `unicode.IsSpace` says)
+  isSpaceCode : Int -> Bool
+  isSpaceCode c =
+    9 <= c && c <= 13
+    || c == 32
+    || c == 133
+    || c == 160
+    || c == 5760
+    || 8192 <= c && c <= 8202
+    || c == 8232
+    || c == 8233
+    || c == 8239
+    || c == 8287
+    || c == 12288
+  -- (whether a field is written quoted, as Go's `fieldNeedsQuotes` says:
+  -- one with a comma, a quote or a line break in it, one that starts with
+  -- a space, and `\.`)
+  needsQuotes : Bool
+  needsQuotes =
+    strLength f > 0
+    && (strEq f "\\."
+        || contains "," f
+        || contains "\"" f
+        || contains "\r" f
+        || contains "\n" f
+        || isSpaceCode (Rune.toInt (runeAt f 0).rune))
+
+-- | The text of records, as Go's `csv.Writer` writes it: each record
+-- | ended by a line feed, its fields between commas; a field quoted
+-- | where it has a comma, a quote or a line break in it, or starts with
+-- | a space, each `"` in it doubled.
+-- | >>> render [["a", "b c", "d,e"], ["say \"hi\"", " x", "two\nlines"]]
+-- | "a,b c,\"d,e\"\n\"say \"\"hi\"\"\",\" x\",\"two\nlines\"\n"
+-- | >>> render []
+-- | ""
+-- |
+-- | (what it writes, `parse` reads back)
+-- | >>> parse (render [["", "\"", "a,b"], [" x", "", "two\nlines"]])
+-- | Right [["", "\"", "a,b"], [" x", "", "two\nlines"]]
+render : List (List String) -> String
+render records = recordsInto "" records
+  where
+  -- (`acc`, then the fields after a record's first, a comma before each)
+  restInto : String -> List String -> String
+  restInto acc Nil = acc
+  restInto acc (f :: fs) = restInto (fieldInto (acc ^ ",") f) fs
+  -- (`acc`, then the records, each ended by a line feed)
+  recordsInto : String -> List (List String) -> String
+  recordsInto acc Nil = acc
+  recordsInto acc (Nil :: rs) = recordsInto (acc ^ "\n") rs
+  recordsInto acc ((f :: fs) :: rs) =
+    recordsInto (restInto (fieldInto acc f) fs ^ "\n") rs

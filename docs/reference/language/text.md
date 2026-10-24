@@ -51,7 +51,7 @@ What is done with them is in the library:
 - strings: the [prelude](../../api/prelude.md), such as
   [`strLength`](../../api/prelude.md#strLength),
   [`runes`](../../api/prelude.md#runes),
-  [`ofRunes`](../../api/prelude.md#ofRunes) and
+  [`fromRunes`](../../api/prelude.md#fromRunes) and
   [`split`](../../api/prelude.md#split); `^` joins two, and groups to
   the left: `s ^ a ^ b` is `(s ^ a) ^ b`, so a string that nothing else
   holds is grown in place; [`mapBytes`](../../api/prelude.md#mapBytes),

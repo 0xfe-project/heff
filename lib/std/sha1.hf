@@ -1,0 +1,123 @@
+-- SHA-1, the hash of FIPS 180-4: any bytes to 20 bytes.  It is broken
+-- (two different files of the same SHA-1 are known): it is here for what
+-- still names things by it, git's objects among them, not to tell bytes
+-- that may have been made to collide apart -- that is `std.sha256`'s.
+-- Written in heff, a block of 64 bytes at a time.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.sha1 as Sha1
+--
+-- -- | the name git gives a file's content, a blob
+-- blobName : Bytes -> Bytes
+-- blobName content =
+--   Sha1.digest
+--     (Bytes.concat
+--        [Bytes.fromString ("blob " ^ show (Bytes.length content)), b[0], content])
+-- ```
+
+module std.sha1 (digest)
+
+import array as Array
+import bytes as Bytes
+import uint32 as UInt32
+import uint8 as UInt8
+
+-- | The SHA-1 hash of the bytes, 20 bytes.
+-- | >>> digest Bytes.empty == b[0xda39a3ee5e6b4b0d::64, 0x3255bfef95601890::64, 0xafd80709::32]
+-- | True
+-- | >>> digest (Bytes.fromString "abc") == b[0xa9993e364706816a::64, 0xba3e25717850c26c::64, 0x9cd0d89d::32]
+-- | True
+-- | >>> digest (Bytes.fromString "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") == b[0x84983e441c3bd26e::64, 0xbaae4aa1f95129e5::64, 0xe54670f1::32]
+-- | True
+-- | >>> digest (Bytes.fromString "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu") == b[0xa49b2446a02c645b::64, 0xf419f995b6709125::64, 0x3a04a259::32]
+-- | True
+digest : Bytes -> Bytes
+digest m =
+  let hs : Array UInt32 =
+    blocksFrom
+      padded
+      0
+      (Array.replicate 80 0)
+      (Array.fromList
+         [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0])
+  in Bytes.concat (List.map (\x -> b[UInt32.toInt x::32]) (Array.toList hs))
+  where
+  -- (the bytes padded to whole blocks: a 1 bit, zeros, then their length
+  -- in bits, 64 bits big-endian)
+  padded : Bytes
+  padded =
+    let n : Int = Bytes.length m
+    in Bytes.concat
+      [ m
+      , b[0x80]
+      , Bytes.fromList (List.replicate ((55 - n) % 64) 0)
+      , b[(n * 8)::64]
+      ]
+  -- (the hash `hs` after the blocks of `m` from `at` on, `w` room for a
+  -- block's schedule)
+  blocksFrom : Bytes -> Int -> Array UInt32 -> Array UInt32 -> Array UInt32
+  blocksFrom m at w hs =
+    if at >= Bytes.length m then hs
+    else let ws : Array UInt32 = scheduled 0 w
+         in blocksFrom
+           m
+           (at + 64)
+           ws
+           (rounds
+              ws
+              0
+              (Array.arrayIndex hs 0)
+              (Array.arrayIndex hs 1)
+              (Array.arrayIndex hs 2)
+              (Array.arrayIndex hs 3)
+              (Array.arrayIndex hs 4))
+    where
+    -- (the big-endian word of the four bytes from `i`)
+    wordAt : Int -> UInt32
+    wordAt i =
+      UInt32.fromInt
+        (UInt8.toInt (Bytes.bytesAt m i) * 16777216
+         + UInt8.toInt (Bytes.bytesAt m (i + 1)) * 65536
+         + UInt8.toInt (Bytes.bytesAt m (i + 2)) * 256
+         + UInt8.toInt (Bytes.bytesAt m (i + 3)))
+    -- (the message schedule `w` of the block at `at`, its words from `t` on
+    -- written)
+    scheduled : Int -> Array UInt32 -> Array UInt32
+    scheduled t w =
+      if t >= 80 then w
+      else if t < 16
+      then scheduled (t + 1) (Array.set w t (wordAt (at + 4 * t)))
+      else let next : UInt32 =
+             xor
+               (xor (Array.arrayIndex w (t - 3)) (Array.arrayIndex w (t - 8)))
+               (xor (Array.arrayIndex w (t - 14)) (Array.arrayIndex w (t - 16)))
+           in scheduled (t + 1) (Array.set w t (UInt32.rotateLeft next 1))
+    -- (the rounds from `t` of the working variables `a` to `e` over the
+    -- schedule `w`, then each added to the hash `hs` the block began with)
+    rounds : Array UInt32
+           -> Int
+           -> UInt32
+           -> UInt32
+           -> UInt32
+           -> UInt32
+           -> UInt32
+           -> Array UInt32
+    rounds w t a b c d e =
+      if t >= 80
+      then Array.fromList
+          [ Array.arrayIndex hs 0 + a
+          , Array.arrayIndex hs 1 + b
+          , Array.arrayIndex hs 2 + c
+          , Array.arrayIndex hs 3 + d
+          , Array.arrayIndex hs 4 + e
+          ]
+      else let mixed : UInt32 =
+             if t < 20 then or (and b c) (and (complement b) d) + 0x5a827999
+             else if t < 40 then xor (xor b c) d + 0x6ed9eba1
+             else if t < 60
+             then or (or (and b c) (and b d)) (and c d) + 0x8f1bbcdc
+             else xor (xor b c) d + 0xca62c1d6
+           in let next : UInt32 =
+             UInt32.rotateLeft a 5 + mixed + e + Array.arrayIndex w t
+           in rounds w (t + 1) next a (UInt32.rotateLeft b 30) c d

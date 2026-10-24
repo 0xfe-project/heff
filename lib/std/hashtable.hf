@@ -95,11 +95,6 @@ slotOf eq hs ks mask s key i =
   else if t == s && eq key (arrayIndex ks i) then i
   else slotOf eq hs ks mask s key (and (i + 1) mask)
 
--- (the empty slot, from `i` on)
-emptyFrom : Array Int -> Int -> Int -> Int
-emptyFrom hs mask i =
-  if arrayIndex hs i == 0 then i else emptyFrom hs mask (and (i + 1) mask)
-
 -- (what an empty slot holds: what is after the last)
 filler : {a : Type} -> Array a -> a
 filler xs = arrayIndex xs (arrayLength xs - 1)
@@ -120,12 +115,17 @@ filledWith cap x xs =
 -- are grown, no key compared)
 movedIn : {k v : Type} -> Int -> k -> v -> HashTable k v -> HashTable k v
 movedIn s key value (MkHashTable n hs ks vs) =
-  let i = emptyFrom hs (arrayLength hs - 1) (homeOf s (arrayLength hs - 1))
+  let i = emptyFrom (arrayLength hs - 1) (homeOf s (arrayLength hs - 1))
   in MkHashTable
     (n + 1)
     (arraySet hs i s)
     (arraySet ks i key)
     (arraySet vs i value)
+  where
+  -- (the empty slot, from `i` on)
+  emptyFrom : Int -> Int -> Int
+  emptyFrom mask i =
+    if arrayIndex hs i == 0 then i else emptyFrom mask (and (i + 1) mask)
 
 -- (the keys of the slots from `i` on moved into the table `t`)
 moved : {k v : Type}
@@ -406,23 +406,16 @@ alter : {k v : Type}
       -> HashTable k v
 alter t key f = alterAt equal f (stored (HashMap.hash key)) key t
 
--- (each key and its value in the slots from `i` on, into `z`)
-foldlFrom : {k v b : Type}
-          -> (b -> k -> v -> b)
-          -> Int
-          -> b
-          -> Array Int
-          -> Array k
-          -> Array v
-          -> b
-foldlFrom f i z hs ks vs =
-  if i == arrayLength hs then z
-  else if arrayIndex hs i == 0 then foldlFrom f (i + 1) z hs ks vs
-  else foldlFrom f (i + 1) (f z (arrayIndex ks i) (arrayIndex vs i)) hs ks vs
-
 -- | Each key and its value, from `z`, in the slots' order.
 foldl : {k v b : Type} -> (b -> k -> v -> b) -> b -> HashTable k v -> b
-foldl f z (MkHashTable n hs ks vs) = foldlFrom f 0 z hs ks vs
+foldl f z (MkHashTable n hs ks vs) = foldlFrom 0 z
+  where
+  -- (each key and its value in the slots from `i` on, into `z`)
+  foldlFrom : Int -> b -> b
+  foldlFrom i z =
+    if i == arrayLength hs then z
+    else if arrayIndex hs i == 0 then foldlFrom (i + 1) z
+    else foldlFrom (i + 1) (f z (arrayIndex ks i) (arrayIndex vs i))
 
 -- | How many keys are bound: kept as they are bound and removed, not
 -- | counted.
@@ -452,15 +445,33 @@ listBefore i hs ks vs acc =
 toList : {k v : Type} -> HashTable k v -> List (Pair k v)
 toList (MkHashTable n hs ks vs) = listBefore (arrayLength hs) hs ks vs Nil
 
+-- | Whether `k` is bound in it.
+-- | >>> List.map (member (insert (empty : HashTable String Int) "a" 1)) ["a", "b"]
+-- | Cons True (Cons False Nil)
+member : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> Bool
+member m k = case lookup m k of
+  Just _ -> True
+  Nothing -> False
+
+-- | The keys, in `toList`'s order.
+-- | >>> keys (insert (empty : HashTable String Int) "a" 1)
+-- | Cons "a" Nil
+keys : {k v : Type} -> HashTable k v -> List k
+keys m = List.map (\(p : Pair k v) -> fst p) (toList m)
+
+-- | The values, in `toList`'s order.
+-- | >>> values (insert (empty : HashTable String Int) "a" 1)
+-- | Cons 1 Nil
+values : {k v : Type} -> HashTable k v -> List v
+values m = List.map (\(p : Pair k v) -> snd p) (toList m)
+
 -- (a walk through a table's slots: where it is, and the table's arrays)
 data Slots k v = MkSlots Int (Array Int) (Array k) (Array v)
-
--- (the first slot from `i` on that is taken, or the end)
-takenFrom : Array Int -> Int -> Int
-takenFrom hs i =
-  if i == arrayLength hs then i
-  else if arrayIndex hs i /= 0 then i
-  else takenFrom hs (i + 1)
 
 -- | A hash table, each key and its value in the slots' order, as
 -- | `toList` has them: `for p in t` goes through the slots.
@@ -468,6 +479,12 @@ instance instanceIterateHashTable : {k v : Type} -> Iterate (HashTable k v)
 instanceIterateHashTable =
   { Elem = Pair k v, Cursor = Slots k v, start = begin, next = step }
   where
+  -- (the first slot from `i` on that is taken, or the end)
+  takenFrom : Array Int -> Int -> Int
+  takenFrom hs i =
+    if i == arrayLength hs then i
+    else if arrayIndex hs i /= 0 then i
+    else takenFrom hs (i + 1)
   begin : HashTable k v -> Slots k v
   begin (MkHashTable n hs ks vs) = MkSlots (takenFrom hs 0) hs ks vs
   step : Slots k v -> Maybe (Pair (Pair k v) (Slots k v))
@@ -503,7 +520,7 @@ instanceIterateHashTable =
 -- | 1
 -- | >>> fst (remove (fromList [MkPair "a" 1, MkPair "b" 2]) "a")
 -- | Just 1
--- | >>> fst (remove (fromList [MkPair "a" 1]) "c")
+-- | >>> fst (remove (insert (empty : HashTable String Int) "a" 1) "c")
 -- | Nothing
 -- | >>> toList (snd (remove (fromList [MkPair "a" 1, MkPair "b" 2]) "a"))
 -- | Cons (MkPair "b" 2) Nil
@@ -545,7 +562,7 @@ instanceEqualityHashTable = { equal = same }
   same a b = size a == size b && foldl (holds b) True a
 
 -- | A table as `fromList` of its pairs, in the slots' order.
--- | >>> show (fromList [MkPair "a" 1])
+-- | >>> show (insert (empty : HashTable String Int) "a" 1)
 -- | "fromList [MkPair (\"a\") (1)]"
 instance instanceShowHashTable : {k v : Type}
                                -> {{showsKey : Show k}}

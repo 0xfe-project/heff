@@ -1,0 +1,491 @@
+-- URLs (RFC 3986), written in heff: a URL read from its text into its
+-- parts (`parse`), written back (`render`), a reference resolved against
+-- the URL it is in (`resolve`, RFC 3986 §5.2), and the escapes of its
+-- parts and of a query's keys and values.  Where the RFC leaves a choice,
+-- Go's net/url is the model.  The parts are kept as they are written,
+-- escapes and all: `unescape` reads one.
+--
+-- ```haskell
+-- import std.url as URL
+--
+-- -- | >>> next "https://example.com/docs/a/index.html" "../b/"
+-- -- | Just ("https://example.com/docs/b/")
+-- next : String -> String -> Maybe String
+-- next page link = case URL.parse page of
+--   Nothing -> Nothing
+--   Just base ->
+--     maybe Nothing (\ref -> Just (URL.render (URL.resolve base ref))) (URL.parse link)
+-- ```
+
+module std.url
+  ( URL
+  , parse
+  , render
+  , resolve
+  , escapeQuery
+  , escapePath
+  , unescape
+  , unescapeQuery
+  , parseQuery
+  , renderQuery
+  )
+
+-- | A URL, or a reference relative to one, in its parts as they are
+-- | written (escaped): the scheme (`""` in a relative reference), the
+-- | user information before an `@`, the host (an IPv6 address without
+-- | its brackets), the port, the path, and the query and the fragment,
+-- | without their `?` and `#`.
+type URL =
+  { scheme : String
+  , user : Maybe String
+  , host : String
+  , port : Maybe Int
+  , path : String
+  , query : Maybe String
+  , fragment : Maybe String
+  }
+
+-- (a byte of a decimal digit)
+isDigit : Int -> Bool
+isDigit c = 48 <= c && c <= 57
+
+-- (a byte of an ASCII letter)
+isLetter : Int -> Bool
+isLetter c = 65 <= c && c <= 90 || 97 <= c && c <= 122
+
+-- (the value of a byte that is a hex digit, in either case; -1 for any
+-- other)
+hexValue : Int -> Int
+hexValue c =
+  if isDigit c then c - 48
+  else if 65 <= c && c <= 70 then c - 55
+  else if 97 <= c && c <= 102 then c - 87
+  else 0 - 1
+
+-- (a byte no escape changes: a letter, a digit, `-`, `.`, `_` or `~`)
+isUnreserved : Int -> Bool
+isUnreserved c =
+  isDigit c || isLetter c || c == 45 || c == 46 || c == 95 || c == 126
+
+-- (a byte escaped: `%` and its two hex digits, in upper case)
+percent : Int -> String
+percent c =
+  "%"
+  ^ strSlice "0123456789ABCDEF" (c / 16) (c / 16 + 1)
+  ^ strSlice "0123456789ABCDEF" (c % 16) (c % 16 + 1)
+
+-- | A key or a value of a query escaped, as Go's `QueryEscape`: a space
+-- | `+`, a letter, a digit, `-`, `.`, `_` and `~` as they are, every
+-- | other byte `%XX`.
+-- | >>> escapeQuery "a b&c=d/é"
+-- | "a+b%26c%3Dd%2F%C3%A9"
+-- | >>> escapeQuery "-_.~+"
+-- | "-_.~%2B"
+escapeQuery : String -> String
+escapeQuery s = foldBytes (\acc c -> acc ^ escaped c) "" s
+  where
+  escaped : Int -> String
+  escaped c =
+    if isUnreserved c then byteString c
+    else if c == 32
+    then "+"
+    else percent c
+
+-- | A segment of a path escaped, as Go's `PathEscape` escapes it: a
+-- | letter, a digit, `-`, `.`, `_`, `~` and `$&+:=@` as they are, every
+-- | other byte `%XX` -- a space `%20`, a `/` `%2F`, a `;` `%3B`.
+-- | >>> escapePath "a b/c?d#e"
+-- | "a%20b%2Fc%3Fd%23e"
+-- | >>> escapePath "x=1;y+z@h:p!$&'()*,~"
+-- | "x=1%3By+z@h:p%21$&%27%28%29%2A%2C~"
+escapePath : String -> String
+escapePath s = foldBytes (\acc c -> acc ^ escaped c) "" s
+  where
+  escaped : Int -> String
+  escaped c =
+    if isUnreserved c || c < 128 && contains (byteString c) "$&+:=@"
+    then byteString c
+    else percent c
+
+-- (the bytes of `s` from `i` on after `acc`, each escape `%XX` the byte
+-- it is and, if `plus`, each `+` a space; nothing if a `%` is not
+-- followed by two hex digits)
+unescapeFrom : Bool -> String -> Int -> String -> Maybe String
+unescapeFrom plus s i acc =
+  if i >= strLength s then Just acc
+  else if strByteAt s i == 37
+  then (if hexValue (strByteAt s (i + 1)) >= 0
+           && hexValue (strByteAt s (i + 2)) >= 0
+        then unescapeFrom
+            plus
+            s
+            (i + 3)
+            (acc
+             ^ byteString
+               (hexValue (strByteAt s (i + 1)) * 16
+                + hexValue (strByteAt s (i + 2))))
+        else Nothing)
+  else if plus && strByteAt s i == 43
+  then unescapeFrom plus s (i + 1) (acc ^ " ")
+  else unescapeFrom plus s (i + 1) (acc ^ strSlice s i (i + 1))
+
+-- | Each escape `%XX` (in either case) the byte it is, a `+` kept;
+-- | nothing if a `%` is not followed by two hex digits.
+-- | >>> unescape "a%20b+c%2fd%C3%A9"
+-- | Just ("a b+c/dé")
+-- | >>> unescape "100%"
+-- | Nothing
+-- | >>> unescape "%zz"
+-- | Nothing
+unescape : String -> Maybe String
+unescape s = unescapeFrom False s 0 ""
+
+-- | A key or a value of a query read: each escape `%XX` the byte it is,
+-- | each `+` a space; nothing if a `%` is not followed by two hex digits.
+-- | >>> unescapeQuery "a+b%2Bc"
+-- | Just ("a b+c")
+-- | >>> unescapeQuery "%4"
+-- | Nothing
+unescapeQuery : String -> Maybe String
+unescapeQuery s = unescapeFrom True s 0 ""
+
+-- (the first index from `i` on of a byte of `stops` in `s`, or `s`'s
+-- length)
+indexOfAny : String -> String -> Int -> Int
+indexOfAny stops s i =
+  if i >= strLength s || contains (strSlice s i (i + 1)) stops then i
+  else indexOfAny stops s (i + 1)
+
+-- (the last index of the byte `b` in `s` before `i`, or -1)
+lastIndexBefore : Int -> String -> Int -> Int
+lastIndexBefore b s i =
+  if i <= 0 then 0 - 1
+  else if strByteAt s (i - 1) == b
+  then i - 1
+  else lastIndexBefore b s (i - 1)
+
+-- | The URL, or the relative reference, `s` writes, if it writes one:
+-- | a scheme (a letter, then letters, digits, `+`, `-` and `.`) and `:`,
+-- | then perhaps `//` and an authority (user information and `@`, a
+-- | host -- an IPv6 address in brackets -- and `:` and a port, its
+-- | digits), a path, perhaps `?` and a query, and perhaps `#` and a
+-- | fragment.  Nothing if the scheme or the port is not one, if a `%`
+-- | is not followed by two hex digits, or if a byte is a control
+-- | character.  An empty port is none.
+-- | >>> parse "https://ann:pw@example.com:8080/a/b%2Fc?x=1&y=2#top"
+-- | Just ({ scheme = "https", user = Just ("ann:pw"), host = "example.com", port = Just (8080), path = "/a/b%2Fc", query = Just ("x=1&y=2"), fragment = Just ("top") })
+-- | >>> parse "http://[::1]:80/"
+-- | Just ({ scheme = "http", user = Nothing, host = "::1", port = Just (80), path = "/", query = Nothing, fragment = Nothing })
+-- | >>> parse "mailto:ann@example.com"
+-- | Just ({ scheme = "mailto", user = Nothing, host = "", port = Nothing, path = "ann@example.com", query = Nothing, fragment = Nothing })
+-- | >>> parse "../a?q#"
+-- | Just ({ scheme = "", user = Nothing, host = "", port = Nothing, path = "../a", query = Just ("q"), fragment = Just ("") })
+-- | >>> parse "//example.com"
+-- | Just ({ scheme = "", user = Nothing, host = "example.com", port = Nothing, path = "", query = Nothing, fragment = Nothing })
+-- | >>> (List.map (\s -> maybe True (\_ -> False) (parse s)) ["http://a:8x/", "1http://a", ":x", "a b:c", "http://a/%zz", "http://a/%2", "http://a/\n", "http://[::1", "http://[::1]x", "http://[a]/", "http://a]/"] : List Bool)
+-- | [True, True, True, True, True, True, True, True, True, True, True]
+parse : String -> Maybe URL
+parse s =
+  if not (wellEscaped 0) then Nothing
+  else if schemeEnd < strLength s && strByteAt s schemeEnd == 58
+  then (if isScheme (strSlice s 0 schemeEnd)
+        then withScheme
+            (strSlice s 0 schemeEnd)
+            (strSlice s (schemeEnd + 1) (strLength s))
+        else Nothing)
+  else withScheme "" s
+  where
+  -- (from `i` on, each `%` starts an escape of two hex digits, and no byte
+  -- is a control character, as Go's `url.Parse` asks)
+  wellEscaped : Int -> Bool
+  wellEscaped i =
+    if i >= strLength s then True
+    else if strByteAt s i < 32 || strByteAt s i == 127
+    then False
+    else if strByteAt s i == 37
+    then (if hexValue (strByteAt s (i + 1)) >= 0
+             && hexValue (strByteAt s (i + 2)) >= 0
+          then wellEscaped (i + 3)
+          else False)
+    else wellEscaped (i + 1)
+
+  -- (a scheme: a letter, then letters, digits, `+`, `-` and `.`)
+  isScheme : String -> Bool
+  isScheme s =
+    isLetter (strByteAt s 0)
+    && foldBytes
+      (\ok c ->
+         ok && (isLetter c || isDigit c || c == 43 || c == 45 || c == 46))
+      True
+      s
+
+  -- (`u` with the user, the host and the port the authority `authority`
+  -- writes, if it writes them well)
+  withAuthority : URL -> String -> Maybe URL
+  withAuthority u authority =
+    if startsWith "[" hostPort then bracketed (indexOf "]" hostPort 0)
+    else case indexOf ":" hostPort 0 of
+      Nothing -> withHost hostPort ""
+      Just colon ->
+        withHost
+          (strSlice hostPort 0 colon)
+          (strSlice hostPort (colon + 1) (strLength hostPort))
+    where
+    -- (a port as an authority writes it after its `:`, if it is one: none
+    -- if it is empty)
+    portOf : String -> Maybe (Maybe Int)
+    portOf "" = Just Nothing
+    portOf p =
+      if foldBytes (\ok c -> ok && isDigit c) True p then Just (parseInt p)
+      else Nothing
+
+    atSign : Int
+    atSign = lastIndexBefore 64 authority (strLength authority)
+
+    userinfo : Maybe String
+    userinfo =
+      if atSign < 0 then Nothing else Just (strSlice authority 0 atSign)
+
+    hostPort : String
+    hostPort = strSlice authority (atSign + 1) (strLength authority)
+
+    withHost : String -> String -> Maybe URL
+    withHost host portText =
+      if contains "[" host || contains "]" host then Nothing
+      else case portOf portText of
+        Nothing -> Nothing
+        Just port -> Just { u | user = userinfo, host = host, port = port }
+
+    bracketed : Maybe Int -> Maybe URL
+    bracketed Nothing = Nothing
+    bracketed (Just close) =
+      if not (contains ":" (strSlice hostPort 1 close)) then Nothing
+      else if close + 1 == strLength hostPort
+      then withHost (strSlice hostPort 1 close) ""
+      else if strByteAt hostPort (close + 1) == 58
+      then withHost
+          (strSlice hostPort 1 close)
+          (strSlice hostPort (close + 2) (strLength hostPort))
+      else Nothing
+
+  schemeEnd : Int
+  schemeEnd = indexOfAny ":/?#" s 0
+
+  hierarchical : String -> String -> Maybe String -> Maybe String -> Maybe URL
+  hierarchical scheme rest query fragment =
+    if startsWith "//" rest
+    then withAuthority
+        { scheme = scheme
+        , user = Nothing
+        , host = ""
+        , port = Nothing
+        , path = strSlice rest (indexOfAny "/" rest 2) (strLength rest)
+        , query = query
+        , fragment = fragment
+        }
+        (strSlice rest 2 (indexOfAny "/" rest 2))
+    else Just
+        { scheme = scheme
+        , user = Nothing
+        , host = ""
+        , port = Nothing
+        , path = rest
+        , query = query
+        , fragment = fragment
+        }
+
+  withPath : String -> String -> Maybe String -> Maybe URL
+  withPath scheme rest fragment = case indexOf "?" rest 0 of
+    Nothing -> hierarchical scheme rest Nothing fragment
+    Just mark ->
+      hierarchical
+        scheme
+        (strSlice rest 0 mark)
+        (Just (strSlice rest (mark + 1) (strLength rest)))
+        fragment
+
+  withQuery : String -> String -> Maybe Int -> Maybe URL
+  withQuery scheme rest Nothing = withPath scheme rest Nothing
+  withQuery scheme rest (Just hash) =
+    withPath
+      scheme
+      (strSlice rest 0 hash)
+      (Just (strSlice rest (hash + 1) (strLength rest)))
+
+  withScheme : String -> String -> Maybe URL
+  withScheme scheme rest = withQuery scheme rest (indexOf "#" rest 0)
+
+-- (`u` has an authority: a host, user information or a port, or a path
+-- starting with `//`, which only one after an authority can)
+hasAuthority : URL -> Bool
+hasAuthority u =
+  not (strEq u.host "")
+  || maybe False (\_ -> True) u.user
+  || maybe False (\_ -> True) u.port
+  || startsWith "//" u.path
+
+-- | The text of `u`: `parse`'s inverse on what it reads, but that a URL
+-- | with a scheme and a path from the root has an authority written, if
+-- | an empty one, as Go writes it (`file:/a` is `file:///a`), and that
+-- | an empty port is not written.  An IPv6 host (one with a `:`) is
+-- | written in brackets; a path is written from the root after an
+-- | authority, and after `./` where its first segment would be read as a
+-- | scheme.
+-- | >>> List.map (\s -> maybe "" render (parse s)) ["https://ann:pw@example.com:8080/a/b%2Fc?x=1&y=2#top", "http://[::1]:80/", "mailto:ann@example.com", "../a?q#", "//example.com", "file:///etc/hosts", "http:////x", "?", "#f", ""]
+-- | ["https://ann:pw@example.com:8080/a/b%2Fc?x=1&y=2#top", "http://[::1]:80/", "mailto:ann@example.com", "../a?q#", "//example.com", "file:///etc/hosts", "http:////x", "?", "#f", ""]
+-- | >>> List.map (\s -> maybe "" render (parse s)) ["file:/etc/hosts", "http://a:/"]
+-- | ["file:///etc/hosts", "http://a/"]
+-- | >>> render { scheme = "http", user = Nothing, host = "fe80::1", port = Just 8080, path = "x", query = Nothing, fragment = Nothing }
+-- | "http://[fe80::1]:8080/x"
+-- | >>> render { scheme = "", user = Nothing, host = "", port = Nothing, path = "a:b/c", query = Nothing, fragment = Nothing }
+-- | "./a:b/c"
+render : URL -> String
+render u =
+  (if strEq u.scheme "" then "" else u.scheme ^ ":")
+  ^ (if authorityWritten then "//" ^ authority else "")
+  ^ pathWritten
+  ^ maybe "" (\q -> "?" ^ q) u.query
+  ^ maybe "" (\f -> "#" ^ f) u.fragment
+  where
+  authorityWritten : Bool
+  authorityWritten =
+    hasAuthority u || not (strEq u.scheme "") && startsWith "/" u.path
+
+  authority : String
+  authority =
+    maybe "" (\i -> i ^ "@") u.user
+    ^ (if contains ":" u.host then "[" ^ u.host ^ "]" else u.host)
+    ^ maybe "" (\p -> ":" ^ showInt p) u.port
+
+  pathWritten : String
+  pathWritten =
+    if authorityWritten && not (strEq u.path "") && not (startsWith "/" u.path)
+    then "/" ^ u.path
+    else if not authorityWritten
+            && strEq u.scheme ""
+            && contains ":" (strSlice u.path 0 (indexOfAny "/" u.path 0))
+    then "./" ^ u.path
+    else u.path
+
+-- | The URL the reference `ref` names, read where `base` is, as RFC 3986
+-- | §5.2 resolves one (strictly: a scheme in `ref` is its own, even
+-- | `base`'s): `ref`'s parts from the first it has on, `base`'s before
+-- | them, a relative path merged with `base`'s, and the `.` and `..`
+-- | segments of the path taken away.
+-- | >>> ((let resolved : String -> String = \r -> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse r)) (parse "http://a/b/c/d;p?q") in List.map resolved ["g:h", "g", "./g", "g/", "/g", "//g", "?y", "g?y"]) : List String)
+-- | ["g:h", "http://a/b/c/g", "http://a/b/c/g", "http://a/b/c/g/", "http://a/g", "http://g", "http://a/b/c/d;p?y", "http://a/b/c/g?y"]
+-- | >>> ((let resolved : String -> String = \r -> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse r)) (parse "http://a/b/c/d;p?q") in List.map resolved ["#s", "g#s", "g?y#s", ";x", "g;x", "g;x?y#s", ""]) : List String)
+-- | ["http://a/b/c/d;p?q#s", "http://a/b/c/g#s", "http://a/b/c/g?y#s", "http://a/b/c/;x", "http://a/b/c/g;x", "http://a/b/c/g;x?y#s", "http://a/b/c/d;p?q"]
+-- | >>> ((let resolved : String -> String = \r -> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse r)) (parse "http://a/b/c/d;p?q") in List.map resolved [".", "./", "..", "../", "../g", "../..", "../../", "../../g"]) : List String)
+-- | ["http://a/b/c/", "http://a/b/c/", "http://a/b/", "http://a/b/", "http://a/b/g", "http://a/", "http://a/", "http://a/g"]
+-- | >>> ((let resolved : String -> String = \r -> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse r)) (parse "http://a/b/c/d;p?q") in List.map resolved ["../../../g", "../../../../g", "/./g", "/../g", "g.", ".g", "g..", "..g"]) : List String)
+-- | ["http://a/g", "http://a/g", "http://a/g", "http://a/g", "http://a/b/c/g.", "http://a/b/c/.g", "http://a/b/c/g..", "http://a/b/c/..g"]
+-- | >>> ((let resolved : String -> String = \r -> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse r)) (parse "http://a/b/c/d;p?q") in List.map resolved ["./../g", "./g/.", "g/./h", "g/../h", "g;x=1/./y", "g;x=1/../y", "g?y/./x", "g#s/../x", "http:g"]) : List String)
+-- | ["http://a/b/g", "http://a/b/c/g/", "http://a/b/c/g/h", "http://a/b/c/h", "http://a/b/c/g;x=1/y", "http://a/b/c/y", "http://a/b/c/g?y/./x", "http://a/b/c/g#s/../x", "http:g"]
+-- | >>> maybe "" (\b -> maybe "" (\x -> render (resolve b x)) (parse "a/./b")) (parse "http://h")
+-- | "http://h/a/b"
+resolve : URL -> URL -> URL
+resolve base ref =
+  if not (strEq ref.scheme "")
+  then { ref | path = removeDotSegmentsFrom ref.path "" }
+  else if hasAuthority ref
+  then { ref | scheme = base.scheme, path = removeDotSegmentsFrom ref.path "" }
+  else if strEq ref.path ""
+  then { base
+       | query =
+           (case ref.query of
+            Nothing -> base.query
+            q -> q)
+       , fragment = ref.fragment
+       }
+  else { base
+       | path =
+           removeDotSegmentsFrom
+             (if startsWith "/" ref.path then ref.path else merged)
+             ""
+       , query = ref.query
+       , fragment = ref.fragment
+       }
+  where
+  -- (the path without its last segment and the `/` before it, if it has
+  -- one: what is left of the output of `removeDotSegmentsFrom` at a `..`)
+  withoutLastSegment : String -> String
+  withoutLastSegment p =
+    let i : Int = lastIndexBefore 47 p (strLength p)
+    in if i < 0 then "" else strSlice p 0 i
+
+  -- (RFC 3986's remove_dot_segments, §5.2.4: the path `input`, without its
+  -- `.` and `..` segments, each `..` taking the segment before it away,
+  -- after `output`, what is done of it so far)
+  removeDotSegmentsFrom : String -> String -> String
+  removeDotSegmentsFrom input output =
+    if strEq input "" then output
+    else if startsWith "../" input
+    then removeDotSegmentsFrom (strSlice input 3 (strLength input)) output
+    else if startsWith "./" input
+    then removeDotSegmentsFrom (strSlice input 2 (strLength input)) output
+    else if startsWith "/./" input
+    then removeDotSegmentsFrom ("/" ^ strSlice input 3 (strLength input)) output
+    else if strEq input "/."
+    then removeDotSegmentsFrom "/" output
+    else if startsWith "/../" input
+    then removeDotSegmentsFrom
+        ("/" ^ strSlice input 4 (strLength input))
+        (withoutLastSegment output)
+    else if strEq input "/.."
+    then removeDotSegmentsFrom "/" (withoutLastSegment output)
+    else if strEq input "." || strEq input ".."
+    then output
+    else removeDotSegmentsFrom
+        (strSlice input (indexOfAny "/" input 1) (strLength input))
+        (output ^ strSlice input 0 (indexOfAny "/" input 1))
+
+  merged : String
+  merged =
+    if hasAuthority base && strEq base.path "" then "/" ^ ref.path
+    else strSlice
+        base.path
+        0
+        (lastIndexBefore 47 base.path (strLength base.path) + 1)
+      ^ ref.path
+
+-- | A query's keys and values, in order: its pieces between `&`s (an
+-- | empty one left out), each a key, and `=` and a value (`""` if it has
+-- | none), both read by `unescapeQuery`; nothing if one does not read.
+-- | Only `&` separates two (a `;` is no separator, but text).
+-- | >>> parseQuery "a=1&b=x+y%21&a=3&flag&&=v&k=a=b"
+-- | Just ([MkPair ("a") ("1"), MkPair ("b") ("x y!"), MkPair ("a") ("3"), MkPair ("flag") (""), MkPair ("") ("v"), MkPair ("k") ("a=b")])
+-- | >>> parseQuery ""
+-- | Just ([])
+-- | >>> parseQuery "a=%zz"
+-- | Nothing
+parseQuery : String -> Maybe (List (Pair String String))
+parseQuery s =
+  traverse
+    (mo := instanceMonadMaybe)
+    keyValue
+    (List.keepIf (\piece -> not (strEq piece "")) (split "&" s))
+  where
+  bothRead : Maybe String -> Maybe String -> Maybe (Pair String String)
+  bothRead (Just k) (Just v) = Just (MkPair k v)
+  bothRead _ _ = Nothing
+
+  keyValue : String -> Maybe (Pair String String)
+  keyValue piece = case indexOf "=" piece 0 of
+    Nothing -> bothRead (unescapeQuery piece) (Just "")
+    Just i ->
+      bothRead
+        (unescapeQuery (strSlice piece 0 i))
+        (unescapeQuery (strSlice piece (i + 1) (strLength piece)))
+
+-- | A query of the keys and values, in the order given, each `key=value`
+-- | escaped by `escapeQuery`, joined by `&`.
+-- | >>> renderQuery [MkPair "q" "heff lang", MkPair "page" "2", MkPair "x&y" ""]
+-- | "q=heff+lang&page=2&x%26y="
+-- | >>> parseQuery (renderQuery [MkPair "a b" "c=d&e", MkPair "" "+"])
+-- | Just ([MkPair ("a b") ("c=d&e"), MkPair ("") ("+")])
+renderQuery : List (Pair String String) -> String
+renderQuery kvs =
+  joinWith
+    "&"
+    (List.map (\kv -> escapeQuery (fst kv) ^ "=" ^ escapeQuery (snd kv)) kvs)
