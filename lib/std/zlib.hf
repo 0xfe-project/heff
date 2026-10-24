@@ -1,0 +1,86 @@
+-- zlib (RFC 1950), decompressed: DEFLATE data between a header of two
+-- bytes and the Adler-32 of what it holds, as Go's `compress/zlib` reads
+-- it.  A stream made with a preset dictionary is not read.  Import it by a
+-- name, `import std.zlib as Zlib`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.flate as Flate
+-- import std.zlib as Zlib
+--
+-- -- | >>> greeting
+-- -- | Right "hello"
+-- greeting : Either Flate.CorruptInput String
+-- greeting = case Zlib.decompress b["x", 1, 1, 5, 0, 250, 255, "hello", 6, ",", 2, 21] of
+--   Right out -> Right (toString out)
+--   Left e -> Left e
+-- ```
+
+module std.zlib (decompress)
+
+import bytes as Bytes
+import std.adler32 as Adler32
+import std.flate as Flate
+import uint32 as UInt32
+import uint8 as UInt8
+
+-- | The zlib stream the bytes begin with, decompressed, its checksum
+-- | checked; any bytes after it are not looked at.  Where it is wrong, the
+-- | byte of the input where it went wrong, and what is wrong.
+-- | >>> decompress b["x", 156, 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30, 6, 246]
+-- | Right b["hello, hello, hello!"]
+-- | >>> decompress b["x", 1, 1, 5, 0, 250, 255, "hello", 6, ",", 2, 21]
+-- | Right b["hello"]
+-- | >>> decompress b["x", 156, 3, 0, 0, 0, 0, 1]
+-- | Right b[]
+-- | >>> decompress b["x", 156, 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30, 6, 246, "xyz"]
+-- | Right b["hello, hello, hello!"]
+-- |
+-- | (a header not checked by its 5 bits, another method than DEFLATE, a
+-- | window over 32 KB, a preset dictionary; DEFLATE data that is wrong; a
+-- | checksum not the data's; too few bytes)
+-- | >>> decompress b["x", 157, 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30, 6, 246]
+-- | Left { offset = 0, message = "incorrect header check" }
+-- | >>> decompress b["y", 24, 3, 0, 0, 0, 0, 1]
+-- | Left { offset = 0, message = "unknown compression method" }
+-- | >>> decompress b[136, 28, 3, 0, 0, 0, 0, 1]
+-- | Left { offset = 0, message = "invalid window size" }
+-- | >>> decompress b["x ", 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30, 6, 246]
+-- | Left { offset = 1, message = "preset dictionary not supported" }
+-- | >>> decompress b["x", 156, 7]
+-- | Left { offset = 2, message = "invalid block type 3" }
+-- | >>> decompress b["x", 156, 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30, 6, 247]
+-- | Left { offset = 14, message = "incorrect data check" }
+-- | >>> decompress b["x", 156, 203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1, "K", 30]
+-- | Left { offset = 16, message = "unexpected end of input" }
+-- | >>> decompress b["x"]
+-- | Left { offset = 1, message = "unexpected end of input" }
+decompress : Bytes -> Either Flate.CorruptInput Bytes
+decompress input =
+  if Bytes.length input < 2
+  then failure (Bytes.length input) "unexpected end of input"
+  else if (256 * byteOf 0 + byteOf 1) % 31 /= 0
+  then failure 0 "incorrect header check"
+  else if byteOf 0 % 16 /= 8 then failure 0 "unknown compression method"
+  else if byteOf 0 / 16 > 7 then failure 0 "invalid window size"
+  else if byteOf 1 / 32 % 2 == 1
+  then failure 1 "preset dictionary not supported"
+  else case Flate.decompressAt input 2 of
+    Left e -> Left e
+    Right (MkPair out end) ->
+      if end + 4 > Bytes.length input
+      then failure (Bytes.length input) "unexpected end of input"
+      else if UInt32.toInt (Adler32.checksum out)
+              /= 16777216 * byteOf end
+              + 65536 * byteOf (end + 1)
+              + 256 * byteOf (end + 2)
+              + byteOf (end + 3)
+      then failure end "incorrect data check"
+      else Right out
+  where
+  -- (the input's byte at `i`)
+  byteOf : Int -> Int
+  byteOf i = UInt8.toInt (Bytes.bytesAt input i)
+  -- (the input found wrong at byte `offset`, by `message`)
+  failure : Int -> String -> Either Flate.CorruptInput Bytes
+  failure offset message = Left { offset = offset, message = message }

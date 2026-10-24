@@ -1,0 +1,147 @@
+-- gzip (RFC 1952), decompressed: members, one after another, each
+-- DEFLATE data between a header and the CRC-32 and the length of what it
+-- holds, as Go's `compress/gzip` reads them -- the bytes of all the
+-- members, one after another.  A header's file name, comment and extra
+-- field are passed over, and its own CRC, where it has one, checked.
+-- Import it by a name, `import std.gzip as Gzip`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.flate as Flate
+-- import std.gzip as Gzip
+--
+-- -- | the text of a file that was gzipped, where it is gzip
+-- unzipped : Bytes -> Either Flate.CorruptInput String
+-- unzipped content = case Gzip.decompress content of
+--   Right out -> Right (toString out)
+--   Left e -> Left e
+-- ```
+
+module std.gzip (decompress)
+
+import bytes as Bytes
+import std.crc32 as CRC32
+import std.flate as Flate
+import uint32 as UInt32
+import uint8 as UInt8
+
+-- | The gzip members of the bytes, decompressed, their bytes one after
+-- | another, each checked by its CRC-32 and its length.  The bytes must be
+-- | members and nothing else, and at least one.  Where they are wrong, the
+-- | byte of the input where it went wrong, and what is wrong.
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, "H", 205, 201, 201, 7, 0, 134, 166, 16, "6", 5, 0, 0, 0]
+-- | Right b["hello"]
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+-- | Right b[]
+-- |
+-- | (two members; a file name; an extra field, a name, a comment and the
+-- | header's CRC)
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, "H", 205, 201, 201, 215, "Q", 0, 0, 153, "V", 234, 17, 7, 0, 0, 0, 31, 139, 8, 0, 0, 0, 0, 0, 0, 3, "+", 207, "/", 202, "I", 1, 0, "C", 17, "w:", 5, 0, 0, 0]
+-- | Right b["hello, world"]
+-- | >>> decompress b[31, 139, 8, 9, 0, 0, 0, 0, 0, 3, "hi.txt", 0, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Right b["hi"]
+-- | >>> decompress b[31, 139, 8, 30, 0, 0, 0, 0, 0, 3, 2, 0, "abn", 0, "c", 0, 132, 139, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Right b["hi"]
+-- |
+-- | (a header's CRC not its own; not gzip; another method than DEFLATE;
+-- | a flag no one knows)
+-- | >>> decompress b[31, 139, 8, 10, 0, 0, 0, 0, 0, 3, "n", 0, "\"4", 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Left { offset = 12, message = "header crc mismatch" }
+-- | >>> decompress b[31, 140, 8, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Left { offset = 0, message = "incorrect header check" }
+-- | >>> decompress b[31, 139, 7, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Left { offset = 2, message = "unknown compression method" }
+-- | >>> decompress b[31, 139, 8, " ", 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0]
+-- | Left { offset = 3, message = "unknown header flags set" }
+-- |
+-- | (DEFLATE data that is wrong; a CRC-32 or a length not the data's)
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 7]
+-- | Left { offset = 10, message = "invalid block type 3" }
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 173, "*", 147, 216, 2, 0, 0, 0]
+-- | Left { offset = 14, message = "incorrect data check" }
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 3, 0, 0, 0]
+-- | Left { offset = 18, message = "incorrect length check" }
+-- |
+-- | (too few bytes: a trailer, a header, a name not ended, none at all;
+-- | after a member, what is not one)
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 2]
+-- | Left { offset = 19, message = "unexpected end of input" }
+-- | >>> decompress b[31, 139, 8, 0, 0, 0]
+-- | Left { offset = 6, message = "unexpected end of input" }
+-- | >>> decompress b[31, 139, 8, 8, 0, 0, 0, 0, 0, 3, "abc"]
+-- | Left { offset = 13, message = "unexpected end of input" }
+-- | >>> decompress b[]
+-- | Left { offset = 0, message = "unexpected end of input" }
+-- | >>> decompress b[31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 200, 4, 0, 172, "*", 147, 216, 2, 0, 0, 0, "x"]
+-- | Left { offset = 23, message = "unexpected end of input" }
+decompress : Bytes -> Either Flate.CorruptInput Bytes
+decompress input = membersFrom 0 Nil
+  where
+  -- (the input's byte at `i`)
+  byteOf : Int -> Int
+  byteOf i = UInt8.toInt (Bytes.bytesAt input i)
+  -- (the little-endian number of the `k` bytes from `i`)
+  littleEndian : Int -> Int -> Int
+  littleEndian i k =
+    if k == 0 then 0 else byteOf i + 256 * littleEndian (i + 1) (k - 1)
+  -- (the input found wrong at byte `offset`, by `message`)
+  failure : {a : Type} -> Int -> String -> Either Flate.CorruptInput a
+  failure offset message = Left { offset = offset, message = message }
+  -- (the input ended where more was wanted)
+  ended : {a : Type} -> Either Flate.CorruptInput a
+  ended = failure (Bytes.length input) "unexpected end of input"
+  -- (the byte after the first 0 from `i` on, or -1 where none is or `i`
+  -- is -1)
+  afterZero : Int -> Int
+  afterZero i =
+    if i < 0 || i >= Bytes.length input then 0 - 1
+    else if byteOf i == 0 then i + 1
+    else afterZero (i + 1)
+  -- (the byte after the extra field at `i`, its length first, or -1 where
+  -- the input ends first)
+  afterExtra : Int -> Int
+  afterExtra i =
+    if i + 2 > Bytes.length input then 0 - 1 else i + 2 + littleEndian i 2
+  -- (the member at `start`: the bytes it holds, and the byte after it)
+  member : Int -> Either Flate.CorruptInput (Pair Bytes Int)
+  member start =
+    if start + 10 > Bytes.length input then ended
+    else if byteOf start /= 31 || byteOf (start + 1) /= 139
+    then failure start "incorrect header check"
+    else if byteOf (start + 2) /= 8
+    then failure (start + 2) "unknown compression method"
+    else if byteOf (start + 3) >= 32
+    then failure (start + 3) "unknown header flags set"
+    else let flags : Int = byteOf (start + 3)
+         in let extraEnd : Int =
+           if flags / 4 % 2 == 1 then afterExtra (start + 10) else start + 10
+         in let nameEnd : Int =
+           if flags / 8 % 2 == 1 then afterZero extraEnd else extraEnd
+         in let fieldsEnd : Int =
+           if flags / 16 % 2 == 1 then afterZero nameEnd else nameEnd
+         in let at : Int =
+           if flags / 2 % 2 == 1 then fieldsEnd + 2 else fieldsEnd
+         in if fieldsEnd < 0 || at > Bytes.length input then ended
+         else if flags / 2 % 2 == 1
+                 && UInt32.toInt
+                   (CRC32.checksum (Bytes.slice input start fieldsEnd))
+                 % 65536
+                 /= littleEndian fieldsEnd 2
+         then failure fieldsEnd "header crc mismatch"
+         else case Flate.decompressAt input at of
+           Left e -> Left e
+           Right (MkPair out end) ->
+             if end + 8 > Bytes.length input then ended
+             else if UInt32.toInt (CRC32.checksum out) /= littleEndian end 4
+             then failure end "incorrect data check"
+             else if Bytes.length out % 4294967296 /= littleEndian (end + 4) 4
+             then failure (end + 4) "incorrect length check"
+             else Right (MkPair out (end + 8))
+  -- (the members from `at` on, after those of `outs`, the last first)
+  membersFrom : Int -> List Bytes -> Either Flate.CorruptInput Bytes
+  membersFrom at outs = case member at of
+    Left e -> Left e
+    Right (MkPair out next) ->
+      if next >= Bytes.length input
+      then Right (Bytes.concat (List.reverse (out :: outs)))
+      else membersFrom next (out :: outs)
