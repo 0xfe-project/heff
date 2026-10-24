@@ -6,9 +6,13 @@
 -- are passed or put, in order, used or not.  A global is evaluated when
 -- first used.  `abandon` is a value, `Abn`, threaded through every
 -- step -- so a watch that abandons reports `<abandoned>` instead of
--- ending the run.  Evaluation that goes deeper than `deepest` is said
--- to diverge, `Div`: every function and every thunk is given the depth
--- it is forced at.  What type checking rules out -- a value of the wrong
+-- ending the run.  Evaluation that nests deeper than `deepest`, or
+-- whose path takes more than `longest` steps, is said to diverge, `Div`:
+-- every function and every thunk is given the depth it is forced at, and
+-- a step in a tail position -- a function's body, applied, a match's arm
+-- -- nests no deeper, so a loop's depth stays put while its steps count
+-- to `longest`, as a recursion's nesting counts to `deepest`.  What
+-- type checking rules out -- a value of the wrong
 -- shape, a name not in scope -- is a bug of the compiler, `Bug`, said
 -- (`<compiler bug: ...>`) and never taken for a value.
 
@@ -62,10 +66,39 @@ rbind (Bug what) f = Bug what
 okTh : Val -> Th RVal
 okTh v = \d -> Ok v
 
--- | how deep evaluation goes before it is said to diverge: deeper than a
--- | program that ends needs
+-- | how deep evaluation nests -- how many evaluations wait, one inside
+-- | another, for its value -- before it is said to diverge: deeper than a
+-- | program that ends needs, and within the interpreter's own stack
 deepest : Int
 deepest = 1000000
+
+-- | how many steps the path to a computation takes, tail ones too,
+-- | before it is said to diverge: the end of a loop that never ends
+longest : Int
+longest = 100000000
+
+-- (a depth is one `Int`, so that passing it allocates nothing: how deep
+-- it nests in the bits from 40 up, how many steps its path took below
+-- them)
+nestUnit : Int
+nestUnit = 1099511627776
+
+-- (the depth where the nesting is past `deepest`)
+nestedTooDeep : Int
+nestedTooDeep = (deepest + 1) * nestUnit
+
+-- (a computation at depth `d` waited for, nested in it: one deeper, and a
+-- step)
+nested : Int -> Int
+nested d = d + nestUnit + 1
+
+-- (a step on from depth `d`, in a tail position: no deeper)
+onward : Int -> Int
+onward d = d + 1
+
+-- (whether evaluation at depth `d` is said to diverge)
+diverges : Int -> Bool
+diverges d = d >= nestedTooDeep || d % nestUnit > longest
 
 -- | a function applied, by evaluation at depth `d`
 app : Int -> Val -> Th RVal -> RVal
@@ -1151,7 +1184,7 @@ evalFields ev (Cons (MkPair l t) rest) k =
 
 evalIn : Int -> Env -> Syntax.Tm -> RVal
 evalIn d e t =
-  if d > deepest then Div
+  if diverges d then Div
   else case t of
     SLocal i -> case nthTh e.local i of
       Just v -> v d
@@ -1160,47 +1193,47 @@ evalIn d e t =
       Just v -> v d
       Nothing -> Bug (x ^ " is not in scope")
     SLam _ (MkAbs _ body) ->
-      Ok (VFun (\dc v -> evalIn (dc + 1) (bindLocal e v) body))
-    SLam _ (AbsConst body) -> Ok (VFun (\dc u -> evalIn (dc + 1) e body))
+      Ok (VFun (\dc v -> evalIn (onward dc) (bindLocal e v) body))
+    SLam _ (AbsConst body) -> Ok (VFun (\dc u -> evalIn (onward dc) e body))
     SApp t1 t2 ->
       rbind
-        (evalIn (d + 1) e t1)
-        (\f -> rbind (evalIn (d + 1) e t2) (\a -> app d f (okTh a)))
+        (evalIn (nested d) e t1)
+        (\f -> rbind (evalIn (nested d) e t2) (\a -> app d f (okTh a)))
     SCons fs ->
       evalFields
-        (\t2 -> evalIn (d + 1) e t2)
+        (\t2 -> evalIn (nested d) e t2)
         (Dict.toList fs)
         (\vs -> Ok (VCons (Dict.fromList vs)))
-    SProj t2 x -> rbind (evalIn (d + 1) e t2) (\v -> projV v x)
+    SProj t2 x -> rbind (evalIn (nested d) e t2) (\v -> projV v x)
     STag x ts ->
       evalEach
-        (\t2 -> evalIn (d + 1) e t2)
+        (\t2 -> evalIn (nested d) e t2)
         (Array.toList ts)
         (\vs -> Ok (VTag x vs))
     SMatch scrut cases ->
-      rbind (evalIn (d + 1) e scrut) (\v -> case v of
+      rbind (evalIn (nested d) e scrut) (\v -> case v of
         VTag x vs ->
           (case Dict.lookup cases x of
-           Just (MkPair _ body) -> evalIn (d + 1) (bindVals e vs) body
+           Just (MkPair _ body) -> evalIn (onward d) (bindVals e vs) body
            -- (the default case, of the tags no other names: it binds none
            -- of their arguments)
            Nothing -> case Dict.lookup cases "_" of
-             Just (MkPair _ body) -> evalIn (d + 1) e body
+             Just (MkPair _ body) -> evalIn (onward d) e body
              Nothing -> Bug ("no case for " ^ x))
         VErased -> Ok VErased
         _ -> Bug "a case of what is not a tag")
     SCode _ -> Ok VErased
-    SIs t2 -> evalIn (d + 1) e t2
+    SIs t2 -> evalIn (onward d) e t2
     SAbandon -> Abn
-    SRec t2 -> evalIn (d + 1) e t2
+    SRec t2 -> evalIn (onward d) e t2
     -- (the definition itself is its own body, evaluated again whenever it
     -- is called for)
     SFix ty (MkAbs x body) ->
       evalIn
-        (d + 1)
+        (onward d)
         (bindLocal e (\dc -> evalIn dc e (SFix ty (MkAbs x body))))
         body
-    SFix _ (AbsConst body) -> evalIn (d + 1) e body
+    SFix _ (AbsConst body) -> evalIn (onward d) e body
     SPrim x -> Ok (prim x)
     SLitInt i -> Ok (VInt i)
     SLitFloat x -> Ok (VFloat x)
@@ -1210,7 +1243,7 @@ evalIn d e t =
     -- (a fixed-width integer is an integer, of its type's range)
     SLitFixed _ i -> Ok (VInt i)
     SLitFloat32 x -> Ok (VFloat32 (Float32.fromFloat x))
-    SImplicit _ t2 -> evalIn (d + 1) e t2
+    SImplicit _ t2 -> evalIn (onward d) e t2
     SSpecialize _ _ _ -> Ok VErased
     _ -> Bug "a term that is not evaluated"
 
@@ -1294,7 +1327,7 @@ type GlobalEnv = OrdMap.OrdMap String (Th RVal)
 -- (the definition itself is local 0: forcing it ties the knot)
 fixThunk : GlobalEnv -> Syntax.Tm -> Th RVal
 fixThunk g t = \d ->
-    evalIn (d + 1) { local = Cons (fixThunk g t) Nil, global = g } t
+    evalIn (nested d) { local = Cons (fixThunk g t) Nil, global = g } t
 
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = OrdMap.empty } (SApp (SApp (SPrim IntAdd) (SLitInt 2)) (SLitInt 3))))
 -- | "5"

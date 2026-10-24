@@ -88,6 +88,7 @@
 
 ### Compiler and tools
 
+- The interpreter (doc tests, watches, `heff eval`) tells a loop from a recursion: a call in a tail position, a function's body applied or a match's arm, nests no deeper, so a loop runs as long as it takes up to a hundred million steps, and only what waits for a value nests, up to a million (#128). A tail loop of ten million turns, or JSON nested 500000 deep, is no longer `<diverged>`; `spin x = spin (x + 1)` still is, after about 7 s.
 - `heff fmt`: a block that is an application's last argument, `f x (case y of`, laid out on a line of its own (after `=`, or a lambda's arrow), has its items indented from that line, as a statement's are, not under the application's first token.
 - The language server goes to a local's definition, its binder, and highlights a name's occurrences in the file. References and renaming elaborate only the files whose text has the name, the rest thawed from the cache, and keep what they elaborated until it changes: references of `IR.Expr` in heff's own project take 1.8 s the first time and 0.7 s after an edit, not 10 s each time; a local's references are found in its file alone. A module claim's entry is a reference too, and is renamed.
 - `heff get` takes a package no tag is a version of at a pseudo-version, `0.0.0-TIME-COMMIT`, of its default branch's commit, or with `PATH@BRANCH` or `PATH@COMMIT` of that commit. A pseudo-version is older than every release.
