@@ -1,0 +1,1104 @@
+-- Concurrent ML (Reppy), on std.domain: threads that meet at channels,
+-- and events, their synchronous operations as values.  A `send` waits
+-- for its receiver and a `recv` for its sender, each the `sync` of an
+-- event (`sendEvt`, `recvEvt`); events are composed before they are
+-- committed -- `choose` among several, `wrap` what one comes to,
+-- `guard` what is done at sync time, `withNack` told when another was
+-- chosen -- and a `sync` commits exactly one base event of them.  The
+-- threads run on as many domains as the machine has cores.  Import it
+-- by a name, `import cml as CML`.
+--
+-- > [!CAUTION]
+-- > Unstable: concurrency in heff is not settled. What this module offers
+-- > may change, or go, in any release.
+--
+-- ```haskell
+-- import cml as CML
+-- import co
+-- import std.domain as Domain
+--
+-- -- | what comes on `a`, one more, sent on `b`, for ever
+-- ponger : {e w : HFunctor}
+--        -> {{cm : CML.cml w <: e}}
+--        -> CML.Chan w Int
+--        -> CML.Chan w Int
+--        -> Co e Unit
+-- ponger a b = do
+--   x <- CML.recv a
+--   CML.send b (x + 1)
+--   ponger a b
+--
+-- -- | main and one thread: 0 sent there, and 1 back
+-- pinged : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
+-- pinged = do
+--   a <- CML.newChan (cm := cm)
+--   b <- CML.newChan (cm := cm)
+--   CML.spawn (cm := cm) (ponger a b)
+--   CML.send a 0
+--   CML.recv b
+--
+-- -- | `Just 1`, the threads on domains
+-- pingedHere : {w : HFunctor}
+--            -> {{dm : Domain.domain <: w}}
+--            -> Co w (Maybe Int)
+-- pingedHere = CML.scheduled (pinged (w := w) (cm := _))
+-- ```
+--
+-- Operation | What it does
+-- --- | ---
+-- `spawn c` | `c` is a thread of its own; this one goes on
+-- `yield` | the next thread's turn; this one's again after those ready
+-- `newChan` | a channel, of what its type says
+-- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver
+-- `recv ch` | what a thread sends on `ch`, once one does: waits for the sender
+-- `sendEvt ch x` / `recvEvt ch` | ... the same, as events
+-- `newIVar` | an ivar, holding nothing yet
+-- `putIVar iv x` | `iv` holds `x` now, its readers given it; once, a second put abandons; never waits
+-- `readIVar iv` / `readIVarEvt iv` | what `iv` holds, waiting until it does; ... as an event
+-- `always x` / `never` | an event ready at once, coming to `x`; one never ready
+-- `choose evs` | one of the events: whichever is ready, the first of them where several are
+-- `wrap ev f` | `ev`, coming to `f` of what `ev` came to
+-- `guard c` | the event `c` comes to, `c` run at each `sync`
+-- `withNack f` | `f`'s event, `f` given one that is ready once a `sync` chose another over it
+-- `sync ev` | `ev` committed, this thread waiting until one of its base events can be: what it comes to
+-- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits
+--
+-- An event is a value: `sendEvt ch x`, `recvEvt ch`, `readIVarEvt iv`
+-- and `always x` are its base events, and a `choose` of several is one
+-- too, so a protocol of several messages is one event, put in a
+-- `choose` with others and committed at once, which is what Go's
+-- `select` cannot do.  A `sync` runs the event's guards (`guard`,
+-- `withNack`), on this thread, and so comes to the base events; where
+-- one of them can be committed now -- a sender waiting at the channel
+-- of a `recvEvt`, a receiver at the channel of a `sendEvt`, an ivar
+-- written, an `always` -- it is, the first such in the order of the
+-- `choose`, and the thread goes on with what it comes to; else the
+-- thread waits at every one of them, and goes on when another's
+-- `sync` meets one.  Then each `withNack`'s nack event is ready, where
+-- the base event committed was not among that `withNack`'s: the other
+-- branches told they were not chosen.  `Event w e a` is of threads run
+-- in the world `w` (as its channels, `Chan w a`), its guards run in
+-- `e`, the world of the thread that syncs it, and comes to an `a`.
+--
+-- The threads are the scheduler's, a handler in the language, and the
+-- domains are their workers: a thread is a resumption, run by a
+-- worker from where it stopped to where it next ends, gives up its
+-- turn (`yield`), or waits in a `sync`, and the worker takes the next
+-- thread ready (one queue under a mutex, the workers waiting on a
+-- condition while it is empty).  A `sync` that waits leaves an offer
+-- at each of its base events' channels and ivars: one cell
+-- (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
+-- whichever other `sync` meets one of them first, which readies the
+-- waiting thread with what came; so a waiting thread occupies no
+-- worker, and a `choose` commits one base event at most.  A `sync`
+-- holds the mutexes of its channels and ivars, each once, in the order
+-- of their numbers, from looking for a partner until its offers are
+-- left, so that no `sync` misses a partner leaving its offer meanwhile,
+-- and none waits for another round a cycle.  `scheduled` counts the
+-- threads running or ready, one more for a thread as it is readied
+-- (before the one readying it may itself wait), one fewer for one that
+-- waits or ends: at none left before main is done every thread waits
+-- in a `sync`, a deadlock, and it comes to `Nothing`.  Main's answer
+-- ends it all, the other threads dropped where they stopped.  A
+-- thread gives up its domain at its operations alone: long pure work
+-- in a thread holds its domain until it comes to one, and the other
+-- threads there wait for it.  A computation held by an operation of
+-- `w` (`Domain.spawn c` holds `c`) is run alone, as the operation does
+-- it: its `spawn`s, channels and ivars are the scheduler's, but a
+-- `sync` in it has no thread to meet, and is abandoned unless an
+-- `always` is among its base events.  A thread that fails fails its
+-- worker, which `scheduled` says once main is done.
+
+module cml
+  ( cml
+  , Chan
+  , Event
+  , IVar
+  , spawn
+  , yield
+  , newChan
+  , send
+  , recv
+  , sendEvt
+  , recvEvt
+  , newIVar
+  , putIVar
+  , readIVar
+  , readIVarEvt
+  , always
+  , never
+  , choose
+  , wrap
+  , guard
+  , withNack
+  , sync
+  , scheduled
+  )
+
+import co
+import std.domain as Domain
+
+-- Offers, channels and ivars
+--------------------------------------------------------------------------------
+
+-- (a sync's offer, as the channels and ivars it waits at hold it:
+-- whether it has been claimed.  One cell for every base event of the
+-- sync, so that one of them is claimed at most, by whichever party
+-- claims it first.)
+data Offer = MkOffer (Domain.Atomic Bool)
+
+-- (a sender waiting at a channel: its offer, the value, and what
+-- readies its thread once a receiver has taken it)
+data Sender (w : HFunctor) a = MkSender Offer a (Co w Unit)
+
+-- (a receiver waiting at a channel or an ivar: its offer, and what
+-- readies its thread, given the value)
+data Receiver (w : HFunctor) a = MkReceiver Offer (a -> Co w Unit)
+
+-- (those waiting at a channel or an ivar, the longest first)
+type Senders (w : HFunctor) a = Domain.Atomic (List (Sender w a))
+
+type Receivers (w : HFunctor) a = Domain.Atomic (List (Receiver w a))
+
+-- | A channel of `a`s, of threads run in the world `w`: a rendezvous,
+-- | a sender and a receiver each waiting for the other.  (Its number,
+-- | which orders the mutexes a sync holds; its mutex; the senders and
+-- | the receivers waiting at it.)
+data Chan (w : HFunctor) a
+  = MkChan Int Domain.Mutex (Senders w a) (Receivers w a)
+
+-- | An ivar: a variable of threads run in the world `w`, written once
+-- | and read any number of times, each reader waiting until it is
+-- | written -- a signal.  (Its number, its mutex, what it holds, and
+-- | the readers waiting for it.)
+data IVar (w : HFunctor) a
+  = MkIVar Int Domain.Mutex (Domain.Atomic (Maybe a)) (Receivers w a)
+
+-- Base events
+--------------------------------------------------------------------------------
+
+-- | A value of some type, the type hidden: what an operation of a type
+-- | of its own holds (the effect has no parameter for it).
+type Some (f : Type -> Type) = (r : Type) -> ((a : Type) -> f a -> r) -> r
+
+-- (what it holds, changed, of whatever type)
+someThen : {f g : Type -> Type}
+         -> ({a : Type} -> f a -> g a)
+         -> Some f
+         -> Some g
+someThen h s = \r use -> s r (\a v -> use a (h v))
+
+-- (a send as a base event: the channel, the value, and what comes after
+-- it, once the value is taken)
+data SendOn (w : HFunctor) x a = MkSendOn (Chan w a) a (Unit -> x)
+
+-- (a receive: the channel, and what comes after it, given the value)
+data RecvOn (w : HFunctor) x a = MkRecvOn (Chan w a) (a -> x)
+
+-- (an ivar's read: the ivar, and what comes after it, given its value)
+data ReadOn (w : HFunctor) x a = MkReadOn (IVar w a) (a -> x)
+
+sendOnThen : {w : HFunctor}
+           -> {x y a : Type}
+           -> (x -> y)
+           -> SendOn w x a
+           -> SendOn w y a
+sendOnThen g (MkSendOn ch v k) = MkSendOn ch v (\u -> g (k u))
+
+recvOnThen : {w : HFunctor}
+           -> {x y a : Type}
+           -> (x -> y)
+           -> RecvOn w x a
+           -> RecvOn w y a
+recvOnThen g (MkRecvOn ch k) = MkRecvOn ch (\v -> g (k v))
+
+readOnThen : {w : HFunctor}
+           -> {x y a : Type}
+           -> (x -> y)
+           -> ReadOn w x a
+           -> ReadOn w y a
+readOnThen g (MkReadOn iv k) = MkReadOn iv (\v -> g (k v))
+
+-- (a base event, and what comes after it, an `x`: a send, a receive, an
+-- ivar's read, or one ready at once)
+data Base (w : HFunctor) x
+  = SendBase (Some (SendOn w x))
+  | RecvBase (Some (RecvOn w x))
+  | ReadBase (Some (ReadOn w x))
+  | AlwaysBase x
+
+baseThen : {w : HFunctor} -> {x y : Type} -> (x -> y) -> Base w x -> Base w y
+baseThen g (SendBase s) = SendBase (someThen (sendOnThen g) s)
+baseThen g (RecvBase s) = RecvBase (someThen (recvOnThen g) s)
+baseThen g (ReadBase s) = ReadBase (someThen (readOnThen g) s)
+baseThen g (AlwaysBase x) = AlwaysBase (g x)
+
+-- Events
+--------------------------------------------------------------------------------
+
+-- | An event of threads run in the world `w`, its guards run in `e`: a
+-- | synchronous operation, composed, and committed by `sync`, which
+-- | comes to an `a`.  (A base event, with what it comes to; none, never
+-- | ready; a choice; a guard, run at sync time; or a function of the
+-- | event that is ready once another was chosen over its own.)
+data Event (w : HFunctor) (e : HFunctor) a
+  = Primitive (Base w a)
+  | NeverReady
+  | Choice (List (Event w e a))
+  | Guarded (Co e (Event w e a))
+  | Nacked (Event w e Unit -> Co e (Event w e a))
+
+-- The effect
+--------------------------------------------------------------------------------
+
+-- (a channel made: what comes after, given it)
+data MakingChan (w : HFunctor) x a = MkMakingChan (Chan w a -> x)
+
+-- (an ivar made: what comes after, given it)
+data MakingIVar (w : HFunctor) x a = MkMakingIVar (IVar w a -> x)
+
+-- (an ivar written: the ivar, the value, and what comes after)
+data Putting (w : HFunctor) x a = MkPutting (IVar w a) a x
+
+makingChanThen : {w : HFunctor}
+               -> {x y a : Type}
+               -> (x -> y)
+               -> MakingChan w x a
+               -> MakingChan w y a
+makingChanThen g (MkMakingChan k) = MkMakingChan (\ch -> g (k ch))
+
+makingIVarThen : {w : HFunctor}
+               -> {x y a : Type}
+               -> (x -> y)
+               -> MakingIVar w x a
+               -> MakingIVar w y a
+makingIVarThen g (MkMakingIVar k) = MkMakingIVar (\iv -> g (k iv))
+
+puttingThen : {w : HFunctor}
+            -> {x y a : Type}
+            -> (x -> y)
+            -> Putting w x a
+            -> Putting w y a
+puttingThen g (MkPutting iv v x) = MkPutting iv v (g x)
+
+data CmlF (w : HFunctor) (m : Type -> Type) x
+  = Spawn (m Unit) x
+  | Yield x
+  | NewChan (Some (MakingChan w x))
+  | NewIVar (Some (MakingIVar w x))
+  | PutIVar (Some (Putting w x))
+  | Sync (List (Base w x))
+
+-- (what comes after an operation, changed)
+stepThen : {w : HFunctor}
+         -> {m : Type -> Type}
+         -> {x y : Type}
+         -> (x -> y)
+         -> CmlF w m x
+         -> CmlF w m y
+stepThen g (Spawn c x) = Spawn c (g x)
+stepThen g (Yield x) = Yield (g x)
+stepThen g (NewChan s) = NewChan (someThen (makingChanThen g) s)
+stepThen g (NewIVar s) = NewIVar (someThen (makingIVarThen g) s)
+stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
+stepThen g (Sync bs) = Sync (List.map (baseThen g) bs)
+
+-- | Threads run in the world `w`, as an effect.
+cml : HFunctor -> HFunctor
+cml w =
+  { f = CmlF w
+  , hfmap = \m g p -> stepThen g p
+  , hmap = \m n nt p -> case p of
+      Spawn c x -> Spawn (nt c) x
+      Yield x -> Yield x
+      NewChan s -> NewChan s
+      NewIVar s -> NewIVar s
+      PutIVar s -> PutIVar s
+      Sync bs -> Sync bs
+  }
+
+-- Threads
+--------------------------------------------------------------------------------
+
+-- | `c`, a thread of its own; this one goes on.
+spawn : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit -> Co e Unit
+spawn c = op (cm (Spawn c MkUnit)) val
+
+-- | The next thread's turn; this one's again after those ready.
+yield : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit
+yield = op (cm (Yield MkUnit)) val
+
+-- Channels and ivars
+--------------------------------------------------------------------------------
+
+-- | A channel of `a`s.
+newChan : {e w : HFunctor}
+        -> {a : Type}
+        -> {{cm : cml w <: e}}
+        -> Co e (Chan w a)
+newChan = op (cm (NewChan (\r use -> use a (MkMakingChan (\ch -> ch))))) val
+
+-- | An ivar, holding nothing yet.
+newIVar : {e w : HFunctor}
+        -> {a : Type}
+        -> {{cm : cml w <: e}}
+        -> Co e (IVar w a)
+newIVar = op (cm (NewIVar (\r use -> use a (MkMakingIVar (\iv -> iv))))) val
+
+-- | The ivar holds `v` now, every thread waiting to read it given it;
+-- | once: a second put is abandoned.  Never waits.
+putIVar : {e w : HFunctor}
+        -> {a : Type}
+        -> {{cm : cml w <: e}}
+        -> IVar w a
+        -> a
+        -> Co e Unit
+putIVar iv v = op (cm (PutIVar (\r use -> use a (MkPutting iv v MkUnit)))) val
+
+-- Events
+--------------------------------------------------------------------------------
+
+-- | An event ready at once, coming to `v`.
+always : {w e : HFunctor} -> {a : Type} -> a -> Event w e a
+always v = Primitive (AlwaysBase v)
+
+-- | An event never ready: a `sync` of it alone waits for ever.
+never : {w e : HFunctor} -> {a : Type} -> Event w e a
+never = NeverReady
+
+-- | `v` sent on the channel, as an event: ready where a receiver waits
+-- | there.
+sendEvt : {w e : HFunctor} -> {a : Type} -> Chan w a -> a -> Event w e Unit
+sendEvt ch v = Primitive (SendBase (\r use -> use a (MkSendOn ch v (\u -> u))))
+
+-- | What is sent on the channel, as an event: ready where a sender
+-- | waits there, coming to its value.
+recvEvt : {w e : HFunctor} -> {a : Type} -> Chan w a -> Event w e a
+recvEvt ch = Primitive (RecvBase (\r use -> use a (MkRecvOn ch (\v -> v))))
+
+-- | What the ivar holds, as an event: ready once it is written.
+readIVarEvt : {w e : HFunctor} -> {a : Type} -> IVar w a -> Event w e a
+readIVarEvt iv = Primitive (ReadBase (\r use -> use a (MkReadOn iv (\v -> v))))
+
+-- | One of the events, whichever a `sync` can commit: the first of
+-- | them where several can be, and where none can, whichever is met
+-- | first.
+choose : {w e : HFunctor} -> {a : Type} -> List (Event w e a) -> Event w e a
+choose evs = Choice evs
+
+-- | The event, coming to `g` of what it came to.
+wrap : {w e : HFunctor}
+     -> {a b : Type}
+     -> Event w e a
+     -> (a -> b)
+     -> Event w e b
+wrap (Primitive b) g = Primitive (baseThen g b)
+wrap NeverReady g = NeverReady
+wrap (Choice evs) g = Choice (List.map (\ev -> wrap ev g) evs)
+wrap (Guarded c) g = Guarded (bind c (\ev -> pure (wrap ev g)))
+wrap (Nacked h) g = Nacked (\nack -> bind (h nack) (\ev -> pure (wrap ev g)))
+
+-- | The event `c` comes to, `c` run by each `sync`, on its thread, before
+-- | it looks for a partner: what is to be done at sync time, a channel
+-- | made or a request sent, is done here.
+guard : {w e : HFunctor} -> {a : Type} -> Co e (Event w e a) -> Event w e a
+guard c = Guarded c
+
+-- | The event `h` comes to, run as a guard, `h` given the nack event:
+-- | ready once the `sync` has committed a base event not among those
+-- | `h` came to, so a thread waiting on the nack knows this branch was
+-- | not chosen.
+withNack : {w e : HFunctor}
+         -> {a : Type}
+         -> (Event w e Unit -> Co e (Event w e a))
+         -> Event w e a
+withNack h = Nacked h
+
+-- Sync
+--------------------------------------------------------------------------------
+
+-- (a base event an event came to: the nacks enclosing it, by number,
+-- and itself)
+type Leaf (w : HFunctor) a = Pair (List Int) (Base w a)
+
+-- (the nacks made so far, flattening an event: the next one's number,
+-- and each by its number)
+type Nacks (w : HFunctor) = { next : Int, vars : List (Pair Int (IVar w Unit)) }
+
+-- (the event flattened to the base events it comes to, its guards run,
+-- `enclosing` the nacks around it so far: each base event with the
+-- nacks enclosing it, and the nacks made)
+flattened : {e w : HFunctor}
+          -> {a : Type}
+          -> {{cm : cml w <: e}}
+          -> Event w e a
+          -> List Int
+          -> Nacks w
+          -> Co e (Pair (List (Leaf w a)) (Nacks w))
+flattened (Primitive b) enclosing ns = pure (MkPair [MkPair enclosing b] ns)
+flattened NeverReady enclosing ns = pure (MkPair Nil ns)
+flattened (Choice Nil) enclosing ns = pure (MkPair Nil ns)
+flattened (Choice (ev :: evs)) enclosing ns = do
+  first <- flattened ev enclosing ns
+  rest <- flattened (Choice evs) enclosing (snd first)
+  pure (MkPair (fst first ++ fst rest) (snd rest))
+flattened (Guarded c) enclosing ns = do
+  ev <- c
+  flattened ev enclosing ns
+flattened (Nacked h) enclosing ns = do
+  nack <- newIVar (cm := cm)
+  ev <- h (readIVarEvt nack)
+  flattened
+      ev
+      (ns.next :: enclosing)
+      { next = ns.next + 1, vars = MkPair ns.next nack :: ns.vars }
+
+-- (every nack but those enclosing the base event committed, written:
+-- the other branches told they were not chosen)
+nacked : {e w : HFunctor}
+       -> {{cm : cml w <: e}}
+       -> List Int
+       -> List (Pair Int (IVar w Unit))
+       -> Co e Unit
+nacked enclosing Nil = pure ()
+nacked enclosing (MkPair n nack :: rest) = do
+  if List.elem n enclosing then pure () else putIVar nack MkUnit
+  nacked enclosing rest
+
+-- (a base event, what comes after it the nacks written and what it
+-- came to)
+committing : {e w : HFunctor}
+           -> {a : Type}
+           -> {{cm : cml w <: e}}
+           -> List (Pair Int (IVar w Unit))
+           -> Leaf w a
+           -> Base w (Co e a)
+committing nacks (MkPair enclosing b) =
+  baseThen (\v -> bind (nacked enclosing nacks) (\u -> pure v)) b
+
+-- | The event committed: its guards run, then one of its base events,
+-- | this thread waiting until one can be; the nacks of the branches not
+-- | chosen written; what it comes to.
+sync : {e w : HFunctor}
+     -> {a : Type}
+     -> {{cm : cml w <: e}}
+     -> Event w e a
+     -> Co e a
+sync ev = do
+  flat <- flattened ev Nil { next = 0, vars = Nil }
+  let nacks : Nacks w = snd flat
+  after <- op (cm (Sync (List.map (committing nacks.vars) (fst flat)))) val
+  after
+
+-- | `v` sent on the channel, once a thread takes it: waits for the
+-- | receiver.
+send : {e w : HFunctor}
+     -> {a : Type}
+     -> {{cm : cml w <: e}}
+     -> Chan w a
+     -> a
+     -> Co e Unit
+send ch v = sync (sendEvt ch v)
+
+-- | What a thread sends on the channel, once one does: waits for the
+-- | sender.
+recv : {e w : HFunctor}
+     -> {a : Type}
+     -> {{cm : cml w <: e}}
+     -> Chan w a
+     -> Co e a
+recv ch = sync (recvEvt ch)
+
+-- | What the ivar holds, waiting until it is written.
+readIVar : {e w : HFunctor}
+         -> {a : Type}
+         -> {{cm : cml w <: e}}
+         -> IVar w a
+         -> Co e a
+readIVar iv = sync (readIVarEvt iv)
+
+-- The handler: a thread as a resumption
+--------------------------------------------------------------------------------
+
+-- | A thread, stopped where the scheduler has a say: done; at an
+-- | operation of `cml`, what comes after it a thread again; or at one
+-- | of the world's, to be done in `Co w`.
+data Res (w : HFunctor) a
+  = RDone a
+  | RStep (CmlF w (Res w) (Res w a))
+  | RAct (Co w (Res w a))
+
+thenRes : {w : HFunctor} -> {a b : Type} -> Res w a -> (a -> Res w b) -> Res w b
+thenRes (RDone x) f = f x
+thenRes (RStep p) f = RStep (stepThen (\r -> thenRes r f) p)
+thenRes (RAct m) f = RAct (bind m (\r -> pure (thenRes r f)))
+
+resFunctor : (w : HFunctor) -> RawFunctor
+resFunctor w = { f = Res w, fmap = \g r -> thenRes r (\x -> RDone (g x)) }
+
+-- The scheduler
+--------------------------------------------------------------------------------
+
+-- (what the domains running threads share: the next channel's or
+-- ivar's number; how many threads are running or ready, which is 0
+-- only at a deadlock; the threads ready, a queue, its front and its
+-- back reversed; the mutex they are taken under, the condition the
+-- domains wait on for one, and the one the caller waits on until main
+-- is done or every thread waits; whether that has come; and whether
+-- the domains are to stop)
+type Sched (w : HFunctor) =
+  { numbers : Domain.Atomic Int
+  , live : Domain.Atomic Int
+  , ready : Domain.Atomic (Pair (List (Res w Unit)) (List (Res w Unit)))
+  , mutex : Domain.Mutex
+  , work : Domain.Condition
+  , finished : Domain.Condition
+  , done : Domain.Atomic Bool
+  , stopping : Domain.Atomic Bool
+  }
+
+-- (the thread put among those ready, a domain waiting for one woken)
+readied : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Res w Unit
+        -> Co w Unit
+readied st r = do
+  Domain.lock st.mutex
+  q <- Domain.get st.ready
+  Domain.set st.ready (MkPair (fst q) (r :: snd q))
+  Domain.signal st.work
+  Domain.unlock st.mutex
+
+-- (one more thread running or ready)
+counted : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
+counted st = do
+  _ <- Domain.fetchAdd st.live 1
+  pure ()
+
+-- (the caller told that it is over: main done, or every thread waiting)
+finishedWith : {w : HFunctor}
+             -> {{dm : Domain.domain <: w}}
+             -> Sched w
+             -> Co w Unit
+finishedWith st = do
+  Domain.lock st.mutex
+  Domain.set st.done True
+  Domain.broadcast st.finished
+  Domain.unlock st.mutex
+
+-- (one fewer thread running or ready: it waits, or it ended.  Where
+-- none is left, every thread waits in a sync -- a deadlock, unless main
+-- is done -- and the caller is told.)
+uncounted : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
+          -> Co w Unit
+uncounted st = do
+  n <- Domain.fetchAdd st.live (0 - 1)
+  if n == 1 then finishedWith st else pure ()
+
+-- (the thread, waiting no more: counted, and among those ready)
+readyAgain : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Res w Unit
+           -> Co w Unit
+readyAgain st r = do
+  counted st
+  readied st r
+
+-- (a channel made)
+madeChan : {w : HFunctor}
+         -> {a : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> Co w (Chan w a)
+madeChan st = do
+  n <- Domain.fetchAdd st.numbers 1
+  mu <- Domain.newMutex
+  senders <- Domain.newAtomic (Nil : List (Sender w a))
+  receivers <- Domain.newAtomic (Nil : List (Receiver w a))
+  pure (MkChan n mu senders receivers)
+
+-- (an ivar made)
+madeIVar : {w : HFunctor}
+         -> {a : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> Co w (IVar w a)
+madeIVar st = do
+  n <- Domain.fetchAdd st.numbers 1
+  mu <- Domain.newMutex
+  value <- Domain.newAtomic (Nothing : Maybe a)
+  readers <- Domain.newAtomic (Nil : List (Receiver w a))
+  pure (MkIVar n mu value readers)
+
+-- (each reader whose offer is not yet claimed, claimed and readied,
+-- given `v`)
+wokenAll : {w : HFunctor}
+         -> {a : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> List (Receiver w a)
+         -> a
+         -> Co w Unit
+wokenAll Nil v = pure ()
+wokenAll (MkReceiver (MkOffer claimed) wake :: rest) v = do
+  ok <- Domain.cas claimed False True
+  if ok then wake v else pure ()
+  wokenAll rest v
+
+-- (the ivar holds `v` now, its readers woken; a second write abandoned:
+-- what comes after)
+written : {w : HFunctor}
+        -> {x a : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> Putting w x a
+        -> Co w x
+written (MkPutting (MkIVar n mu value readers) v k) = do
+  Domain.lock mu
+  held <- Domain.get value
+  case held of
+    Just old -> do
+      Domain.unlock mu
+      abandon
+    Nothing -> do
+      Domain.set value (Just v)
+      rs <- Domain.get readers
+      Domain.set readers Nil
+      Domain.unlock mu
+      wokenAll rs v
+      pure k
+
+-- (the first receiver waiting whose offer is not yet claimed, claimed
+-- and readied, given `v`, those before it stale and dropped: whether
+-- there was one, and the receivers left)
+claimedReceiver : {w : HFunctor}
+                -> {a : Type}
+                -> {{dm : Domain.domain <: w}}
+                -> List (Receiver w a)
+                -> a
+                -> Co w (Pair Bool (List (Receiver w a)))
+claimedReceiver Nil v = pure (MkPair False Nil)
+claimedReceiver (MkReceiver (MkOffer claimed) wake :: rest) v = do
+  ok <- Domain.cas claimed False True
+  if ok
+  then do
+    wake v
+    pure (MkPair True rest)
+  else claimedReceiver rest v
+
+-- (the first sender waiting whose offer is not yet claimed, claimed and
+-- readied, those before it stale and dropped: `Just` its value, and
+-- the senders left)
+claimedSender : {w : HFunctor}
+              -> {a : Type}
+              -> {{dm : Domain.domain <: w}}
+              -> List (Sender w a)
+              -> Co w (Pair (Maybe a) (List (Sender w a)))
+claimedSender Nil = pure (MkPair Nothing Nil)
+claimedSender (MkSender (MkOffer claimed) v wake :: rest) = do
+  ok <- Domain.cas claimed False True
+  if ok
+  then do
+    wake
+    pure (MkPair (Just v) rest)
+  else claimedSender rest
+
+-- (a send tried, the channel's mutex held: where a receiver waits, it
+-- is given the value and readied, and the thread goes on)
+polledSend : {w : HFunctor}
+           -> {x a : Type}
+           -> {{dm : Domain.domain <: w}}
+           -> SendOn w x a
+           -> Co w (Maybe x)
+polledSend (MkSendOn (MkChan n mu senders receivers) v k) = do
+  rs <- Domain.get receivers
+  r <- claimedReceiver rs v
+  Domain.set receivers (snd r)
+  pure (if fst r then Just (k MkUnit) else Nothing)
+
+-- (a receive tried, the channel's mutex held: where a sender waits, it
+-- is readied and the thread goes on with its value)
+polledRecv : {w : HFunctor}
+           -> {x a : Type}
+           -> {{dm : Domain.domain <: w}}
+           -> RecvOn w x a
+           -> Co w (Maybe x)
+polledRecv (MkRecvOn (MkChan n mu senders receivers) k) = do
+  ss <- Domain.get senders
+  r <- claimedSender ss
+  Domain.set senders (snd r)
+  pure (case fst r of
+    Just v -> Just (k v)
+    Nothing -> Nothing)
+
+-- (an ivar's read tried, its mutex held: where it is written, the
+-- thread goes on with what it holds)
+polledRead : {w : HFunctor}
+           -> {x a : Type}
+           -> {{dm : Domain.domain <: w}}
+           -> ReadOn w x a
+           -> Co w (Maybe x)
+polledRead (MkReadOn (MkIVar n mu value readers) k) = do
+  held <- Domain.get value
+  pure (case held of
+    Just v -> Just (k v)
+    Nothing -> Nothing)
+
+-- (a base event tried, its mutex held: `Just` what comes after it where
+-- it can be committed now, its partner, if one, claimed and readied)
+polled : {w : HFunctor}
+       -> {x : Type}
+       -> {{dm : Domain.domain <: w}}
+       -> Base w x
+       -> Co w (Maybe x)
+polled (AlwaysBase x) = pure (Just x)
+polled (SendBase s) = s (Co w (Maybe x)) (\a sd -> polledSend sd)
+polled (RecvBase s) = s (Co w (Maybe x)) (\a rc -> polledRecv rc)
+polled (ReadBase s) = s (Co w (Maybe x)) (\a rd -> polledRead rd)
+
+-- (the base events tried in order: the first that can be committed
+-- now, committed)
+polledAll : {w : HFunctor}
+          -> {x : Type}
+          -> {{dm : Domain.domain <: w}}
+          -> List (Base w x)
+          -> Co w (Maybe x)
+polledAll Nil = pure Nothing
+polledAll (b :: bs) = do
+  r <- polled b
+  case r of
+    Just x -> pure (Just x)
+    Nothing -> polledAll bs
+
+-- (the thread's offer left at the base event's channel or ivar, its
+-- mutex held, with what readies the thread there)
+offered : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Offer
+        -> Base w (Res w Unit)
+        -> Co w Unit
+offered st off (AlwaysBase k) = pure ()
+offered st off (SendBase s) =
+  s (Co w Unit) (\a sd -> case sd of
+    MkSendOn (MkChan n mu senders receivers) v k -> do
+      ss <- Domain.get senders
+      Domain.set senders (ss ++ [MkSender off v (readyAgain st (k MkUnit))]))
+offered st off (RecvBase s) =
+  s (Co w Unit) (\a rc -> case rc of
+    MkRecvOn (MkChan n mu senders receivers) k -> do
+      rs <- Domain.get receivers
+      Domain.set receivers (rs ++ [MkReceiver off (\v -> readyAgain st (k v))]))
+offered st off (ReadBase s) =
+  s (Co w Unit) (\a rd -> case rd of
+    MkReadOn (MkIVar n mu value readers) k -> do
+      rs <- Domain.get readers
+      Domain.set readers (rs ++ [MkReceiver off (\v -> readyAgain st (k v))]))
+
+offeredAll : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Offer
+           -> List (Base w (Res w Unit))
+           -> Co w Unit
+offeredAll st off Nil = pure ()
+offeredAll st off (b :: bs) = do
+  offered st off b
+  offeredAll st off bs
+
+-- (the mutex of the base event's channel or ivar, with its number)
+lockOf : {w : HFunctor}
+       -> {x : Type}
+       -> Base w x
+       -> Maybe (Pair Int Domain.Mutex)
+lockOf (AlwaysBase x) = Nothing
+lockOf (SendBase s) =
+  s (Maybe (Pair Int Domain.Mutex)) (\a sd -> case sd of
+    MkSendOn (MkChan n mu senders receivers) v k -> Just (MkPair n mu))
+lockOf (RecvBase s) =
+  s (Maybe (Pair Int Domain.Mutex)) (\a rc -> case rc of
+    MkRecvOn (MkChan n mu senders receivers) k -> Just (MkPair n mu))
+lockOf (ReadBase s) =
+  s (Maybe (Pair Int Domain.Mutex)) (\a rd -> case rd of
+    MkReadOn (MkIVar n mu value readers) k -> Just (MkPair n mu))
+
+-- (the mutexes in order of their numbers, each once)
+distinctLocks : List (Pair Int Domain.Mutex) -> List (Pair Int Domain.Mutex)
+distinctLocks (a :: b :: rest) =
+  if fst a == fst b then distinctLocks (b :: rest)
+  else a :: distinctLocks (b :: rest)
+distinctLocks locks = locks
+
+-- (the mutexes of the base events' channels and ivars, each once, in
+-- the order of their numbers: held in that order by every sync, so
+-- that none waits for another round a cycle)
+locksOf : {w : HFunctor}
+        -> {x : Type}
+        -> List (Base w x)
+        -> List (Pair Int Domain.Mutex)
+locksOf bs = distinctLocks (List.sortOn (\l -> fst l) (List.mapMaybe lockOf bs))
+
+lockedAll : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> List (Pair Int Domain.Mutex)
+          -> Co w Unit
+lockedAll Nil = pure ()
+lockedAll (l :: ls) = do
+  Domain.lock (snd l)
+  lockedAll ls
+
+unlockedAll : {w : HFunctor}
+            -> {{dm : Domain.domain <: w}}
+            -> List (Pair Int Domain.Mutex)
+            -> Co w Unit
+unlockedAll Nil = pure ()
+unlockedAll (l :: ls) = do
+  Domain.unlock (snd l)
+  unlockedAll ls
+
+-- (what a thread's step came to: it goes on from here; or it stopped
+-- -- ended, waiting, or its turn given up -- and the domain takes
+-- another)
+data Stepped (w : HFunctor) = GoesOn (Res w Unit) | Stopped
+
+-- (a sync: the mutexes of its base events held, the first that can be
+-- committed is, and the thread goes on; where none can, the thread's
+-- offer is left at each, and it waits, one fewer running)
+synced : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> List (Base w (Res w Unit))
+       -> Co w (Stepped w)
+synced st bs = do
+  let locks = locksOf bs
+  lockedAll locks
+  r <- polledAll bs
+  case r of
+    Just k -> do
+      unlockedAll locks
+      pure (GoesOn k)
+    Nothing -> do
+      claimed <- Domain.newAtomic False
+      offeredAll st (MkOffer claimed) bs
+      unlockedAll locks
+      uncounted st
+      pure Stopped
+
+-- (what comes after the first `always` among the base events, if one)
+firstAlways : {w : HFunctor} -> {x : Type} -> List (Base w x) -> Maybe x
+firstAlways Nil = Nothing
+firstAlways (AlwaysBase x :: bs) = Just x
+firstAlways (b :: bs) = firstAlways bs
+
+-- (a thread run alone to its end: what an operation of `w` holding
+-- computations is given, as `Domain.spawn c` holds `c`.  Its spawns,
+-- channels and ivars are the scheduler's; a sync in it has no thread to
+-- meet, and is abandoned unless an `always` is among its base events.)
+alone : {w : HFunctor}
+      -> {a : Type}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Res w a
+      -> Co w a
+alone st (RDone x) = pure x
+alone st (RAct m) = bind m (\r -> alone st r)
+alone st (RStep (Spawn c k)) = do
+  readyAgain st c
+  alone st k
+alone st (RStep (Yield k)) = alone st k
+alone st (RStep (NewChan s)) =
+  s (Co w a) (\t mk -> case mk of
+    MkMakingChan k -> bind (madeChan st) (\ch -> alone st (k ch)))
+alone st (RStep (NewIVar s)) =
+  s (Co w a) (\t mk -> case mk of
+    MkMakingIVar k -> bind (madeIVar st) (\iv -> alone st (k iv)))
+alone st (RStep (PutIVar s)) =
+  s (Co w a) (\t p -> bind (written p) (\k -> alone st k))
+alone st (RStep (Sync bs)) = case firstAlways bs of
+  Just k -> alone st k
+  Nothing -> abandon
+
+cmlAlg : {w : HFunctor}
+       -> {a : Type}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> (cml w <+> w).f (Res w) a
+       -> Res w a
+cmlAlg st (InL p) = RStep (stepThen (\x -> RDone x) p)
+cmlAlg st (InR q) =
+  RAct
+    (op
+       (w.hmap (resFunctor w) (coFunctor w) (\r -> alone st r) q)
+       (\x -> pure (RDone x)))
+
+cmlHandler : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Handler (cml w <+> w)
+cmlHandler st =
+  { M = Res w
+  , ret = \x -> RDone x
+  , bind = \m f -> thenRes m f
+  , malg = \p -> cmlAlg st p
+  }
+
+-- (a thread's step: where it stopped, what the scheduler does there)
+stepped : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Res w Unit
+        -> Co w (Stepped w)
+stepped st (RDone u) = do
+  uncounted st
+  pure Stopped
+stepped st (RAct m) = bind m (\r -> pure (GoesOn r))
+stepped st (RStep (Spawn c k)) = do
+  readyAgain st c
+  pure (GoesOn k)
+stepped st (RStep (Yield k)) = do
+  readied st k
+  pure Stopped
+stepped st (RStep (NewChan s)) =
+  s (Co w (Stepped w)) (\a mk -> case mk of
+    MkMakingChan k -> bind (madeChan st) (\ch -> pure (GoesOn (k ch))))
+stepped st (RStep (NewIVar s)) =
+  s (Co w (Stepped w)) (\a mk -> case mk of
+    MkMakingIVar k -> bind (madeIVar st) (\iv -> pure (GoesOn (k iv))))
+stepped st (RStep (PutIVar s)) =
+  s (Co w (Stepped w)) (\a p -> bind (written p) (\k -> pure (GoesOn k)))
+stepped st (RStep (Sync bs)) = synced st bs
+
+-- (a thread run from where it stopped until it ends, waits, or gives up
+-- its turn)
+run : {w : HFunctor}
+    -> {{dm : Domain.domain <: w}}
+    -> Sched w
+    -> Res w Unit
+    -> Co w Unit
+run st r = do
+  s <- stepped st r
+  case s of
+    GoesOn next -> run st next
+    Stopped -> pure ()
+
+-- (the next thread ready, the mutex held: waiting for one while none
+-- is; `Nothing` once the domains are to stop and none is left)
+taken : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Co w (Maybe (Res w Unit))
+taken st = do
+  q <- Domain.get st.ready
+  case q of
+    MkPair (x :: xs) back -> do
+      Domain.set st.ready (MkPair xs back)
+      pure (Just x)
+    MkPair Nil Nil -> do
+      stop <- Domain.get st.stopping
+      if stop then pure Nothing
+      else do
+        Domain.wait st.work st.mutex
+        taken st
+    MkPair Nil back -> do
+      Domain.set st.ready (MkPair (List.reverse back) Nil)
+      taken st
+
+-- (a domain running threads, each ready one it takes, until it is to
+-- stop)
+worker : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
+worker st = do
+  Domain.lock st.mutex
+  next <- taken st
+  Domain.unlock st.mutex
+  case next of
+    Just r -> do
+      run st r
+      worker st
+    Nothing -> pure ()
+
+workers : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Int
+        -> Co w (List (Domain.Domain Unit))
+workers st n =
+  if n <= 0 then pure Nil
+  else do
+    d <- Domain.spawn (worker st)
+    ds <- workers st (n - 1)
+    pure (d :: ds)
+
+joinedAll : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> List (Domain.Domain Unit)
+          -> Co w Unit
+joinedAll Nil = pure ()
+joinedAll (d :: ds) = do
+  Domain.join d
+  joinedAll ds
+
+-- (waiting, the mutex held, until main is done or every thread waits)
+idleUntilDone : {w : HFunctor}
+              -> {{dm : Domain.domain <: w}}
+              -> Sched w
+              -> Co w Unit
+idleUntilDone st = do
+  d <- Domain.get st.done
+  if d then pure ()
+  else do
+    Domain.wait st.finished st.mutex
+    idleUntilDone st
+
+-- | `c` and the threads it spawns, run on as many domains as the
+-- | machine has cores (`Domain.cores`): `Just` main's answer, the other
+-- | threads dropped where they stopped; or `Nothing` where main is not
+-- | done and every thread waits in a `sync`, a deadlock.  A thread that
+-- | fails fails the domain running it, which fails this once main is
+-- | done.
+scheduled : {w : HFunctor}
+          -> {a : Type}
+          -> {{dm : Domain.domain <: w}}
+          -> Co (cml w <+> w) a
+          -> Co w (Maybe a)
+scheduled c = do
+  numbers <- Domain.newAtomic 0
+  live <- Domain.newAtomic 0
+  ready <-
+    Domain.newAtomic
+      (MkPair Nil Nil : Pair (List (Res w Unit)) (List (Res w Unit)))
+  mutex <- Domain.newMutex
+  work <- Domain.newCondition
+  finished <- Domain.newCondition
+  done <- Domain.newAtomic False
+  stopping <- Domain.newAtomic False
+  let st : Sched w =
+    { numbers = numbers
+    , live = live
+    , ready = ready
+    , mutex = mutex
+    , work = work
+    , finished = finished
+    , done = done
+    , stopping = stopping
+    }
+  answer <- Domain.newAtomic (Nothing : Maybe a)
+  let main : Res w Unit =
+    thenRes
+      (handle (cmlHandler st) c)
+      (\x ->
+         RAct (do
+           Domain.set answer (Just x)
+           finishedWith st
+           pure (RDone MkUnit)))
+  readyAgain st main
+  n <- Domain.cores
+  ds <- workers st n
+  Domain.lock mutex
+  idleUntilDone st
+  Domain.set stopping True
+  Domain.broadcast work
+  Domain.unlock mutex
+  joinedAll ds
+  Domain.get answer

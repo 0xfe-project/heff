@@ -1,0 +1,196 @@
+-- What the tests of `cml` run, on every backend: the same program, by
+-- cml on std.domain, on the C backend's threads (test/node/cml.hf) and
+-- in JavaScript's one domain (test/apps/cml.hf), the same lines said.
+-- Ping-pong over two channels; many senders and one receiver, their
+-- sum; a choice between two channels with a sender on one, the other
+-- branch told it was not chosen; a guard run at each sync; a wrap; an
+-- ivar read by several threads; and a program whose threads all wait,
+-- scheduled, coming to `Nothing`.
+
+module test.node.cml-program
+
+import cml as CML
+import co
+import std.domain as Domain
+
+-- Ping-pong -----------------------------------------------------------------------------
+
+-- (what comes on `a`, one more, sent on `b`, for ever)
+ponger : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> CML.Chan w Int
+       -> CML.Chan w Int
+       -> Co e Unit
+ponger a b = do
+  x <- CML.recv a
+  CML.send b (x + 1)
+  ponger a b
+
+-- | 0 sent to a thread on one channel, and 1 back on another
+pinged : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
+pinged = do
+  a <- CML.newChan (cm := cm)
+  b <- CML.newChan (cm := cm)
+  CML.spawn (cm := cm) (ponger a b)
+  CML.send a 0
+  CML.recv b
+
+-- Many senders, one receiver ---------------------------------------------------------
+
+-- (threads `k` down to 1, each sending its number)
+senders : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.Chan w Int
+        -> Int
+        -> Co e Unit
+senders ch 0 = pure ()
+senders ch k = do
+  CML.spawn (cm := cm) (CML.send ch k)
+  senders ch (k - 1)
+
+-- (`k` values received, in the order they come)
+received : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
+         -> CML.Chan w Int
+         -> Int
+         -> Co e (List Int)
+received ch 0 = pure Nil
+received ch k = do
+  v <- CML.recv ch
+  vs <- received ch (k - 1)
+  pure (v :: vs)
+
+-- | 100 threads each sending its number, 1 to 100, to one receiver:
+-- | their sum
+summed : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
+summed = do
+  ch <- CML.newChan (cm := cm)
+  senders ch 100
+  xs <- received ch 100
+  pure (List.sum xs)
+
+-- A choice, and the branch not chosen told --------------------------------------------
+
+-- | a choice between two channels, a sender on the first alone: what
+-- | came on it, and whether the second branch's nack was seen by the
+-- | thread waiting on it
+chosen : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e (String, Bool)
+chosen = do
+  a <- CML.newChan (cm := cm)
+  b <- (CML.newChan (cm := cm) : Co e (CML.Chan w Int))
+  nackSeen <- CML.newIVar (cm := cm)
+  CML.spawn (cm := cm) (CML.send a 1)
+  x <-
+    CML.sync
+      (CML.choose
+         [ CML.wrap (CML.recvEvt a) (\v -> "a " ^ show v)
+         , CML.withNack (\nack -> do
+             CML.spawn (cm := cm) (do
+               CML.sync nack
+               CML.putIVar nackSeen True)
+             pure (CML.wrap (CML.recvEvt b) (\v -> "b " ^ show v)))
+         ])
+  seen <- CML.readIVar nackSeen
+  pure (x, seen)
+
+-- A guard, run at sync time ------------------------------------------------------------
+
+-- | a guard run by each sync, not where the event is made: how often it
+-- | had run before the first, after it, and after a second
+guarded : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> Co e (List Int)
+guarded = do
+  runs <- Domain.newAtomic 0
+  let ev : CML.Event w e Unit =
+    CML.guard (do
+      _ <- Domain.fetchAdd runs 1
+      pure (CML.always MkUnit))
+  before <- Domain.get runs
+  CML.sync ev
+  once <- Domain.get runs
+  CML.sync ev
+  twice <- Domain.get runs
+  pure [before, once, twice]
+
+-- A wrap ------------------------------------------------------------------------------------
+
+-- | 20, always, and 1 added by a wrap: 21
+wrapped : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
+wrapped = CML.sync (CML.wrap (CML.always 20 : CML.Event w e Int) (\x -> x + 1))
+
+-- An ivar read by several threads -----------------------------------------------------
+
+-- (a reader: what the ivar holds, times `k`, sent on `out`)
+reader : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> CML.IVar w Int
+       -> CML.Chan w Int
+       -> Int
+       -> Co e Unit
+reader iv out k = do
+  v <- CML.readIVar iv
+  CML.send out (v * k)
+
+-- (readers `k` down to 1)
+readers : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.IVar w Int
+        -> CML.Chan w Int
+        -> Int
+        -> Co e Unit
+readers iv out 0 = pure ()
+readers iv out k = do
+  CML.spawn (cm := cm) (reader iv out k)
+  readers iv out (k - 1)
+
+-- | an ivar read by three threads, each sending what it read times its
+-- | number, written once they wait: what they sent, sorted
+shared : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e (List Int)
+shared = do
+  iv <- CML.newIVar (cm := cm)
+  out <- CML.newChan (cm := cm)
+  readers iv out 3
+  CML.putIVar iv 7
+  xs <- received out 3
+  pure (List.sort xs)
+
+-- Every thread waiting ------------------------------------------------------------------
+
+-- | a thread receiving on a channel nobody sends on, and main on
+-- | another: a deadlock
+blocked : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
+blocked = do
+  a <- (CML.newChan (cm := cm) : Co e (CML.Chan w Int))
+  b <- CML.newChan (cm := cm)
+  CML.spawn (cm := cm) (do
+    _ <- CML.recv a
+    pure ())
+  CML.recv b
+
+-- | what the program says, line by line
+said : {e w : HFunctor}
+     -> {{cm : CML.cml w <: e}}
+     -> {{dm : Domain.domain <: e}}
+     -> Co e (List String)
+said = do
+  p <- pinged (cm := cm)
+  s <- summed (cm := cm)
+  c <- chosen (cm := cm)
+  g <- guarded (cm := cm)
+  wr <- wrapped (cm := cm)
+  xs <- shared (cm := cm)
+  d <- CML.scheduled (w := e) (blocked (w := e) (cm := _))
+  pure
+      [ "pinged: " ^ show p
+      , "summed from 100 senders: " ^ show s
+      , "chosen: " ^ fst c ^ ", b told: " ^ (if snd c then "yes" else "no")
+      , "guard ran: " ^ unwords (List.map show g)
+      , "wrapped: " ^ show wr
+      , "ivar read by 3: " ^ unwords (List.map show xs)
+      , "all waiting: "
+      ^ (case d of
+         Just n -> "Just " ^ show n
+         Nothing -> "Nothing")
+      ]

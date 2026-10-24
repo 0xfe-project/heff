@@ -11,7 +11,7 @@
 //                                      slept, clocked, painted, texts,
 //                                      names, greet, two (counter's and
 //                                      clock's), vecadd, pixels, domains,
-//                                      cowns
+//                                      cowns, cml
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -175,6 +175,8 @@ const apps = {
   },
   // (boc's behaviours, on std.domain's one domain: as `domains`)
   cowns: () => apps.domains(),
+  // (cml's threads, on std.domain's one domain: as `domains`)
+  cml: () => apps.domains(),
   slept: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;
