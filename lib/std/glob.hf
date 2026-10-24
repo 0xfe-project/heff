@@ -1,0 +1,379 @@
+-- Glob patterns, as a shell writes them: `src/**/*.hf`, read once
+-- (`compile`), then matched against a path (`matches`) or expanded from
+-- a directory into the paths there that match (`glob`).  A pattern is
+-- cut at each `/` into segments, matched one by one against a path's
+-- (std.path's `segments`); a pattern starting with `/` matches an
+-- absolute path, any other a relative one.  In a segment:
+--
+-- - a rune stands for itself; `\` before a rune, that rune (`\*`, `\[`,
+--   `\\`);
+-- - `*`: any run of runes, none too, in the segment (never past a `/`,
+--   as Go's `filepath.Match`), a `.` first in a name too;
+-- - `?`: one rune;
+-- - `[abc]`, `[a-z0-9]`: one rune of the class; `[^...]` or `[!...]`:
+--   one not of it (a `]` first in it is one of it, as a `-` first or
+--   last is; `\` escapes in it too);
+-- - `**`, a segment of its own: any number of segments, none too.
+--
+-- Runes are compared as they are: case counts.
+--
+-- ```haskell
+-- import co
+-- import exception
+-- import std.filesystem
+-- import std.glob as Glob
+-- import std.path
+--
+-- -- | the heff sources under a directory, at any depth
+-- sources : {e : HFunctor}
+--         -> {{disk : filesystem <: e}}
+--         -> {{ex : exception FileError <: e}}
+--         -> Path
+--         -> Co e (List Path)
+-- sources dir = case Glob.compile "**/*.hf" of
+--   Left why -> pure Nil
+--   Right g -> Glob.glob dir g
+-- ```
+
+module std.glob (Glob, compile, matches, glob)
+
+import co
+import exception
+import std.filesystem
+import std.path
+
+-- | A part of a segment: a run of runes as they are, `*`, `?`, or a
+-- | class (whether it is of the runes not in its ranges, and its
+-- | ranges, of code points, low and high).
+data Part
+  = Literal String
+  | Star
+  | AnyRune
+  | Class Bool (List (Pair Int Int))
+
+-- | A segment of a pattern: its parts, or `**`.
+data Segment = Parts (List Part) | AnySegments
+
+-- | A pattern read: whether it starts with `/`, and its segments.
+data Glob = MkGlob Bool (List Segment)
+
+-- Reading
+--------------------------------------------------------------------------------
+
+-- (what is said of a class not closed)
+unclosed : String
+unclosed = "a `[` with no `]`"
+
+-- (what is said of a `\` with nothing after it)
+trailingEscape : String
+trailingEscape = "a `\\` at the end"
+
+-- (the code point of the rune at `i`, and where it ends)
+runeFrom : String -> Int -> Pair Int Int
+runeFrom s i = MkPair (runeToInt (strRuneAt s i)) (i + strRuneWidth s i)
+
+-- (a rune of a class at `i`, after a `\` or not, and where it ends)
+classRune : String -> Int -> Either String (Pair Int Int)
+classRune s i =
+  if i >= strLength s then Left unclosed
+  else if byteAt s i /= 92 then Right (runeFrom s i)
+  else if i + 1 >= strLength s then Left trailingEscape
+  else Right (runeFrom s (i + 1))
+
+-- (a class's ranges from `i` to its `]`, the other way round, and where
+-- it ends; `first`, whether `i` is its first place, where a `]` is one
+-- of it)
+rangesFrom : String
+           -> Int
+           -> Bool
+           -> List (Pair Int Int)
+           -> Either String (Pair (List (Pair Int Int)) Int)
+rangesFrom s i first acc =
+  if i >= strLength s then Left unclosed
+  else if byteAt s i == 93 && not first then Right (MkPair acc (i + 1))
+  else case classRune s i of
+    Left why -> Left why
+    Right (MkPair low j) ->
+      if j + 1 < strLength s && byteAt s j == 45 && byteAt s (j + 1) /= 93
+      then (case classRune s (j + 1) of
+            Left why -> Left why
+            Right (MkPair high k) ->
+              if high < low then Left "a range of a class backwards"
+              else rangesFrom s k False (MkPair low high :: acc))
+      else rangesFrom s j False (MkPair low low :: acc)
+
+-- (a class, `i` just after its `[`, and where it ends)
+classAt : String -> Int -> Either String (Pair Part Int)
+classAt s i =
+  if i < strLength s && (byteAt s i == 94 || byteAt s i == 33)
+  then classed True (rangesFrom s (i + 1) True Nil)
+  else classed False (rangesFrom s i True Nil)
+  where
+  -- (the ranges read, as a class)
+  classed : Bool
+          -> Either String (Pair (List (Pair Int Int)) Int)
+          -> Either String (Pair Part Int)
+  classed negated (Left why) = Left why
+  classed negated (Right (MkPair ranges j)) =
+    Right (MkPair (Class negated ranges) j)
+
+-- (the parts read so far, the other way round, and a rune as it is
+-- after them: with the run of runes before it, where there is one)
+withLiteral : String -> List Part -> List Part
+withLiteral rune (Literal run :: acc) = Literal (run ^ rune) :: acc
+withLiteral rune acc = Literal rune :: acc
+
+-- (the parts of a segment from `i`, those read before it the other way
+-- round in `acc`)
+partsFrom : String -> Int -> List Part -> Either String (List Part)
+partsFrom s i acc =
+  if i >= strLength s then Right (List.reverse acc)
+  else if byteAt s i == 42
+  then (if i + 1 < strLength s && byteAt s (i + 1) == 42
+        then Left
+            "a `**` with more in its segment: `**` is a segment of its own"
+        else partsFrom s (i + 1) (Star :: acc))
+  else if byteAt s i == 63 then partsFrom s (i + 1) (AnyRune :: acc)
+  else if byteAt s i == 91
+  then (case classAt s (i + 1) of
+        Left why -> Left why
+        Right (MkPair part j) -> partsFrom s j (part :: acc))
+  else if byteAt s i == 92
+  then (if i + 1 >= strLength s then Left trailingEscape
+        else partsFrom
+            s
+            (i + 1 + strRuneWidth s (i + 1))
+            (withLiteral
+               (strSlice s (i + 1) (i + 1 + strRuneWidth s (i + 1)))
+               acc))
+  else partsFrom
+      s
+      (i + strRuneWidth s i)
+      (withLiteral (strSlice s i (i + strRuneWidth s i)) acc)
+
+-- | A pattern read, or why it cannot be: a `[` with no `]`, a `\` at
+-- | the end, a range backwards, a `**` with more in its segment.  An
+-- | empty segment, or `.`, is none (`a//./b` is `a/b`).
+-- | >>> either (\why -> why) (\g -> "read") (compile "src/**/*.hf")
+-- | "read"
+-- | >>> either (\why -> why) (\g -> "read") (compile "[ab")
+-- | "a `[` with no `]`"
+-- | >>> either (\why -> why) (\g -> "read") (compile "a\\")
+-- | "a `\\` at the end"
+-- | >>> either (\why -> why) (\g -> "read") (compile "[z-a]")
+-- | "a range of a class backwards"
+-- | >>> either (\why -> why) (\g -> "read") (compile "src/a**")
+-- | "a `**` with more in its segment: `**` is a segment of its own"
+compile : String -> Either String Glob
+compile p = case segmentsRead (List.keepIf kept (split "/" p)) Nil of
+  Left why -> Left why
+  Right segs -> Right (MkGlob (startsWith (prefix := "/") p) segs)
+  where
+  -- (a segment kept: not `""`, nor `.`)
+  kept : String -> Bool
+  kept "" = False
+  kept "." = False
+  kept _ = True
+  -- (the segments read, after those in `acc`, the other way round; one
+  -- `**` for several one after another)
+  segmentsRead : List String -> List Segment -> Either String (List Segment)
+  segmentsRead Nil acc = Right (List.reverse acc)
+  segmentsRead ("**" :: rest) (AnySegments :: acc) =
+    segmentsRead rest (AnySegments :: acc)
+  segmentsRead ("**" :: rest) acc = segmentsRead rest (AnySegments :: acc)
+  segmentsRead (s :: rest) acc = case partsFrom s 0 Nil of
+    Left why -> Left why
+    Right parts -> segmentsRead rest (Parts parts :: acc)
+
+-- Matching
+--------------------------------------------------------------------------------
+
+-- (whether a code point is in one of the ranges)
+inRanges : Int -> List (Pair Int Int) -> Bool
+inRanges c Nil = False
+inRanges c (MkPair low high :: rest) = low <= c && c <= high || inRanges c rest
+
+-- (where a part, not `*`, matching `name` from `i` ends; -1 where it
+-- does not match)
+matchedTo : Part -> String -> Int -> Int
+matchedTo (Literal run) name i =
+  if i + strLength run <= strLength name
+     && strEq (strSlice name i (i + strLength run)) run
+  then i + strLength run
+  else -1
+matchedTo AnyRune name i =
+  if i < strLength name then i + strRuneWidth name i else -1
+matchedTo (Class negated ranges) name i =
+  if i < strLength name
+     && inRanges (runeToInt (strRuneAt name i)) ranges /= negated
+  then i + strRuneWidth name i
+  else -1
+matchedTo Star name i = -1
+
+-- (whether `parts` match `name` from `i`; `star`, where the last `*`
+-- passed is: the parts after it, and the place up to which it has
+-- taken runes -- where what follows does not match, it takes one more)
+partsMatch : List Part
+           -> String
+           -> Int
+           -> Maybe (Pair (List Part) Int)
+           -> Bool
+partsMatch (Star :: rest) name i star =
+  partsMatch rest name i (Just (MkPair rest i))
+partsMatch Nil name i star =
+  if i == strLength name then True
+  else case star of
+    Nothing -> False
+    Just (MkPair after taken) ->
+      if taken < strLength name
+      then partsMatch
+          (Star :: after)
+          name
+          (taken + strRuneWidth name taken)
+          Nothing
+      else False
+partsMatch (part :: rest) name i star =
+  let j : Int = matchedTo part name i
+  in if j >= 0 then partsMatch rest name j star
+  else case star of
+    Nothing -> False
+    Just (MkPair after taken) ->
+      if taken < strLength name
+      then partsMatch
+          (Star :: after)
+          name
+          (taken + strRuneWidth name taken)
+          Nothing
+      else False
+
+-- (whether a segment's parts match a name)
+nameMatches : List Part -> String -> Bool
+nameMatches parts name = partsMatch parts name 0 Nothing
+
+-- (whether `segs` match `names`; `spread`, where the last `**` passed
+-- is: the segments after it, and the names it has not taken -- where
+-- what follows does not match, it takes one more)
+segmentsMatch : List Segment
+              -> List String
+              -> Maybe (Pair (List Segment) (List String))
+              -> Bool
+segmentsMatch (AnySegments :: rest) names spread =
+  segmentsMatch rest names (Just (MkPair rest names))
+segmentsMatch Nil Nil spread = True
+segmentsMatch (Parts parts :: rest) (name :: names) spread =
+  if nameMatches parts name then segmentsMatch rest names spread
+  else case spread of
+    Just (MkPair after (_ :: left)) ->
+      segmentsMatch (AnySegments :: after) left Nothing
+    _ -> False
+segmentsMatch segs names spread = case spread of
+  Just (MkPair after (_ :: left)) ->
+    segmentsMatch (AnySegments :: after) left Nothing
+  _ -> False
+
+-- | Whether the pattern matches a path, segment by segment: both
+-- | absolute, or neither, and each segment of the pattern matching one
+-- | of the path's -- a `**`, any number of them.
+-- | >>> either (\why -> False) (\g -> matches g "main.hf") (compile "*.hf")
+-- | True
+-- | >>> either (\why -> False) (\g -> matches g "src/main.hf") (compile "*.hf")
+-- | False
+-- | >>> either (\why -> False) (\g -> matches g ".profile") (compile "*")
+-- | True
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["src/a.hf", "src/x/y/b.hf", "a.hf", "src/x/y"]) (compile "src/**/*.hf")
+-- | [True, True, False, False]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["a/b", "a", "b"]) (compile "**")
+-- | [True, True, True]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["a/x/b/y/c", "a/b/c", "a/c", "a/b/x"]) (compile "a/**/b/**/c")
+-- | [True, True, False, False]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["abc", "a\u{e9}c", "ac", "abbc"]) (compile "a?c")
+-- | [True, True, False, False]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["xb", "xd", "x-", "x]"]) (compile "x[]a-c-]")
+-- | [True, False, True, True]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["b", "d", "!"]) (compile "[!a-c]")
+-- | [False, True, True]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["a*b", "axb"]) (compile "a\\*b")
+-- | [True, False]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["aaaab", "aaaa"]) (compile "*a*a*b")
+-- | [True, False]
+-- | >>> either (\why -> Nil) (\g -> List.map (\p -> matches g p) ["/usr/bin", "usr/bin"]) (compile "/usr/*")
+-- | [True, False]
+matches : Glob -> Path -> Bool
+matches (MkGlob absolute segs) path =
+  (if absolute then isAbsolute path else not (isAbsolute path))
+  && segmentsMatch segs (segments path) Nothing
+
+-- Expanding
+--------------------------------------------------------------------------------
+
+-- | The paths the pattern matches from `root` -- a relative pattern
+-- | from it, an absolute one from the root -- each `root` and the
+-- | segments after it, sorted, name by name, as `walk` visits them.
+-- | Only the directories the pattern reaches are read: a segment with
+-- | no `*`, `?` nor class is gone on to, not looked for, and a `**`
+-- | walks below where it is, links not followed (elsewhere a link is
+-- | followed, as Go's `filepath.Glob` follows one).  A directory not
+-- | there, or not a directory, has no paths that match; what else
+-- | cannot be read is thrown.
+glob : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> Path
+     -> Glob
+     -> Co e (List Path)
+glob root (MkGlob absolute segs) = do
+  found <- expanded (if absolute then root / "/" else root) False segs
+  pure (withoutRepeats (List.sortBy before found))
+  where
+  -- (a path not there, nor in a directory there)
+  missing : FileError -> Bool
+  missing err = strEq err.name "ENOENT" || strEq err.name "ENOTDIR"
+  -- (no paths, where nothing was there; else what could not be read,
+  -- thrown)
+  absent : FileError -> Co e (List Path)
+  absent err = if missing err then pure Nil else throw err
+  -- (what a directory holds; none where there is no directory)
+  listed : Path -> Co e (List Path)
+  listed dir = recover (readDirectory dir) absent
+  -- (the path, where something is there, a link to nothing too)
+  present : Path -> Co e (List Path)
+  present p = recover (bind (linkStatus p) (\st -> pure [p])) absent
+  -- (the name of a segment that is no more than a run of runes)
+  literalOf : List Part -> Maybe String
+  literalOf [Literal name] = Just name
+  literalOf _ = Nothing
+  -- (the paths from `at` that `segs` match; `known`, whether something
+  -- is known to be at `at`)
+  expanded : Path -> Bool -> List Segment -> Co e (List Path)
+  expanded at known Nil = if known then pure [at] else present at
+  expanded at known (Parts parts :: rest) = case literalOf parts of
+    Just name -> expanded (at / parse name) False rest
+    Nothing -> do
+      found <- for p in (<- listed at) do
+        if nameMatches parts (basename p) then expanded p True rest
+        else pure Nil
+      pure (List.concat found)
+  expanded at known (AnySegments :: rest) = do
+    below <- for p in (<- listed at) do
+      findFiles p (\q k -> List.null rest || isDirectoryKind k)
+    here <- expanded at known rest
+    found <- for p in List.concat below do
+      expanded p True rest
+    pure (List.append here (List.concat found))
+  -- (the names of one path, name by name, not after another's)
+  namesNotAfter : List String -> List String -> Bool
+  namesNotAfter Nil names = True
+  namesNotAfter (_ :: _) Nil = False
+  namesNotAfter (x :: xs) (y :: ys) = case compareString x y of
+    LT -> True
+    GT -> False
+    EQ -> namesNotAfter xs ys
+  -- (one path not after another, as `walk` visits them)
+  before : Path -> Path -> Bool
+  before p q = namesNotAfter (segments p) (segments q)
+  -- (sorted paths, each once)
+  withoutRepeats : List Path -> List Path
+  withoutRepeats (p :: q :: rest) =
+    if p == q then withoutRepeats (q :: rest)
+    else p :: withoutRepeats (q :: rest)
+  withoutRepeats ps = ps

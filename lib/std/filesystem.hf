@@ -104,6 +104,9 @@ module std.filesystem
   , readLink
   , temporaryDirectory
   , temporaryFile
+  , Visit(..)
+  , walk
+  , findFiles
   , withFile
   , withStdin
   , withStdout
@@ -540,6 +543,95 @@ temporaryFile : {e : HFunctor}
               -> String
               -> Co e Path
 temporaryFile prefix = fromSystem (op (ev (TemporaryFile prefix (\r -> r))) val)
+
+-- Walking a tree
+--------------------------------------------------------------------------------
+
+-- | What a walk does after a path is visited: go into it (a directory;
+-- | for any other, go on), not go into it (a directory; for any other,
+-- | skip what is left of the directory it is in), or end.
+data Visit = Descend | SkipDirectory | Stop
+
+-- (the tree from `root` walked as `walk` walks it, each path given to
+-- `step` with what the paths before it came to: what they all come to)
+walked : {e : HFunctor}
+       -> {a : Type}
+       -> {{ev : filesystem <: e}}
+       -> {{ex : exception FileError <: e}}
+       -> Path
+       -> a
+       -> (a -> Path -> Kind -> Co e (Pair a Visit))
+       -> Co e a
+walked root start step = do
+  st <- linkStatus root
+  (acc, answer) <- step start root st.kind
+  case answer of
+    Descend ->
+      if isDirectoryKind st.kind
+      then do
+        (under, stopped) <- within acc (<- readDirectory root)
+        pure under
+      else pure acc
+    _ -> pure acc
+  where
+  -- (the entries of a directory, those left, each given to `step` and,
+  -- a directory gone into, walked: what they came to, and whether the
+  -- walk was ended)
+  within : a -> List Path -> Co e (Pair a Bool)
+  within acc Nil = pure (MkPair acc False)
+  within acc (p :: ps) = do
+    st <- linkStatus p
+    (next, answer) <- step acc p st.kind
+    case answer of
+      Stop -> pure (MkPair next True)
+      SkipDirectory ->
+        if isDirectoryKind st.kind then within next ps
+        else pure (MkPair next False)
+      Descend ->
+        if isDirectoryKind st.kind
+        then do
+          (under, stopped) <- within next (<- readDirectory p)
+          if stopped then pure (MkPair under True) else within under ps
+        else within next ps
+
+-- | Each path from `root` down, `root` first, given to `visit` with its
+-- | kind, as Go's `WalkDir` gives them: depth first, a directory's
+-- | entries in the order `readDirectory` sorts them, and links not
+-- | followed -- a link is visited, its kind `Link`, and not gone into,
+-- | `root` too.  What `visit` answers says what is next: `Descend`, go
+-- | into a directory (for any other, go on); `SkipDirectory`, not go
+-- | into a directory (for any other, as Go's `SkipDir` on a file, skip
+-- | what is left of the directory it is in); `Stop`, end the walk.  A
+-- | path that cannot be read (`root` not there, a directory not to be
+-- | opened) is thrown.
+walk : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> Path
+     -> (Path -> Kind -> Co e Visit)
+     -> Co e Unit
+walk root visit =
+  walked
+    root
+    MkUnit
+    (\u p k -> bind (visit p k) (\answer -> pure (MkPair u answer)))
+
+-- | Every path from `root` down, `root` too, of which `holds` holds
+-- | (given the path and its kind, as `walk` gives them), in the order
+-- | `walk` visits them (Racket's `find-files`).
+findFiles : {e : HFunctor}
+          -> {{ev : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> Path
+          -> (Path -> Kind -> Bool)
+          -> Co e (List Path)
+findFiles root holds =
+  bind (walked root Nil found) (\ps -> pure (List.reverse ps))
+  where
+  -- (the paths found so far, the other way round, `p` among them if
+  -- `holds` holds of it)
+  found : List Path -> Path -> Kind -> Co e (Pair (List Path) Visit)
+  found ps p k = pure (MkPair (if holds p k then p :: ps else ps) Descend)
 
 -- Open files
 --------------------------------------------------------------------------------

@@ -1,0 +1,182 @@
+-- A tree walked (std.filesystem's `walk` and `findFiles`) and globbed
+-- (std.glob), by C.
+--
+--   main DIR   a tree made in DIR, beside the links already there
+--              (`link`, to `src`; `dangling`, to nothing), then
+--              walked, each path said from DIR: all of it, each way
+--              `SkipDirectory` and `Stop` answer, a file and a link as
+--              its root; the files found of a kind; the paths patterns
+--              match; and a walk from a root not there
+
+module test.node.walk
+
+import co
+import exception
+import std.filesystem
+import std.glob as Glob
+import std.io
+import std.path
+import std.process
+
+-- (a kind, as it is said)
+showKind : Kind -> String
+showKind Regular = "file"
+showKind Directory = "dir"
+showKind Link = "link"
+showKind Other = "other"
+
+-- (a path, said from the tree's top)
+from : Path -> Path -> String
+from top p = render (os := Posix) (fromMaybe p (relative top p))
+
+-- (the tree made under `top`: files and directories)
+made : {e : HFunctor}
+     -> {{disk : filesystem <: e}}
+     -> {{fx : exception FileError <: e}}
+     -> Path
+     -> Co e Unit
+made top = do
+  makeDirectory (top / "src" / "lib")
+  makeDirectory (top / "docs")
+  writeFile (top / "a.txt") "a"
+  writeFile (top / "b.hf") "b"
+  writeFile (top / ".hidden.hf") "h"
+  writeFile (top / "src" / "main.hf") "m"
+  writeFile (top / "src" / "zz.hf") "z"
+  writeFile (top / "src" / "lib" / "x.hf") "x"
+  writeFile (top / "src" / "lib" / "y.txt") "y"
+  writeFile (top / "docs" / "readme.md") "r"
+
+-- (a walk from `root`, each path visited said, answered by `answer`)
+walkSaid : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
+         -> Path
+         -> String
+         -> Path
+         -> (String -> Visit)
+         -> Co e Unit
+walkSaid top title root answer = do
+  print ("walk, " ^ title ^ ":")
+  walk root (\p k -> do
+    print ("  " ^ from top p ^ " " ^ showKind k)
+    pure (answer (from top p)))
+
+-- (paths, said from the tree's top)
+pathsSaid : Path -> List Path -> String
+pathsSaid top ps = show (List.map (\p -> from top p) ps)
+
+-- (a pattern's matches, said)
+globSaid : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
+         -> Path
+         -> String
+         -> Co e Unit
+globSaid top pattern = case Glob.compile pattern of
+  Left why -> print ("glob " ^ pattern ^ ": " ^ why)
+  Right g -> do
+    ps <- Glob.glob top g
+    print ("glob " ^ pattern ^ ": " ^ pathsSaid top ps)
+
+-- (the patterns globbed)
+patterns : List String
+patterns =
+  [ "*.hf"
+  , "*"
+  , "**/*.hf"
+  , "src/*/x.hf"
+  , "src/**"
+  , "**"
+  , "link/*.hf"
+  , "link/**"
+  , "missing/*.hf"
+  , "missing/**"
+  , "a.txt/*"
+  , "src/lib/x.hf"
+  , "src/lib/nope.hf"
+  , "dangling"
+  , "*/**/*.txt"
+  , "**/lib/**"
+  , "[ab].*"
+  , "src/**/**/*.hf"
+  , "s?c/[!m]*"
+  , "[ab"
+  ]
+
+-- (the name of what was thrown)
+thrownName : {e : HFunctor} -> FileError -> Co e String
+thrownName err = pure err.name
+
+-- (whether a kind is a link's)
+isLink : Kind -> Bool
+isLink Link = True
+isLink _ = False
+
+-- (the tree made, walked, found in and globbed)
+walked : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> Path
+       -> Co e Unit
+walked top = do
+  made top
+  walkSaid top "all" top (\p -> Descend)
+  walkSaid
+      top
+      "SkipDirectory on src/lib"
+      top
+      (\p -> if strEq p "src/lib" then SkipDirectory else Descend)
+  walkSaid
+      top
+      "SkipDirectory on the file b.hf"
+      top
+      (\p -> if strEq p "b.hf" then SkipDirectory else Descend)
+  walkSaid
+      top
+      "SkipDirectory on the file src/lib/x.hf"
+      top
+      (\p -> if strEq p "src/lib/x.hf" then SkipDirectory else Descend)
+  walkSaid
+      top
+      "Stop at src/lib/x.hf"
+      top
+      (\p -> if strEq p "src/lib/x.hf" then Stop else Descend)
+  walkSaid top "SkipDirectory on the root" top (\p -> SkipDirectory)
+  walkSaid top "a file as the root" (top / "a.txt") (\p -> Descend)
+  walkSaid top "a link as the root" (top / "link") (\p -> Descend)
+  sources <- findFiles top (\p k -> strEq (extension p) ".hf" && isRegular k)
+  print ("findFiles, regular .hf: " ^ pathsSaid top sources)
+  dirs <- findFiles top (\p k -> isDirectoryKind k)
+  print ("findFiles, directories: " ^ pathsSaid top dirs)
+  links <- findFiles top (\p k -> isLink k)
+  print ("findFiles, links: " ^ pathsSaid top links)
+  for pattern in patterns do
+    globSaid top pattern
+  case Glob.compile (render (os := Posix) top ^ "/src/*.hf") of
+    Left why -> print ("glob, absolute: " ^ why)
+    Right g -> do
+      ps <- Glob.glob current g
+      print ("glob, absolute: " ^ pathsSaid top ps)
+  said <-
+    recover
+      (bind
+         (walk (top / "gone") (\p k -> pure Descend))
+         (\u -> pure "no throw"))
+      thrownName
+  print ("walk, from a root not there: " ^ said)
+
+main : Co (stdio <+> filesystem <+> process) Unit
+main = do
+  argv <- args (ev := _)
+  case argv of
+    [dir] -> do
+      r <-
+        attempt FileError (walked (io := _) (disk := _) (fx := _) (parse dir))
+      case r of
+        Left err -> print (ev := _) ("thrown: " ^ showFileError err)
+        Right _ -> pure MkUnit
+    _ -> printErr (ev := _) "main DIR"
