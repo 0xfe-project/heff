@@ -63,6 +63,7 @@
 - std.base32, RFC 4648's, both alphabets (the standard and the extended hex), read strictly, as std.base64.
 - std.html: `escape` as Go's `EscapeString`, and `unescape` of every HTML5 named reference (2231, the older ones without their `;` too) and of numeric ones, as Go's `UnescapeString`.
 - std.adler32, RFC 1950's checksum, as std.crc32 is CRC-32's.
+- std.flate: DEFLATE data decompressed (RFC 1951), stored, fixed and dynamic blocks, what is wrong said with its offset: `decompress`, and `decompressAt b (from := i)`, which also gives where the data ends.
 
 ### Backends and performance
 

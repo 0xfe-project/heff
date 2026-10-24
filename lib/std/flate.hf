@@ -1,0 +1,536 @@
+-- DEFLATE (RFC 1951), decompressed: the compressed data of zlib, gzip,
+-- zip and PNG, as Go's `compress/flate` reads it -- its blocks stored,
+-- of the fixed Huffman codes or of codes of their own, until the one
+-- marked last.  Written in heff, a code looked up by a table of the
+-- bits it may begin with.  Import it by a name, `import std.flate as
+-- Flate`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.flate as Flate
+--
+-- -- | >>> greeting
+-- -- | Right "hello, hello, hello!"
+-- greeting : Either Flate.CorruptInput String
+-- greeting = case Flate.decompress b[203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1] of
+--   Right out -> Right (toString out)
+--   Left e -> Left e
+-- ```
+
+module std.flate (CorruptInput, decompress, decompressAt)
+
+import array as Array
+import bytes as Bytes
+import int
+import uint8 as UInt8
+
+-- | Where the input is not DEFLATE data: the byte where it went wrong,
+-- | counted from the start of the input, and what is wrong.
+type CorruptInput = { offset : Int, message : String }
+
+-- (a canonical Huffman code as a table: at the next bits read, `mask` of
+-- them, what the code they begin with is, its symbol times 16 and its
+-- length -- 0 where none is)
+type Code = { table : Array Int, mask : Int }
+
+-- (how far a decompression has come: the next bit of the input to read,
+-- and the bytes written, as a string -- grown in place, as a string held
+-- nowhere else is, a byte at a time by `fromByte`, whose strings are made
+-- once, not at each byte)
+type Progress = { at : Int, out : String }
+
+-- | The DEFLATE data of the bytes from byte `from` on (from 0, where it is
+-- | below): the bytes it holds, and the byte after its last block, its
+-- | last bits padded to a byte -- where what holds it, a zlib stream's
+-- | checksum or a gzip member's trailer, goes on.  Where it is wrong, the
+-- | offset is counted from the start of all the bytes.
+-- | >>> decompressAt b[0, 0, 1, 12, 0, 243, 255, "hello, world", "trailer"] (from := 2)
+-- | Right (MkPair b["hello, world"] 19)
+decompressAt : Bytes -> (from : Int) -> Either CorruptInput (Pair Bytes Int)
+decompressAt input from = blocksFrom (8 * max 0 from) ""
+  where
+  -- (each length code's, from 257 on: its least length times 16, and how
+  -- many bits after it say how much more -- 3 to 10, then four codes for
+  -- each number of bits from 1 to 5, then 258)
+  lengthCodes : Array Int
+  lengthCodes =
+    Array.generate
+      29
+      (\k ->
+         if k < 8 then 16 * (3 + k)
+         else if k == 28 then 16 * 258
+         else 16 * (shiftL (4 + k % 4) (k / 4 - 1) + 3) + (k / 4 - 1))
+  -- (each distance code's: its least distance times 16, and how many bits
+  -- after it say how much more -- 1 to 4, then two codes for each number
+  -- of bits from 1 to 13)
+  distanceCodes : Array Int
+  distanceCodes =
+    Array.generate
+      30
+      (\k ->
+         if k < 4 then 16 * (1 + k)
+         else 16 * (shiftL (2 + k % 2) (k / 2 - 1) + 1) + (k / 2 - 1))
+  -- (the symbols of the code length code, in the order a block gives their
+  -- lengths)
+  codeLengthOrder : Array Int
+  codeLengthOrder =
+    Array.fromList
+      [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+  -- (the code of the lengths of the `count` symbols from `start` in
+  -- `lengths`, 0 for a symbol that has none; the codes of a length are of
+  -- the symbols in their order)
+  codeOf : Array Int -> Int -> Int -> Code
+  codeOf lengths start count =
+    let longest : Int = longestFrom 0 0
+    in let size : Int = shiftL 1 longest
+    in { table =
+           filledFrom
+             0
+             (firstCodes
+                1
+                0
+                (countedFrom 0 (Array.replicate 16 0))
+                (Array.replicate 16 0))
+             size
+             (Array.replicate size 0)
+       , mask = size - 1
+       }
+    where
+    -- (the length of the `i`th symbol)
+    lengthOf : Int -> Int
+    lengthOf i = Array.arrayIndex lengths (start + i)
+    -- (the longest length from the `i`th symbol on, `most` before)
+    longestFrom : Int -> Int -> Int
+    longestFrom i most =
+      if i >= count then most else longestFrom (i + 1) (max most (lengthOf i))
+    -- (how many symbols are of each length, those from the `i`th on added
+    -- to `counts`)
+    countedFrom : Int -> Array Int -> Array Int
+    countedFrom i counts =
+      if i >= count then counts
+      else if lengthOf i == 0 then countedFrom (i + 1) counts
+      else countedFrom (i + 1) (Array.modify counts (lengthOf i) (\c -> c + 1))
+    -- (the first code of each length from `n` on, after `code`, the first
+    -- of the length before)
+    firstCodes : Int -> Int -> Array Int -> Array Int -> Array Int
+    firstCodes n code counts firsts =
+      if n > 15 then firsts
+      else let first : Int = shiftL (code + Array.arrayIndex counts (n - 1)) 1
+           in firstCodes (n + 1) first counts (Array.set firsts n first)
+    -- (the `k` low bits of `code` the other way round, after `acc`)
+    reversed : Int -> Int -> Int -> Int
+    reversed code k acc =
+      if k == 0 then acc
+      else reversed (shiftR code 1) (k - 1) (or (shiftL acc 1) (and code 1))
+    -- (`entry` at `k` of `table`, of `size`, and at each `step` after)
+    spread : Int -> Int -> Int -> Int -> Array Int -> Array Int
+    spread k step entry size table =
+      if k >= size then table
+      else spread (k + step) step entry size (Array.set table k entry)
+    -- (the codes from the `i`th symbol on put in `table`, of `size`: the
+    -- next code of each length in `next`, and the bits read, the first the
+    -- lowest, that begin with a code given it)
+    filledFrom : Int -> Array Int -> Int -> Array Int -> Array Int
+    filledFrom i next size table =
+      if i >= count then table
+      else let n : Int = lengthOf i
+           in if n == 0 then filledFrom (i + 1) next size table
+           else let code : Int = Array.arrayIndex next n
+                in filledFrom
+                  (i + 1)
+                  (Array.set next n (code + 1))
+                  size
+                  (spread
+                     (reversed code n 0)
+                     (shiftL 1 n)
+                     (16 * i + n)
+                     size
+                     table)
+  -- (what a code of the lengths of the `count` symbols from `start` in
+  -- `lengths` is: "complete", "over-subscribed" (more codes than its
+  -- lengths have room for), "incomplete" (fewer) or "empty"; one code of
+  -- length 1 is complete, as zlib and Go take it)
+  shapeOf : Array Int -> Int -> Int -> String
+  shapeOf lengths start count = shapeFrom 0 0 0
+    where
+    -- (the shape, the symbols before the `i`th taking `room` of 32768,
+    -- `codes` of them having a code)
+    shapeFrom : Int -> Int -> Int -> String
+    shapeFrom i room codes =
+      if i < count
+      then (let n : Int = Array.arrayIndex lengths (start + i)
+            in if n == 0 then shapeFrom (i + 1) room codes
+            else shapeFrom (i + 1) (room + shiftL 1 (15 - n)) (codes + 1))
+      else if codes == 0 then "empty"
+      else if room > 32768 then "over-subscribed"
+      else if room == 32768 || codes == 1 && room == 16384 then "complete"
+      else "incomplete"
+  -- (the fixed literal/length code)
+  fixedLiterals : Code
+  fixedLiterals =
+    codeOf
+      (Array.generate
+         288
+         (\s ->
+            if s < 144 then 8
+            else if s < 256 then 9
+            else if s < 280 then 7
+            else 8))
+      0
+      288
+  -- (the fixed distance code)
+  fixedDistances : Code
+  fixedDistances = codeOf (Array.replicate 32 5) 0 32
+  -- (the input's byte at `i`; past its end, 0)
+  byteOf : Int -> Int
+  byteOf i =
+    if i < Bytes.length input then UInt8.toInt (Bytes.bytesAt input i) else 0
+  -- (24 bits of the input from bit `at`, the first the lowest; past its
+  -- end, 0s)
+  window : Int -> Int
+  window at =
+    let i : Int = shiftR at 3
+    in if i + 2 < Bytes.length input
+    then shiftR
+        (UInt8.toInt (Bytes.bytesAt input i)
+         + shiftL (UInt8.toInt (Bytes.bytesAt input (i + 1))) 8
+         + shiftL (UInt8.toInt (Bytes.bytesAt input (i + 2))) 16)
+        (and at 7)
+    else shiftR
+        (byteOf i + shiftL (byteOf (i + 1)) 8 + shiftL (byteOf (i + 2)) 16)
+        (and at 7)
+  -- (the `k` bits from bit `at`, `k` no more than 16, as a number, the
+  -- first the lowest)
+  bitsAt : Int -> Int -> Int
+  bitsAt at k = and (window at) (shiftL 1 k - 1)
+  -- (whether bit `at` is past the input's end)
+  beyond : Int -> Bool
+  beyond at = at > 8 * Bytes.length input
+  -- (the input found wrong at bit `at`, by `message`)
+  failure : {a : Type} -> Int -> String -> Either CorruptInput a
+  failure at message = Left { offset = shiftR at 3, message = message }
+  -- (the input ended where more was wanted)
+  ended : {a : Type} -> Either CorruptInput a
+  ended =
+    Left { offset = Bytes.length input, message = "unexpected end of input" }
+  -- (the codes of a block to its end, of the literal/length code
+  -- `literals` and the distance code `distances`, after the bytes `out`:
+  -- read from the input's byte `pos` on, its bits before held in `buffer`,
+  -- `count` of them, the first the lowest -- at least 48, where the input
+  -- has them, as many as a length and its distance take)
+  codesFrom : Code
+            -> Code
+            -> Int
+            -> Int
+            -> Int
+            -> String
+            -> Either CorruptInput Progress
+  codesFrom literals distances pos buffer count out =
+    if count < 48 && pos < Bytes.length input
+    then codesFrom
+        literals
+        distances
+        (pos + 1)
+        (or buffer (shiftL (UInt8.toInt (Bytes.bytesAt input pos)) count))
+        (count + 8)
+        out
+    else let entry : Int =
+           Array.arrayIndex literals.table (and buffer literals.mask)
+         in let used : Int = and entry 15
+         in let symbol : Int = shiftR entry 4
+         in if max used 1 > count then ended
+         else if used == 0
+         then failure (8 * pos - count) "invalid literal/length code"
+         else if symbol < 256
+         then codesFrom
+             literals
+             distances
+             pos
+             (shiftR buffer used)
+             (count - used)
+             (out ^ fromByte (UInt8.fromInt symbol))
+         else if symbol == 256
+         then Right { at = 8 * pos - count + used, out = out }
+         else if symbol > 285
+         then failure
+             (8 * pos - count)
+             ("invalid literal/length symbol " ^ show symbol)
+         else let lengthCode : Int = Array.arrayIndex lengthCodes (symbol - 257)
+              in let extra : Int = and lengthCode 15
+              in let rest : Int = shiftR buffer used
+              in let copies : Int =
+                shiftR lengthCode 4 + and rest (shiftL 1 extra - 1)
+              in let distanceBits : Int = shiftR rest extra
+              in let distanceEntry : Int =
+                Array.arrayIndex
+                  distances.table
+                  (and distanceBits distances.mask)
+              in let distanceUsed : Int = and distanceEntry 15
+              in let distanceSymbol : Int = shiftR distanceEntry 4
+              in if used + extra + max distanceUsed 1 > count then ended
+              else if distanceUsed == 0
+              then failure
+                  (8 * pos - count + used + extra)
+                  "invalid distance code"
+              else if distanceSymbol > 29
+              then failure
+                  (8 * pos - count + used + extra)
+                  ("invalid distance symbol " ^ show distanceSymbol)
+              else let distanceCode : Int =
+                     Array.arrayIndex distanceCodes distanceSymbol
+                   in let distanceExtra : Int = and distanceCode 15
+                   in let taken : Int =
+                     used + extra + distanceUsed + distanceExtra
+                   in let distance : Int =
+                     shiftR distanceCode 4
+                     + and
+                       (shiftR distanceBits distanceUsed)
+                       (shiftL 1 distanceExtra - 1)
+                   in if taken > count then ended
+                   else if distance > strLength out
+                   then failure
+                       (8 * pos - count + used + extra)
+                       "distance too far back"
+                   else codesFrom
+                       literals
+                       distances
+                       pos
+                       (shiftR buffer taken)
+                       (count - taken)
+                       (copied out (strLength out - distance) copies)
+    where
+    -- (the bytes `out`, then `k` more, each the byte at `from` and after,
+    -- which may be among those copied: as many at a time as are there
+    -- already, up to 63 -- fewer than 64, a slice is a copy, not a view
+    -- that would keep `out` from growing in place)
+    copied : String -> Int -> Int -> String
+    copied out from k =
+      if k == 0 then out
+      else let chunk : Int = min k (min (strLength out - from) 63)
+           in if chunk == 1
+           then copied
+               (out ^ fromByte (UInt8.fromInt (byteAt out from)))
+               (from + 1)
+               (k - 1)
+           else copied
+               (out ^ strSlice out from (from + chunk))
+               (from + chunk)
+               (k - chunk)
+  -- (the codes of a block from bit `at` to its end, of the literal/length
+  -- code `literals` and the distance code `distances`, after the bytes
+  -- `out`)
+  codesAt : Code -> Code -> Int -> String -> Either CorruptInput Progress
+  codesAt literals distances at out =
+    if and at 7 == 0 then codesFrom literals distances (shiftR at 3) 0 0 out
+    else codesFrom
+        literals
+        distances
+        (shiftR at 3 + 1)
+        (shiftR (byteOf (shiftR at 3)) (and at 7))
+        (8 - and at 7)
+        out
+  -- (a stored block, its header ending at bit `at`, after the bytes `out`)
+  stored : Int -> String -> Either CorruptInput Progress
+  stored at out =
+    let i : Int = shiftR (at + 7) 3
+    in if i + 4 > Bytes.length input then ended
+    else let size : Int = byteOf i + shiftL (byteOf (i + 1)) 8
+         in let inverse : Int = byteOf (i + 2) + shiftL (byteOf (i + 3)) 8
+         in if xor size inverse /= 65535
+         then failure
+             (8 * i)
+             "stored block length does not match its complement"
+         else if i + 4 + size > Bytes.length input then ended
+         else Right
+             { at = 8 * (i + 4 + size)
+             , out =
+                 out ^ Bytes.asString (Bytes.slice input (i + 4) (i + 4 + size))
+             }
+  -- (a block of codes of its own, its header ending at bit `at`, after the
+  -- bytes `out`)
+  dynamic : Int -> String -> Either CorruptInput Progress
+  dynamic at out =
+    let literalCount : Int = bitsAt at 5 + 257
+    in let distanceCount : Int = bitsAt (at + 5) 5 + 1
+    in let codeLengthCount : Int = bitsAt (at + 10) 4 + 4
+    in let lengthsAt : Int = at + 14 + 3 * codeLengthCount
+    in if beyond (at + 14) then ended
+    else if literalCount > 286
+    then failure at "more than 286 literal/length codes"
+    else if distanceCount > 30 then failure at "more than 30 distance codes"
+    else if beyond lengthsAt then ended
+    else let codeLengths : Array Int =
+           gatheredFrom 0 codeLengthCount (Array.replicate 19 0)
+         in let shape : String = shapeOf codeLengths 0 19
+         in if shape /= "complete"
+         then failure (at + 14) (shape ^ " code length code")
+         else lengthsFrom
+             (codeOf codeLengths 0 19)
+             literalCount
+             distanceCount
+             lengthsAt
+             0
+             lengthsAt
+             (Array.replicate (literalCount + distanceCount) 0)
+    where
+    -- (the lengths of the code length code from the `k`th of `count` on,
+    -- 3 bits each, put in `lengths`)
+    gatheredFrom : Int -> Int -> Array Int -> Array Int
+    gatheredFrom k count lengths =
+      if k >= count then lengths
+      else gatheredFrom
+          (k + 1)
+          count
+          (Array.set
+             lengths
+             (Array.arrayIndex codeLengthOrder k)
+             (bitsAt (at + 14 + 3 * k) 3))
+    -- (the lengths of the literal/length and distance codes, from the
+    -- `i`th on, read by `code` from bit `at`, put in `lengths`; then the
+    -- block's codes; they began at bit `start`)
+    lengthsFrom : Code
+                -> Int
+                -> Int
+                -> Int
+                -> Int
+                -> Int
+                -> Array Int
+                -> Either CorruptInput Progress
+    lengthsFrom code literalCount distanceCount start i at lengths =
+      if i >= literalCount + distanceCount
+      then (let literalShape : String = shapeOf lengths 0 literalCount
+            in let distanceShape : String =
+              shapeOf lengths literalCount distanceCount
+            in if Array.arrayIndex lengths 256 == 0
+            then failure start "no code for the end of a block"
+            else if literalShape /= "complete"
+            then failure start (literalShape ^ " literal/length code")
+            else if distanceShape /= "complete" && distanceShape /= "empty"
+            then failure start (distanceShape ^ " distance code")
+            else codesAt
+                (codeOf lengths 0 literalCount)
+                (codeOf lengths literalCount distanceCount)
+                at
+                out)
+      else (let entry : Int =
+              Array.arrayIndex code.table (and (window at) code.mask)
+            in let used : Int = and entry 15
+            in let symbol : Int = shiftR entry 4
+            in if beyond (at + max used 1) then ended
+            else if used == 0 then failure at "invalid code length code"
+            else if symbol < 16
+            then lengthsFrom
+                code
+                literalCount
+                distanceCount
+                start
+                (i + 1)
+                (at + used)
+                (Array.set lengths i symbol)
+            else if symbol == 16 && i == 0
+            then failure at "a length repeated before any"
+            else let extra : Int =
+                   if symbol == 16 then 2 else if symbol == 17 then 3 else 7
+                 in let times : Int =
+                   (if symbol == 18 then 11 else 3) + bitsAt (at + used) extra
+                 in let value : Int =
+                   if symbol == 16 then Array.arrayIndex lengths (i - 1) else 0
+                 in if beyond (at + used + extra) then ended
+                 else if i + times > literalCount + distanceCount
+                 then failure at "lengths repeated past the last"
+                 else lengthsFrom
+                     code
+                     literalCount
+                     distanceCount
+                     start
+                     (i + times)
+                     (at + used + extra)
+                     (repeated i (i + times) value lengths))
+      where
+      -- (`value` at each of `lengths` from `j` up to `end`)
+      repeated : Int -> Int -> Int -> Array Int -> Array Int
+      repeated j end value lengths =
+        if j >= end then lengths
+        else repeated (j + 1) end value (Array.set lengths j value)
+  -- (the block of the `kind` in its header, which ends at bit `at`, after
+  -- the bytes `out`)
+  block : Int -> Int -> String -> Either CorruptInput Progress
+  block kind at out =
+    if kind == 0 then stored at out
+    else if kind == 1 then codesAt fixedLiterals fixedDistances at out
+    else if kind == 2 then dynamic at out
+    else failure (at - 3) "invalid block type 3"
+  -- (the blocks from bit `at` on, after the bytes `out`)
+  blocksFrom : Int -> String -> Either CorruptInput (Pair Bytes Int)
+  blocksFrom at out =
+    let header : Int = bitsAt at 3
+    in if beyond (at + 3) then ended
+    else case block (shiftR header 1) (at + 3) out of
+      Left e -> Left e
+      Right p ->
+        if and header 1 == 1
+        then Right
+            (MkPair (Bytes.fromString p.out) (shiftR (p.at + 7) 3))
+        else blocksFrom p.at p.out
+
+-- | The DEFLATE data the bytes begin with, decompressed; any bytes after
+-- | its last block are not looked at.
+-- |
+-- | (a stored block, a block of the fixed codes, one of codes of its own,
+-- | a length copied over what it copies -- 29 `a`s from one -- and no
+-- | bytes)
+-- | >>> decompress b[1, 12, 0, 243, 255, "hello, world"]
+-- | Right b["hello, world"]
+-- | >>> decompress b[203, "H", 205, 201, 201, 215, "Q", 200, "@", 162, 20, 1]
+-- | Right b["hello, hello, hello!"]
+-- | >>> decompress b[21, 135, "1", 1, 0, 0, 12, 130, 178, 194, 250, "w", 152, 28, 2, 170, 28, 131, 228, "TT", 229, 166, 187, "<"]
+-- | Right b["bbbacabbabaacababaaaacaababbaaabaabbcaaa"]
+-- | >>> decompress b["KL", 196, 7, 0]
+-- | Right b["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+-- | >>> decompress b[3, 0]
+-- | Right b[]
+-- |
+-- | (where it is not DEFLATE data: a block of type 3; a stored block's
+-- | length and its complement not agreeing; too few bytes; more codes than
+-- | there are; lengths with more codes, or fewer, than their code has room
+-- | for; a length repeated with none before it; no code for the end of a
+-- | block; a literal/length or distance code of no symbol; a distance
+-- | further back than the bytes written)
+-- | >>> decompress b[7]
+-- | Left { offset = 0, message = "invalid block type 3" }
+-- | >>> decompress b[1, 12, 0, 0, 0, "hello, world"]
+-- | Left { offset = 1, message = "stored block length does not match its complement" }
+-- | >>> decompress b[1, 12, 0, 243, 255, "hel"]
+-- | Left { offset = 8, message = "unexpected end of input" }
+-- | >>> decompress b[245, 0, 0, 0]
+-- | Left { offset = 0, message = "more than 286 literal/length codes" }
+-- | >>> decompress b[5, 30, 0, 0]
+-- | Left { offset = 0, message = "more than 30 distance codes" }
+-- | >>> decompress b[5, 0, 146, 4]
+-- | Left { offset = 2, message = "over-subscribed code length code" }
+-- | >>> decompress b[5, 0, 4, 0]
+-- | Left { offset = 2, message = "incomplete code length code" }
+-- | >>> decompress b[5, 0, 2, "$"]
+-- | Left { offset = 3, message = "a length repeated before any" }
+-- | >>> decompress b[5, 192, 183, "m", 24, 0, 0, 192, "0", 242, 255, 167, "I"]
+-- | Left { offset = 8, message = "over-subscribed literal/length code" }
+-- | >>> decompress b[5, 192, 183, "m", 24, 0, 0, 192, "0", 242, 255, 171, 9]
+-- | Left { offset = 8, message = "no code for the end of a block" }
+-- | >>> decompress b[5, 192, 183, "m", 24, 0, 0, 192, 176, 252, 127, "u", 8]
+-- | Left { offset = 8, message = "incomplete literal/length code" }
+-- | >>> decompress b[5, 193, 183, "m", 24, 0, 0, 192, "0", 254, 127, "5", 13]
+-- | Left { offset = 8, message = "incomplete distance code" }
+-- | >>> decompress b[27, 3]
+-- | Left { offset = 0, message = "invalid literal/length symbol 286" }
+-- | >>> decompress b["K", 4, ">"]
+-- | Left { offset = 2, message = "invalid distance symbol 30" }
+-- | >>> decompress b["K", 4, "B", 0]
+-- | Left { offset = 2, message = "distance too far back" }
+-- | >>> decompress b[203, "H", 205, 201]
+-- | Left { offset = 4, message = "unexpected end of input" }
+-- | >>> decompress b[]
+-- | Left { offset = 0, message = "unexpected end of input" }
+decompress : Bytes -> Either CorruptInput Bytes
+decompress input = case decompressAt input 0 of
+  Left e -> Left e
+  Right (MkPair out end) -> Right out
