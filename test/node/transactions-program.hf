@@ -1,0 +1,283 @@
+-- What the tests of `stm` run, on every backend: the same program, by
+-- stm on std.domain, on the C backend's threads
+-- (test/node/transactions.hf) and in JavaScript's one domain
+-- (test/apps/transactions.hf), the same lines said.  A counter many
+-- threads add to; money moved round accounts by clerks at once, the
+-- total kept; a bounded queue, its producer waiting while it is full
+-- and its consumer while it is empty; an `orElse` taking from the
+-- queue that has something; a thread woken by the write it waits for;
+-- and a program whose threads all wait, scheduled, coming to `Nothing`.
+
+module test.node.transactions-program
+
+import co
+import std.domain as Domain
+import stm as STM
+
+-- (the next of a sequence of numbers that look random)
+nextRandom : Int -> Int
+nextRandom x = (x * 1103515245 + 12345) % 2147483648
+
+-- (waiting until the counter says `n`)
+awaited : {e w : HFunctor}
+        -> {{sm : STM.stm w <: e}}
+        -> STM.TVar w Int
+        -> Int
+        -> Co e Unit
+awaited done n =
+  STM.atomically (do
+    k <- STM.readTVar done
+    STM.check (k == n))
+
+-- A counter -----------------------------------------------------------------------------
+
+-- (1 added, `k` times, and the thread counted done)
+adding : {e w : HFunctor}
+       -> {{sm : STM.stm w <: e}}
+       -> STM.TVar w Int
+       -> STM.TVar w Int
+       -> Int
+       -> Co e Unit
+adding counter done 0 = STM.atomically (STM.modifyTVar done (\n -> n + 1))
+adding counter done k = do
+  STM.atomically (STM.modifyTVar counter (\n -> n + 1))
+  adding counter done (k - 1)
+
+-- (`k` threads, each adding `n` times)
+adders : {e w : HFunctor}
+       -> {{sm : STM.stm w <: e}}
+       -> STM.TVar w Int
+       -> STM.TVar w Int
+       -> Int
+       -> Int
+       -> Co e Unit
+adders counter done 0 n = pure ()
+adders counter done k n = do
+  STM.spawn (adding counter done n)
+  adders counter done (k - 1) n
+
+-- | 100 threads each adding 1 to one variable 50 times: 5000
+counted : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e Int
+counted = do
+  counter <- STM.newTVar 0
+  done <- STM.newTVar 0
+  adders counter done 100 50
+  awaited done 100
+  STM.atomically (STM.readTVar counter)
+
+-- A bank ----------------------------------------------------------------------------------
+
+-- (the `i`th of the list)
+nth : {a : Type} -> List a -> Int -> a
+nth xs i = case List.head (List.drop i xs) of
+  Just x -> x
+  Nothing -> abandon
+
+-- (`n` moved from one account to another, where the first has it;
+-- else nothing)
+moved : {w : HFunctor}
+      -> STM.TVar w Int
+      -> STM.TVar w Int
+      -> Int
+      -> Co (STM.transaction w) Unit
+moved from to n =
+  STM.orElse
+    (do
+      have <- STM.readTVar from
+      STM.check (have >= n)
+      STM.writeTVar from (have - n)
+      STM.modifyTVar to (\m -> m + n))
+    (pure ())
+
+-- (a clerk's `k` transfers, each between two accounts of the eight
+-- and of an amount the random numbers say)
+clerk : {e w : HFunctor}
+      -> {{sm : STM.stm w <: e}}
+      -> List (STM.TVar w Int)
+      -> STM.TVar w Int
+      -> Int
+      -> Int
+      -> Co e Unit
+clerk accounts done seed 0 = STM.atomically (STM.modifyTVar done (\n -> n + 1))
+clerk accounts done seed k = do
+  let s1 = nextRandom seed
+  let s2 = nextRandom s1
+  let s3 = nextRandom s2
+  let from = nth accounts (s1 % 8)
+  let to = nth accounts (s2 % 8)
+  STM.atomically (moved from to (s3 % 60))
+  clerk accounts done s3 (k - 1)
+
+-- (`k` clerks, each of 250 transfers, from its own seed)
+clerks : {e w : HFunctor}
+       -> {{sm : STM.stm w <: e}}
+       -> List (STM.TVar w Int)
+       -> STM.TVar w Int
+       -> Int
+       -> Co e Unit
+clerks accounts done 0 = pure ()
+clerks accounts done k = do
+  STM.spawn (clerk accounts done k 250)
+  clerks accounts done (k - 1)
+
+-- (`k` accounts, each of 100)
+opened : {e w : HFunctor}
+       -> {{sm : STM.stm w <: e}}
+       -> Int
+       -> Co e (List (STM.TVar w Int))
+opened 0 = pure Nil
+opened k = do
+  a <- STM.newTVar 100
+  rest <- opened (k - 1)
+  pure (a :: rest)
+
+-- (what each holds)
+balances : {w : HFunctor} -> List (STM.TVar w Int) -> Co (STM.transaction w) (List Int)
+balances Nil = pure Nil
+balances (a :: rest) = do
+  x <- STM.readTVar a
+  xs <- balances rest
+  pure (x :: xs)
+
+-- | eight accounts of 100, four clerks making 250 transfers each at
+-- | once: the total, 800 still
+total : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e Int
+total = do
+  accounts <- opened 8
+  done <- STM.newTVar 0
+  clerks accounts done 4
+  awaited done 4
+  xs <- STM.atomically (balances accounts)
+  pure (List.sum xs)
+
+-- A bounded queue -------------------------------------------------------------------
+
+-- (`x` put at the back of the queue, waiting while it holds `cap`)
+putting : {w : HFunctor}
+        -> STM.TVar w (List Int)
+        -> Int
+        -> Int
+        -> Co (STM.transaction w) Unit
+putting q cap x = do
+  xs <- STM.readTVar q
+  STM.check (List.length xs < cap)
+  STM.writeTVar q (xs ++ [x])
+
+-- (the front of the queue taken, waiting while it is empty)
+taking : {w : HFunctor} -> STM.TVar w (List Int) -> Co (STM.transaction w) Int
+taking q = do
+  xs <- STM.readTVar q
+  case xs of
+    x :: rest -> do
+      STM.writeTVar q rest
+      pure x
+    Nil -> STM.retry
+
+-- (`i` to `n` put on the queue, one at a time)
+producing : {e w : HFunctor}
+          -> {{sm : STM.stm w <: e}}
+          -> STM.TVar w (List Int)
+          -> Int
+          -> Int
+          -> Int
+          -> Co e Unit
+producing q cap i n =
+  if i > n then pure ()
+  else do
+    STM.atomically (putting q cap i)
+    producing q cap (i + 1) n
+
+-- (`n` taken from the queue, in the order they come)
+consuming : {e w : HFunctor}
+          -> {{sm : STM.stm w <: e}}
+          -> STM.TVar w (List Int)
+          -> Int
+          -> Co e (List Int)
+consuming q 0 = pure Nil
+consuming q n = do
+  x <- STM.atomically (taking q)
+  xs <- consuming q (n - 1)
+  pure (x :: xs)
+
+-- | 1 to 50 through a queue of three places, a thread producing and
+-- | main consuming: their sum, and whether they came in order
+queued : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e (Int, Bool)
+queued = do
+  q <- STM.newTVar Nil
+  STM.spawn (producing q 3 1 50)
+  xs <- consuming q 50
+  pure (List.sum xs, xs == List.range 1 50)
+
+-- An orElse -----------------------------------------------------------------------------
+
+-- | taken from the left queue, or from the right where the left is
+-- | empty: the right's 7 first, then the left's 3 once it has it
+either : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e (List Int)
+either = do
+  l <- STM.newTVar Nil
+  r <- STM.newTVar [7]
+  a <- STM.atomically (STM.orElse (taking l) (taking r))
+  STM.atomically (STM.writeTVar l [3])
+  b <- STM.atomically (STM.orElse (taking l) (taking r))
+  pure [a, b]
+
+-- Woken by a write ----------------------------------------------------------------------
+
+-- | a thread waiting until a flag is set, then doubling what another
+-- | variable holds; main setting the flag, then waiting for the double:
+-- | 42
+woken : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e Int
+woken = do
+  flag <- STM.newTVar False
+  value <- STM.newTVar 21
+  STM.spawn
+    (STM.atomically (do
+      set <- STM.readTVar flag
+      STM.check set
+      STM.modifyTVar value (\x -> x * 2)))
+  STM.atomically (STM.writeTVar flag True)
+  STM.atomically (do
+    x <- STM.readTVar value
+    STM.check (x > 21)
+    pure x)
+
+-- Every thread waiting ------------------------------------------------------------------
+
+-- | a thread waiting for a variable nobody writes, and main for
+-- | another: a deadlock
+blocked : {e w : HFunctor} -> {{sm : STM.stm w <: e}} -> Co e Int
+blocked = do
+  a <- STM.newTVar 0
+  b <- STM.newTVar 0
+  STM.spawn
+    (STM.atomically (do
+      x <- STM.readTVar a
+      STM.check (x > 0)))
+  STM.atomically (do
+    y <- STM.readTVar b
+    STM.check (y > 0)
+    pure y)
+
+-- | what the program says, line by line
+said : {e w : HFunctor}
+     -> {{sm : STM.stm w <: e}}
+     -> {{dm : Domain.domain <: e}}
+     -> Co e (List String)
+said = do
+  n <- counted
+  t <- total
+  (s, o) <- queued
+  xs <- either
+  v <- woken
+  d <- STM.scheduled (w := e) (blocked (w := e) (sm := _))
+  pure
+      [ "added by 100 threads: " ^ show n
+      , "accounts total: " ^ show t
+      , "through a bounded queue: " ^ show s ^ ", in order: " ^ (if o then "yes" else "no")
+      , "orElse: " ^ unwords (List.map show xs)
+      , "woken by a write: " ^ show v
+      , "all waiting: "
+      ^ (case d of
+         Just k -> "Just " ^ show k
+         Nothing -> "Nothing")
+      ]
