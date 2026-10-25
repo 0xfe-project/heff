@@ -27,6 +27,9 @@ million = 1_000_000
 
 flags : Int
 flags = 0b1010
+
+mode : Int
+mode = 0o644
 ```
 
 - An integer literal can be of any number type; a fractional one, `2.5`,
@@ -45,8 +48,8 @@ flags = 0b1010
   the `Float32` nearest it, rounded once. A `-`, digits, a point and
   digits, an exponent (`2.5`, `-1e-7`, `12.5E+3`); anything else
   (`"Infinity"`, `"1."`, `" 1"`) is `Nothing`.
-- Hexadecimal `0x605` and binary `0b1010` are allowed, and `_` can
-  separate digits.
+- Hexadecimal `0x605`, octal `0o644` and binary `0b1010` are allowed,
+  and `_` can separate digits.
 - The literal must fit its type: `300` as a `UInt8` is an error, and so
   is `1.5` as an `Int32`.
 - Where nothing decides the type, an integer literal is an `Int` and a
