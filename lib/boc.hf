@@ -24,7 +24,11 @@
 --      -> BOC.Cown w Int
 --      -> Int
 --      -> Co e Unit
--- paid from to n = BOC.when (from, to) (\(x, y) -> pure (x - n, y + n))
+-- paid from to n = do
+--   with x := from
+--        y := to do
+--     x := x - n
+--     y := y + n
 --
 -- -- | alice given 10, then 5 paid to bob; what bob has then, written
 -- -- | by a last behaviour on bob, which comes after the others on him
@@ -54,12 +58,17 @@
 -- --- | ---
 -- `newCown v` | a cown holding `v`
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
+-- `with a := c do ...` | the same, its body statements, `a` what `c` holds (more cowns, a binding each)
 -- `scheduled c` | `c` and its behaviours run, on domains, every behaviour waited for
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
 -- gives back their new contents, the same shape: `Cowns` says what a
--- cown or a tuple of them holds.  The body is a computation of the
+-- cown or a tuple of them holds.  A `with` of cowns is a behaviour too,
+-- each cown bound to a name (`with x := from` and `y := to` under it),
+-- its statements the body, the names what they hold, set to change it:
+-- only the cowns whose names it sets are written back, and the `with`
+-- comes to `()`.  The body is a computation of the
 -- world like any other, run on whichever domain takes it: it may spawn
 -- behaviours, on its own cowns too (they run after it), and do what
 -- else its effects allow, whose providers must then be safe on threads.
@@ -113,6 +122,10 @@ module boc
   , Cowns
   , instanceCownsCown
   , instanceCownsPair
+  , instanceBinderCown
+  , instanceBinderCowns
+  , instanceHolderCown
+  , instanceHolderCowns
   , boc
   , newCown
   , when
@@ -177,22 +190,31 @@ numberOf (MkHandle n last none) = n
 
 -- | What a behaviour can be on: a cown, or a tuple of them (`(a, b, c)`,
 -- | nesting to the left); the world their behaviours run in, what they
--- | hold, their queues, and how what they hold is read and written.
+-- | hold, how many cowns, their queues, and how what they hold is read
+-- | and written -- written where its `Bool` says, one a cown, in order.
 theory Cowns (c : Type) where
   World : HFunctor
   Contents : Type
+  width : Int
   handles : c -> List (Handle World)
   read : (Domain.domain <: World) -> c -> Co World Contents
-  write : (Domain.domain <: World) -> c -> Contents -> Co World Unit
+  write : (Domain.domain <: World)
+        -> c
+        -> List Bool
+        -> Contents
+        -> Co World Unit
 
 -- | A cown: what it holds.
 instance instanceCownsCown : {w : HFunctor} -> {a : Type} -> Cowns (Cown w a)
 instanceCownsCown =
   { World = w
   , Contents = a
+  , width = 1
   , handles = \c -> [handleOf c]
   , read = \dm c -> Domain.get (dm := dm) (cellOf c)
-  , write = \dm c v -> Domain.set (dm := dm) (cellOf c) v
+  , write = \dm c ws v -> case ws of
+      Cons False _ -> pure MkUnit
+      _ -> Domain.set (dm := dm) (cellOf c) v
   }
 
 -- | Two (each a cown or a tuple) of one world: the pair of what they
@@ -204,13 +226,16 @@ instance instanceCownsPair : {c d : Type}
 instanceCownsPair =
   { World = l.World
   , Contents = (l.Contents, r.Contents)
+  , width = l.width + r.width
   , handles = \p -> l.handles (fst p) ++ r.handles (snd p)
   , read = \dm p ->
         bind
           (l.read dm (fst p))
           (\x -> bind (r.read dm (snd p)) (\y -> pure (x, y)))
-  , write = \dm p v ->
-        bind (l.write dm (fst p) (fst v)) (\u -> r.write dm (snd p) (snd v))
+  , write = \dm p ws v ->
+        bind
+          (l.write dm (fst p) ws (fst v))
+          (\u -> r.write dm (snd p) (List.drop l.width ws) (snd v))
   }
 
 -- The effect
@@ -287,6 +312,30 @@ newCown : {e w : HFunctor}
         -> Co e (Cown w a)
 newCown v = op (bc (NewCown (\r use -> use a (MkMaking v (\c -> c))))) val
 
+-- (a behaviour on `cs`, writing back the cowns `written` says)
+behaviour : {c : Type}
+          -> {e : HFunctor}
+          -> c
+          -> {{cw : Cowns c}}
+          -> {{bc : boc cw.World <: e}}
+          -> List Bool
+          -> (cw.Contents -> Co e cw.Contents)
+          -> Co e Unit
+behaviour cs written body =
+  op
+    (bc
+       (When
+          (\r use ->
+             use
+               cw.Contents
+               (MkBehaving
+                  (cw.handles cs)
+                  (\dm -> cw.read dm cs)
+                  (\dm v -> cw.write dm cs written v)
+                  body
+                  MkUnit))))
+    val
+
 -- | A behaviour on the cowns `cs`, one or a tuple of them, spawned;
 -- | this one goes on.  Its turn comes once every behaviour spawned
 -- | before it on any of them is done; then `body` is given what they
@@ -299,20 +348,55 @@ when : {c : Type}
      -> {{bc : boc cw.World <: e}}
      -> (cw.Contents -> Co e cw.Contents)
      -> Co e Unit
-when cs body =
-  op
-    (bc
-       (When
-          (\r use ->
-             use
-               cw.Contents
-               (MkBehaving
-                  (cw.handles cs)
-                  (\dm -> cw.read dm cs)
-                  (\dm v -> cw.write dm cs v)
-                  body
-                  MkUnit))))
-    val
+when cs body = behaviour cs (List.replicate cw.width True) body
+
+-- | A `with` of a cown: a behaviour on it, spawned (`with a := c do
+-- | ...`: `a` what it holds); this one goes on, and the `with` comes to
+-- | nothing.
+instance instanceBinderCown : {w : HFunctor} -> {a : Type} -> Binder (Cown w a)
+instanceBinderCown = { Contents = \s -> a, Result = \r -> Unit }
+
+-- | A `with` of cowns, each bound to a name (`with a := c0` and `b := c1`
+-- | under it): one behaviour on all of them, which takes them all at
+-- | once.
+instance instanceBinderCowns : {w : HFunctor}
+                             -> {a d : Type}
+                             -> {{cw : Cowns (Cown w a, d)}}
+                             -> Binder (Cown w a, d)
+instanceBinderCowns = { Contents = \s -> cw.Contents, Result = \r -> Unit }
+
+-- | A behaviour on a cown held by a `with`: its body's names set are
+-- | what the cown holds after it; one only read is not written back.
+instance instanceHolderCown : {e w : HFunctor}
+                            -> {a : Type}
+                            -> {{bc : boc w <: e}}
+                            -> Holder e (Cown w a) (\s -> a) (\r -> Unit)
+instanceHolderCown =
+  { held = \c written body ->
+        behaviour
+          c
+          written
+          (\v -> bind (body (s := Unit) v) (\p -> pure (snd p)))
+  }
+
+-- | ... on cowns.
+instance instanceHolderCowns : {e w : HFunctor}
+                             -> {a d : Type}
+                             -> {{cw : Cowns (Cown w a, d)}}
+                             -> {{bc : boc cw.World <: e}}
+                             -> Holder
+                               e
+                               (Cown w a, d)
+                               (\s -> cw.Contents)
+                               (\r -> Unit)
+instanceHolderCowns =
+  { held = \c written body ->
+        behaviour
+          c
+          (cw := cw)
+          written
+          (\v -> bind (body (s := Unit) v) (\p -> pure (snd p)))
+  }
 
 -- The scheduler
 --------------------------------------------------------------------------------

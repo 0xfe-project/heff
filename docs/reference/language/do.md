@@ -170,5 +170,47 @@ takes it apart: `e (\p -> case p of (a, b) -> do ...)`.
 - A `with` throws what it could not acquire or release: a `try` around
   it catches that.
 
+### with, of bindings
+
+```haskell
+import boc as BOC
+
+paid : {e w : HFunctor}
+     -> {{bc : BOC.boc w <: e}}
+     -> BOC.Cown w Int
+     -> BOC.Cown w Int
+     -> Int
+     -> Co e Unit
+paid from to n = do
+  with a := from
+       b := to do
+    a := a - n
+    b := b + n
+```
+
+`with x := M do` binds names, each to a value: one binding, or more, each
+on a line of its own under the first, `do` at the end of the last. The
+whole group is handed to the handler that owns what they are bound to,
+which decides what the names are in the body, when and where the body
+runs, and what happens at its end: here one behaviour on both cowns, `a`
+and `b` what they hold, written back when it ends; with
+`std.filesystem`'s `open path o`, a file opened, the body run with it,
+and closed.
+
+- The names are the body's variables: they can be set, `a := a - n`.
+  The handler is told which ones the body sets, and is given what they
+  are at its end beside the body's value.
+- `_ := M` binds no name.
+- The body is a block of its own: it sets no variable of the block
+  around, nor leaves it by `break`, `continue` or `return`; a `return`
+  in it ends the body.
+- Its value is what the handler says: a file's `with` comes to what its
+  body came to, a cown's to `()` (the behaviour runs later). `x <- with
+  ... do` binds it.
+- A handler is a pair of instances, co's `Binder` (of what the names are
+  bound to: what they are in the body, and what the `with` comes to)
+  and `Holder` (how it runs in the world), and the `with` is co's
+  `holding`.
+
 `with` and `as` are [keywords](definitions.md#keywords): neither is a
 name.

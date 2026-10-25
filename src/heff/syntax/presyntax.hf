@@ -259,6 +259,10 @@ data Stmt e
 -- | statements, a block's or an arm's
 type Stmts e = List (Params.Spanned (Stmt e))
 
+-- | `x := M`, a binding of a `with`: the name (`_` for none), where it
+-- | is, what it is bound to
+data Binding e = MkBinding String Params.Span e
+
 -- | a `try` statement's `catch` arm: its binder (`x`, `(x : T)`), its
 -- | statements
 data CatchArm e = MkCatchArm (LamBinder e) (Stmts e)
@@ -391,6 +395,12 @@ data ExprF
   -- | statements, its body
   | EWith (Params.Spanned ExprF) String Params.Span (Stmts
                                                        (Params.Spanned ExprF))
+  -- | `with x := M do ...`: the bindings, the statements, its body (a
+  -- | block of its own: the names its variables, nothing of the block
+  -- | around set or left from it)
+  | EWithBound (List (Params.Spanned (Binding (Params.Spanned ExprF)))) (Stmts
+                                                                           (Params.Spanned
+                                                                              ExprF))
 
 type Expr = Params.Spanned ExprF
 
@@ -703,8 +713,10 @@ type Jump = { head : Expr, vars : List String, unit : Bool, depth : Int }
 
 -- | where the statements are: the names, the variables (`let mut`) in
 -- | scope, the innermost loop's `continue` and `break`, the block's span,
--- | how many scopes (`try`) they are in, and, in a loop giving its
--- | variables back, whether it may give back a `return`'s value too
+-- | how many scopes (`try`) they are in, in a loop giving its variables
+-- | back, whether it may give back a `return`'s value too, and, in a
+-- | `with`'s body, what its names are at its end, given back beside its
+-- | value
 type DoCx =
   { names : DoNames
   , muts : List String
@@ -712,6 +724,7 @@ type DoCx =
   , sp : Params.Span
   , depth : Int
   , giving : Maybe Bool
+  , bound : Maybe Expr
   }
 
 -- | what follows the statements' end: the last one's value is the
@@ -800,6 +813,13 @@ ifOf sp c a b =
 
 pureOf : DoCx -> Params.Span -> Expr -> Expr
 pureOf cx sp v = app (At (EVar cx.names.pure) sp) [v]
+
+-- | the block's value: in a `with`'s body, beside what its names are
+-- | there, `(v, names)`
+boundBeside : DoCx -> Params.Span -> Expr -> Expr
+boundBeside cx sp v = case cx.bound of
+  Just names -> At (ETuple [v, names]) sp
+  Nothing -> v
 
 -- | `call`, from `n` scopes in: each scope's answer is what to do once it
 -- | is left, `pure` of it, so `call` is made once all `n` are (each
@@ -937,6 +957,14 @@ catchAcc : {s : Type}
 catchAcc f st (MkCatchArm b ss) =
   pairK (accList (stmtAcc f) st ss) (\st1 ss' -> MkPair st1 (MkCatchArm b ss'))
 
+bindingAcc : {s : Type}
+           -> (s -> Expr -> Pair s Expr)
+           -> s
+           -> Params.Spanned (Binding Expr)
+           -> Pair s (Params.Spanned (Binding Expr))
+bindingAcc f st (At (MkBinding x xsp e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (MkBinding x xsp e') sp))
+
 -- | each expression of a `try`'s statements, by `f` (its type, none)
 tryAcc : {s : Type}
        -> (s -> Expr -> Pair s Expr)
@@ -1040,6 +1068,11 @@ childrenAcc f st (At (EWith w x xsp body) sp) =
        pairK
          (accList (stmtAcc f) st1 body)
          (\st2 body' -> MkPair st2 (At (EWith w' x xsp body') sp)))
+-- (a `with`'s bindings: its body is a block of its own)
+childrenAcc f st (At (EWithBound bs body) sp) =
+  pairK
+    (accList (bindingAcc f) st bs)
+    (\st1 bs' -> MkPair st1 (At (EWithBound bs' body) sp))
 childrenAcc f st e = MkPair st e
 
 -- | the expressions an expression holds, each by `f`
@@ -1069,6 +1102,20 @@ declaredMuts : List (Params.Spanned (Stmt Expr)) -> List String
 declaredMuts Nil = Nil
 declaredMuts (Cons (At (StmtLetMut x _ _) _) rest) = Cons x (declaredMuts rest)
 declaredMuts (Cons _ rest) = declaredMuts rest
+
+-- (a binding's expression, by `f`)
+bindingBy : (Expr -> Expr)
+          -> Params.Spanned (Binding Expr)
+          -> Params.Spanned (Binding Expr)
+bindingBy f (At (MkBinding x xsp e) sp) = At (MkBinding x xsp (f e)) sp
+
+-- | the names a `with` binds, `_` too
+boundNames : List (Params.Spanned (Binding Expr)) -> List String
+boundNames bs =
+  List.map
+    (\b -> case b of
+     At (MkBinding x _ _) _ -> x)
+    bs
 
 guardE : Guard -> Expr -> Expr
 guardE g (At (ENest c) sp) =
@@ -1101,7 +1148,7 @@ guardE g (At (EAssign x xsp v) sp) =
       xsp
       ("`"
        ^ x
-       ^ "` is a `let mut` variable of the `do` block around: a closure (a lambda, or a `do` block of its own) holds its value, and cannot set it")
+       ^ "` is a `let mut` variable of the `do` block around: a closure (a lambda, a `do` block of its own, a `with`'s body) holds its value, and cannot set it")
   else At (EAssign x xsp (guardE g v)) sp
 guardE g (At (ELam b body) sp) =
   At (ELam b (guardE { muts = g.muts, inLam = True } body)) sp
@@ -1118,6 +1165,35 @@ guardE g (At (EDo ss) sp) =
        , inLam = False
        })
     (At (EDo ss) sp)
+guardE g (At (EWithBound bs body) sp) =
+  At
+    (EWithBound
+       (List.map (bindingBy (guardE g)) bs)
+       (List.map
+          (\st ->
+             snd
+               (stmtAcc
+                  (\u c ->
+                     MkPair
+                       u
+                       (guardE
+                          { muts =
+                              List.keepIf
+                                (\x ->
+                                   not
+                                     (List.any
+                                        (\y -> strEq x y)
+                                        (List.append
+                                           (boundNames bs)
+                                           (declaredMuts body))))
+                                g.muts
+                          , inLam = False
+                          }
+                          c))
+                  (MkUnit : Unit)
+                  st))
+          body))
+    sp
 guardE g e = mapChildren (guardE g) e
 
 -- The values of actions, `(<- c)`, bound before what holds them: a
@@ -1210,6 +1286,12 @@ liftE l acc (At (ELetIn rhs (At (MkAlt p body) asp)) sp) =
 liftE l acc (At (ETry tr) sp) = MkPair acc (At (ETry tr) sp)
 liftE l acc (At (EWith w x xsp body) sp) =
   MkPair acc (At (EWith w x xsp body) sp)
+-- (a `with`'s bindings' `(<- c)` bound before it; its body, a block of
+-- its own, guarded)
+liftE l acc (At (EWithBound bs body) sp) =
+  pairK
+    (accList (bindingAcc (liftE l)) acc bs)
+    (\acc1 bs' -> MkPair acc1 (guardE l.guard (At (EWithBound bs' body) sp)))
 liftE l acc e = childrenAcc (liftE l) acc e
 
 -- | `k` of the expression, its `(<- c)` bound before
@@ -1285,7 +1367,17 @@ packTy sp (Cons x xs) =
 -- | what the statements' end leads to
 endOf : DoCx -> Params.Span -> End -> Expr
 endOf cx sp EndValue =
-  leaving cx sp cx.depth (pureOf cx sp (At (ETag "MkUnit") sp))
+  leaving
+    cx
+    sp
+    cx.depth
+    (pureOf cx sp (case cx.bound of
+     Just _ ->
+       boundBeside
+         cx
+         sp
+         (ann (At (ETag "MkUnit") sp) (At (EVar "builtin.Unit") sp))
+     Nothing -> At (ETag "MkUnit") sp))
 endOf cx sp (EndJump j) = jumpCall cx sp j
 endOf cx sp (EndGive vars d) =
   leaving cx sp (cx.depth - d) (pureOf cx sp (packE sp vars))
@@ -1298,6 +1390,7 @@ withMut cx x =
   , sp = cx.sp
   , depth = cx.depth
   , giving = cx.giving
+  , bound = cx.bound
   }
 
 withLoop : DoCx -> Jump -> Jump -> DoCx
@@ -1308,6 +1401,7 @@ withLoop cx cont brk =
   , sp = cx.sp
   , depth = cx.depth
   , giving = cx.giving
+  , bound = cx.bound
   }
 
 -- | the statements of a scope (`try`), one further in
@@ -1319,6 +1413,7 @@ inScope cx =
   , sp = cx.sp
   , depth = cx.depth + 1
   , giving = cx.giving
+  , bound = cx.bound
   }
 
 -- | `break` or `continue`: the call it is, the last of its statements
@@ -1579,7 +1674,7 @@ givenE sp False vars = packE sp vars
 returnOf : DoCx -> Params.Span -> Expr -> Expr
 returnOf cx sp v = case cx.giving of
   Just _ -> pureOf cx sp (app (At (ETag "Left") sp) [v])
-  Nothing -> pureOf cx sp v
+  Nothing -> pureOf cx sp (boundBeside cx sp v)
 
 -- | the statements of a loop giving its variables back, `ret` whether a
 -- | `return`'s value too
@@ -1591,6 +1686,7 @@ givingCx cx ret =
   , sp = cx.sp
   , depth = cx.depth
   , giving = Just ret
+  , bound = cx.bound
   }
 
 -- (what follows a loop, given what it gave back: the variables bound
@@ -2153,8 +2249,26 @@ lastT t cx (At (StmtExpr e) sp) =
               cx
               sp
               cx.depth
-              (pureOf cx sp (At (EVar (madeName "last" sp)) sp))))
-  else hoist cx e (\e' -> e')
+              (pureOf
+                 cx
+                 sp
+                 (boundBeside cx sp (At (EVar (madeName "last" sp)) sp)))))
+  else case cx.bound of
+    Just _ ->
+      hoist
+        cx
+        e
+        (\e' ->
+           doBind
+             cx
+             e'
+             (madeName "last" sp)
+             sp
+             (pureOf
+                cx
+                sp
+                (boundBeside cx sp (At (EVar (madeName "last" sp)) sp))))
+    Nothing -> hoist cx e (\e' -> e')
 lastT t cx (At _ sp) = badE sp "a `do` block ends with an expression"
 
 -- | `let p = e` and the statements after it, `body`
@@ -2302,10 +2416,116 @@ doBlock names sp stmts =
          , sp = sp
          , depth = 0
          , giving = Nothing
+         , bound = Nothing
          }
          stmts
          EndValue)
   else Nothing
+
+-- | `(a, (b, c))`: the first and a pair of the rest, the last alone
+rightTuple : Params.Span -> List Expr -> Expr
+rightTuple sp (Cons a Nil) = a
+rightTuple sp (Cons a rest) = At (ETuple [a, rightTuple sp rest]) sp
+rightTuple sp Nil = ann (At (ETag "MkUnit") sp) (At (EVar "builtin.Unit") sp)
+
+rightTupleP : Params.Span -> List Pat -> Pat
+rightTupleP sp (Cons p Nil) = p
+rightTupleP sp (Cons p rest) = patTag "MkPair" sp [p, rightTupleP sp rest]
+rightTupleP sp Nil = patTag "MkUnit" sp Nil
+
+listOfE : Params.Span -> List Expr -> Expr
+listOfE sp xs =
+  List.foldr
+    (\x rest -> app (At (ETag "Cons") sp) [x, rest])
+    (At (ETag "Nil") sp)
+    xs
+
+-- | the variables statements set, `x := e` (not in a `with`'s body of
+-- | its own)
+assignedIn : List (Params.Spanned (Stmt Expr)) -> List String
+assignedIn ss =
+  List.foldl
+    (\acc st -> fst (stmtAcc (\a c -> MkPair (assignsOf c a) c) acc st))
+    Nil
+    ss
+  where
+  assignsOf : Expr -> List String -> List String
+  assignsOf (At (EAssign x _ v) _) acc = assignsOf v (Cons x acc)
+  assignsOf e acc = fst (childrenAcc (\a c -> MkPair (assignsOf c a) c) acc e)
+
+-- | `with x := M ... do ss`: co's `holding` of what the names are bound
+-- | to (`M`, or a pair of the first and the rest's, nesting to the
+-- | right), which of them `ss` sets (a `Bool` each), and its body: `ss`
+-- | a block of its own, the names its variables, given what they are
+-- | bound to and giving back its value beside what they are at its end
+withBoundOf : Params.Span
+            -> List (Params.Spanned (Binding Expr))
+            -> List (Params.Spanned (Stmt Expr))
+            -> Expr
+withBoundOf sp bs body =
+  app
+    (At (EVar "holding") sp)
+    [ rightTuple
+      sp
+      (List.map
+         (\b -> case b of
+          At (MkBinding _ _ m) _ -> m)
+         bs)
+    , listOfE
+      sp
+      (List.map
+         (\x ->
+            boolOf
+              (At
+                 (ETag
+                    (if List.elem x (assignedIn body) then "True" else "False"))
+                 sp))
+         names)
+    , namesLam
+      (doT.stmts
+         { names = coNames
+         , muts = names
+         , loop = Nothing
+         , sp = sp
+         , depth = 0
+         , giving = Nothing
+         , bound = Just (rightTuple sp (List.map (\x -> At (EVar x) sp) names))
+         }
+         body
+         EndValue)
+    ]
+  where
+  -- (`_` named, by where it is)
+  nameOf : Params.Spanned (Binding Expr) -> String
+  nameOf (At (MkBinding x xsp _) _) =
+    if strEq x "_" then madeName "unbound" xsp else x
+  names : List String
+  names = List.map nameOf bs
+  spans : List Params.Span
+  spans =
+    List.map
+      (\b -> case b of
+       At (MkBinding _ xsp _) _ -> xsp)
+      bs
+  -- (the body over the names: one, the lambda's; more, its pair taken
+  -- apart)
+  namesLam : Expr -> Expr
+  namesLam inner = case List.zip names spans of
+    Cons (MkPair x xsp) Nil -> At (ELam (LamName x xsp) inner) sp
+    nsps ->
+      At
+        (ELam
+           (LamName (madeName "bound" sp) sp)
+           (matchOf
+              sp
+              (At (EVar (madeName "bound" sp)) sp)
+              [ alt
+                (rightTupleP
+                   sp
+                   (List.map (\n -> At (PatVar (fst n)) (snd n)) nsps))
+                inner
+              ]))
+        sp
 
 -- | `run do ...`: the block through the identity monad's names
 runArgs : Expr -> List Expr -> List Expr
@@ -2825,6 +3045,7 @@ classifyTermF r (At (EWith _ _ _ _) sp) =
        3
        "a `with` is a statement of a `do` block (or an arm of its `if` or `case`)"
        sp)
+classifyTermF r (At (EWithBound bs body) sp) = r.e (withBoundOf sp bs body)
 classifyTermF r (At (ENest _) sp) =
   IsInferable
     (invalid
