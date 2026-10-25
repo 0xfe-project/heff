@@ -8,8 +8,17 @@
 // failed, and ends by `heff_thread_end`.  A join waits for it, on the
 // domain's own mutex and condition, and is given the answer, one more
 // count of it (`heff_dup`) each join, or fails as it did
-// (`heff_fail_again`).  A domain, a cell, a mutex and a condition are
-// each a number, its address: never let go of.
+// (`heff_fail_again`).
+//
+// A domain, a cell, a mutex and a condition are each a foreign value
+// (`heff_foreign`), let go of when the program drops its last reference
+// to it: a cell drops the value it holds, a mutex and a condition are
+// destroyed, a domain drops its answer -- or, its thread still running,
+// is marked dropped, and the thread frees it at its end: the later of
+// the two to let go frees it, which is settled under the domain's own
+// mutex.  An operation keeps the value holding its handle until it has
+// acted on it, since dropping the value may drop the handle's last
+// reference.
 //
 // A cell holds a value shared, read by one more count, written by a
 // swap, the old value let go of after: a read and its count, and a
@@ -43,18 +52,6 @@ static V dm_open(V s) {
   return dm_held;
 }
 
-// (a thing of the provider's, as the number the program holds it by)
-static V dm_number(int tag, void *p) {
-  V i = MK_INT((int64_t)(intptr_t)p);
-  return heff_tag(tag, 1, &i);
-}
-
-// (... the thing, of the number in `v`, made by `tag`; else why not)
-static void *dm_thing(V v, int tag, const char *why) {
-  if (heff_tag_of(v) != tag) heff_fail(why);
-  return (void *)(intptr_t)INT_OF(heff_field(v, 0));
-}
-
 static char *dm_dup(const char *s) {
   char *c = heff_alloc(strlen(s) + 1);
   strcpy(c, s);
@@ -66,10 +63,32 @@ static char *dm_dup(const char *s) {
 typedef struct {
   pthread_mutex_t mu;
   pthread_cond_t ended;
-  int done;
-  V answer;   // shared, once it is done
-  char *why;  // or why it failed
+  int done;     // its thread ended
+  int dropped;  // the program's last reference to it gone
+  V answer;     // shared, once it is done
+  char *why;    // or why it failed
 } DmDomain;
+
+// (the domain freed, its thread ended and the program's last reference
+// gone: its answer dropped)
+static void dm_domain_free(DmDomain *d) {
+  pthread_mutex_destroy(&d->mu);
+  pthread_cond_destroy(&d->ended);
+  if (d->answer) heff_drop(d->answer);
+  free(d->why);
+  free(d);
+}
+
+// (the program's last reference to the domain gone: freed, unless its
+// thread still runs -- then the thread frees it at its end)
+static void dm_domain_let_go(void *x) {
+  DmDomain *d = x;
+  pthread_mutex_lock(&d->mu);
+  int done = d->done;
+  d->dropped = 1;
+  pthread_mutex_unlock(&d->mu);
+  if (done) dm_domain_free(d);
+}
 
 typedef struct { DmDomain *d; V c; char *dir; } DmStart;
 
@@ -99,8 +118,11 @@ static void *dm_thread(void *u) {
   if (why) d->why = dm_dup(why);
   else if (!d->answer) d->why = dm_dup("domain: a domain ended without an answer");
   d->done = 1;
+  int dropped = d->dropped;
   pthread_cond_broadcast(&d->ended);
   pthread_mutex_unlock(&d->mu);
+  // (the program let go of it first: no joiner can be waiting)
+  if (dropped) dm_domain_free(d);
   free(s);
   heff_thread_end();
   return NULL;
@@ -112,6 +134,7 @@ static DmDomain *dm_spawn(V c) {
   pthread_mutex_init(&d->mu, NULL);
   pthread_cond_init(&d->ended, NULL);
   d->done = 0;
+  d->dropped = 0;
   d->answer = 0;
   d->why = NULL;
   DmStart *s = heff_alloc(sizeof(DmStart));
@@ -169,6 +192,13 @@ static DmAtomic *dm_atomic(V v) {
   atomic_init(&a->v, heff_share(v));
   atomic_flag_clear(&a->busy);
   return a;
+}
+
+// (the program's last reference to the cell gone: what it holds dropped)
+static void dm_atomic_let_go(void *x) {
+  DmAtomic *a = x;
+  heff_drop(atomic_load_explicit(&a->v, memory_order_acquire));
+  free(a);
 }
 
 // (what the cell holds, one more count of it)
@@ -246,8 +276,20 @@ static pthread_cond_t *dm_condition(void) {
   return c;
 }
 
-#define DM_MUTEX(v) ((pthread_mutex_t *)dm_thing(v, TAG_MkMutex, "domain: not a mutex"))
-#define DM_CONDITION(v) ((pthread_cond_t *)dm_thing(v, TAG_MkCondition, "domain: not a condition"))
+// (the program's last reference gone: no domain holds the mutex, none
+// waits on the condition, since it would hold the reference)
+static void dm_mutex_let_go(void *x) {
+  pthread_mutex_destroy(x);
+  free(x);
+}
+
+static void dm_condition_let_go(void *x) {
+  pthread_cond_destroy(x);
+  free(x);
+}
+
+#define DM_MUTEX(v) ((pthread_mutex_t *)heff_foreign_ptr(v))
+#define DM_CONDITION(v) ((pthread_cond_t *)heff_foreign_ptr(v))
 
 static void dm_lock(pthread_mutex_t *m) {
   int r = pthread_mutex_lock(m);
@@ -265,7 +307,8 @@ static void dm_wait(pthread_cond_t *c, pthread_mutex_t *m) {
 
 // The operations --------------------------------------------------------------------
 
-#define DM_ATOMIC(v) ((DmAtomic *)dm_thing(v, TAG_MkAtomic, "domain: not a cell"))
+#define DM_ATOMIC(v) ((DmAtomic *)heff_foreign_ptr(v))
+#define DM_DOMAIN(v) ((DmDomain *)heff_foreign_ptr(v))
 
 static V heff_provider_domain(V p, V k) {
   V x;
@@ -275,14 +318,14 @@ static V heff_provider_domain(V p, V k) {
     heff_drop(p);
     V c = heff_dup(heff_field(sp, 0)), g = heff_dup(heff_field(sp, 1));
     heff_drop(sp);
-    x = heff_answer(g, dm_number(TAG_MkDomain, dm_spawn(c)));
+    x = heff_answer(g, heff_foreign(dm_spawn(c), dm_domain_let_go));
     break;
   }
   case TAG_Join: {
     V j = dm_open(heff_dup(heff_field(p, 0)));
     heff_drop(p);
     V d = heff_field(j, 0), g = heff_dup(heff_field(j, 1));
-    V v = dm_join(dm_thing(d, TAG_MkDomain, "domain: not a domain"));
+    V v = dm_join(DM_DOMAIN(d));
     heff_drop(j);
     x = heff_answer(g, v);
     break;
@@ -298,7 +341,7 @@ static V heff_provider_domain(V p, V k) {
     heff_drop(p);
     V v = heff_tget_v(mk, 0), g = heff_dup(heff_field(mk, 1));
     heff_drop(mk);
-    x = heff_answer(g, dm_number(TAG_MkAtomic, dm_atomic(v)));
+    x = heff_answer(g, heff_foreign(dm_atomic(v), dm_atomic_let_go));
     break;
   }
   case TAG_GetAtomic: {
@@ -306,8 +349,9 @@ static V heff_provider_domain(V p, V k) {
     heff_drop(p);
     DmAtomic *a = DM_ATOMIC(heff_field(rd, 0));
     V g = heff_dup(heff_field(rd, 1));
+    V v = dm_get(a);
     heff_drop(rd);
-    x = heff_answer(g, dm_get(a));
+    x = heff_answer(g, v);
     break;
   }
   case TAG_SetAtomic: {
@@ -316,8 +360,8 @@ static V heff_provider_domain(V p, V k) {
     DmAtomic *a = DM_ATOMIC(heff_field(wr, 0));
     V v = heff_tget_v(wr, 1);
     x = heff_dup(heff_field(wr, 2));
-    heff_drop(wr);
     dm_set(a, v);
+    heff_drop(wr);
     break;
   }
   case TAG_CasAtomic: {
@@ -325,63 +369,65 @@ static V heff_provider_domain(V p, V k) {
     heff_drop(p);
     DmAtomic *a = DM_ATOMIC(heff_field(cp, 0));
     V seen = heff_tget_v(cp, 1), v = heff_tget_v(cp, 2), g = heff_dup(heff_field(cp, 3));
+    int ok = dm_cas(a, seen, v);
     heff_drop(cp);
-    x = heff_answer(g, heff_bool(dm_cas(a, seen, v)));
+    x = heff_answer(g, heff_bool(ok));
     break;
   }
   case TAG_FetchAdd: {
     DmAtomic *a = DM_ATOMIC(heff_field(p, 0));
     V n = heff_dup(heff_field(p, 1)), g = heff_dup(heff_field(p, 2));
+    V old = dm_fetch_add(a, n);
     heff_drop(p);
-    x = heff_answer(g, dm_fetch_add(a, n));
+    x = heff_answer(g, old);
     break;
   }
   case TAG_NewMutex: {
     V g = heff_dup(heff_field(p, 0));
     heff_drop(p);
-    x = heff_answer(g, dm_number(TAG_MkMutex, dm_mutex()));
+    x = heff_answer(g, heff_foreign(dm_mutex(), dm_mutex_let_go));
     break;
   }
   case TAG_Lock: {
     pthread_mutex_t *m = DM_MUTEX(heff_field(p, 0));
     x = heff_dup(heff_field(p, 1));
-    heff_drop(p);
     dm_lock(m);
+    heff_drop(p);
     break;
   }
   case TAG_Unlock: {
     pthread_mutex_t *m = DM_MUTEX(heff_field(p, 0));
     x = heff_dup(heff_field(p, 1));
-    heff_drop(p);
     dm_unlock(m);
+    heff_drop(p);
     break;
   }
   case TAG_NewCondition: {
     V g = heff_dup(heff_field(p, 0));
     heff_drop(p);
-    x = heff_answer(g, dm_number(TAG_MkCondition, dm_condition()));
+    x = heff_answer(g, heff_foreign(dm_condition(), dm_condition_let_go));
     break;
   }
   case TAG_Wait: {
     pthread_cond_t *c = DM_CONDITION(heff_field(p, 0));
     pthread_mutex_t *m = DM_MUTEX(heff_field(p, 1));
     x = heff_dup(heff_field(p, 2));
-    heff_drop(p);
     dm_wait(c, m);
+    heff_drop(p);
     break;
   }
   case TAG_Signal: {
     pthread_cond_t *c = DM_CONDITION(heff_field(p, 0));
     x = heff_dup(heff_field(p, 1));
-    heff_drop(p);
     pthread_cond_signal(c);
+    heff_drop(p);
     break;
   }
   case TAG_Broadcast: {
     pthread_cond_t *c = DM_CONDITION(heff_field(p, 0));
     x = heff_dup(heff_field(p, 1));
-    heff_drop(p);
     pthread_cond_broadcast(c);
+    heff_drop(p);
     break;
   }
   default:
