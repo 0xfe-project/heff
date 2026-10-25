@@ -5028,6 +5028,8 @@ struct HeffWait {
   V f, k;
   int64_t group;
   int done;
+  int64_t epoch;                 // (how many descriptors had been closed,
+                                 //  by any thread, when it began to wait)
   HeffWait *prev, *next;
 };
 
@@ -5047,11 +5049,14 @@ struct HeffSource {
 };
 #endif
 
-typedef struct { int64_t id, pending; } HeffGroup;
+// (a group: its number, unique among every thread's; how many waits are
+// pending in it -- in a root, those of the groups within it too -- and
+// the root it is within, or 0 where it is one)
+typedef struct { int64_t id, pending, root; } HeffGroup;
 typedef struct { int64_t group; V v; } HeffFinished;
 
 HEFF_VAR(HEFF_TLS int64_t heff_group);
-HEFF_VAR(HEFF_TLS int64_t heff_last_group);
+HEFF_VAR(int64_t heff_last_group);
 HEFF_VAR(HEFF_TLS HeffGroup *heff_groups_open);
 HEFF_VAR(HEFF_TLS size_t heff_ngroups);
 HEFF_VAR(HEFF_TLS size_t heff_capgroups);
@@ -5065,7 +5070,45 @@ HEFF_VAR(HEFF_TLS HeffSource *heff_sources);
 HEFF_VAR(HEFF_TLS struct pollfd *heff_polled);
 HEFF_VAR(HEFF_TLS HeffWait **heff_polled_waits);
 HEFF_VAR(HEFF_TLS size_t heff_cappolled);
+// (what wakes this thread's reactor from another thread: a pipe, made
+// with its first group and closed with its last, written a byte to; and
+// whether a turn has read one since `heff_reactor_finished` last came
+// back)
+HEFF_VAR(HEFF_TLS int heff_wake_made);
+HEFF_VAR(HEFF_TLS int heff_wake_fds[2]);
+HEFF_VAR(HEFF_TLS int heff_woken);
 #endif
+
+// (every thread's open groups, each with the pipe that wakes its
+// thread's reactor, under a lock: so that a group is woken from any
+// thread, and not once its pipe is closed)
+typedef struct { int64_t id; int fd; } HeffWaker;
+#ifdef HEFF_PART
+extern HeffWaker *heff_wakers;
+extern size_t heff_nwakers, heff_capwakers;
+extern pthread_mutex_t heff_wakers_mu;
+#else
+HeffWaker *heff_wakers;
+size_t heff_nwakers, heff_capwakers;
+pthread_mutex_t heff_wakers_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+// (the descriptors closed last, by any thread, under the wakers' lock:
+// each with the count of those closed so far, kept at that count modulo
+// how many are kept -- so that a wait pending in another thread's
+// reactor on one that is closed is done, EBADF, by that thread, and not
+// one begun after on a descriptor of the same number; and how many this
+// thread has looked at)
+#define HEFF_CLOSED_KEPT 1024
+typedef struct { int fd; int64_t epoch; } HeffClosed;
+#ifdef HEFF_PART
+extern HeffClosed heff_closed[HEFF_CLOSED_KEPT];
+extern int64_t heff_closed_epoch;
+#else
+HeffClosed heff_closed[HEFF_CLOSED_KEPT];
+int64_t heff_closed_epoch;
+#endif
+HEFF_VAR(HEFF_TLS int64_t heff_closed_seen);
 
 // (the group open of that number, or NULL)
 HEFF_FN HeffGroup *heff_group_of(int64_t g) {
@@ -5074,14 +5117,25 @@ HEFF_FN HeffGroup *heff_group_of(int64_t g) {
   return NULL;
 }
 
+// (the group's pending, and its root's, `by` more)
+HEFF_FN void heff_group_pending(int64_t id, int64_t by) {
+  HeffGroup *g = heff_group_of(id);
+  if (!g) return;
+  g->pending += by;
+  if (g->root) {
+    HeffGroup *r = heff_group_of(g->root);
+    if (r) r->pending += by;
+  }
+}
+
 HEFF_FN void heff_wait_link(HeffWait *w) {
   w->prev = heff_waits_last;
   w->next = NULL;
   if (heff_waits_last) heff_waits_last->next = w;
   else heff_waits_first = w;
   heff_waits_last = w;
-  HeffGroup *g = heff_group_of(w->group);
-  if (g) g->pending++;
+  w->epoch = __atomic_load_n(&heff_closed_epoch, __ATOMIC_ACQUIRE);
+  heff_group_pending(w->group, 1);
 }
 
 HEFF_FN void heff_wait_unlink(HeffWait *w) {
@@ -5090,8 +5144,7 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
   if (w->next) w->next->prev = w->prev;
   else heff_waits_last = w->prev;
   w->prev = w->next = NULL;
-  HeffGroup *g = heff_group_of(w->group);
-  if (g) g->pending--;
+  heff_group_pending(w->group, -1);
 }
 
 // (a wait done, as its source says: given its answer at the next turn)
@@ -5106,7 +5159,50 @@ HEFF_FN void heff_reactor_closing(int fd) {
       w->err = EBADF;
       w->done = 1;
     }
+#ifndef _WIN32
+  // (and every other thread's, by that thread: told so, and woken)
+  pthread_mutex_lock(&heff_wakers_mu);
+  if (heff_nwakers) {
+    int64_t e = __atomic_add_fetch(&heff_closed_epoch, 1, __ATOMIC_RELEASE);
+    heff_closed[e % HEFF_CLOSED_KEPT].fd = fd;
+    heff_closed[e % HEFF_CLOSED_KEPT].epoch = e;
+    for (size_t i = 0; i < heff_nwakers; i++)
+      if (!heff_wake_made || heff_wakers[i].fd != heff_wake_fds[1]) {
+        char b = 0;
+        ssize_t r = write(heff_wakers[i].fd, &b, 1);
+        (void)r;
+      }
+  }
+  pthread_mutex_unlock(&heff_wakers_mu);
+#endif
 }
+
+#ifndef _WIN32
+// (the waits of this thread's on descriptors another thread closed since
+// it last looked, each begun before it was closed: done, EBADF -- where
+// any was, the poll to come not waiting)
+HEFF_FN int heff_reactor_closed_elsewhere(void) {
+  int64_t e = __atomic_load_n(&heff_closed_epoch, __ATOMIC_ACQUIRE);
+  if (e == heff_closed_seen) return 0;
+  int some = 0;
+  pthread_mutex_lock(&heff_wakers_mu);
+  e = heff_closed_epoch;
+  int64_t from = heff_closed_seen + 1;
+  if (e - from >= HEFF_CLOSED_KEPT) from = e - HEFF_CLOSED_KEPT + 1;
+  for (int64_t k = from; k <= e; k++) {
+    HeffClosed c = heff_closed[k % HEFF_CLOSED_KEPT];
+    for (HeffWait *w = heff_waits_first; w; w = w->next)
+      if (w->fd == c.fd && !w->done && w->epoch < c.epoch) {
+        w->err = EBADF;
+        w->done = 1;
+        some = 1;
+      }
+  }
+  pthread_mutex_unlock(&heff_wakers_mu);
+  heff_closed_seen = e;
+  return some;
+}
+#endif
 
 #ifndef _WIN32
 // (a source of waits, polled with the others from now on, by this thread)
@@ -5166,7 +5262,12 @@ HEFF_FN V heff_outside(HeffWait *w, V f, V k) {
 // (what was started in group `g` come to its value `v`: one of the
 // group's finished -- or, the group closed meanwhile, let go of)
 HEFF_FN void heff_finished_put(int64_t g, V v) {
-  if (!heff_group_of(g)) {
+  HeffGroup *gr = heff_group_of(g);
+  if (gr && gr->root) {
+    g = gr->root;
+    gr = heff_group_of(g);
+  }
+  if (!gr) {
     heff_drop(v);
     return;
   }
@@ -5200,8 +5301,79 @@ HEFF_FN void heff_reactor_run(int64_t g, V k, V x) {
   if (r != HEFF_PENDING) heff_finished_put(g, r);
 }
 
-// | A group of its own, for a scheduler: its number.
-HEFF_FN int64_t heff_reactor_open(void) {
+// (group `g` among those woken by this thread's pipe)
+HEFF_FN void heff_waker_add(int64_t g) {
+#ifndef _WIN32
+  if (!heff_wake_made) {
+    if (pipe(heff_wake_fds) != 0) heff_fail("the reactor's pipe could not be made");
+    for (int i = 0; i < 2; i++) {
+      fcntl(heff_wake_fds[i], F_SETFL, fcntl(heff_wake_fds[i], F_GETFL) | O_NONBLOCK);
+      fcntl(heff_wake_fds[i], F_SETFD, FD_CLOEXEC);
+    }
+    heff_wake_made = 1;
+  }
+  pthread_mutex_lock(&heff_wakers_mu);
+  if (heff_nwakers == heff_capwakers) {
+    size_t cap = heff_capwakers ? heff_capwakers * 2 : 16;
+    HeffWaker *m = heff_alloc(cap * sizeof *m);
+    if (heff_nwakers) memcpy(m, heff_wakers, heff_nwakers * sizeof *m);
+    free(heff_wakers);
+    heff_wakers = m;
+    heff_capwakers = cap;
+  }
+  heff_wakers[heff_nwakers].id = g;
+  heff_wakers[heff_nwakers].fd = heff_wake_fds[1];
+  heff_nwakers++;
+  pthread_mutex_unlock(&heff_wakers_mu);
+#else
+  (void)g;
+#endif
+}
+
+// (group `g` no longer woken; with the thread's last group, its pipe
+// closed)
+HEFF_FN void heff_waker_remove(int64_t g) {
+#ifndef _WIN32
+  pthread_mutex_lock(&heff_wakers_mu);
+  for (size_t i = 0; i < heff_nwakers; i++)
+    if (heff_wakers[i].id == g) {
+      heff_wakers[i] = heff_wakers[--heff_nwakers];
+      break;
+    }
+  if (heff_ngroups == 0 && heff_wake_made) {
+    close(heff_wake_fds[0]);
+    close(heff_wake_fds[1]);
+    heff_wake_made = 0;
+    heff_woken = 0;
+  }
+  pthread_mutex_unlock(&heff_wakers_mu);
+#else
+  (void)g;
+#endif
+}
+
+// | The thread whose group `g` is woken, from any thread: its reactor's
+// | next turn, or the one it is waiting in, comes back, and so does
+// | `heff_reactor_finished`, with none finished where none is.
+HEFF_FN void heff_reactor_wake_group(int64_t g) {
+#ifndef _WIN32
+  pthread_mutex_lock(&heff_wakers_mu);
+  for (size_t i = 0; i < heff_nwakers; i++)
+    if (heff_wakers[i].id == g) {
+      char b = 0;
+      ssize_t r = write(heff_wakers[i].fd, &b, 1);
+      (void)r;
+      break;
+    }
+  pthread_mutex_unlock(&heff_wakers_mu);
+#else
+  (void)g;
+#endif
+}
+
+// (a group of this thread's, of a number no other has, within the root
+// `root` or 0)
+HEFF_FN int64_t heff_group_made(int64_t root) {
   if (heff_ngroups == heff_capgroups) {
     size_t cap = heff_capgroups ? heff_capgroups * 2 : 8;
     HeffGroup *m = heff_alloc(cap * sizeof *m);
@@ -5210,11 +5382,24 @@ HEFF_FN int64_t heff_reactor_open(void) {
     heff_groups_open = m;
     heff_capgroups = cap;
   }
-  int64_t g = ++heff_last_group;
+  int64_t g = __atomic_add_fetch(&heff_last_group, 1, __ATOMIC_RELAXED);
   heff_groups_open[heff_ngroups].id = g;
   heff_groups_open[heff_ngroups].pending = 0;
+  heff_groups_open[heff_ngroups].root = root;
   heff_ngroups++;
+  heff_waker_add(g);
   return g;
+}
+
+// | A group of its own, for a scheduler: its number.
+HEFF_FN int64_t heff_reactor_open(void) { return heff_group_made(0); }
+
+// | A group within group `g`: what is started in it finishes among the
+// | finished of `g`'s root, and is pending among its pending.
+HEFF_FN int64_t heff_reactor_open_within(int64_t g) {
+  HeffGroup *gr = heff_group_of(g);
+  if (!gr) heff_fail("a group within one that is not open");
+  return heff_group_made(gr->root ? gr->root : g);
 }
 
 // | `c`, a computation of the world (its handler's monad: a function of
@@ -5281,6 +5466,7 @@ HEFF_FN void heff_polled_room(size_t n) {
 HEFF_FN void heff_reactor_turn(int wait) {
   size_t n = 0;
   int ms = wait ? -1 : 0;
+  if (heff_reactor_closed_elsewhere()) ms = 0;
   int64_t now = heff_now_ms();
   for (HeffWait *w = heff_waits_first; w; w = w->next) {
     if (w->done) ms = 0;
@@ -5293,6 +5479,7 @@ HEFF_FN void heff_reactor_turn(int wait) {
     }
   }
   size_t mine = n;
+  if (heff_wake_made) n++;
   for (HeffSource *s = heff_sources; s; s = s->next) {
     int t = -1;
     s->n = s->fds(NULL, 0, &t);
@@ -5308,6 +5495,13 @@ HEFF_FN void heff_reactor_turn(int wait) {
       heff_polled_waits[n] = w;
       n++;
     }
+  size_t wake = n;
+  if (heff_wake_made) {
+    heff_polled[n].fd = heff_wake_fds[0];
+    heff_polled[n].events = POLLIN;
+    heff_polled[n].revents = 0;
+    n++;
+  }
   for (HeffSource *s = heff_sources; s; s = s->next) {
     int t = -1;
     s->at = n;
@@ -5325,6 +5519,11 @@ HEFF_FN void heff_reactor_turn(int wait) {
       HeffWait *w = heff_polled_waits[i];
       if (!w->done && w->step(w) == HEFF_STEP_DONE) w->done = 1;
     }
+  if (heff_wake_made && heff_polled[wake].revents) {
+    char b[64];
+    while (read(heff_wake_fds[0], b, sizeof b) > 0) {}
+    heff_woken = 1;
+  }
   for (HeffSource *s = heff_sources; s; s = s->next) s->ready(heff_polled + s->at, s->n);
   heff_reactor_expire();
   heff_reactor_wake();
@@ -5356,9 +5555,15 @@ HEFF_FN V heff_reactor_finished(int64_t g, int wait) {
     for (size_t i = 0; i < heff_nfinished && !some; i++) some = heff_finished[i].group == g;
     HeffGroup *gr = heff_group_of(g);
     if (some || !gr || gr->pending == 0) break;
+#ifndef _WIN32
+    if (heff_woken) break;
+#endif
     heff_reactor_turn(wait);
     if (!wait) break;
   }
+#ifndef _WIN32
+  heff_woken = 0;
+#endif
   // (the group's taken, in order; the others' kept, in theirs)
   V l = NTAG(TAG_Nil);
   for (size_t i = heff_nfinished; i-- > 0;)
@@ -5370,12 +5575,25 @@ HEFF_FN V heff_reactor_finished(int64_t g, int wait) {
   return l;
 }
 
+// | How many of group `g`'s computations started are pending: in a
+// | root, those of the groups within it too; 0 where it is not open.
+HEFF_FN int64_t heff_reactor_pending(int64_t g) {
+  HeffGroup *gr = heff_group_of(g);
+  return gr ? gr->pending : 0;
+}
+
 // | Group `g` closed: what is pending in it let go of, undone, and what
 // | of it is finished and not asked for.
+HEFF_FN int heff_group_in(int64_t id, int64_t g) {
+  if (id == g) return 1;
+  HeffGroup *gr = heff_group_of(id);
+  return gr && gr->root == g;
+}
+
 HEFF_FN void heff_reactor_close(int64_t g) {
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
     next = w->next;
-    if (w->group != g) continue;
+    if (!heff_group_in(w->group, g)) continue;
     heff_wait_unlink(w);
     V f = w->f, k = w->k;
     w->cancel(w);
@@ -5388,11 +5606,13 @@ HEFF_FN void heff_reactor_close(int64_t g) {
     else heff_finished[kept++] = heff_finished[i];
   }
   heff_nfinished = kept;
-  for (size_t i = 0; i < heff_ngroups; i++)
-    if (heff_groups_open[i].id == g) {
+  for (size_t i = 0; i < heff_ngroups;) {
+    int64_t id = heff_groups_open[i].id;
+    if (id == g || heff_groups_open[i].root == g) {
       heff_groups_open[i] = heff_groups_open[--heff_ngroups];
-      break;
-    }
+      heff_waker_remove(id);
+    } else i++;
+  }
 }
 
 // Running

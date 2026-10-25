@@ -105,6 +105,27 @@ static V heff_provider_reactor(V p, V k) {
     V x = heff_answer(f, heff_reactor_finished(g, wait));
     return heff_tail(k, 1, &x);
   }
+  case TAG_Within: {
+    int64_t g = INT_OF(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V x = heff_answer(f, heff_int(heff_reactor_open_within(g)));
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Pending: {
+    int64_t g = INT_OF(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V x = heff_answer(f, heff_int(heff_reactor_pending(g)));
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Wake: {
+    int64_t g = INT_OF(heff_field(p, 0));
+    V x = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    heff_reactor_wake_group(g);
+    return heff_tail(k, 1, &x);
+  }
   case TAG_Close: {
     int64_t g = INT_OF(heff_field(p, 0));
     V x = heff_dup(heff_field(p, 1));
