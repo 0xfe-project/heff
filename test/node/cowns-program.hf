@@ -160,23 +160,37 @@ nested = do
   BOC.when a (spawning a b out)
   pure out
 
+-- (`why` pushed onto what `whys` holds, by a `cas` retried)
+reported : {e : HFunctor}
+         -> {{dm : Domain.domain <: e}}
+         -> Domain.Atomic (List String)
+         -> String
+         -> Co e Unit
+reported whys why = do
+  old <- Domain.get whys
+  ok <- Domain.cas whys old (why :: old)
+  if ok then pure () else reported whys why
+
 -- | three behaviours on one cown of 0: 1 added, the second abandons,
 -- | 1 added -- the one that failed leaves the cown as it was, the
--- | others run, and read out to `out`: 2.  `scheduled` abandons once
--- | they are done, so `out` is made outside it
+-- | others run, and read out to the cell given back: 2, and how many
+-- | failures `whys` held then, the one before them reported by then
 failing : {e w : HFunctor}
         -> {{bc : BOC.boc w <: e}}
         -> {{dm : Domain.domain <: e}}
-        -> Domain.Atomic Int
-        -> Co e Unit
-failing out = do
+        -> Domain.Atomic (List String)
+        -> Co e (Domain.Atomic (Int, Int))
+failing whys = do
   c <- BOC.newCown (0 : Int)
+  out <- Domain.newAtomic (0, 0)
   BOC.when c (\n -> pure (n + 1))
   BOC.when c (\n -> if n == 1 then abandon else pure (n + 100))
   BOC.when c (\n -> pure (n + 1))
   BOC.when c (\n -> do
-    Domain.set out n
+    seen <- Domain.get whys
+    Domain.set out (n, List.length seen)
     pure n)
+  pure out
 
 -- (how many operations at most the long body does)
 longBound : Int
@@ -239,30 +253,50 @@ kept = do
 -- | `scheduled` of its own, its cell read once every behaviour is done
 said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
 said = do
-  failedOut <- Domain.newAtomic 0
-  outcome <- Domain.tried (BOC.scheduled (failing (w := e) (bc := _) (dm := _) failedOut))
-  f <- Domain.get failedOut
-  nOut <- BOC.scheduled (counted (w := e) (bc := _) (dm := _))
+  whys <- Domain.newAtomic (Nil : List String)
+  failedOut <-
+    BOC.scheduled (reported whys) (failing (w := e) (bc := _) (dm := _) whys)
+  (f, failedBefore) <- Domain.get failedOut
+  failures <- Domain.get whys
+  unreported <- Domain.newAtomic (Nil : List String)
+  outcome <-
+    Domain.tried
+      (BOC.scheduled
+         (\why -> abandon)
+         (failing (w := e) (bc := _) (dm := _) unreported))
+  nOut <- BOC.scheduled (\why -> abandon) (counted (w := e) (bc := _) (dm := _))
   n <- Domain.get nOut
-  heldOut <- BOC.scheduled (accounts (w := e) (bc := _) (dm := _))
+  heldOut <-
+    BOC.scheduled (\why -> abandon) (accounts (w := e) (bc := _) (dm := _))
   (p, q, r, s) <- Domain.get heldOut
-  xsOut <- BOC.scheduled (ordered (w := e) (bc := _) (dm := _))
+  xsOut <-
+    BOC.scheduled (\why -> abandon) (ordered (w := e) (bc := _) (dm := _))
   xs <- Domain.get xsOut
-  pairOut <- BOC.scheduled (nested (w := e) (bc := _) (dm := _))
+  pairOut <-
+    BOC.scheduled (\why -> abandon) (nested (w := e) (bc := _) (dm := _))
   (x, y) <- Domain.get pairOut
-  seenOut <- BOC.scheduled (kept (w := e) (bc := _) (dm := _))
+  seenOut <- BOC.scheduled (\why -> abandon) (kept (w := e) (bc := _) (dm := _))
   seen <- Domain.get seenOut
   cores <- Domain.cores
   pure
       [ "added by 1000: " ^ show n
       , "accounts: " ^ unwords (List.map show [p, q, r, s, p + q + r + s])
-      , "in the order spawned: " ^ (if List.reverse xs == List.range 1 100 then "yes" else "no")
+      , "in the order spawned: "
+      ^ (if List.reverse xs == List.range 1 100 then "yes" else "no")
       , "nested: " ^ show x ^ " " ^ show y
-      , "a failing behaviour: " ^ show f ^ " added by the others, scheduled "
-        ^ (case outcome of
-             Left why -> why
-             Right u -> "gave an answer")
-      , "kept in a long body's slot: " ^ (if seen >= 0 then "run" else "not run")
-        ^ (if cores == 1 || seen < longBound then ", before its end where another domain is"
-           else ", only after its end")
+      , "a failing behaviour: "
+      ^ show f
+      ^ " added by the others, failed "
+      ^ unwords failures
+      ^ (if failedBefore == 1 then ", before the next ran"
+         else ", after the next ran")
+      , "a failed that fails: scheduled "
+      ^ (case outcome of
+         Left why -> why
+         Right u -> "gave an answer")
+      , "kept in a long body's slot: "
+      ^ (if seen >= 0 then "run" else "not run")
+      ^ (if cores == 1 || seen < longBound
+         then ", before its end where another domain is"
+         else ", only after its end")
       ]

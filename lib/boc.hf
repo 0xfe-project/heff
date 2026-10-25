@@ -50,7 +50,7 @@
 -- -- | the behaviours run, every one done: what bob has, 5
 -- bobHas : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
 -- bobHas = do
---   seen <- BOC.scheduled (bobs (w := e) (bc := _) (dm := _))
+--   seen <- BOC.scheduled (\why -> abandon) (bobs (w := e) (bc := _) (dm := _))
 --   Domain.get seen
 -- ```
 --
@@ -59,7 +59,7 @@
 -- `newCown v` | a cown holding `v`
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
 -- `with a := c do ...` | the same, its body statements, `a` what `c` holds (more cowns, a binding each)
--- `scheduled c` | `c` and its behaviours run, on domains, every behaviour waited for
+-- `scheduled failed c` | `c` and its behaviours run, on domains, every behaviour waited for; `failed why` where one fails
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
@@ -79,12 +79,18 @@
 -- same cown twice in one `when` is abandoned when the `when` runs.
 --
 -- A behaviour whose body fails -- abandons, or fails in the runtime --
--- is done with that: its cowns are handed on as if it had ended, and
--- hold what they held, since what they are to hold is written after
--- the body (`Domain.tried` catches the failure).  The other behaviours,
--- and main, go on.  The failures are counted, and `scheduled`, once
--- every behaviour is done, abandons instead of giving main's answer
--- where any behaviour failed.
+-- is done with that: its cowns hold what they held, since what they
+-- are to hold is written after the body (`Domain.tried` catches the
+-- failure).  Then `scheduled`'s `failed`, given why, is run, a
+-- computation of the world, on the behaviour's domain while the
+-- behaviour still holds its cowns: one after it on them comes after
+-- that.  Then the cowns are handed on as if the behaviour had ended,
+-- and the other behaviours, and main, go on.  `failed` runs on
+-- whichever domain a behaviour fails on, at once with the others, so
+-- what it does must be safe on threads.  A `failed` that itself fails
+-- is counted, and `scheduled`, once every behaviour is done, abandons
+-- instead of giving main's answer: `\why -> abandon` makes any failure
+-- the run's.
 --
 -- The scheduling is the paper's, as Verona's runtime has it: each cown
 -- has a queue, kept as the last request for it, and a behaviour is
@@ -403,13 +409,15 @@ instanceHolderCowns =
 
 -- (what the domains running behaviours share: the next cown's number;
 -- how many behaviours are not yet done, main's own run one of them;
--- how many failed; those ready, which the domains take from, `Nothing`
+-- what is run where a body fails, and how many times that failed too;
+-- those ready, which the domains take from, `Nothing`
 -- telling a domain to stop; and where the last behaviour done says so,
 -- once, for `scheduled` to wait on)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
   , live : Domain.Atomic Int
-  , failed : Domain.Atomic Int
+  , failed : String -> Co w Unit
+  , unreported : Domain.Atomic Int
   , ready : Domain.Queue (Maybe (Behaviour w))
   , done : Domain.Queue Unit
   }
@@ -615,7 +623,7 @@ distinct _ = True
 -- (a behaviour spawned on its cowns' queues, `rd` and `wr` reading and
 -- writing what they hold, `body` its work: what they hold is written
 -- after the body, by its answer; a body that fails leaves them as they
--- were, counted among the failed)
+-- were, and its failure is given to `failed` before they are let go)
 spawnedOn : {w : HFunctor}
           -> {t : Type}
           -> {{dm : Domain.domain <: w}}
@@ -642,8 +650,13 @@ spawnedOn st runner hs rd wr body = do
       case outcome of
         Right after -> wr dm after
         Left why -> do
-          _ <- Domain.fetchAdd st.failed 1
-          pure ()
+          reported <-
+            Domain.tried (bind (later (\u -> st.failed why)) (\c -> c))
+          case reported of
+            Right u -> pure ()
+            Left again -> do
+              _ <- Domain.fetchAdd st.unreported 1
+              pure ()
       releasedAll st on held
       finished st
     let b : Behaviour w = MkBehaviour count turn
@@ -780,23 +793,27 @@ joinedAll (d :: ds) = do
 -- | `c` and the behaviours it spawns, run on as many domains as the
 -- | machine has cores (`Domain.cores`), every behaviour waited for:
 -- | main's answer.  A behaviour whose body fails is done with that, its
--- | cowns holding what they held; the others go on, and once every one
--- | is done this abandons, instead of giving the answer.
+-- | cowns holding what they held: `failed why` is run on its domain,
+-- | while it still holds them, and the others go on.  Where a `failed`
+-- | fails too, this abandons once every behaviour is done, instead of
+-- | giving the answer.
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
+          -> (String -> Co w Unit)
           -> Co (boc w <+> w) a
           -> Co w a
-scheduled c = do
+scheduled failed c = do
   numbers <- Domain.newAtomic 0
   live <- Domain.newAtomic 1
-  failed <- Domain.newAtomic 0
+  unreported <- Domain.newAtomic 0
   ready <- (Domain.newQueue : Co w (Domain.Queue (Maybe (Behaviour w))))
   done <- (Domain.newQueue : Co w (Domain.Queue Unit))
   let st : Sched w =
     { numbers = numbers
     , live = live
     , failed = failed
+    , unreported = unreported
     , ready = ready
     , done = done
     }
@@ -807,5 +824,5 @@ scheduled c = do
   Domain.take done
   stoppedAll st ds
   joinedAll ds
-  k <- Domain.get failed
+  k <- Domain.get unreported
   if k > 0 then abandon else pure x
