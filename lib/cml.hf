@@ -99,10 +99,17 @@
 -- nothing to do takes a thread from another's slot before it waits;
 -- and a thread's slot is emptied into the queue before an operation of
 -- the world's, which may hold its domain a while.  `yield` puts the
--- thread behind those ready, in its slot only where none is.  A `sync`
--- that waits leaves an offer at each of its base events' channels and
--- ivars: one cell
--- (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
+-- thread behind those ready, in its slot only where none is.  The
+-- worker counts a thread's steps, each operation of it the worker
+-- handles, as an engine of Chez Scheme's counts its fuel: a thread that
+-- has gone on for 256 (`fuelPerRun`) since the worker took it, without
+-- stopping, is put behind those ready as at a `yield` where another is
+-- ready -- in the slot or the queue -- and the worker takes the next, its
+-- slot's first, so that no thread is passed over for one that goes on,
+-- and none needs a timer; where none is ready, it goes on, its fuel full
+-- again, and a thread alone pays the count only.  A `sync` that waits
+-- leaves an offer at each of its base events' channels and ivars: one
+-- cell (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
 -- whichever other `sync` meets one of them first, which readies the
 -- waiting thread with what came; so a waiting thread occupies no
 -- worker, and a `choose` commits one base event at most.  What a
@@ -129,14 +136,19 @@
 -- each run.  `scheduled` counts the threads running or ready, one more
 -- for a thread as it is readied
 -- (before the one readying it may itself wait), one fewer for one that
--- waits or ends: at none left before main is done every thread waits
--- in a `sync`, a deadlock, and it comes to `Nothing`.  Main's answer
--- ends it all, the other threads dropped where they stopped.  A
--- thread gives up its domain at its operations alone: long pure work
--- in a thread holds its domain until it comes to one, and the other
--- threads there wait for it -- the one in its slot too, until a domain
--- with nothing to do takes it, or the thread comes to an operation of
--- the world's.  A computation held by an operation of `w`
+-- waits or ends (one put behind those ready, by a `yield` or by its
+-- fuel, is counted still): at none left before main is done every
+-- thread waits in a `sync`, a deadlock, and it comes to `Nothing`.
+-- Main's answer ends it all, the other threads dropped where they
+-- stopped.  A thread gives up its domain at its operations alone, and
+-- its fuel is counted at them: long pure work in a thread, with no
+-- operation in it, cannot be stopped, and holds its domain until it
+-- comes to one -- the threads there wait for it, the one in its slot
+-- too, until a domain with nothing to do takes it, or the thread comes
+-- to an operation of the world's.  That is the program's own to weigh:
+-- a pure loop that is to give the others their turns performs `yield`
+-- every so many rounds, what comes after it computed once the yield
+-- has taken effect.  A computation held by an operation of `w`
 -- (`Domain.spawn c` holds `c`) is run alone, as the operation does
 -- it: its `spawn`s, channels and ivars are the scheduler's, but a
 -- `sync` in it has no thread to meet, and is abandoned unless an
@@ -1339,32 +1351,68 @@ stepped st turnOf runner (RStep (PutIVar s)) =
   s (Co w (Stepped w)) (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
 stepped st turnOf runner (RStep (Sync bs)) = synced st turnOf runner bs
 
+-- (how many steps a thread takes in a run on a worker, each operation
+-- of it the worker handles, before it is put behind the others ready,
+-- as at a `yield`, where any is.  A few hundred: a step is a microsecond
+-- or so, so a thread ready waits a fraction of a millisecond at most
+-- behind one that goes on, and what the fuel costs beyond its count --
+-- two reads, and the mutex where the thread is put behind -- comes once
+-- in that many steps)
+fuelPerRun : Int
+fuelPerRun = 256
+
+-- (whether a turn other than the running thread's is ready for the
+-- worker: one its slot holds, or one in the queue, as far as this domain
+-- sees now)
+othersReady : {w : HFunctor}
+            -> {{dm : Domain.domain <: w}}
+            -> Sched w
+            -> Runner w
+            -> Co w Bool
+othersReady st Nothing = pure False
+othersReady st (Just slot) = do
+  holding <- isHolding slot
+  if holding then pure True
+  else do
+    q <- Domain.get st.ready
+    case q of
+      MkPair Nil Nil -> pure False
+      _ -> pure True
+
 -- (a thread run, on `runner`, from where it stopped until it ends,
 -- waits, or gives up its turn, `turnOf` making the turns of the threads
--- it readies)
+-- it readies; `fuel` the steps left of its run: at none, where another
+-- turn is ready, it gives up its turn as at a `yield`, else it goes on
+-- with its fuel full again)
 ranOn : {w : HFunctor}
       -> {{dm : Domain.domain <: w}}
       -> Sched w
       -> ((Unit -> Res w Unit) -> Turn w)
       -> Runner w
+      -> Int
       -> Res w Unit
       -> Co w Unit
-ranOn st turnOf runner r = do
+ranOn st turnOf runner fuel r = do
   s <- stepped st turnOf runner r
   case s of
-    GoesOn next -> ranOn st turnOf runner next
+    GoesOn next ->
+      if fuel > 1 then ranOn st turnOf runner (fuel - 1) next
+      else do
+        others <- othersReady st runner
+        if others then yielded st runner (turnOf (\u -> next))
+        else ranOn st turnOf runner fuelPerRun next
     Stopped -> pure ()
 
 -- (a thread run, on `runner`, from where it stopped until it ends,
--- waits, or gives up its turn; the turns of the threads it readies run
--- them so, on the worker that takes each)
+-- waits, or gives up its turn, its fuel full; the turns of the threads
+-- it readies run them so, on the worker that takes each)
 run : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
     -> Runner w
     -> Res w Unit
     -> Co w Unit
-run st runner r = ranOn st (\k on -> run st on (k MkUnit)) runner r
+run st runner r = ranOn st (\k on -> run st on (k MkUnit)) runner fuelPerRun r
 
 -- (what comes after the first `always` among the base events, if one)
 firstAlways : {w : HFunctor} -> {x : Type} -> List (Base w x) -> Maybe x

@@ -6,8 +6,9 @@
 -- branch told it was not chosen; a guard run at each sync; a wrap; an
 -- ivar read by several threads; a choice between two events both
 -- ready, synced many times, each chosen at least once (no fixed
--- priority); and a program whose threads all wait, scheduled, coming
--- to `Nothing`.
+-- priority); a thread going on step after step, which gives its turn,
+-- once its fuel is used, to the one it readied; and a program whose
+-- threads all wait, scheduled, coming to `Nothing`.
 
 module test.node.cml-program
 
@@ -176,6 +177,44 @@ bothChosen = do
   n <- firstChosen 64
   pure (0 < n && n < 64)
 
+-- Fuel: a thread that goes on gives the others their turns ------------------------------
+
+-- (at most `k` syncs of a choice between the ivar `stop` read and an
+-- `always`, until the ivar is read: whether it was, before the syncs
+-- ran out)
+goneOn : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> CML.IVar w Unit
+       -> Int
+       -> Co e Bool
+goneOn stop 0 = pure False
+goneOn stop k = do
+  stopped <-
+    CML.sync
+      (CML.choose
+         [ CML.wrap (CML.readIVarEvt stop) (\u -> (True : Bool))
+         , CML.always (False : Bool)
+         ])
+  if stopped then pure True else goneOn stop (k - 1)
+
+-- | a thread spawning one that tells main, kept in the slot of the
+-- | worker running the first, which then goes on for 100000 syncs at
+-- | most, until main, told, writes an ivar: whether the one it spawned
+-- | had its turn meanwhile -- in JavaScript's one domain, by the fuel
+-- | of the first alone
+fueled : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Bool
+fueled = do
+  stop <- CML.newIVar
+  told <- (CML.newChan : Co e (CML.Chan w Unit))
+  answer <- CML.newChan
+  CML.spawn (do
+    CML.spawn (CML.send told MkUnit)
+    stopped <- goneOn stop 100000
+    CML.send answer stopped)
+  CML.recv told
+  CML.putIVar stop MkUnit
+  CML.recv answer
+
 -- Every thread waiting ------------------------------------------------------------------
 
 -- | a thread receiving on a channel nobody sends on, and main on
@@ -202,6 +241,7 @@ said = do
   wr <- wrapped
   xs <- shared
   both <- bothChosen
+  f <- fueled
   d <- CML.scheduled (w := e) (blocked (w := e) (cm := _))
   pure
       [ "pinged: " ^ show p
@@ -211,6 +251,8 @@ said = do
       , "wrapped: " ^ show wr
       , "ivar read by 3: " ^ unwords (List.map show xs)
       , "two always: " ^ (if both then "both chosen" else "one alone")
+      , "going on, the one readied ran meanwhile: "
+      ^ (if f then "yes" else "no")
       , "all waiting: "
       ^ (case d of
          Just n -> "Just " ^ show n
