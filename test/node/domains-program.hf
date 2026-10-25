@@ -5,7 +5,8 @@
 -- add to by a `cas` retried, and a list they push onto so, compared by
 -- identity; values handed over under a mutex, waited for on a
 -- condition; answers joined; many cells, mutexes and conditions made
--- and let go of at once, and domains never joined.
+-- and let go of at once, and domains never joined; lists handed through
+-- a queue, taken by domains waiting at it, in the order put.
 
 module test.node.domains-program
 
@@ -221,11 +222,87 @@ parentFirst = do
   Domain.join d
   Domain.get box
 
+-- Through a queue --------------------------------------------------------------------
+
+-- (`k` lists put, each of `i * 1000 + k` down to `i * 1000 + 1`, a fresh
+-- list of `k` cells: what the putter holds alone, so moved)
+putting : {e : HFunctor}
+        -> {{dm : Domain.domain <: e}}
+        -> Domain.Queue (List Int)
+        -> Int
+        -> Int
+        -> Co e Unit
+putting q i 0 = pure ()
+putting q i k = do
+  Domain.put q (List.map (\j -> i * 1000 + j) (List.range 1 k))
+  putting q i (k - 1)
+
+-- (`k` lists taken, waiting for each: how many cells, and their heads'
+-- sum)
+taking : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Queue (List Int)
+       -> Int
+       -> (Int, Int)
+       -> Co e (Int, Int)
+taking q 0 acc = pure acc
+taking q k (MkPair cells heads) = do
+  xs <- Domain.take q
+  case xs of
+    x :: rest -> taking q (k - 1) (MkPair (cells + List.length xs) (heads + x))
+    Nil -> taking q (k - 1) (MkPair cells heads)
+
+-- | 4 domains putting 1000 lists each, 2 taking 2000 each, waiting
+-- | while the queue is empty: the cells taken, and the heads' sum
+queued : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Int, Int)
+queued = do
+  q <- Domain.newQueue
+  takers <- spawned 2 (\i -> taking q 2000 (MkPair 0 0))
+  putters <- spawned 4 (\i -> putting q i 1000)
+  _ <- joined putters
+  taken <- joined takers
+  pure
+      ( List.sum (List.map fst taken)
+      , List.sum (List.map snd taken)
+      )
+
+-- (`k` to 1 put, one after another)
+counting : {e : HFunctor}
+         -> {{dm : Domain.domain <: e}}
+         -> Domain.Queue Int
+         -> Int
+         -> Int
+         -> Co e Unit
+counting q i n = if i > n then pure () else do
+  Domain.put q i
+  counting q (i + 1) n
+
+-- (`k` taken, as they come)
+takenAll : {e : HFunctor}
+         -> {{dm : Domain.domain <: e}}
+         -> Domain.Queue Int
+         -> Int
+         -> Co e (List Int)
+takenAll q 0 = pure Nil
+takenAll q k = do
+  x <- Domain.take q
+  xs <- takenAll q (k - 1)
+  pure (x :: xs)
+
+-- | one domain putting 1 to 5, main taking them: in the order put
+inOrder : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List Int)
+inOrder = do
+  q <- Domain.newQueue
+  d <- Domain.spawn (counting q 1 5)
+  xs <- takenAll q 5
+  Domain.join d
+  pure xs
+
 -- Let go of ---------------------------------------------------------------------------
 
--- (`k` more cells, mutexes and conditions made, each let go of at
--- once -- freed with its last reference, or the memory grows with
--- them; `n` counted up by what each cell held)
+-- (`k` more cells, mutexes, conditions and queues made, a list left in
+-- each queue, each let go of at once -- freed with its last reference,
+-- or the memory grows with them; `n` counted up by what each cell held)
 letGoOf : {e : HFunctor}
         -> {{dm : Domain.domain <: e}}
         -> Int
@@ -236,6 +313,8 @@ letGoOf k n = do
   cell <- Domain.newAtomic [k]
   _ <- Domain.newMutex
   _ <- Domain.newCondition
+  q <- Domain.newQueue
+  Domain.put q ([k, k] : List Int)
   held <- Domain.get cell
   letGoOf (k - 1) (n + List.length held)
 
@@ -247,7 +326,7 @@ unjoined k = do
   _ <- Domain.spawn (pure k)
   unjoined (k - 1)
 
--- | 100000 cells, mutexes and conditions made and let go of; 20
+-- | 100000 cells, mutexes, conditions and queues made and let go of; 20
 -- | domains never joined
 letGo : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
 letGo = do
@@ -268,6 +347,8 @@ said = do
   ws <- joined answers
   sp <- spinning
   pf <- parentFirst
+  qd <- queued
+  io <- inOrder
   lg <- letGo
   k <- Domain.cores
   pure
@@ -279,6 +360,8 @@ said = do
       , "answers: " ^ unwords ws
       , "a flag read until set: " ^ (if sp then "set" else "not set")
       , "locked after main let go: " ^ show pf
+      , "through a queue by 4, taken by 2: " ^ show (fst qd) ^ " cells, heads " ^ show (snd qd)
+      , "in the order put: " ^ unwords (List.map show io)
       , "made and let go of: " ^ show lg
       , "cores: " ^ (if k >= 1 then "at least one" else "none")
       ]

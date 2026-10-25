@@ -3,17 +3,19 @@
 // so, and the runtime is built for threads:
 #define HEFF_THREADS 1
 // A domain is a thread, started with the computation it runs (the
-// world's: given what to do with its answer), shared (`heff_share`,
+// world's: given what to do with its answer), moved to it where this
+// thread held it alone, else shared (`heff_move`, #125; `heff_share`,
 // #66); it runs it by `heff_try`, keeps its answer, shared, or why it
 // failed, and ends by `heff_thread_end`.  A join waits for it, on the
 // domain's own mutex and condition, and is given the answer, one more
 // count of it (`heff_dup`) each join, or fails as it did
 // (`heff_fail_again`).
 //
-// A domain, a cell, a mutex and a condition are each a foreign value
-// (`heff_foreign`), let go of when the program drops its last reference
-// to it: a cell drops the value it holds, a mutex and a condition are
-// destroyed, a domain drops its answer -- or, its thread still running,
+// A domain, a cell, a mutex, a condition and a queue are each a foreign
+// value (`heff_foreign`), let go of when the program drops its last
+// reference to it: a cell drops the value it holds, a queue what is
+// left in it, a mutex and a condition are destroyed, a domain drops its
+// answer -- or, its thread still running,
 // is marked dropped, and the thread frees it at its end: the later of
 // the two to let go frees it, which is settled under the domain's own
 // mutex.  An operation keeps the value holding its handle until it has
@@ -27,6 +29,12 @@
 // word (or a constructor without fields) is no object: read without
 // the lock, and `fetchAdd` adds to one by a compare-and-swap alone.
 // `cas` compares the words, so by identity.
+//
+// A queue is a list of what was put, under its own mutex, with a
+// condition the takers wait on while it is empty.  What is put is moved
+// (`heff_move`): the putter's reference becomes the queue's, and the
+// taker's, with no count touched between, so what the putter held alone
+// the taker holds alone, counted by it without atomics.
 //
 // An operation of a type of its own holds it as a function given what
 // to do with it (`Some`, its types erased): `dm_open` takes it.
@@ -128,7 +136,7 @@ static void *dm_thread(void *u) {
   return NULL;
 }
 
-// (a domain running `c`, shared; `c` consumed)
+// (a domain running `c`, moved to it where held alone; `c` consumed)
 static DmDomain *dm_spawn(V c) {
   DmDomain *d = heff_alloc(sizeof(DmDomain));
   pthread_mutex_init(&d->mu, NULL);
@@ -139,7 +147,7 @@ static DmDomain *dm_spawn(V c) {
   d->why = NULL;
   DmStart *s = heff_alloc(sizeof(DmStart));
   s->d = d;
-  s->c = heff_share(c);
+  s->c = heff_move(c);
   s->dir = heff_dir_copy();
   pthread_t t;
   if (heff_thread_start(&t, dm_thread, s) != 0) heff_fail("domain: cannot start a thread");
@@ -258,6 +266,66 @@ static V dm_fetch_add(DmAtomic *a, V n) {
   return old;
 }
 
+// Queues ----------------------------------------------------------------------------
+
+typedef struct DmLink { V v; struct DmLink *next; } DmLink;
+
+typedef struct {
+  pthread_mutex_t mu;
+  pthread_cond_t filled;
+  DmLink *front, *back;
+} DmQueue;
+
+static DmQueue *dm_queue(void) {
+  DmQueue *q = heff_alloc(sizeof(DmQueue));
+  pthread_mutex_init(&q->mu, NULL);
+  pthread_cond_init(&q->filled, NULL);
+  q->front = q->back = NULL;
+  return q;
+}
+
+// (the program's last reference to the queue gone: no domain waits at
+// it, since it would hold the reference; what is left in it dropped)
+static void dm_queue_let_go(void *x) {
+  DmQueue *q = x;
+  for (DmLink *l = q->front; l;) {
+    DmLink *next = l->next;
+    heff_drop(l->v);
+    free(l);
+    l = next;
+  }
+  pthread_mutex_destroy(&q->mu);
+  pthread_cond_destroy(&q->filled);
+  free(q);
+}
+
+// (`v` put at the back, moved; `v` consumed, by the queue)
+static void dm_put(DmQueue *q, V v) {
+  DmLink *l = heff_alloc(sizeof(DmLink));
+  l->v = heff_move(v);
+  l->next = NULL;
+  pthread_mutex_lock(&q->mu);
+  if (q->back) q->back->next = l;
+  else q->front = l;
+  q->back = l;
+  pthread_cond_signal(&q->filled);
+  pthread_mutex_unlock(&q->mu);
+}
+
+// (the front taken out, waited for while there is none: the queue's
+// reference to it, now the caller's)
+static V dm_take(DmQueue *q) {
+  pthread_mutex_lock(&q->mu);
+  while (!q->front) pthread_cond_wait(&q->filled, &q->mu);
+  DmLink *l = q->front;
+  q->front = l->next;
+  if (!q->front) q->back = NULL;
+  pthread_mutex_unlock(&q->mu);
+  V v = l->v;
+  free(l);
+  return v;
+}
+
 // Mutexes and conditions ------------------------------------------------------------
 
 static pthread_mutex_t *dm_mutex(void) {
@@ -309,6 +377,7 @@ static void dm_wait(pthread_cond_t *c, pthread_mutex_t *m) {
 
 #define DM_ATOMIC(v) ((DmAtomic *)heff_foreign_ptr(v))
 #define DM_DOMAIN(v) ((DmDomain *)heff_foreign_ptr(v))
+#define DM_QUEUE(v) ((DmQueue *)heff_foreign_ptr(v))
 
 static V heff_provider_domain(V p, V k) {
   V x;
@@ -428,6 +497,36 @@ static V heff_provider_domain(V p, V k) {
     x = heff_dup(heff_field(p, 1));
     pthread_cond_broadcast(c);
     heff_drop(p);
+    break;
+  }
+  case TAG_NewQueue: {
+    V mk = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V g = heff_dup(heff_field(mk, 0));
+    heff_drop(mk);
+    x = heff_answer(g, heff_foreign(dm_queue(), dm_queue_let_go));
+    break;
+  }
+  case TAG_PutQueue: {
+    V pt = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V qv = heff_dup(heff_field(pt, 0)), v = heff_tget_v(pt, 1);
+    x = heff_dup(heff_field(pt, 2));
+    // (the record dropped first: its count of `v` gone, `v` is counted as
+    // the program holds it, once where it holds it alone)
+    heff_drop(pt);
+    dm_put(DM_QUEUE(qv), v);
+    heff_drop(qv);
+    break;
+  }
+  case TAG_TakeQueue: {
+    V tk = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    DmQueue *q = DM_QUEUE(heff_field(tk, 0));
+    V g = heff_dup(heff_field(tk, 1));
+    V v = dm_take(q);
+    heff_drop(tk);
+    x = heff_answer(g, v);
     break;
   }
   default:

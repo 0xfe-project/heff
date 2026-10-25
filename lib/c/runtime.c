@@ -1505,9 +1505,50 @@ HEFF_FN V heff_share(V v) {
   free(s.v);
   return v;
 }
+
+// (one slot of what is moved: an object counted once is held through
+// this slot alone, and goes on being walked, as it is; one counted more
+// is held by something else too, and is shared, with all it holds)
+HEFF_FN void heff_move_one(HeffStack *s, V *at) {
+  V v = *at;
+  if (!IS_OBJ(v) || !v) return;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (rc & (IMMORTAL | SHARED)) return;
+  if (rc == 1) heff_stack_push(s, v);
+  else heff_share(v);
+}
+
+// (`v` handed to one other thread, which holds it instead of this one
+// (#125): where this thread holds `v` alone -- counted once, and not
+// shared -- it is moved, its count as it is, no mark: the taker counts
+// it alone from then on, as its own, and may take it apart or build in
+// it in place.  Below it, each object counted once under one so held is
+// the same, moved; one counted more than once something else holds too,
+// so it is shared (`heff_share`), with all it holds, and the walk goes
+// no further there.  A thread's own object may hold shared ones, so
+// what is moved keeps the invariant.  Where `v` is not held alone, it
+// is shared, as `heff_share` does.  `v` not consumed: the reference
+// handed over is the caller's, which must not count it after.  The walk
+// is the same as `heff_share`'s, and finds the objects held more than
+// once; what it saves is every mark, and the atomic counting after)
+HEFF_FN V heff_move(V v) {
+  if (!IS_OBJ(v) || !v) return v;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (rc & (IMMORTAL | SHARED)) return v;
+  if (rc != 1) return heff_share(v);
+  HeffStack s = {0};
+  heff_stack_push(&s, v);
+  while (s.n) {
+    V o = s.v[--s.n];
+    HEFF_EACH_SLOT(o, heff_move_one, &s);
+  }
+  free(s.v);
+  return v;
+}
 #else
 // (one thread: nothing is shared, nothing to do)
 static inline V heff_share(V v) { return v; }
+static inline V heff_move(V v) { return v; }
 #endif
 
 // Calls of what is not known

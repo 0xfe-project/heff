@@ -51,12 +51,16 @@
 -- `newCondition` | a condition, for domains to wait on
 -- `wait c m` | `m` let go of, until the condition is signalled, then held again
 -- `signal c` / `broadcast c` | one domain waiting on `c` woken; ... every one
+-- `newQueue` | a queue, for every domain: what is put in it is taken out once
+-- `put q v` / `take q` | `v` put at the back, never waiting; the front taken out, waiting while empty
 --
 -- `cas` compares by identity, as OCaml's `Atomic.compare_and_set`: a
 -- number of a word or a constructor without fields is itself, anything
 -- else the value that was read, not an equal one built again.  A `wait` may end
 -- without a signal: what it waits for is checked again, in a loop.  A
--- domain's failure is its joiner's, as it failed.
+-- domain's failure is its joiner's, as it failed.  What is put in a queue
+-- is handed to the one domain that takes it, first in first out: a
+-- `take` waits while the queue is empty, a `put` never waits.
 --
 -- What runs the domains is the backend's runtime, the program the same
 -- on each.  A domain, a cell, a mutex and a condition are the
@@ -65,8 +69,10 @@
 -- letting go of what it holds, a domain of its answer.  The C
 -- backend's (domain.provider.c): a domain is a thread of the system, a
 -- cell is changed atomically, a mutex and a condition are the system's.
--- What a domain is given and what it gives back are shared
--- (`heff_share`), not copied.  A domain whose last reference goes while
+-- What a domain gives back is shared (`heff_share`), not copied; what a
+-- domain is given, and what is put in a queue, is moved where the
+-- domain giving it held it alone (`heff_move`: counted by the taker
+-- alone from then on), and shared otherwise.  A domain whose last reference goes while
 -- it still runs is freed as its thread ends.  The program ends where
 -- `main` does, domains not joined with it.
 --
@@ -85,6 +91,7 @@ module std.domain
   , Atomic
   , Mutex
   , Condition
+  , Queue
   , spawn
   , join
   , cores
@@ -100,6 +107,9 @@ module std.domain
   , wait
   , signal
   , broadcast
+  , newQueue
+  , put
+  , take
   )
 
 import co
@@ -119,6 +129,11 @@ data Mutex
 -- | A condition.  (The runtime's own, a foreign value: no value of the
 -- | program has it.)
 data Condition
+
+-- | A queue of `a`s, for every domain: what one domain puts in, exactly
+-- | one domain takes out, first in first out.  (The runtime's own, a
+-- | foreign value: no value of the program has it.)
+data Queue a
 
 -- | A value of some type, the type hidden: what an operation of a type
 -- | of its own holds (the effect has no parameter for it).
@@ -142,6 +157,12 @@ data Reading x a = MkReading (Atomic a) (a -> x)
 data Writing x a = MkWriting (Atomic a) a x
 
 data Comparing x a = MkComparing (Atomic a) a a (Bool -> x)
+
+data MakingQueue x a = MkMakingQueue (Queue a -> x)
+
+data Putting x a = MkPutting (Queue a) a x
+
+data Taking x a = MkTaking (Queue a) (a -> x)
 
 spawningThen : {m : Type -> Type}
              -> {x y a : Type}
@@ -173,6 +194,15 @@ comparingThen : {x y a : Type} -> (x -> y) -> Comparing x a -> Comparing y a
 comparingThen g (MkComparing at seen v k) =
   MkComparing at seen v (\b -> g (k b))
 
+makingQueueThen : {x y a : Type} -> (x -> y) -> MakingQueue x a -> MakingQueue y a
+makingQueueThen g (MkMakingQueue k) = MkMakingQueue (\q -> g (k q))
+
+puttingThen : {x y a : Type} -> (x -> y) -> Putting x a -> Putting y a
+puttingThen g (MkPutting q v x) = MkPutting q v (g x)
+
+takingThen : {x y a : Type} -> (x -> y) -> Taking x a -> Taking y a
+takingThen g (MkTaking q k) = MkTaking q (\v -> g (k v))
+
 data DomainF (m : Type -> Type) x
   = Spawn (Some (Spawning m x))
   | Join (Some (Joining x))
@@ -189,6 +219,9 @@ data DomainF (m : Type -> Type) x
   | Wait Condition Mutex x
   | Signal Condition x
   | Broadcast Condition x
+  | NewQueue (Some (MakingQueue x))
+  | PutQueue (Some (Putting x))
+  | TakeQueue (Some (Taking x))
 
 -- | Domains as an effect.
 domain : HFunctor
@@ -210,6 +243,9 @@ domain =
       Wait cd mu x -> Wait cd mu (g x)
       Signal cd x -> Signal cd (g x)
       Broadcast cd x -> Broadcast cd (g x)
+      NewQueue s -> NewQueue (someThen (makingQueueThen g) s)
+      PutQueue s -> PutQueue (someThen (puttingThen g) s)
+      TakeQueue s -> TakeQueue (someThen (takingThen g) s)
   , hmap = \m n nt p -> case p of
       Spawn s -> Spawn (someThen (spawningBy nt) s)
       Join s -> Join s
@@ -226,6 +262,9 @@ domain =
       Wait cd mu x -> Wait cd mu x
       Signal cd x -> Signal cd x
       Broadcast cd x -> Broadcast cd x
+      NewQueue s -> NewQueue s
+      PutQueue s -> PutQueue s
+      TakeQueue s -> TakeQueue s
   }
 
 -- Domains
@@ -330,3 +369,25 @@ signal cd = op (dm (Signal cd MkUnit)) val
 -- | Every domain waiting on the condition woken.
 broadcast : {e : HFunctor} -> {{dm : domain <: e}} -> Condition -> Co e Unit
 broadcast cd = op (dm (Broadcast cd MkUnit)) val
+
+-- Queues
+--------------------------------------------------------------------------------
+
+-- | A queue, for every domain, holding nothing yet.
+newQueue : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> Co e (Queue a)
+newQueue = op (dm (NewQueue (\r use -> use a (MkMakingQueue (\q -> q))))) val
+
+-- | `v` put at the back of the queue, for one domain to take; never
+-- | waits.
+put : {e : HFunctor}
+    -> {a : Type}
+    -> {{dm : domain <: e}}
+    -> Queue a
+    -> a
+    -> Co e Unit
+put q v = op (dm (PutQueue (\r use -> use a (MkPutting q v MkUnit)))) val
+
+-- | The front of the queue taken out, this domain's alone now; waits
+-- | while the queue is empty.
+take : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> Queue a -> Co e a
+take q = op (dm (TakeQueue (\r use -> use a (MkTaking q (\v -> v))))) val
