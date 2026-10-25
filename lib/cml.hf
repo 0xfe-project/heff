@@ -1,12 +1,12 @@
 -- Concurrent ML (Reppy), on std.domain: threads that meet at channels,
--- and events, their synchronous operations as values.  A `send` waits
--- for its receiver and a `recv` for its sender, each the `sync` of an
--- event (`sendEvt`, `recvEvt`); events are composed before they are
--- committed -- `choose` among several, `wrap` what one comes to,
--- `guard` what is done at sync time, `withNack` told when another was
--- chosen -- and a `sync` commits exactly one base event of them.  The
--- threads run on as many domains as the machine has cores.  Import it
--- by a name, `import cml as CML`.
+-- and events, their synchronous operations, composed before one of
+-- them is committed.  An event is a computation run up to its commit
+-- point: a `send` waits for its receiver and a `recv` for its sender,
+-- each a base event; `choose` runs each of several branches up to its
+-- first base event and commits one of them, what follows that base
+-- event the wrap, the others abandoned -- told so where they asked, by
+-- `withNack`.  The threads run on as many domains as the machine has
+-- cores.  Import it by a name, `import cml as CML`.
 --
 -- > [!CAUTION]
 -- > Unstable: concurrency in heff is not settled. What this module offers
@@ -49,44 +49,47 @@
 -- `spawn c` | `c` is a thread of its own; this one goes on
 -- `yield` | the next thread's turn; this one's again after those ready
 -- `newChan` | a channel, of what its type says
--- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver
--- `recv ch` | what a thread sends on `ch`, once one does: waits for the sender
--- `sendEvt ch x` / `recvEvt ch` | ... the same, as events
+-- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver; a base event
+-- `recv ch` | what a thread sends on `ch`, once one does: waits for the sender; a base event
 -- `newIVar` | an ivar, holding nothing yet
 -- `putIVar iv x` | `iv` holds `x` now, its readers given it; once, a second put abandons; never waits
--- `readIVar iv` / `readIVarEvt iv` | what `iv` holds, waiting until it does; ... as an event
--- `always x` / `never` | an event ready at once, coming to `x`; one never ready
--- `choose evs` | one of the events: whichever is ready, one of them at random where several are
--- `wrap ev f` | `ev`, coming to `f` of what `ev` came to
--- `guard c` | the event `c` comes to, `c` run at each `sync`
--- `withNack f` | `f`'s event, `f` given one that is ready once a `sync` chose another over it
--- `sync ev` | `ev` committed, this thread waiting until one of its base events can be: what it comes to
+-- `readIVar iv` | what `iv` holds, waiting until it does; a base event
+-- `never` | a base event never ready
+-- `choose cs` | one of the branches: each run to its first base event, one of those committed, at random where several can be
+-- `withNack f` | `f nack`, `nack` ready once a `choose` abandoned this branch for another
 -- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits
 --
--- An event is a value: `sendEvt ch x`, `recvEvt ch`, `readIVarEvt iv`
--- and `always x` are its base events, and a `choose` of several is one
--- too, so a protocol of several messages is one event, put in a
--- `choose` with others and committed at once, which is what Go's
--- `select` cannot do.  A `sync` runs the event's guards (`guard`,
--- `withNack`), on this thread, and so comes to the base events; where
--- one of them can be committed now -- a sender waiting at the channel
--- of a `recvEvt`, a receiver at the channel of a `sendEvt`, an ivar
--- written, an `always` -- it is, one of them drawn at random where
--- several can (as Reppy's CML and Racket's `sync` choose: no branch of
--- a `choose` has priority over another), and the thread goes on with
--- what it comes to; else the thread waits at every one of them, and
--- goes on when another's `sync` meets one.  Then each `withNack`'s
--- nack event is ready, where
--- the base event committed was not among that `withNack`'s: the other
--- branches told they were not chosen.  `Event w e a` is of threads run
--- in the world `w` (as its channels, `Chan w a`), its guards run in
--- `e`, the world of the thread that syncs it, and comes to an `a`.
+-- An event is a computation, and its base events are operations: a
+-- `send`, a `recv`, an ivar's read, `never`.  Run alone, an event is
+-- its first base event, committed once it can be, the thread waiting
+-- until then, and what follows.  In a `choose`, each branch is run, in
+-- order and on this thread, up to its first base event -- what comes
+-- before it is done as it comes, a guard's work: a channel made, a
+-- request sent, a thread spawned -- and that base event is the
+-- branch's commit point; a branch that ends before one is ready at
+-- once, its value what it ends with, and a `choose` in a branch is
+-- that branch's base events, so a protocol of several messages is one
+-- event, put in a `choose` with others and committed at once, which is
+-- what Go's `select` cannot do.  Where one of the base events can be
+-- committed now -- a sender waiting at the channel of a `recv`, a
+-- receiver at the channel of a `send`, an ivar written, a branch ended
+-- -- it is, one of them drawn at random where several can (as Reppy's
+-- CML and Racket's `sync` choose: no branch has priority over
+-- another); else the thread waits at every one of them, and goes on
+-- when another thread's base event meets one.  The branch committed
+-- goes on from its base event: what follows it is the wrap, as
+-- effectful as any statements.  The others are abandoned at their
+-- commit points, and each `withNack` met on the way to one of them,
+-- not on the way to the one committed, has its nack ready: the
+-- branches not chosen told so.  A thread dropped while it waits (main
+-- done), or a `choose` left by a throw before it commits, tells no
+-- nack.
 --
 -- The threads are the scheduler's, a handler in the language, and the
 -- domains are their workers: a thread is a resumption, run by a
 -- worker from where it stopped to where it next ends, gives up its
--- turn (`yield`), or waits in a `sync`.  A thread readied by one a
--- worker runs -- spawned, or met by its `sync` -- is kept in that
+-- turn (`yield`), or waits at a base event.  A thread readied by one a
+-- worker runs -- spawned, or met by its base event -- is kept in that
 -- worker's slot, the next it runs, where the slot is empty, and no
 -- domain is woken for it: a thread that hands a value on and then
 -- waits hands its domain on to the one it readied, no domain waking
@@ -107,19 +110,19 @@
 -- ready -- in the slot or the queue -- and the worker takes the next, its
 -- slot's first, so that no thread is passed over for one that goes on,
 -- and none needs a timer; where none is ready, it goes on, its fuel full
--- again, and a thread alone pays the count only.  A `sync` that waits
+-- again, and a thread alone pays the count only.  A thread that waits
 -- leaves an offer at each of its base events' channels and ivars: one
 -- cell (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
--- whichever other `sync` meets one of them first, which readies the
+-- whichever other thread's base event meets one of them first, which readies the
 -- waiting thread with what came; so a waiting thread occupies no
 -- worker, and a `choose` commits one base event at most.  What a
 -- readied thread does next is left to the worker that takes it (its
 -- turn is a function of that worker, its continuation unapplied until
 -- then): the one readying it applies nothing of another thread's, and
--- holds no mutex while a thread computes.  A `sync` holds the mutexes
--- of its channels and ivars, each once, in the order of their numbers,
+-- holds no mutex while a thread computes.  Committing, a thread holds the
+-- mutexes of its channels and ivars, each once, in the order of their numbers,
 -- from looking for a partner until its offers are left, so that no
--- `sync` misses a partner leaving its offer meanwhile, and none waits
+-- thread misses a partner leaving its offer meanwhile, and none waits
 -- for another round a cycle; with them held it first asks of each base
 -- event whether it can be committed, claiming nothing, then draws one
 -- of those that can and claims its partner -- where the partner's offer
@@ -138,7 +141,7 @@
 -- (before the one readying it may itself wait), one fewer for one that
 -- waits or ends (one put behind those ready, by a `yield` or by its
 -- fuel, is counted still): at none left before main is done every
--- thread waits in a `sync`, a deadlock, and it comes to `Nothing`.
+-- thread waits at a base event, a deadlock, and it comes to `Nothing`.
 -- Main's answer ends it all, the other threads dropped where they
 -- stopped.  A thread gives up its domain at its operations alone, and
 -- its fuel is counted at them: long pure work in a thread, with no
@@ -151,33 +154,25 @@
 -- has taken effect.  A computation held by an operation of `w`
 -- (`Domain.spawn c` holds `c`) is run alone, as the operation does
 -- it: its `spawn`s, channels and ivars are the scheduler's, but a
--- `sync` in it has no thread to meet, and is abandoned unless an
--- `always` is among its base events.  A thread that fails fails its
+-- base event in it has no thread to meet, and is abandoned -- unless
+-- it is in a `choose` with a branch that ends before its own.  A thread that fails fails its
 -- worker, which `scheduled` says once main is done.
 
 module cml
   ( cml
   , Chan
-  , Event
   , IVar
   , spawn
   , yield
   , newChan
   , send
   , recv
-  , sendEvt
-  , recvEvt
   , newIVar
   , putIVar
   , readIVar
-  , readIVarEvt
-  , always
   , never
   , choose
-  , wrap
-  , guard
   , withNack
-  , sync
   , scheduled
   )
 
@@ -367,11 +362,11 @@ readOnThen : {w : HFunctor}
 readOnThen g (MkReadOn iv k) = MkReadOn iv (\v -> g (k v))
 
 -- (a base event, and what comes after it, an `x`: a send, a receive, an
--- ivar's read, or one ready at once.  What comes after is a function
--- in each, computed where the event commits, not where a continuation
--- is put after it: an always of a `choose` with what comes after it
--- computed at once would compute the next sync's, and its always's
--- theirs, every branch of every sync to come)
+-- ivar's read, or a branch of a `choose` ended, ready at once.  What
+-- comes after is a function in each, computed where the event commits,
+-- not where a continuation is put after it: a branch ended with what
+-- comes after it computed at once would compute the next `choose`'s,
+-- and its branches' theirs, every branch of every choice to come)
 data Base (w : HFunctor) x
   = SendBase (Some (SendOn w x))
   | RecvBase (Some (RecvOn w x))
@@ -383,21 +378,6 @@ baseThen g (SendBase s) = SendBase (someThen (sendOnThen g) s)
 baseThen g (RecvBase s) = RecvBase (someThen (recvOnThen g) s)
 baseThen g (ReadBase s) = ReadBase (someThen (readOnThen g) s)
 baseThen g (AlwaysBase k) = AlwaysBase (\u -> g (k u))
-
--- Events
---------------------------------------------------------------------------------
-
--- | An event of threads run in the world `w`, its guards run in `e`: a
--- | synchronous operation, composed, and committed by `sync`, which
--- | comes to an `a`.  (A base event, with what it comes to; none, never
--- | ready; a choice; a guard, run at sync time; or a function of the
--- | event that is ready once another was chosen over its own.)
-data Event (w : HFunctor) (e : HFunctor) a
-  = Primitive (Base w a)
-  | NeverReady
-  | Choice (List (Event w e a))
-  | Guarded (Co e (Event w e a))
-  | Nacked (Event w e Unit -> Co e (Event w e a))
 
 -- The effect
 --------------------------------------------------------------------------------
@@ -434,6 +414,25 @@ puttingThen : {w : HFunctor}
             -> Putting w y a
 puttingThen g (MkPutting iv v k) = MkPutting iv v (\u -> g (k u))
 
+-- (a choice: its branches, each a computation run to its first base
+-- event, and what comes after the one committed, given what its branch
+-- came to)
+data Choosing (m : Type -> Type) x a = MkChoosing (List (m a)) (a -> x)
+
+choosingThen : {m : Type -> Type}
+             -> {x y a : Type}
+             -> (x -> y)
+             -> Choosing m x a
+             -> Choosing m y a
+choosingThen g (MkChoosing bs k) = MkChoosing bs (\v -> g (k v))
+
+choosingMapped : {m n : Type -> Type}
+               -> {x a : Type}
+               -> ({b : Type} -> m b -> n b)
+               -> Choosing m x a
+               -> Choosing n x a
+choosingMapped nt (MkChoosing bs k) = MkChoosing (List.map (\b -> nt b) bs) k
+
 data CmlF (w : HFunctor) (m : Type -> Type) x
   = Spawn (m Unit) (Unit -> x)
   | Yield (Unit -> x)
@@ -441,6 +440,8 @@ data CmlF (w : HFunctor) (m : Type -> Type) x
   | NewIVar (Some (MakingIVar w x))
   | PutIVar (Some (Putting w x))
   | Sync (List (Base w x))
+  | Choose (Some (Choosing m x))
+  | Nack (IVar w Unit) (Unit -> x)
 
 -- (what comes after an operation, changed)
 stepThen : {w : HFunctor}
@@ -455,6 +456,8 @@ stepThen g (NewChan s) = NewChan (someThen (makingChanThen g) s)
 stepThen g (NewIVar s) = NewIVar (someThen (makingIVarThen g) s)
 stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
 stepThen g (Sync bs) = Sync (List.map (baseThen g) bs)
+stepThen g (Choose s) = Choose (someThen (choosingThen g) s)
+stepThen g (Nack iv k) = Nack iv (\u -> g (k u))
 
 -- | For CML threads run in the world `w`: spawned and yielding,
 -- | channels and ivars made, and events synced on.
@@ -469,6 +472,8 @@ cml w =
       NewIVar s -> NewIVar s
       PutIVar s -> PutIVar s
       Sync bs -> Sync bs
+      Choose s -> Choose (someThen (choosingMapped nt) s)
+      Nack iv k -> Nack iv k
   }
 
 -- Threads
@@ -513,164 +518,72 @@ putIVar iv v =
 -- Events
 --------------------------------------------------------------------------------
 
--- | An event ready at once, coming to `v`.
-always : {w e : HFunctor} -> {a : Type} -> a -> Event w e a
-always v = Primitive (AlwaysBase (\u -> v))
-
--- | An event never ready: a `sync` of it alone waits for ever.
-never : {w e : HFunctor} -> {a : Type} -> Event w e a
-never = NeverReady
-
--- | `v` sent on the channel, as an event: ready where a receiver waits
--- | there.
-sendEvt : {w e : HFunctor} -> {a : Type} -> Chan w a -> a -> Event w e Unit
-sendEvt ch v = Primitive (SendBase (\r use -> use a (MkSendOn ch v (\u -> u))))
-
--- | What is sent on the channel, as an event: ready where a sender
--- | waits there, coming to its value.
-recvEvt : {w e : HFunctor} -> {a : Type} -> Chan w a -> Event w e a
-recvEvt ch = Primitive (RecvBase (\r use -> use a (MkRecvOn ch (\v -> v))))
-
--- | What the ivar holds, as an event: ready once it is written.
-readIVarEvt : {w e : HFunctor} -> {a : Type} -> IVar w a -> Event w e a
-readIVarEvt iv = Primitive (ReadBase (\r use -> use a (MkReadOn iv (\v -> v))))
-
--- | One of the events, whichever a `sync` can commit: one of them
--- | drawn at random where several can be, none with priority over
--- | another, and where none can, whichever is met first.
-choose : {w e : HFunctor} -> {a : Type} -> List (Event w e a) -> Event w e a
-choose evs = Choice evs
-
--- | The event, coming to `g` of what it came to.
-wrap : {w e : HFunctor}
-     -> {a b : Type}
-     -> Event w e a
-     -> (a -> b)
-     -> Event w e b
-wrap (Primitive b) g = Primitive (baseThen g b)
-wrap NeverReady g = NeverReady
-wrap (Choice evs) g = Choice (List.map (\ev -> wrap ev g) evs)
-wrap (Guarded c) g = Guarded (bind c (\ev -> pure (wrap ev g)))
-wrap (Nacked h) g = Nacked (\nack -> bind (h nack) (\ev -> pure (wrap ev g)))
-
--- | The event `c` comes to, `c` run by each `sync`, on its thread, before
--- | it looks for a partner: what is to be done at sync time, a channel
--- | made or a request sent, is done here.
-guard : {w e : HFunctor} -> {a : Type} -> Co e (Event w e a) -> Event w e a
-guard c = Guarded c
-
--- | The event `h` comes to, run as a guard, `h` given the nack event:
--- | ready once the `sync` has committed a base event not among those
--- | `h` came to, so a thread waiting on the nack knows this branch was
--- | not chosen.
-withNack : {w e : HFunctor}
-         -> {a : Type}
-         -> (Event w e Unit -> Co e (Event w e a))
-         -> Event w e a
-withNack h = Nacked h
-
--- Sync
---------------------------------------------------------------------------------
-
--- (a base event an event came to: the nacks enclosing it, by number,
--- and itself)
-type Leaf (w : HFunctor) a = Pair (List Int) (Base w a)
-
--- (the nacks made so far, flattening an event: the next one's number,
--- and each by its number)
-type Nacks (w : HFunctor) = { next : Int, vars : List (Pair Int (IVar w Unit)) }
-
--- (the event flattened to the base events it comes to, its guards run,
--- `enclosing` the nacks around it so far: each base event with the
--- nacks enclosing it, and the nacks made)
-flattened : {e w : HFunctor}
-          -> {a : Type}
-          -> {{cm : cml w <: e}}
-          -> Event w e a
-          -> List Int
-          -> Nacks w
-          -> Co e (Pair (List (Leaf w a)) (Nacks w))
-flattened (Primitive b) enclosing ns = pure (MkPair [MkPair enclosing b] ns)
-flattened NeverReady enclosing ns = pure (MkPair Nil ns)
-flattened (Choice Nil) enclosing ns = pure (MkPair Nil ns)
-flattened (Choice (ev :: evs)) enclosing ns = do
-  first <- flattened ev enclosing ns
-  rest <- flattened (Choice evs) enclosing (snd first)
-  pure (MkPair (fst first ++ fst rest) (snd rest))
-flattened (Guarded c) enclosing ns = do
-  ev <- c
-  flattened ev enclosing ns
-flattened (Nacked h) enclosing ns = do
-  nack <- newIVar
-  ev <- h (readIVarEvt nack)
-  flattened
-      ev
-      (ns.next :: enclosing)
-      { next = ns.next + 1, vars = MkPair ns.next nack :: ns.vars }
-
--- (every nack but those enclosing the base event committed, written:
--- the other branches told they were not chosen)
-nacked : {e w : HFunctor}
-       -> {{cm : cml w <: e}}
-       -> List Int
-       -> List (Pair Int (IVar w Unit))
-       -> Co e Unit
-nacked enclosing Nil = pure ()
-nacked enclosing (MkPair n nack :: rest) = do
-  if List.elem n enclosing then pure () else putIVar nack MkUnit
-  nacked enclosing rest
-
--- (a base event, what comes after it the nacks written and what it
--- came to)
-committing : {e w : HFunctor}
-           -> {a : Type}
-           -> {{cm : cml w <: e}}
-           -> List (Pair Int (IVar w Unit))
-           -> Leaf w a
-           -> Base w (Co e a)
-committing nacks (MkPair enclosing b) =
-  baseThen (\v -> bind (nacked enclosing nacks) (\u -> pure v)) b
-
--- | The event committed: its guards run, then one of its base events,
--- | this thread waiting until one can be; the nacks of the branches not
--- | chosen written; what it comes to.
-sync : {e w : HFunctor}
-     -> {a : Type}
-     -> {{cm : cml w <: e}}
-     -> Event w e a
-     -> Co e a
-sync ev = do
-  flat <- flattened ev Nil { next = 0, vars = Nil }
-  let nacks : Nacks w = snd flat
-  after <- op (cm (Sync (List.map (committing nacks.vars) (fst flat)))) val
-  after
-
 -- | `v` sent on the channel, once a thread takes it: waits for the
--- | receiver.
+-- | receiver.  A base event: in a `choose`, its branch's commit point.
 send : {e w : HFunctor}
      -> {a : Type}
      -> {{cm : cml w <: e}}
      -> Chan w a
      -> a
      -> Co e Unit
-send ch v = sync (sendEvt ch v)
+send ch v =
+  op (cm (Sync [SendBase (\r use -> use a (MkSendOn ch v (\u -> u)))])) val
 
 -- | What a thread sends on the channel, once one does: waits for the
--- | sender.
+-- | sender.  A base event.
 recv : {e w : HFunctor}
      -> {a : Type}
      -> {{cm : cml w <: e}}
      -> Chan w a
      -> Co e a
-recv ch = sync (recvEvt ch)
+recv ch =
+  op (cm (Sync [RecvBase (\r use -> use a (MkRecvOn ch (\v -> v)))])) val
 
--- | What the ivar holds, waiting until it is written.
+-- | What the ivar holds, waiting until it is written.  A base event.
 readIVar : {e w : HFunctor}
          -> {a : Type}
          -> {{cm : cml w <: e}}
          -> IVar w a
          -> Co e a
-readIVar iv = sync (readIVarEvt iv)
+readIVar iv =
+  op (cm (Sync [ReadBase (\r use -> use a (MkReadOn iv (\v -> v)))])) val
+
+-- | A base event never ready: waits for ever, and in a `choose` is
+-- | never the one committed.
+never : {e w : HFunctor} -> {a : Type} -> {{cm : cml w <: e}} -> Co e a
+never = op (cm (Sync Nil)) val
+
+-- | One of the branches: each run, in order, up to its first base event
+-- | -- what comes before it done as it comes, a guard's work -- then one
+-- | of those base events committed, whichever can be, one drawn at
+-- | random where several can, none with priority over another; where
+-- | none can, whichever is met first.  A branch that ends before any
+-- | base event is ready at once, its value what it ends with.  The
+-- | branch committed goes on from its base event, what follows it the
+-- | wrap; the others are abandoned there, each `withNack` of theirs
+-- | told.  A `choose` in a branch is that branch's base events.
+choose : {e w : HFunctor}
+       -> {a : Type}
+       -> {{cm : cml w <: e}}
+       -> List (Co e a)
+       -> Co e a
+choose bs = op (cm (Choose (\r use -> use a (MkChoosing bs (\v -> v))))) val
+
+-- | `f` given its nack, the computation run: `f nack`, run as the rest
+-- | of its branch, and `nack` a base event ready once the `choose` it
+-- | is in has committed another branch -- this one abandoned, so a
+-- | thread waiting on `nack` knows it was not chosen.  Outside a
+-- | `choose`, or where its branch is the one committed, `nack` is never
+-- | ready.
+withNack : {e w : HFunctor}
+         -> {a : Type}
+         -> {{cm : cml w <: e}}
+         -> (Co e Unit -> Co e a)
+         -> Co e a
+withNack f = do
+  nack <- (newIVar : Co e (IVar w Unit))
+  op (cm (Nack nack (\u -> u))) val
+  f (readIVar nack)
 
 -- The handler: a thread as a resumption
 --------------------------------------------------------------------------------
@@ -1266,6 +1179,171 @@ unlockedAll (l :: ls) = do
   Domain.unlock (snd l)
   unlockedAll ls
 
+-- Choices
+--------------------------------------------------------------------------------
+
+-- (a choice's branches run to their commit points: each base event, with
+-- the numbers of the nacks around it, and every nack made, the last
+-- first)
+type Branches (w : HFunctor) =
+  { bases : List (Pair (List Int) (Base w (Res w Unit)))
+  , nacks : List (IVar w Unit)
+  }
+
+ivarNumber : {w : HFunctor} -> {a : Type} -> IVar w a -> Int
+ivarNumber (MkIVar n mu value readers) = n
+
+-- (the thread going on as `r` says, the nacks written first: the
+-- branches abandoned told)
+nacking : {w : HFunctor} -> List (IVar w Unit) -> Res w Unit -> Res w Unit
+nacking Nil r = r
+nacking (nack :: rest) r =
+  RStep
+    (PutIVar
+       (\t use -> use Unit (MkPutting nack MkUnit (\u -> nacking rest r))))
+
+-- (the nacks not among `around`: those of the branches abandoned where
+-- a base event the nacks `around` enclose is committed)
+abandonedNacks : {w : HFunctor}
+               -> List Int
+               -> List (IVar w Unit)
+               -> List (IVar w Unit)
+abandonedNacks around Nil = Nil
+abandonedNacks around (nack :: rest) =
+  if List.elem (ivarNumber nack) around then abandonedNacks around rest
+  else nack :: abandonedNacks around rest
+
+-- (a branch of a choice, of whatever type: what is left of it to run
+-- up to its commit point, `up` making the thread's continuation of what
+-- follows that, and the numbers of the nacks enclosing it)
+data Branch (w : HFunctor) a
+  = MkBranch (Res w a) (Res w a -> Res w Unit) (List Int)
+
+-- (the branches, each run on `runner` up to its first base event, in
+-- order: its base events, or one ready at once where it ends first,
+-- put among `acc`'s.  What comes before is done here, as the thread's:
+-- its spawns, channels, ivars and writes, its operations of the world,
+-- a `withNack`'s nack made; a `choose` in one is more branches, each
+-- going on as that one, through what comes after that `choose`, run
+-- next)
+branched : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> ((Unit -> Res w Unit) -> Turn w)
+         -> Runner w
+         -> List (Some (Branch w))
+         -> Branches w
+         -> Co w (Branches w)
+branched st turnOf runner Nil acc = pure acc
+branched st turnOf runner (sb :: rest) acc =
+  sb (Co w (Branches w)) (\a br -> case br of
+    MkBranch r up around -> case r of
+      RDone x ->
+        branched
+          st
+          turnOf
+          runner
+          rest
+          { acc
+          | bases = MkPair around (AlwaysBase (\u -> up (RDone x))) :: acc.bases
+          }
+      RAct m -> do
+        unkept st runner
+        next <- m
+        branched
+            st
+            turnOf
+            runner
+            ((\t use -> use a (MkBranch next up around)) :: rest)
+            acc
+      RStep p -> case p of
+        Spawn c k -> do
+          readyAgain st runner (turnOf (\u -> c))
+          branched
+              st
+              turnOf
+              runner
+              ((\t use -> use a (MkBranch (k MkUnit) up around)) :: rest)
+              acc
+        Yield k ->
+          branched
+            st
+            turnOf
+            runner
+            ((\t use -> use a (MkBranch (k MkUnit) up around)) :: rest)
+            acc
+        NewChan s ->
+          s (Co w (Branches w)) (\c mk -> case mk of
+            MkMakingChan k -> do
+              ch <- madeChan st
+              branched
+                  st
+                  turnOf
+                  runner
+                  ((\t use -> use a (MkBranch (k ch) up around)) :: rest)
+                  acc)
+        NewIVar s ->
+          s (Co w (Branches w)) (\c mk -> case mk of
+            MkMakingIVar k -> do
+              iv <- madeIVar st
+              branched
+                  st
+                  turnOf
+                  runner
+                  ((\t use -> use a (MkBranch (k iv) up around)) :: rest)
+                  acc)
+        PutIVar s ->
+          s (Co w (Branches w)) (\c pt -> do
+            k <- written runner pt
+            branched
+                st
+                turnOf
+                runner
+                ((\t use -> use a (MkBranch k up around)) :: rest)
+                acc)
+        Nack nack k ->
+          branched
+            st
+            turnOf
+            runner
+            ((\t use ->
+                use
+                  a
+                  (MkBranch (k MkUnit) up (ivarNumber nack :: around)))
+             :: rest)
+            { acc | nacks = nack :: acc.nacks }
+        Sync bs ->
+          branched
+            st
+            turnOf
+            runner
+            rest
+            { acc
+            | bases =
+                List.map (\b -> MkPair around (baseThen up b)) bs ++ acc.bases
+            }
+        Choose s ->
+          s (Co w (Branches w)) (\c ch -> case ch of
+            MkChoosing bs k ->
+              branched
+                st
+                turnOf
+                runner
+                (List.map
+                   (\b t use ->
+                      use c (MkBranch b (\q -> up (thenRes q k)) around))
+                   bs
+                 ++ rest)
+                acc))
+
+-- (a choice's base events, each going on, once committed, with the
+-- nacks of the branches abandoned written)
+committable : {w : HFunctor} -> Branches w -> List (Base w (Res w Unit))
+committable br =
+  List.map
+    (\p -> baseThen (\r -> nacking (abandonedNacks (fst p) br.nacks) r) (snd p))
+    br.bases
+
 -- (what a thread's step came to: it goes on from here; or it stopped
 -- -- ended, waiting, or its turn given up -- and the domain takes
 -- another)
@@ -1351,6 +1429,22 @@ stepped st turnOf runner (RStep (NewIVar s)) =
 stepped st turnOf runner (RStep (PutIVar s)) =
   s (Co w (Stepped w)) (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
 stepped st turnOf runner (RStep (Sync bs)) = synced st turnOf runner bs
+stepped st turnOf runner (RStep (Choose s)) =
+  s (Co w (Stepped w)) (\a ch -> case ch of
+    MkChoosing bs k -> do
+      br <-
+        branched
+          st
+          turnOf
+          runner
+          (List.map
+             (\b t use -> use a (MkBranch b (\q -> thenRes q k) Nil))
+             bs)
+          ({ bases = Nil, nacks = Nil } : Branches w)
+      synced st turnOf runner (committable br))
+stepped st turnOf runner (RStep (Nack nack k)) = do
+  next <- later k
+  pure (GoesOn next)
 
 -- (how many steps a thread takes in a run on a worker, each operation
 -- of it the worker handles, before it is put behind the others ready,
@@ -1415,17 +1509,77 @@ run : {w : HFunctor}
     -> Co w Unit
 run st runner r = ranOn st (\k on -> run st on (k MkUnit)) runner fuelPerRun r
 
--- (what comes after the first `always` among the base events, if one)
-firstAlways : {w : HFunctor} -> {x : Type} -> List (Base w x) -> Maybe x
-firstAlways Nil = Nothing
-firstAlways (AlwaysBase k :: bs) = Just (k MkUnit)
-firstAlways (b :: bs) = firstAlways bs
+-- (a branch of a choice run alone, of whatever type: what is left of
+-- it to run up to its commit point, and `up` making what follows that)
+data AloneBranch (w : HFunctor) x a = MkAloneBranch (Res w a) (Res w a -> x)
+
+-- (the branches run alone, in order, each up to its first base event:
+-- `Just` what follows the commit point of the first that commits
+-- alone -- it ends first, or a `choose` in it does so -- or `Nothing`
+-- where each comes to a base event, which has no thread to meet)
+readyAlone : {w : HFunctor}
+           -> {x : Type}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> List (Some (AloneBranch w x))
+           -> Co w (Maybe x)
+readyAlone st Nil = pure Nothing
+readyAlone st (sb :: rest) =
+  sb (Co w (Maybe x)) (\a br -> case br of
+    MkAloneBranch r up -> case r of
+      RDone v -> pure (Just (up (RDone v)))
+      RAct m -> do
+        next <- m
+        readyAlone st ((\t use -> use a (MkAloneBranch next up)) :: rest)
+      RStep p -> case p of
+        Spawn c k -> do
+          readyAgain st Nothing (\on -> run st on c)
+          readyAlone
+              st
+              ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
+        Yield k ->
+          readyAlone
+            st
+            ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
+        NewChan s ->
+          s (Co w (Maybe x)) (\c mk -> case mk of
+            MkMakingChan k -> do
+              ch <- madeChan st
+              readyAlone
+                  st
+                  ((\t use -> use a (MkAloneBranch (k ch) up)) :: rest))
+        NewIVar s ->
+          s (Co w (Maybe x)) (\c mk -> case mk of
+            MkMakingIVar k -> do
+              iv <- madeIVar st
+              readyAlone
+                  st
+                  ((\t use -> use a (MkAloneBranch (k iv) up)) :: rest))
+        PutIVar s ->
+          s (Co w (Maybe x)) (\c pt -> do
+            k <- written Nothing pt
+            readyAlone st ((\t use -> use a (MkAloneBranch k up)) :: rest))
+        Nack nack k ->
+          readyAlone
+            st
+            ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
+        Sync bs -> readyAlone st rest
+        Choose s ->
+          s (Co w (Maybe x)) (\c ch -> case ch of
+            MkChoosing bs k ->
+              readyAlone
+                st
+                (List.map
+                   (\b t use ->
+                      use c (MkAloneBranch b (\q -> up (thenRes q k))))
+                   bs
+                 ++ rest)))
 
 -- (a thread run alone to its end: what an operation of `w` holding
 -- computations is given, as `Domain.spawn c` holds `c`.  Its spawns,
 -- channels and ivars are the scheduler's, the threads it readies put
--- among those ready; a sync in it has no thread to meet, and is
--- abandoned unless an `always` is among its base events.)
+-- among those ready; a base event in it has no thread to meet, and is
+-- abandoned, unless a `choose` has a branch that ends first.)
 alone : {w : HFunctor}
       -> {a : Type}
       -> {{dm : Domain.domain <: w}}
@@ -1446,9 +1600,20 @@ alone st (RStep (NewIVar s)) =
     MkMakingIVar k -> bind (madeIVar st) (\iv -> alone st (k iv)))
 alone st (RStep (PutIVar s)) =
   s (Co w a) (\t p -> bind (written Nothing p) (\k -> alone st k))
-alone st (RStep (Sync bs)) = case firstAlways bs of
-  Just k -> alone st k
-  Nothing -> abandon
+alone st (RStep (Sync bs)) = abandon
+alone st (RStep (Nack nack k)) = alone st (k MkUnit)
+alone st (RStep (Choose s)) =
+  s (Co w a) (\t ch -> case ch of
+    MkChoosing bs k -> do
+      v <-
+        readyAlone
+          st
+          (List.map
+             (\b u use -> use t (MkAloneBranch b (\q -> thenRes q k)))
+             bs)
+      case v of
+        Just r -> alone st r
+        Nothing -> abandon)
 
 cmlAlg : {w : HFunctor}
        -> {a : Type}
@@ -1637,7 +1802,7 @@ idleUntilDone st = do
 -- | `c` and the threads it spawns, run on as many domains as the
 -- | machine has cores (`Domain.cores`): `Just` main's answer, the other
 -- | threads dropped where they stopped; or `Nothing` where main is not
--- | done and every thread waits in a `sync`, a deadlock.  A thread that
+-- | done and every thread waits at a base event, a deadlock.  A thread that
 -- | fails fails the domain running it, which fails this once main is
 -- | done.
 scheduled : {w : HFunctor}

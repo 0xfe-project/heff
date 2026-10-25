@@ -3,7 +3,8 @@
 -- in JavaScript's one domain (test/apps/cml.hf), the same lines said.
 -- Ping-pong over two channels; many senders and one receiver, their
 -- sum; a choice between two channels with a sender on one, the other
--- branch told it was not chosen; a guard run at each sync; a wrap; an
+-- branch told it was not chosen; the same, a choice in a choice; what
+-- a branch does before its base event, run each time; a wrap; an
 -- ivar read by several threads; a choice between two events both
 -- ready, synced many times, each chosen at least once (no fixed
 -- priority); a thread going on step after step, which gives its turn,
@@ -84,44 +85,97 @@ chosen = do
   nackSeen <- CML.newIVar
   CML.spawn (CML.send a 1)
   x <-
-    CML.sync
-      (CML.choose
-         [ CML.wrap (CML.recvEvt a) (\v -> "a " ^ debug v)
-         , CML.withNack (\nack -> do
-             CML.spawn (do
-               CML.sync nack
-               CML.putIVar nackSeen True)
-             pure (CML.wrap (CML.recvEvt b) (\v -> "b " ^ debug v)))
-         ])
+    CML.choose
+      [ do
+        v <- CML.recv a
+        pure ("a " ^ debug v)
+      , CML.withNack (\nack -> do
+          CML.spawn (do
+            nack
+            CML.putIVar nackSeen True)
+          v <- CML.recv b
+          pure ("b " ^ debug v))
+      ]
+  seen <- CML.readIVar nackSeen
+  pure (x, seen)
+
+-- A choice in a choice ---------------------------------------------------------------
+
+-- | a choice of a choice (between `a`, its branch with a nack, and `b`)
+-- | and `c`, a sender on `b` alone: what came, and whether the branch of
+-- | `a`, inside, was told it was not chosen
+nested : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e (String, Bool)
+nested = do
+  a <- (CML.newChan : Co e (CML.Chan w Int))
+  b <- CML.newChan
+  c <- (CML.newChan : Co e (CML.Chan w Int))
+  nackSeen <- CML.newIVar
+  CML.spawn (CML.send b 2)
+  x <-
+    CML.choose
+      [ CML.choose
+          [ CML.withNack (\nack -> do
+              CML.spawn (do
+                nack
+                CML.putIVar nackSeen True)
+              v <- CML.recv a
+              pure ("a " ^ debug v))
+          , do
+            v <- CML.recv b
+            pure ("b " ^ debug v)
+          ]
+      , do
+        v <- CML.recv c
+        pure ("c " ^ debug v)
+      ]
   seen <- CML.readIVar nackSeen
   pure (x, seen)
 
 -- A guard, run at sync time ------------------------------------------------------------
 
--- | a guard run by each sync, not where the event is made: how often it
--- | had run before the first, after it, and after a second
+-- | what a branch does before its base event, run each time the
+-- | event is, not where it is made: how often it had run before the
+-- | first, after it, and after a second
 guarded : {e w : HFunctor}
         -> {{cm : CML.cml w <: e}}
         -> {{dm : Domain.domain <: e}}
         -> Co e (List Int)
 guarded = do
   runs <- Domain.newAtomic 0
-  let ev : CML.Event w e Unit =
-    CML.guard (do
-      _ <- Domain.fetchAdd runs 1
-      pure (CML.always MkUnit))
+  nobody <- (CML.newChan : Co e (CML.Chan w Unit))
+  let ev : Co e Unit =
+    CML.choose
+      [ do
+        _ <- Domain.fetchAdd runs 1
+        pure MkUnit
+      , CML.recv nobody
+      ]
   before <- Domain.get runs
-  CML.sync ev
+  ev
   once <- Domain.get runs
-  CML.sync ev
+  ev
   twice <- Domain.get runs
   pure [before, once, twice]
 
 -- A wrap ------------------------------------------------------------------------------------
 
--- | 20, always, and 1 added by a wrap: 21
+-- | 20 received, and 1 added by what follows the commit point, a
+-- | thread spawned there telling main: 21 and the word
 wrapped : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
-wrapped = CML.sync (CML.wrap (CML.always 20) (\x -> x + 1))
+wrapped = do
+  a <- CML.newChan
+  b <- CML.newChan
+  told <- CML.newChan
+  CML.spawn (CML.send a 20)
+  x <-
+    CML.choose
+      [ do
+        v <- CML.recv a
+        CML.spawn (CML.send told (v + 1))
+        CML.recv told
+      , CML.recv b
+      ]
+  pure x
 
 -- An ivar read by several threads -----------------------------------------------------
 
@@ -166,7 +220,7 @@ shared = do
 firstChosen : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Int -> Co e Int
 firstChosen 0 = pure 0
 firstChosen k = do
-  x <- CML.sync (CML.choose [CML.always 1, CML.always 0])
+  x <- CML.choose [pure 1, pure 0]
   rest <- firstChosen (k - 1)
   pure (x + rest)
 
@@ -190,11 +244,12 @@ goneOn : {e w : HFunctor}
 goneOn stop 0 = pure False
 goneOn stop k = do
   stopped <-
-    CML.sync
-      (CML.choose
-         [ CML.wrap (CML.readIVarEvt stop) (\u -> (True : Bool))
-         , CML.always (False : Bool)
-         ])
+    CML.choose
+      [ do
+        CML.readIVar stop
+        pure (True : Bool)
+      , pure (False : Bool)
+      ]
   if stopped then pure True else goneOn stop (k - 1)
 
 -- | a thread spawning one that tells main, kept in the slot of the
@@ -237,6 +292,7 @@ said = do
   p <- pinged
   s <- summed
   c <- chosen
+  n <- nested
   g <- guarded
   wr <- wrapped
   xs <- shared
@@ -247,6 +303,7 @@ said = do
       [ "pinged: " ^ debug p
       , "summed from 100 senders: " ^ debug s
       , "chosen: " ^ fst c ^ ", b told: " ^ (if snd c then "yes" else "no")
+      , "nested: " ^ fst n ^ ", a told: " ^ (if snd n then "yes" else "no")
       , "guard ran: " ^ unwords (List.map debug g)
       , "wrapped: " ^ debug wr
       , "ivar read by 3: " ^ unwords (List.map debug xs)
