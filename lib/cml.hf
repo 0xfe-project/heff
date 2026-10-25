@@ -85,22 +85,35 @@
 -- The threads are the scheduler's, a handler in the language, and the
 -- domains are their workers: a thread is a resumption, run by a
 -- worker from where it stopped to where it next ends, gives up its
--- turn (`yield`), or waits in a `sync`, and the worker takes the next
--- thread ready (one queue under a mutex, the workers waiting on a
--- condition while it is empty).  A `sync` that waits leaves an offer
--- at each of its base events' channels and ivars: one cell
+-- turn (`yield`), or waits in a `sync`.  A thread readied by one a
+-- worker runs -- spawned, or met by its `sync` -- is kept in that
+-- worker's slot, the next it runs, where the slot is empty, and no
+-- domain is woken for it: a thread that hands a value on and then
+-- waits hands its domain on to the one it readied, no domain waking
+-- and no mutex taken.  The others ready are in one queue under a
+-- mutex, which a worker takes from when its slot is empty, waiting on
+-- a condition while the queue is empty too; a domain waiting there is
+-- woken for each put in, where one waits.  A worker that has run 64
+-- (`batchLimit`) from its slot in a row puts the next behind those in
+-- the queue, where any are, so that they are not passed over; one with
+-- nothing to do takes a thread from another's slot before it waits;
+-- and a thread's slot is emptied into the queue before an operation of
+-- the world's, which may hold its domain a while.  `yield` puts the
+-- thread behind those ready, in its slot only where none is.  A `sync`
+-- that waits leaves an offer at each of its base events' channels and
+-- ivars: one cell
 -- (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
 -- whichever other `sync` meets one of them first, which readies the
 -- waiting thread with what came; so a waiting thread occupies no
 -- worker, and a `choose` commits one base event at most.  What a
--- readied thread does next is left to the worker that takes it (the
--- continuation is put among those ready unapplied, `deferred`): the
--- one readying it applies nothing of another thread's, and holds no
--- mutex while a thread computes.  A `sync` holds the mutexes of its
--- channels and ivars, each once, in the order of their numbers, from
--- looking for a partner until its offers are left, so that no `sync`
--- misses a partner leaving its offer meanwhile, and none waits for
--- another round a cycle; with them held it first asks of each base
+-- readied thread does next is left to the worker that takes it (its
+-- turn is a function of that worker, its continuation unapplied until
+-- then): the one readying it applies nothing of another thread's, and
+-- holds no mutex while a thread computes.  A `sync` holds the mutexes
+-- of its channels and ivars, each once, in the order of their numbers,
+-- from looking for a partner until its offers are left, so that no
+-- `sync` misses a partner leaving its offer meanwhile, and none waits
+-- for another round a cycle; with them held it first asks of each base
 -- event whether it can be committed, claiming nothing, then draws one
 -- of those that can and claims its partner -- where the partner's offer
 -- was claimed meanwhile, through another channel, that one is dropped
@@ -113,16 +126,18 @@
 -- dropped as they are met).  The draws are a linear congruential
 -- sequence, its last kept in one cell of the scheduler's, so that in
 -- JavaScript, where one domain takes turns, a program draws the same
--- each run.  `scheduled` counts the
--- threads running or ready, one more for a thread as it is readied
+-- each run.  `scheduled` counts the threads running or ready, one more
+-- for a thread as it is readied
 -- (before the one readying it may itself wait), one fewer for one that
 -- waits or ends: at none left before main is done every thread waits
 -- in a `sync`, a deadlock, and it comes to `Nothing`.  Main's answer
 -- ends it all, the other threads dropped where they stopped.  A
 -- thread gives up its domain at its operations alone: long pure work
 -- in a thread holds its domain until it comes to one, and the other
--- threads there wait for it.  A computation held by an operation of
--- `w` (`Domain.spawn c` holds `c`) is run alone, as the operation does
+-- threads there wait for it -- the one in its slot too, until a domain
+-- with nothing to do takes it, or the thread comes to an operation of
+-- the world's.  A computation held by an operation of `w`
+-- (`Domain.spawn c` holds `c`) is run alone, as the operation does
 -- it: its `spawn`s, channels and ivars are the scheduler's, but a
 -- `sync` in it has no thread to meet, and is abandoned unless an
 -- `always` is among its base events.  A thread that fails fails its
@@ -158,6 +173,82 @@ import co
 import std.deque as Deque
 import std.domain as Domain
 
+-- Turns
+--------------------------------------------------------------------------------
+
+-- (a worker's slot, for the turn it is to take next: whether it holds
+-- one -- `slotEmpty`, `slotHeld`, or `slotChanging` while a domain puts
+-- one in or takes it out -- and the turn, the thread run from where it
+-- stopped, given the worker that takes it)
+data Slot (w : HFunctor)
+  = MkSlot (Domain.Atomic Int) (Domain.Atomic
+                                  (Maybe
+                                     (Maybe (Slot w)
+                                      -> Co w Unit)))
+
+-- (where a thread is readied from: a worker, as its slot; or none, a
+-- computation run alone or `scheduled` starting main)
+type Runner (w : HFunctor) = Maybe (Slot w)
+
+-- (a thread's turn, readied: the thread run from where it stopped,
+-- given the worker that takes it)
+type Turn (w : HFunctor) = Runner w -> Co w Unit
+
+slotEmpty : Int
+slotEmpty = 0
+
+slotHeld : Int
+slotHeld = 1
+
+slotChanging : Int
+slotChanging = 2
+
+-- (an empty slot)
+slotMade : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Co w (Slot w)
+slotMade = do
+  state <- Domain.newAtomic slotEmpty
+  held <- Domain.newAtomic (Nothing : Maybe (Turn w))
+  pure (MkSlot state held)
+
+-- (whether the slot holds a turn, as far as this domain sees now)
+isHolding : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Slot w -> Co w Bool
+isHolding (MkSlot state held) = do
+  s <- Domain.get state
+  pure (s == slotHeld)
+
+-- (the turn kept in the slot, where it is empty: whether it was.  By
+-- the slot's worker alone, so that a slot found empty stays so until
+-- this fills it: the other domains only take out what a slot holds)
+keptIn : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Slot w
+       -> Turn w
+       -> Co w Bool
+keptIn (MkSlot state held) t = do
+  s <- Domain.get state
+  if s == slotEmpty
+  then do
+    Domain.set held (Just t)
+    Domain.set state slotHeld
+    pure True
+  else pure False
+
+-- (the turn the slot holds, taken out, where it holds one and no other
+-- domain is taking it meanwhile)
+takenFrom : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Slot w
+          -> Co w (Maybe (Turn w))
+takenFrom (MkSlot state held) = do
+  ok <- Domain.cas state slotHeld slotChanging
+  if ok
+  then do
+    t <- Domain.get held
+    Domain.set held (Nothing : Maybe (Turn w))
+    Domain.set state slotEmpty
+    pure t
+  else pure Nothing
+
 -- Offers, channels and ivars
 --------------------------------------------------------------------------------
 
@@ -168,12 +259,13 @@ import std.domain as Domain
 data Offer = MkOffer (Domain.Atomic Bool)
 
 -- (a sender waiting at a channel: its offer, the value, and what
--- readies its thread once a receiver has taken it)
-data Sender (w : HFunctor) a = MkSender Offer a (Co w Unit)
+-- readies its thread once a receiver has taken it, given where the
+-- receiver runs)
+data Sender (w : HFunctor) a = MkSender Offer a (Runner w -> Co w Unit)
 
 -- (a receiver waiting at a channel or an ivar: its offer, and what
--- readies its thread, given the value)
-data Receiver (w : HFunctor) a = MkReceiver Offer (a -> Co w Unit)
+-- readies its thread, given the value and where the one giving it runs)
+data Receiver (w : HFunctor) a = MkReceiver Offer (a -> Runner w -> Co w Unit)
 
 -- (those waiting at a channel or an ivar, the longest first: a deque,
 -- an offer put at its back, the partner taken from among the first few
@@ -588,17 +680,20 @@ resFunctor w = { f = Res w, fmap = \g r -> thenRes r (\x -> RDone (g x)) }
 
 -- (what the domains running threads share: the next channel's or
 -- ivar's number; the last draw, which the next is made from; how many
--- threads are running or ready, which is 0 only
--- at a deadlock; the threads ready, a queue, its front and its back
--- reversed; the mutex they are taken under, the condition the domains
--- wait on for one, and the one the caller waits on until main is done
--- or every thread waits; whether that has come; and whether the
+-- threads are running or ready, which is 0 only at a deadlock; the
+-- turns ready that are in no worker's slot, a queue, its front and its
+-- back reversed; how many domains wait for one of them; the workers'
+-- slots; the mutex the turns ready are taken under, the condition the
+-- domains wait on for one, and the one the caller waits on until main
+-- is done or every thread waits; whether that has come; and whether the
 -- domains are to stop)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
   , draws : Domain.Atomic Int
   , live : Domain.Atomic Int
-  , ready : Domain.Atomic (Pair (List (Res w Unit)) (List (Res w Unit)))
+  , ready : Domain.Atomic (Pair (List (Turn w)) (List (Turn w)))
+  , idle : Domain.Atomic Int
+  , slots : List (Slot w)
   , mutex : Domain.Mutex
   , work : Domain.Condition
   , finished : Domain.Condition
@@ -606,18 +701,62 @@ type Sched (w : HFunctor) =
   , stopping : Domain.Atomic Bool
   }
 
--- (the thread put among those ready, a domain waiting for one woken)
+-- (the turn put at the back of those ready, the mutex held, a domain
+-- waiting for one woken, where one waits)
+queued : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> Turn w
+       -> Co w Unit
+queued st t = do
+  q <- Domain.get st.ready
+  Domain.set st.ready (MkPair (fst q) (t :: snd q))
+  waiting <- Domain.get st.idle
+  if waiting > 0 then Domain.signal st.work else pure ()
+
+-- (the turn put among those ready, for any domain to take)
 readied : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
-        -> Res w Unit
+        -> Turn w
         -> Co w Unit
-readied st r = do
+readied st t = do
   Domain.lock st.mutex
-  q <- Domain.get st.ready
-  Domain.set st.ready (MkPair (fst q) (r :: snd q))
-  Domain.signal st.work
+  queued st t
   Domain.unlock st.mutex
+
+-- (the turn readied from `runner`: kept in the worker's slot, its next,
+-- where it is a worker's and the slot is empty, no domain woken for it;
+-- else put among those ready)
+readiedOn : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
+          -> Runner w
+          -> Turn w
+          -> Co w Unit
+readiedOn st Nothing t = readied st t
+readiedOn st (Just slot) t = do
+  kept <- keptIn slot t
+  if kept then pure () else readied st t
+
+-- (the turn kept in the worker's slot, if one, put among those ready:
+-- before an operation of the world's, which may hold the domain a
+-- while)
+unkept : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> Runner w
+       -> Co w Unit
+unkept st Nothing = pure ()
+unkept st (Just slot) = do
+  holding <- isHolding slot
+  if holding
+  then do
+    t <- takenFrom slot
+    case t of
+      Just turn -> readied st turn
+      Nothing -> pure ()
+  else pure ()
 
 -- (one more thread running or ready)
 counted : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
@@ -647,22 +786,17 @@ uncounted st = do
   n <- Domain.fetchAdd st.live (0 - 1)
   if n == 1 then finishedWith st else pure ()
 
--- (the thread, waiting no more: counted, and among those ready)
+-- (the thread's turn, waiting no more, readied from `runner`: counted,
+-- and ready)
 readyAgain : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
-           -> Res w Unit
+           -> Runner w
+           -> Turn w
            -> Co w Unit
-readyAgain st r = do
+readyAgain st runner t = do
   counted st
-  readied st r
-
--- (the thread `f` comes to, computed by the worker that runs it, where
--- it does -- not where this is built: a thread readied by another is
--- put among those ready so, its continuation unapplied, so that the
--- one readying it runs none of its code, under no mutex)
-deferred : {w : HFunctor} -> {a : Type} -> (Unit -> Res w a) -> Res w a
-deferred f = RAct (later f)
+  readiedOn st runner t
 
 -- (a number from 0 to `n - 1`, pseudo-random: the scheduler's next
 -- draw, the step after the last of a linear congruential sequence,
@@ -716,28 +850,31 @@ madeIVar st = do
   readers <- Domain.newAtomic (Deque.empty : Deque.Deque (Receiver w a))
   pure (MkIVar n mu value readers)
 
--- (each reader whose offer is not yet claimed, claimed and readied,
--- given `v`)
+-- (each reader whose offer is not yet claimed, claimed and readied
+-- from `runner`, given `v`: the first in the worker's slot, where it is
+-- empty, the others among those ready)
 wokenAll : {w : HFunctor}
          -> {a : Type}
          -> {{dm : Domain.domain <: w}}
+         -> Runner w
          -> List (Receiver w a)
          -> a
          -> Co w Unit
-wokenAll Nil v = pure ()
-wokenAll (MkReceiver (MkOffer claimed) wake :: rest) v = do
+wokenAll runner Nil v = pure ()
+wokenAll runner (MkReceiver (MkOffer claimed) wake :: rest) v = do
   ok <- Domain.cas claimed False True
-  if ok then wake v else pure ()
-  wokenAll rest v
+  if ok then wake v runner else pure ()
+  wokenAll runner rest v
 
--- (the ivar holds `v` now, its readers woken; a second write abandoned:
--- what comes after)
+-- (the ivar holds `v` now, its readers woken from `runner`; a second
+-- write abandoned: what comes after)
 written : {w : HFunctor}
         -> {x a : Type}
         -> {{dm : Domain.domain <: w}}
+        -> Runner w
         -> Putting w x a
         -> Co w x
-written (MkPutting (MkIVar n mu value readers) v k) = do
+written runner (MkPutting (MkIVar n mu value readers) v k) = do
   Domain.lock mu
   held <- Domain.get value
   case held of
@@ -749,7 +886,7 @@ written (MkPutting (MkIVar n mu value readers) v k) = do
       rs <- Domain.get readers
       Domain.set readers Deque.empty
       Domain.unlock mu
-      wokenAll (Deque.toList rs) v
+      wokenAll runner (Deque.toList rs) v
       pure k
 
 -- (the offers at the front of those waiting that are stale -- claimed
@@ -889,40 +1026,44 @@ readyNow (b :: bs) = do
   pure (if can then b :: rest else rest)
 
 -- (a send committed, the channel's mutex held: a receiver waiting
--- claimed, given the value and readied, and what comes after for the
--- thread -- `Nothing` where no receiver's offer can be claimed)
+-- claimed, given the value and readied from `runner`, and what comes
+-- after for the thread -- `Nothing` where no receiver's offer can be
+-- claimed)
 committedSend : {w : HFunctor}
               -> {x a : Type}
               -> {{dm : Domain.domain <: w}}
               -> Sched w
+              -> Runner w
               -> SendOn w x a
               -> Co w (Maybe (Unit -> x))
-committedSend st (MkSendOn (MkChan n mu senders receivers) v k) = do
+committedSend st runner (MkSendOn (MkChan n mu senders receivers) v k) = do
   rs <- Domain.get receivers
   r <- claimedWaiter st receiverOffer rs
   Domain.set receivers (snd r)
   case fst r of
     Just (MkReceiver off wake) -> do
-      wake v
+      wake v runner
       pure (Just k)
     Nothing -> pure Nothing
 
 -- (a receive committed, the channel's mutex held: a sender waiting
--- claimed and readied, and what comes after for the thread, given its
--- value -- `Nothing` where no sender's offer can be claimed)
+-- claimed and readied from `runner`, and what comes after for the
+-- thread, given its value -- `Nothing` where no sender's offer can be
+-- claimed)
 committedRecv : {w : HFunctor}
               -> {x a : Type}
               -> {{dm : Domain.domain <: w}}
               -> Sched w
+              -> Runner w
               -> RecvOn w x a
               -> Co w (Maybe (Unit -> x))
-committedRecv st (MkRecvOn (MkChan n mu senders receivers) k) = do
+committedRecv st runner (MkRecvOn (MkChan n mu senders receivers) k) = do
   ss <- Domain.get senders
   r <- claimedWaiter st senderOffer ss
   Domain.set senders (snd r)
   case fst r of
     Just (MkSender off v wake) -> do
-      wake
+      wake runner
       pure (Just (\u -> k v))
     Nothing -> pure Nothing
 
@@ -940,20 +1081,22 @@ committedRead (MkReadOn (MkIVar n mu value readers) k) = do
     Nothing -> Nothing)
 
 -- (a base event committed, its mutex held, its partner, if one, claimed
--- and readied: `Just` what comes after it, to be computed once the
--- mutexes are let go of; `Nothing` where it cannot be now after all)
+-- and readied from `runner`: `Just` what comes after it, to be computed
+-- once the mutexes are let go of; `Nothing` where it cannot be now
+-- after all)
 committed : {w : HFunctor}
           -> {x : Type}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
+          -> Runner w
           -> Base w x
           -> Co w (Maybe (Unit -> x))
-committed st (AlwaysBase k) = pure (Just k)
-committed st (SendBase s) =
-  s (Co w (Maybe (Unit -> x))) (\a sd -> committedSend st sd)
-committed st (RecvBase s) =
-  s (Co w (Maybe (Unit -> x))) (\a rc -> committedRecv st rc)
-committed st (ReadBase s) =
+committed st runner (AlwaysBase k) = pure (Just k)
+committed st runner (SendBase s) =
+  s (Co w (Maybe (Unit -> x))) (\a sd -> committedSend st runner sd)
+committed st runner (RecvBase s) =
+  s (Co w (Maybe (Unit -> x))) (\a rc -> committedRecv st runner rc)
+committed st runner (ReadBase s) =
   s (Co w (Maybe (Unit -> x))) (\a rd -> committedRead rd)
 
 -- (one of the base events that can be committed now, drawn at random
@@ -965,18 +1108,19 @@ committedAmong : {w : HFunctor}
                -> {x : Type}
                -> {{dm : Domain.domain <: w}}
                -> Sched w
+               -> Runner w
                -> List (Base w x)
                -> Co w (Maybe (Unit -> x))
-committedAmong st Nil = pure Nothing
-committedAmong st (b :: Nil) = committed st b
-committedAmong st bs = do
+committedAmong st runner Nil = pure Nothing
+committedAmong st runner (b :: Nil) = committed st runner b
+committedAmong st runner bs = do
   i <- drawn st (List.length bs)
   case withoutIndex i bs of
     MkPair (Just b) others -> do
-      r <- committed st b
+      r <- committed st runner b
       case r of
         Just k -> pure (Just k)
-        Nothing -> committedAmong st others
+        Nothing -> committedAmong st runner others
     MkPair Nothing others -> pure Nothing
 
 -- (the base events, their mutexes held: those that can be committed now
@@ -987,36 +1131,41 @@ committedOne : {w : HFunctor}
              -> {x : Type}
              -> {{dm : Domain.domain <: w}}
              -> Sched w
+             -> Runner w
              -> List (Base w x)
              -> Co w (Maybe (Unit -> x))
-committedOne st bs = do
+committedOne st runner bs = do
   ready <- readyNow bs
   case ready of
     Nil -> pure Nothing
     _ -> do
-      r <- committedAmong st ready
+      r <- committedAmong st runner ready
       case r of
         Just k -> pure (Just k)
-        Nothing -> committedOne st bs
+        Nothing -> committedOne st runner bs
 
 -- (the thread's offer left at the base event's channel or ivar, its
--- mutex held, with what readies the thread there: its continuation,
--- left unapplied for the worker that takes it)
+-- mutex held, with what readies the thread there, from where its
+-- partner runs: its turn, `turnOf` its continuation -- left unapplied,
+-- for the worker that takes the turn)
 offered : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
+        -> ((Unit -> Res w Unit) -> Turn w)
         -> Offer
         -> Base w (Res w Unit)
         -> Co w Unit
-offered st off (AlwaysBase k) = pure ()
-offered st off (SendBase s) =
+offered st turnOf off (AlwaysBase k) = pure ()
+offered st turnOf off (SendBase s) =
   s (Co w Unit) (\a sd -> case sd of
     MkSendOn (MkChan n mu senders receivers) v k -> do
       ss <- Domain.get senders
       Domain.set
           senders
-          (Deque.pushBack ss (MkSender off v (readyAgain st (deferred k)))))
-offered st off (RecvBase s) =
+          (Deque.pushBack
+             ss
+             (MkSender off v (\on -> readyAgain st on (turnOf k)))))
+offered st turnOf off (RecvBase s) =
   s (Co w Unit) (\a rc -> case rc of
     MkRecvOn (MkChan n mu senders receivers) k -> do
       rs <- Domain.get receivers
@@ -1024,8 +1173,10 @@ offered st off (RecvBase s) =
           receivers
           (Deque.pushBack
              rs
-             (MkReceiver off (\v -> readyAgain st (deferred (\u -> k v))))))
-offered st off (ReadBase s) =
+             (MkReceiver
+                off
+                (\v on -> readyAgain st on (turnOf (\u -> k v))))))
+offered st turnOf off (ReadBase s) =
   s (Co w Unit) (\a rd -> case rd of
     MkReadOn (MkIVar n mu value readers) k -> do
       rs <- Domain.get readers
@@ -1033,18 +1184,21 @@ offered st off (ReadBase s) =
           readers
           (Deque.pushBack
              rs
-             (MkReceiver off (\v -> readyAgain st (deferred (\u -> k v))))))
+             (MkReceiver
+                off
+                (\v on -> readyAgain st on (turnOf (\u -> k v))))))
 
 offeredAll : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
+           -> ((Unit -> Res w Unit) -> Turn w)
            -> Offer
            -> List (Base w (Res w Unit))
            -> Co w Unit
-offeredAll st off Nil = pure ()
-offeredAll st off (b :: bs) = do
-  offered st off b
-  offeredAll st off bs
+offeredAll st turnOf off Nil = pure ()
+offeredAll st turnOf off (b :: bs) = do
+  offered st turnOf off b
+  offeredAll st turnOf off bs
 
 -- (the mutex of the base event's channel or ivar, with its number)
 lockOf : {w : HFunctor}
@@ -1101,20 +1255,23 @@ unlockedAll (l :: ls) = do
 -- another)
 data Stepped (w : HFunctor) = GoesOn (Res w Unit) | Stopped
 
--- (a sync: the mutexes of its base events held, one of those that can
--- be committed is, drawn at random where there are several, and the
--- thread goes on -- with what comes after computed once the mutexes
--- are let go of; where none can, the thread's offer is left at each,
--- and it waits, one fewer running)
+-- (a sync, on `runner`: the mutexes of its base events held, one of
+-- those that can be committed is, drawn at random where there are
+-- several, its partner readied from `runner`, and the thread goes on --
+-- with what comes after computed once the mutexes are let go of; where
+-- none can, the thread's offer is left at each, `turnOf` making its
+-- turn there, and it waits, one fewer running)
 synced : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
+       -> ((Unit -> Res w Unit) -> Turn w)
+       -> Runner w
        -> List (Base w (Res w Unit))
        -> Co w (Stepped w)
-synced st bs = do
+synced st turnOf runner bs = do
   let locks = locksOf bs
   lockedAll locks
-  r <- committedOne st bs
+  r <- committedOne st runner bs
   case r of
     Just k -> do
       unlockedAll locks
@@ -1122,10 +1279,88 @@ synced st bs = do
       pure (GoesOn next)
     Nothing -> do
       claimed <- Domain.newAtomic False
-      offeredAll st (MkOffer claimed) bs
+      offeredAll st turnOf (MkOffer claimed) bs
       unlockedAll locks
       uncounted st
       pure Stopped
+
+-- (a thread's turn given up, on `runner`: the worker's next where no
+-- other turn is ready -- its slot empty, and none among those ready --
+-- else put behind those ready, so that they go first)
+yielded : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Runner w
+        -> Turn w
+        -> Co w Unit
+yielded st Nothing t = readied st t
+yielded st (Just slot) t = do
+  Domain.lock st.mutex
+  q <- Domain.get st.ready
+  case q of
+    MkPair Nil Nil -> do
+      kept <- keptIn slot t
+      if kept then pure () else queued st t
+    _ -> queued st t
+  Domain.unlock st.mutex
+
+-- (a thread's step, on `runner`: where it stopped, what the scheduler
+-- does there, `turnOf` making the turns of the threads it readies)
+stepped : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> ((Unit -> Res w Unit) -> Turn w)
+        -> Runner w
+        -> Res w Unit
+        -> Co w (Stepped w)
+stepped st turnOf runner (RDone u) = do
+  uncounted st
+  pure Stopped
+stepped st turnOf runner (RAct m) = do
+  unkept st runner
+  bind m (\r -> pure (GoesOn r))
+stepped st turnOf runner (RStep (Spawn c k)) = do
+  readyAgain st runner (turnOf (\u -> c))
+  pure (GoesOn k)
+stepped st turnOf runner (RStep (Yield k)) = do
+  yielded st runner (turnOf (\u -> k))
+  pure Stopped
+stepped st turnOf runner (RStep (NewChan s)) =
+  s (Co w (Stepped w)) (\a mk -> case mk of
+    MkMakingChan k -> bind (madeChan st) (\ch -> pure (GoesOn (k ch))))
+stepped st turnOf runner (RStep (NewIVar s)) =
+  s (Co w (Stepped w)) (\a mk -> case mk of
+    MkMakingIVar k -> bind (madeIVar st) (\iv -> pure (GoesOn (k iv))))
+stepped st turnOf runner (RStep (PutIVar s)) =
+  s (Co w (Stepped w)) (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
+stepped st turnOf runner (RStep (Sync bs)) = synced st turnOf runner bs
+
+-- (a thread run, on `runner`, from where it stopped until it ends,
+-- waits, or gives up its turn, `turnOf` making the turns of the threads
+-- it readies)
+ranOn : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> ((Unit -> Res w Unit) -> Turn w)
+      -> Runner w
+      -> Res w Unit
+      -> Co w Unit
+ranOn st turnOf runner r = do
+  s <- stepped st turnOf runner r
+  case s of
+    GoesOn next -> ranOn st turnOf runner next
+    Stopped -> pure ()
+
+-- (a thread run, on `runner`, from where it stopped until it ends,
+-- waits, or gives up its turn; the turns of the threads it readies run
+-- them so, on the worker that takes each)
+run : {w : HFunctor}
+    -> {{dm : Domain.domain <: w}}
+    -> Sched w
+    -> Runner w
+    -> Res w Unit
+    -> Co w Unit
+run st runner r = ranOn st (\k on -> run st on (k MkUnit)) runner r
 
 -- (what comes after the first `always` among the base events, if one)
 firstAlways : {w : HFunctor} -> {x : Type} -> List (Base w x) -> Maybe x
@@ -1135,8 +1370,9 @@ firstAlways (b :: bs) = firstAlways bs
 
 -- (a thread run alone to its end: what an operation of `w` holding
 -- computations is given, as `Domain.spawn c` holds `c`.  Its spawns,
--- channels and ivars are the scheduler's; a sync in it has no thread to
--- meet, and is abandoned unless an `always` is among its base events.)
+-- channels and ivars are the scheduler's, the threads it readies put
+-- among those ready; a sync in it has no thread to meet, and is
+-- abandoned unless an `always` is among its base events.)
 alone : {w : HFunctor}
       -> {a : Type}
       -> {{dm : Domain.domain <: w}}
@@ -1146,7 +1382,7 @@ alone : {w : HFunctor}
 alone st (RDone x) = pure x
 alone st (RAct m) = bind m (\r -> alone st r)
 alone st (RStep (Spawn c k)) = do
-  readyAgain st c
+  readyAgain st Nothing (\on -> run st on c)
   alone st k
 alone st (RStep (Yield k)) = alone st k
 alone st (RStep (NewChan s)) =
@@ -1156,7 +1392,7 @@ alone st (RStep (NewIVar s)) =
   s (Co w a) (\t mk -> case mk of
     MkMakingIVar k -> bind (madeIVar st) (\iv -> alone st (k iv)))
 alone st (RStep (PutIVar s)) =
-  s (Co w a) (\t p -> bind (written p) (\k -> alone st k))
+  s (Co w a) (\t p -> bind (written Nothing p) (\k -> alone st k))
 alone st (RStep (Sync bs)) = case firstAlways bs of
   Just k -> alone st k
   Nothing -> abandon
@@ -1185,91 +1421,144 @@ cmlHandler st =
   , malg = \p -> cmlAlg st p
   }
 
--- (a thread's step: where it stopped, what the scheduler does there)
-stepped : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Res w Unit
-        -> Co w (Stepped w)
-stepped st (RDone u) = do
-  uncounted st
-  pure Stopped
-stepped st (RAct m) = bind m (\r -> pure (GoesOn r))
-stepped st (RStep (Spawn c k)) = do
-  readyAgain st c
-  pure (GoesOn k)
-stepped st (RStep (Yield k)) = do
-  readied st k
-  pure Stopped
-stepped st (RStep (NewChan s)) =
-  s (Co w (Stepped w)) (\a mk -> case mk of
-    MkMakingChan k -> bind (madeChan st) (\ch -> pure (GoesOn (k ch))))
-stepped st (RStep (NewIVar s)) =
-  s (Co w (Stepped w)) (\a mk -> case mk of
-    MkMakingIVar k -> bind (madeIVar st) (\iv -> pure (GoesOn (k iv))))
-stepped st (RStep (PutIVar s)) =
-  s (Co w (Stepped w)) (\a p -> bind (written p) (\k -> pure (GoesOn k)))
-stepped st (RStep (Sync bs)) = synced st bs
+-- (how many turns in a row a worker takes from its slot, before it puts
+-- the next among those ready instead, so that the turns there are not
+-- passed over for ever)
+batchLimit : Int
+batchLimit = 64
 
--- (a thread run from where it stopped until it ends, waits, or gives up
--- its turn)
-run : {w : HFunctor}
+-- (the turn taken, on the worker whose slot this is, and after it the
+-- one left in its slot, and so on, `n` taken so far in a row: the
+-- limit reached, the next is put among those ready, where others are,
+-- to be taken after them; dropped once the domains are to stop)
+ran : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
-    -> Res w Unit
+    -> Slot w
+    -> Turn w
+    -> Int
     -> Co w Unit
-run st r = do
-  s <- stepped st r
-  case s of
-    GoesOn next -> run st next
-    Stopped -> pure ()
+ran st slot turn n = do
+  turn (Just slot)
+  next <- takenFrom slot
+  case next of
+    Nothing -> pure ()
+    Just t ->
+      if n < batchLimit then ran st slot t (n + 1)
+      else do
+        stop <- Domain.get st.stopping
+        q <- Domain.get st.ready
+        if stop then pure ()
+        else case q of
+          MkPair Nil Nil -> ran st slot t 1
+          _ -> readied st t
 
--- (the next thread ready, the mutex held: waiting for one while none
--- is; `Nothing` once the domains are to stop and none is left)
-taken : {w : HFunctor}
-      -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Co w (Maybe (Res w Unit))
-taken st = do
+-- (the first of the turns ready, taken out, the mutex held: `Nothing`
+-- where none is)
+dequeued : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> Co w (Maybe (Turn w))
+dequeued st = do
   q <- Domain.get st.ready
   case q of
     MkPair (x :: xs) back -> do
       Domain.set st.ready (MkPair xs back)
       pure (Just x)
-    MkPair Nil Nil -> do
-      stop <- Domain.get st.stopping
-      if stop then pure Nothing
-      else do
-        Domain.wait st.work st.mutex
-        taken st
+    MkPair Nil Nil -> pure Nothing
     MkPair Nil back -> do
       Domain.set st.ready (MkPair (List.reverse back) Nil)
-      taken st
+      dequeued st
 
--- (a domain running threads, each ready one it takes, until it is to
--- stop)
-worker : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
-worker st = do
+-- (a turn taken from one of the slots, the first found holding one)
+stolen : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> List (Slot w)
+       -> Co w (Maybe (Turn w))
+stolen Nil = pure Nothing
+stolen (slot :: slots) = do
+  holding <- isHolding slot
+  if holding
+  then do
+    t <- takenFrom slot
+    case t of
+      Just turn -> pure (Just turn)
+      Nothing -> stolen slots
+  else stolen slots
+
+-- (the next turn for a worker whose slot is empty, the mutex held: the
+-- first of those ready; else, `looked` not yet, one taken from another
+-- worker's slot, the mutex let go of meanwhile -- one there waits for a
+-- thread that goes on computing, or is held by an operation of the
+-- world's; else waiting for one, counted among the domains waiting;
+-- `Nothing` once the domains are to stop)
+taken : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Bool
+      -> Co w (Maybe (Turn w))
+taken st looked = do
+  stop <- Domain.get st.stopping
+  if stop then pure Nothing
+  else do
+    first <- dequeued st
+    case first of
+      Just t -> pure (Just t)
+      Nothing ->
+        if looked
+        then do
+          _ <- Domain.fetchAdd st.idle 1
+          Domain.wait st.work st.mutex
+          _ <- Domain.fetchAdd st.idle (0 - 1)
+          taken st False
+        else do
+          Domain.unlock st.mutex
+          other <- stolen st.slots
+          Domain.lock st.mutex
+          case other of
+            Just t -> pure (Just t)
+            Nothing -> taken st True
+
+-- (a domain running threads, each turn it takes and those left in its
+-- slot after, until it is to stop)
+worker : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> Slot w
+       -> Co w Unit
+worker st slot = do
   Domain.lock st.mutex
-  next <- taken st
+  next <- taken st False
   Domain.unlock st.mutex
   case next of
-    Just r -> do
-      run st r
-      worker st
+    Just t -> do
+      ran st slot t 1
+      worker st slot
     Nothing -> pure ()
 
+-- (a domain for each slot, its worker)
 workers : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
-        -> Int
+        -> List (Slot w)
         -> Co w (List (Domain.Domain Unit))
-workers st n =
+workers st Nil = pure Nil
+workers st (slot :: slots) = do
+  d <- Domain.spawn (worker st slot)
+  ds <- workers st slots
+  pure (d :: ds)
+
+-- (`n` empty slots)
+slotsMade : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Int
+          -> Co w (List (Slot w))
+slotsMade n =
   if n <= 0 then pure Nil
   else do
-    d <- Domain.spawn (worker st)
-    ds <- workers st (n - 1)
-    pure (d :: ds)
+    slot <- slotMade
+    slots <- slotsMade (n - 1)
+    pure (slot :: slots)
 
 joinedAll : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
@@ -1308,8 +1597,10 @@ scheduled c = do
   draws <- Domain.newAtomic 1
   live <- Domain.newAtomic 0
   ready <-
-    Domain.newAtomic
-      (MkPair Nil Nil : Pair (List (Res w Unit)) (List (Res w Unit)))
+    Domain.newAtomic (MkPair Nil Nil : Pair (List (Turn w)) (List (Turn w)))
+  idle <- Domain.newAtomic 0
+  n <- Domain.cores
+  slots <- slotsMade n
   mutex <- Domain.newMutex
   work <- Domain.newCondition
   finished <- Domain.newCondition
@@ -1320,6 +1611,8 @@ scheduled c = do
     , draws = draws
     , live = live
     , ready = ready
+    , idle = idle
+    , slots = slots
     , mutex = mutex
     , work = work
     , finished = finished
@@ -1335,9 +1628,8 @@ scheduled c = do
            Domain.set answer (Just x)
            finishedWith st
            pure (RDone MkUnit)))
-  readyAgain st main
-  n <- Domain.cores
-  ds <- workers st n
+  readyAgain st Nothing (\on -> run st on main)
+  ds <- workers st slots
   Domain.lock mutex
   idleUntilDone st
   Domain.set stopping True
