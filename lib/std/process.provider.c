@@ -1046,7 +1046,8 @@ static int heff_spawning = 0;
 static int heff_ending_now = 0;
 
 // (the program ended by a signal -- SIGINT, SIGTERM, SIGHUP, where
-// nothing else was to be done at it -- what it started and has not
+// nothing else was to be done at it: one std.signal's provider catches,
+// waited for, is not -- what it started and has not
 // ended asked to end too, then the signal as it was: ended as it would
 // have been)
 static void heff_subs_signal(int sig) {

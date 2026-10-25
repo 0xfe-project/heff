@@ -1,0 +1,158 @@
+-- Signals waited for (std.signal), by C alone: the test sends them, as
+-- the program says what it waits for, and holds it to what it says and
+-- how it ends.
+--
+--   plain      waits where it is: for SIGWINCH or SIGTERM, then, SIGWINCH
+--              come, for SIGTERM, which it stops on
+--   cml        a thread of cml's ticking, main doing each tick until
+--              SIGTERM or SIGINT, a `choose` of the two: stops on it
+--   unawaited  a command started (a shell sleeping), its pid said, then
+--              SIGINT waited for: SIGTERM, not waited for, ends the
+--              program, and the command with it
+
+module test.node.signalled
+
+import cml as CML
+import co
+import exception
+import std.domain as Domain
+import std.duration as Duration
+import std.io
+import std.process
+import std.reactor as Reactor
+import std.signal as Signal
+import std.time as Time
+
+-- (a line written now, for the test to see)
+said : {e : HFunctor} -> {{io : stdio <: e}} -> String -> Co e Unit
+said l = do
+  print l
+  flush
+
+plain : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{sg : Signal.signals <: e}}
+      -> Co e Unit
+plain = do
+  said "waiting"
+  s <- Signal.wait [WindowChanged, Terminate]
+  print ("got " ^ show s)
+  said "waiting for SIGTERM"
+  t <- Signal.wait [Terminate]
+  print ("stopping on " ^ show t)
+
+-- (a tick on `ch` every 20 ms, for ever)
+ticker : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> {{tm : Time.time <: e}}
+       -> CML.Chan w Int
+       -> Int
+       -> Co e Unit
+ticker ch n = do
+  Time.sleep (Duration.milliseconds 20)
+  CML.send ch n
+  ticker ch (n + 1)
+
+-- (each tick taken, "waiting" said after the first -- the signals
+-- caught by then -- until one of them comes)
+worked : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> {{sg : Signal.signals <: e}}
+       -> {{io : stdio <: e}}
+       -> CML.Chan w Int
+       -> Int
+       -> Co e Signal.Signal
+worked ticks n = do
+  next <-
+    (CML.choose
+       [ bind (CML.recv ticks) (\i -> pure (Right i))
+       , bind (Signal.wait [Terminate, Interrupt]) (\s -> pure (Left s))
+       ] :
+       Co e (Either Signal.Signal Int))
+  case next of
+    Right i -> do
+      if n == 0 then said "waiting" else pure ()
+      worked ticks (n + 1)
+    Left s -> pure s
+
+ticked : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
+       -> {{sg : Signal.signals <: e}}
+       -> {{io : stdio <: e}}
+       -> {{tm : Time.time <: e}}
+       -> Co e Signal.Signal
+ticked = do
+  ticks <- CML.newChan
+  CML.spawn (ticker ticks 0)
+  worked ticks 0
+
+inCml : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{dm : Domain.domain <: e}}
+      -> {{rx : Reactor.reactor <: e}}
+      -> {{tm : Time.time <: e}}
+      -> {{sg : Signal.signals <: e}}
+      -> Co e Unit
+inCml = do
+  r <-
+    CML.scheduledWithReactor
+      (ticked (w := e) (cm := _) (sg := _) (io := _) (tm := _))
+  case r of
+    Just s -> print ("stopping on " ^ show s)
+    Nothing -> print "every thread waiting"
+
+unawaited : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{ex : exception ProcessError <: e}}
+          -> {{sg : Signal.signals <: e}}
+          -> Co e Unit
+unawaited =
+  withProcess
+    { command = "sh"
+    , args = ["-c", "echo $$; exec sleep 30"]
+    , output = Piped
+    } (\c -> do
+    r <- readOutput c (Through "\n") 10000
+    case r of
+      Got b -> said ("child " ^ trim (bytesToString b))
+      _ -> said "no child"
+    _ <- Signal.wait [Interrupt]
+    print "not here")
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> {{rx : Reactor.reactor <: e}}
+        -> {{tm : Time.time <: e}}
+        -> {{sg : Signal.signals <: e}}
+        -> Co e Unit
+program = do
+  given <- args
+  case given of
+    ["cml"] -> inCml
+    ["unawaited"] -> do
+      r <-
+        attempt
+          ProcessError
+          (unawaited
+             (e := exception ProcessError <+> e)
+             (io := _)
+             (sys := _)
+             (ex := _)
+             (sg := _))
+      case r of
+        Left err -> print (show err)
+        Right u -> pure ()
+    _ -> plain
+
+main : Co
+       (stdio
+        <+> process
+        <+> Domain.domain
+        <+> Reactor.reactor
+        <+> Time.time
+        <+> Signal.signals)
+       Unit
+main = program (io := _) (sys := _) (dm := _) (rx := _) (tm := _) (sg := _)

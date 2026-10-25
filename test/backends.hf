@@ -2384,6 +2384,88 @@ cmlProcess = do
          { out = Just "3 sleeps waited for at once\n", err = Just "" }
          r)
 
+-- | signals waited for, by C alone (std.signal): the program run by sh,
+-- | in the background, sent each signal once it says it waits for it --
+-- | SIGWINCH again until it is heard, as one sent before the program
+-- | waits is let go of; what it says and how it ends, sh's to say
+signals : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+signals = do
+  bin <- built "test/node/signalled.hf" "main" Nil ""
+  let started : String -> String = \mode ->
+        "o=\"$0." ^ mode ^ ".out\"; \"$0\" " ^ mode ^ " > \"$o\" 2>&1 & p=$!\n"
+        ^ "seen() { grep -q \"$1\" \"$o\"; }\n"
+        ^ "alive() { kill -0 $p 2>/dev/null; }\n"
+        ^ "until seen '^waiting$' || seen '^child ' || ! alive; do sleep 0.02; done\n"
+  let ended = "wait $p; s=$?; sed 's/^child .*/child/' \"$o\"; echo \"status $s\"\n"
+  plain <-
+    run
+      { command = "sh"
+      , args =
+          [ "-c"
+          , started "plain"
+            ^ "while ! seen '^got' && alive; do kill -WINCH $p; sleep 0.05; done\n"
+            ^ "until seen 'for SIGTERM' || ! alive; do sleep 0.02; done\n"
+            ^ "kill -TERM $p; "
+            ^ ended
+          , bin
+          ]
+      , timeout = 60000
+      }
+  inCml <-
+    run
+      { command = "sh"
+      , args = ["-c", started "cml" ^ "kill -INT $p; " ^ ended, bin]
+      , timeout = 60000
+      }
+  unawaited <-
+    run
+      { command = "sh"
+      , args =
+          [ "-c"
+          , started "unawaited"
+            ^ "c=$(sed -n 's/^child //p' \"$o\")\n"
+            ^ "kill -TERM $p; "
+            ^ ended
+            ^ "i=0; while kill -0 $c 2>/dev/null && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done\n"
+            ^ "if kill -0 $c 2>/dev/null; then echo 'the command runs still'; else echo 'the command ended'; fi\n"
+          , bin
+          ]
+      , timeout = 60000
+      }
+  failingWith
+      (List.append
+         (against
+            "waited for where it is"
+            { out =
+                Just
+                  (linesOf
+                     [ "waiting"
+                     , "got SIGWINCH"
+                     , "waiting for SIGTERM"
+                     , "stopping on SIGTERM"
+                     , "status 0"
+                     ])
+            , err = Just ""
+            }
+            plain)
+         (List.append
+            (against
+               "in a choose of cml's"
+               { out = Just (linesOf ["waiting", "stopping on SIGINT", "status 0"])
+               , err = Just ""
+               }
+               inCml)
+            (against
+               "not waited for"
+               -- (sh may say on its error stream that the program was
+               -- terminated)
+               { out = Just (linesOf ["child", "status 143", "the command ended"]) }
+               unawaited)))
+
 -- | TCP sockets, by C alone (std.net): a connection to a listener of
 -- | the program's own at the port the test picked, each side echoing
 -- | the other, one side shut down, then closed; a port the system picks,
@@ -3706,6 +3788,7 @@ backends =
       , withinTime 180000 (integration "threaded stdin" threadedStdin)
       , withinTime 180000 (integration "cml process" cmlProcess)
       , integration "sockets" sockets
+      , withinTime 180000 (integration "signals" signals)
       , withinTime 180000 (integration "cml sockets" cmlSockets)
       , withinTime 180000 (integration "cml http" cmlHttp)
       , withinTime 180000 (integration "timeouts" timeouts)

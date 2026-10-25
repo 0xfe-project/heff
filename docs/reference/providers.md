@@ -21,7 +21,7 @@ library declares them.
 
 - `lib/std/`'s effects are the system's, with C providers: `std.io`,
   `std.filesystem`, `std.process`, `std.progress`, `std.http`,
-  `std.net`, `std.thread`, `std.reactor`, `std.terminal`.
+  `std.net`, `std.thread`, `std.reactor`, `std.signal`, `std.terminal`.
 - `std.reference` and `std.time` have both a C and a JavaScript
   provider.
 - `lib/browser/`'s are the browser's, JavaScript only: `browser.dom`,

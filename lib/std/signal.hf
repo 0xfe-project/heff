@@ -1,0 +1,116 @@
+-- For signals: the ones a program is sent -- Ctrl-C, a `kill`, its
+-- terminal closed or resized -- waited for, each a thing that happens
+-- outside it, as a read of a socket is.  The C backend's alone, and not
+-- on Windows.  Import it by a name, `import std.signal as Signal`.
+--
+-- ```haskell
+-- import cml as CML
+-- import co
+-- import std.io
+-- import std.signal as Signal
+--
+-- -- | what comes on `jobs` done, until SIGTERM or Ctrl-C: then said so,
+-- -- | and stopped
+-- worked : {e w : HFunctor}
+--        -> {{cm : CML.cml w <: e}}
+--        -> {{sg : Signal.signals <: e}}
+--        -> {{io : stdio <: e}}
+--        -> CML.Chan w String
+--        -> Co e Unit
+-- worked jobs = do
+--   next <-
+--     (CML.choose
+--        [ bind (CML.recv jobs) (\job -> pure (Right job))
+--        , bind (Signal.wait [Terminate, Interrupt]) (\s -> pure (Left s))
+--        ]
+--      : Co e (Either Signal.Signal String))
+--   case next of
+--     Right job -> do
+--       print ("done: " ^ job)
+--       worked jobs
+--     Left s -> print ("stopping on " ^ show s)
+-- ```
+--
+-- A signal waited for is the program's from then on: it no longer ends
+-- the program (nor is it ignored, where it was, as `nohup` has SIGHUP),
+-- and one that comes while no wait for it is pending is kept, given to
+-- the next -- so a loop that waits again each round misses none.  A
+-- signal never waited for is as it was: Ctrl-C, SIGTERM and SIGHUP end
+-- the program, and the commands std.process started with it.  A program
+-- that stops on one it waited for ends as it ends otherwise, its
+-- commands ended at its end.
+--
+-- A wait is an outside operation of std.reactor's: in a thread of cml's
+-- `scheduledWithReactor` it is pending while the other threads go on --
+-- and in a `choose`, a base event, let go of where another branch is
+-- committed, the signal it was given, if any, kept for the next wait.
+-- Elsewhere the program waits where it is.
+
+module std.signal (Signal(..), instanceShowSignal, SignalF, signals, wait)
+
+import co
+
+-- | A signal: Ctrl-C (SIGINT); asked to end (SIGTERM), as `kill` and a
+-- | service manager ask; its terminal closed (SIGHUP); Ctrl-\ (SIGQUIT);
+-- | the two left to programs (SIGUSR1, SIGUSR2); its terminal resized
+-- | (SIGWINCH).
+data Signal
+  = Interrupt
+  | Terminate
+  | Hangup
+  | Quit
+  | User1
+  | User2
+  | WindowChanged
+
+-- | Its name, as the system's tools say it.
+-- | >>> show (Terminate : Signal)
+-- | "SIGTERM"
+instance instanceShowSignal : Show Signal
+instanceShowSignal =
+  { show = \s -> case s of
+      Interrupt -> "SIGINT"
+      Terminate -> "SIGTERM"
+      Hangup -> "SIGHUP"
+      Quit -> "SIGQUIT"
+      User1 -> "SIGUSR1"
+      User2 -> "SIGUSR2"
+      WindowChanged -> "SIGWINCH"
+  }
+
+-- (as the provider numbers them)
+numberOf : Signal -> Int
+numberOf Interrupt = 0
+numberOf Terminate = 1
+numberOf Hangup = 2
+numberOf Quit = 3
+numberOf User1 = 4
+numberOf User2 = 5
+numberOf WindowChanged = 6
+
+signalOf : Int -> Signal
+signalOf 0 = Interrupt
+signalOf 1 = Terminate
+signalOf 2 = Hangup
+signalOf 3 = Quit
+signalOf 4 = User1
+signalOf 5 = User2
+signalOf _ = WindowChanged
+
+data SignalF (m : Type -> Type) x = WaitFor (List Int) (Int -> x)
+
+-- | For signals: waits for the first of some to come.
+signals : HFunctor
+signals =
+  { f = SignalF
+  , hfmap = \m g p -> case p of
+      WaitFor l k -> WaitFor l (\i -> g (k i))
+  , hmap = \m n nt p -> case p of
+      WaitFor l k -> WaitFor l k
+  }
+
+-- | The first of the signals to come -- one kept since it came, where
+-- | there is, else the next -- each the program's from now on (of none,
+-- | it waits for ever).
+wait : {e : HFunctor} -> {{sg : signals <: e}} -> List Signal -> Co e Signal
+wait l = op (sg (WaitFor (List.map numberOf l) signalOf)) val
