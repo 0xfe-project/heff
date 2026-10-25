@@ -56,7 +56,7 @@
 -- `putIVar iv x` | `iv` holds `x` now, its readers given it; once, a second put abandons; never waits
 -- `readIVar iv` / `readIVarEvt iv` | what `iv` holds, waiting until it does; ... as an event
 -- `always x` / `never` | an event ready at once, coming to `x`; one never ready
--- `choose evs` | one of the events: whichever is ready, the first of them where several are
+-- `choose evs` | one of the events: whichever is ready, one of them at random where several are
 -- `wrap ev f` | `ev`, coming to `f` of what `ev` came to
 -- `guard c` | the event `c` comes to, `c` run at each `sync`
 -- `withNack f` | `f`'s event, `f` given one that is ready once a `sync` chose another over it
@@ -71,10 +71,12 @@
 -- `withNack`), on this thread, and so comes to the base events; where
 -- one of them can be committed now -- a sender waiting at the channel
 -- of a `recvEvt`, a receiver at the channel of a `sendEvt`, an ivar
--- written, an `always` -- it is, the first such in the order of the
--- `choose`, and the thread goes on with what it comes to; else the
--- thread waits at every one of them, and goes on when another's
--- `sync` meets one.  Then each `withNack`'s nack event is ready, where
+-- written, an `always` -- it is, one of them drawn at random where
+-- several can (as Reppy's CML and Racket's `sync` choose: no branch of
+-- a `choose` has priority over another), and the thread goes on with
+-- what it comes to; else the thread waits at every one of them, and
+-- goes on when another's `sync` meets one.  Then each `withNack`'s
+-- nack event is ready, where
 -- the base event committed was not among that `withNack`'s: the other
 -- branches told they were not chosen.  `Event w e a` is of threads run
 -- in the world `w` (as its channels, `Chan w a`), its guards run in
@@ -90,11 +92,28 @@
 -- (`Domain.Atomic`) for all of them, claimed once, by `Domain.cas`, by
 -- whichever other `sync` meets one of them first, which readies the
 -- waiting thread with what came; so a waiting thread occupies no
--- worker, and a `choose` commits one base event at most.  A `sync`
--- holds the mutexes of its channels and ivars, each once, in the order
--- of their numbers, from looking for a partner until its offers are
--- left, so that no `sync` misses a partner leaving its offer meanwhile,
--- and none waits for another round a cycle.  `scheduled` counts the
+-- worker, and a `choose` commits one base event at most.  What a
+-- readied thread does next is left to the worker that takes it (the
+-- continuation is put among those ready unapplied, `deferred`): the
+-- one readying it applies nothing of another thread's, and holds no
+-- mutex while a thread computes.  A `sync` holds the mutexes of its
+-- channels and ivars, each once, in the order of their numbers, from
+-- looking for a partner until its offers are left, so that no `sync`
+-- misses a partner leaving its offer meanwhile, and none waits for
+-- another round a cycle; with them held it first asks of each base
+-- event whether it can be committed, claiming nothing, then draws one
+-- of those that can and claims its partner -- where the partner's offer
+-- was claimed meanwhile, through another channel, that one is dropped
+-- and another drawn.  The offers waiting at a channel are a deque (one
+-- step to put at the back, however many wait); the partner is drawn
+-- from among the first few unclaimed at its front (`window`, 4), the
+-- others put back before the rest in their order, so that the choice
+-- among several waiting is not first come first served, yet every
+-- waiter reaches the front and is met (offers found claimed are
+-- dropped as they are met).  The draws are a linear congruential
+-- sequence, its last kept in one cell of the scheduler's, so that in
+-- JavaScript, where one domain takes turns, a program draws the same
+-- each run.  `scheduled` counts the
 -- threads running or ready, one more for a thread as it is readied
 -- (before the one readying it may itself wait), one fewer for one that
 -- waits or ends: at none left before main is done every thread waits
@@ -136,6 +155,7 @@ module cml
   )
 
 import co
+import std.deque as Deque
 import std.domain as Domain
 
 -- Offers, channels and ivars
@@ -155,10 +175,33 @@ data Sender (w : HFunctor) a = MkSender Offer a (Co w Unit)
 -- readies its thread, given the value)
 data Receiver (w : HFunctor) a = MkReceiver Offer (a -> Co w Unit)
 
--- (those waiting at a channel or an ivar, the longest first)
-type Senders (w : HFunctor) a = Domain.Atomic (List (Sender w a))
+-- (those waiting at a channel or an ivar, the longest first: a deque,
+-- an offer put at its back, the partner taken from among the first few
+-- at its front)
+type Senders (w : HFunctor) a = Domain.Atomic (Deque.Deque (Sender w a))
 
-type Receivers (w : HFunctor) a = Domain.Atomic (List (Receiver w a))
+type Receivers (w : HFunctor) a = Domain.Atomic (Deque.Deque (Receiver w a))
+
+-- (the offer of a sender, and of a receiver)
+senderOffer : {w : HFunctor} -> {a : Type} -> Sender w a -> Offer
+senderOffer (MkSender off v wake) = off
+
+receiverOffer : {w : HFunctor} -> {a : Type} -> Receiver w a -> Offer
+receiverOffer (MkReceiver off wake) = off
+
+-- (whether the offer has been claimed)
+isClaimed : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Offer
+          -> Co w Bool
+isClaimed (MkOffer claimed) = Domain.get claimed
+
+-- (the offer claimed, where it was not yet: whether it was, by this)
+claimedOffer : {w : HFunctor}
+             -> {{dm : Domain.domain <: w}}
+             -> Offer
+             -> Co w Bool
+claimedOffer (MkOffer claimed) = Domain.cas claimed False True
 
 -- | A channel of `a`s, of threads run in the world `w`: a rendezvous,
 -- | a sender and a receiver each waiting for the other.  (Its number,
@@ -220,18 +263,22 @@ readOnThen : {w : HFunctor}
 readOnThen g (MkReadOn iv k) = MkReadOn iv (\v -> g (k v))
 
 -- (a base event, and what comes after it, an `x`: a send, a receive, an
--- ivar's read, or one ready at once)
+-- ivar's read, or one ready at once.  What comes after is a function
+-- in each, computed where the event commits, not where a continuation
+-- is put after it: an always of a `choose` with what comes after it
+-- computed at once would compute the next sync's, and its always's
+-- theirs, every branch of every sync to come)
 data Base (w : HFunctor) x
   = SendBase (Some (SendOn w x))
   | RecvBase (Some (RecvOn w x))
   | ReadBase (Some (ReadOn w x))
-  | AlwaysBase x
+  | AlwaysBase (Unit -> x)
 
 baseThen : {w : HFunctor} -> {x y : Type} -> (x -> y) -> Base w x -> Base w y
 baseThen g (SendBase s) = SendBase (someThen (sendOnThen g) s)
 baseThen g (RecvBase s) = RecvBase (someThen (recvOnThen g) s)
 baseThen g (ReadBase s) = ReadBase (someThen (readOnThen g) s)
-baseThen g (AlwaysBase x) = AlwaysBase (g x)
+baseThen g (AlwaysBase k) = AlwaysBase (\u -> g (k u))
 
 -- Events
 --------------------------------------------------------------------------------
@@ -360,7 +407,7 @@ putIVar iv v = op (cm (PutIVar (\r use -> use a (MkPutting iv v MkUnit)))) val
 
 -- | An event ready at once, coming to `v`.
 always : {w e : HFunctor} -> {a : Type} -> a -> Event w e a
-always v = Primitive (AlwaysBase v)
+always v = Primitive (AlwaysBase (\u -> v))
 
 -- | An event never ready: a `sync` of it alone waits for ever.
 never : {w e : HFunctor} -> {a : Type} -> Event w e a
@@ -380,9 +427,9 @@ recvEvt ch = Primitive (RecvBase (\r use -> use a (MkRecvOn ch (\v -> v))))
 readIVarEvt : {w e : HFunctor} -> {a : Type} -> IVar w a -> Event w e a
 readIVarEvt iv = Primitive (ReadBase (\r use -> use a (MkReadOn iv (\v -> v))))
 
--- | One of the events, whichever a `sync` can commit: the first of
--- | them where several can be, and where none can, whichever is met
--- | first.
+-- | One of the events, whichever a `sync` can commit: one of them
+-- | drawn at random where several can be, none with priority over
+-- | another, and where none can, whichever is met first.
 choose : {w e : HFunctor} -> {a : Type} -> List (Event w e a) -> Event w e a
 choose evs = Choice evs
 
@@ -540,14 +587,16 @@ resFunctor w = { f = Res w, fmap = \g r -> thenRes r (\x -> RDone (g x)) }
 --------------------------------------------------------------------------------
 
 -- (what the domains running threads share: the next channel's or
--- ivar's number; how many threads are running or ready, which is 0
--- only at a deadlock; the threads ready, a queue, its front and its
--- back reversed; the mutex they are taken under, the condition the
--- domains wait on for one, and the one the caller waits on until main
--- is done or every thread waits; whether that has come; and whether
--- the domains are to stop)
+-- ivar's number; the last draw, which the next is made from; how many
+-- threads are running or ready, which is 0 only
+-- at a deadlock; the threads ready, a queue, its front and its back
+-- reversed; the mutex they are taken under, the condition the domains
+-- wait on for one, and the one the caller waits on until main is done
+-- or every thread waits; whether that has come; and whether the
+-- domains are to stop)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
+  , draws : Domain.Atomic Int
   , live : Domain.Atomic Int
   , ready : Domain.Atomic (Pair (List (Res w Unit)) (List (Res w Unit)))
   , mutex : Domain.Mutex
@@ -608,6 +657,39 @@ readyAgain st r = do
   counted st
   readied st r
 
+-- (the thread `f` comes to, computed by the worker that runs it, where
+-- it does -- not where this is built: a thread readied by another is
+-- put among those ready so, its continuation unapplied, so that the
+-- one readying it runs none of its code, under no mutex)
+deferred : {w : HFunctor} -> {a : Type} -> (Unit -> Res w a) -> Res w a
+deferred f = RAct (later f)
+
+-- (a number from 0 to `n - 1`, pseudo-random: the scheduler's next
+-- draw, the step after the last of a linear congruential sequence,
+-- Park and Miller's (the products under 2^47, so exact in JavaScript's
+-- numbers too, and a program there draws the same each run).  Two
+-- domains drawing at once may draw the same: the sequence is for
+-- fairness, not for secrecy, so the last is read and written, not
+-- swapped)
+drawn : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Int
+      -> Co w Int
+drawn st n = do
+  last <- Domain.get st.draws
+  let next : Int = (last * 48271) % 2147483647
+  Domain.set st.draws next
+  pure (next % n)
+
+-- (the `i`th of them, if there is one, and the others in their order)
+withoutIndex : {x : Type} -> Int -> List x -> Pair (Maybe x) (List x)
+withoutIndex i Nil = MkPair Nothing Nil
+withoutIndex 0 (y :: ys) = MkPair (Just y) ys
+withoutIndex i (y :: ys) = case (withoutIndex (i - 1) ys :
+                                   Pair (Maybe x) (List x)) of
+  MkPair picked rest -> MkPair picked (y :: rest)
+
 -- (a channel made)
 madeChan : {w : HFunctor}
          -> {a : Type}
@@ -617,8 +699,8 @@ madeChan : {w : HFunctor}
 madeChan st = do
   n <- Domain.fetchAdd st.numbers 1
   mu <- Domain.newMutex
-  senders <- Domain.newAtomic (Nil : List (Sender w a))
-  receivers <- Domain.newAtomic (Nil : List (Receiver w a))
+  senders <- Domain.newAtomic (Deque.empty : Deque.Deque (Sender w a))
+  receivers <- Domain.newAtomic (Deque.empty : Deque.Deque (Receiver w a))
   pure (MkChan n mu senders receivers)
 
 -- (an ivar made)
@@ -631,7 +713,7 @@ madeIVar st = do
   n <- Domain.fetchAdd st.numbers 1
   mu <- Domain.newMutex
   value <- Domain.newAtomic (Nothing : Maybe a)
-  readers <- Domain.newAtomic (Nil : List (Receiver w a))
+  readers <- Domain.newAtomic (Deque.empty : Deque.Deque (Receiver w a))
   pure (MkIVar n mu value readers)
 
 -- (each reader whose offer is not yet claimed, claimed and readied,
@@ -665,115 +747,261 @@ written (MkPutting (MkIVar n mu value readers) v k) = do
     Nothing -> do
       Domain.set value (Just v)
       rs <- Domain.get readers
-      Domain.set readers Nil
+      Domain.set readers Deque.empty
       Domain.unlock mu
-      wokenAll rs v
+      wokenAll (Deque.toList rs) v
       pure k
 
--- (the first receiver waiting whose offer is not yet claimed, claimed
--- and readied, given `v`, those before it stale and dropped: whether
--- there was one, and the receivers left)
-claimedReceiver : {w : HFunctor}
-                -> {a : Type}
-                -> {{dm : Domain.domain <: w}}
-                -> List (Receiver w a)
-                -> a
-                -> Co w (Pair Bool (List (Receiver w a)))
-claimedReceiver Nil v = pure (MkPair False Nil)
-claimedReceiver (MkReceiver (MkOffer claimed) wake :: rest) v = do
-  ok <- Domain.cas claimed False True
-  if ok
-  then do
-    wake v
-    pure (MkPair True rest)
-  else claimedReceiver rest v
+-- (the offers at the front of those waiting that are stale -- claimed
+-- already, through this channel or another -- dropped, up to the first
+-- that is not: whether a waiter is left)
+prunedFront : {w : HFunctor}
+            -> {x : Type}
+            -> {{dm : Domain.domain <: w}}
+            -> (x -> Offer)
+            -> Domain.Atomic (Deque.Deque x)
+            -> Co w Bool
+prunedFront offerOf waiting = do
+  d <- Domain.get waiting
+  case Deque.popFront d of
+    Nothing -> pure False
+    Just (MkPair x rest) -> do
+      stale <- isClaimed (offerOf x)
+      if stale
+      then do
+        Domain.set waiting rest
+        prunedFront offerOf waiting
+      else pure True
 
--- (the first sender waiting whose offer is not yet claimed, claimed and
--- readied, those before it stale and dropped: `Just` its value, and
--- the senders left)
-claimedSender : {w : HFunctor}
-              -> {a : Type}
+-- (how many of the waiters at the front the partner is drawn from among)
+window : Int
+window = 4
+
+-- (up to `k` of those waiting, from the front, whose offers are not
+-- claimed, the stale ones met dropped: the first first, and what is left
+-- behind them)
+unclaimedFront : {w : HFunctor}
+               -> {x : Type}
+               -> {{dm : Domain.domain <: w}}
+               -> (x -> Offer)
+               -> Int
+               -> Deque.Deque x
+               -> Co w (Pair (List x) (Deque.Deque x))
+unclaimedFront offerOf k d =
+  if k <= 0 then pure (MkPair Nil d)
+  else case Deque.popFront d of
+    Nothing -> pure (MkPair Nil d)
+    Just (MkPair x rest) -> do
+      stale <- isClaimed (offerOf x)
+      if stale then unclaimedFront offerOf k rest
+      else do
+        more <- unclaimedFront offerOf (k - 1) rest
+        pure (MkPair (x :: fst more) (snd more))
+
+-- (the waiters put back at the front, before what is there, in their
+-- order)
+pushedFront : {x : Type} -> Deque.Deque x -> List x -> Deque.Deque x
+pushedFront d Nil = d
+pushedFront d (x :: xs) = Deque.pushFront (pushedFront d xs) x
+
+-- (one of them, drawn at random where there are several, its offer
+-- claimed: `Just` it, and the others not tried, in their order; where
+-- the claim fails -- the offer claimed meanwhile, through another
+-- channel -- it is dropped and another drawn, `Nothing` where every one
+-- was)
+claimedAmong : {w : HFunctor}
+             -> {x : Type}
+             -> {{dm : Domain.domain <: w}}
+             -> Sched w
+             -> (x -> Offer)
+             -> List x
+             -> Co w (Pair (Maybe x) (List x))
+claimedAmong st offerOf Nil = pure (MkPair Nothing Nil)
+claimedAmong st offerOf (x :: Nil) = do
+  ok <- claimedOffer (offerOf x)
+  pure (MkPair (if ok then Just x else Nothing) Nil)
+claimedAmong st offerOf xs = do
+  i <- drawn st (List.length xs)
+  case withoutIndex i xs of
+    MkPair (Just x) others -> do
+      ok <- claimedOffer (offerOf x)
+      if ok then pure (MkPair (Just x) others)
+      else claimedAmong st offerOf others
+    MkPair Nothing others -> pure (MkPair Nothing others)
+
+-- (a partner among those waiting, drawn from among the first `window`
+-- whose offers are not claimed, claimed; the others put back at the
+-- front in their order, the stale offers met dropped: `Just` it, if any
+-- can be claimed, and those left waiting)
+claimedWaiter : {w : HFunctor}
+              -> {x : Type}
               -> {{dm : Domain.domain <: w}}
-              -> List (Sender w a)
-              -> Co w (Pair (Maybe a) (List (Sender w a)))
-claimedSender Nil = pure (MkPair Nothing Nil)
-claimedSender (MkSender (MkOffer claimed) v wake :: rest) = do
-  ok <- Domain.cas claimed False True
-  if ok
-  then do
-    wake
-    pure (MkPair (Just v) rest)
-  else claimedSender rest
+              -> Sched w
+              -> (x -> Offer)
+              -> Deque.Deque x
+              -> Co w (Pair (Maybe x) (Deque.Deque x))
+claimedWaiter st offerOf d = do
+  front <- unclaimedFront offerOf window d
+  case fst front of
+    Nil -> pure (MkPair Nothing (snd front))
+    candidates -> do
+      c <- claimedAmong st offerOf candidates
+      let rest : Deque.Deque x = pushedFront (snd front) (snd c)
+      case fst c of
+        Just x -> pure (MkPair (Just x) rest)
+        Nothing -> claimedWaiter st offerOf rest
 
--- (a send tried, the channel's mutex held: where a receiver waits, it
--- is given the value and readied, and the thread goes on)
-polledSend : {w : HFunctor}
-           -> {x a : Type}
-           -> {{dm : Domain.domain <: w}}
-           -> SendOn w x a
-           -> Co w (Maybe x)
-polledSend (MkSendOn (MkChan n mu senders receivers) v k) = do
-  rs <- Domain.get receivers
-  r <- claimedReceiver rs v
-  Domain.set receivers (snd r)
-  pure (if fst r then Just (k MkUnit) else Nothing)
-
--- (a receive tried, the channel's mutex held: where a sender waits, it
--- is readied and the thread goes on with its value)
-polledRecv : {w : HFunctor}
-           -> {x a : Type}
-           -> {{dm : Domain.domain <: w}}
-           -> RecvOn w x a
-           -> Co w (Maybe x)
-polledRecv (MkRecvOn (MkChan n mu senders receivers) k) = do
-  ss <- Domain.get senders
-  r <- claimedSender ss
-  Domain.set senders (snd r)
-  pure (case fst r of
-    Just v -> Just (k v)
-    Nothing -> Nothing)
-
--- (an ivar's read tried, its mutex held: where it is written, the
--- thread goes on with what it holds)
-polledRead : {w : HFunctor}
-           -> {x a : Type}
-           -> {{dm : Domain.domain <: w}}
-           -> ReadOn w x a
-           -> Co w (Maybe x)
-polledRead (MkReadOn (MkIVar n mu value readers) k) = do
-  held <- Domain.get value
-  pure (case held of
-    Just v -> Just (k v)
-    Nothing -> Nothing)
-
--- (a base event tried, its mutex held: `Just` what comes after it where
--- it can be committed now, its partner, if one, claimed and readied)
-polled : {w : HFunctor}
-       -> {x : Type}
-       -> {{dm : Domain.domain <: w}}
-       -> Base w x
-       -> Co w (Maybe x)
-polled (AlwaysBase x) = pure (Just x)
-polled (SendBase s) = s (Co w (Maybe x)) (\a sd -> polledSend sd)
-polled (RecvBase s) = s (Co w (Maybe x)) (\a rc -> polledRecv rc)
-polled (ReadBase s) = s (Co w (Maybe x)) (\a rd -> polledRead rd)
-
--- (the base events tried in order: the first that can be committed
--- now, committed)
-polledAll : {w : HFunctor}
+-- (whether the base event can be committed now, its mutex held, nothing
+-- claimed: a partner waits, unclaimed, at the channel (the stale offers
+-- at the front dropped), the ivar is written, or it is an always)
+canCommit : {w : HFunctor}
           -> {x : Type}
           -> {{dm : Domain.domain <: w}}
-          -> List (Base w x)
-          -> Co w (Maybe x)
-polledAll Nil = pure Nothing
-polledAll (b :: bs) = do
-  r <- polled b
-  case r of
-    Just x -> pure (Just x)
-    Nothing -> polledAll bs
+          -> Base w x
+          -> Co w Bool
+canCommit (AlwaysBase k) = pure True
+canCommit (SendBase s) =
+  s (Co w Bool) (\a sd -> case sd of
+    MkSendOn (MkChan n mu senders receivers) v k ->
+      prunedFront receiverOffer receivers)
+canCommit (RecvBase s) =
+  s (Co w Bool) (\a rc -> case rc of
+    MkRecvOn (MkChan n mu senders receivers) k ->
+      prunedFront senderOffer senders)
+canCommit (ReadBase s) =
+  s (Co w Bool) (\a rd -> case rd of
+    MkReadOn (MkIVar n mu value readers) k -> do
+      held <- Domain.get value
+      pure (case held of
+        Just v -> True
+        Nothing -> False))
+
+-- (those of the base events that can be committed now, in their order)
+readyNow : {w : HFunctor}
+         -> {x : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> List (Base w x)
+         -> Co w (List (Base w x))
+readyNow Nil = pure Nil
+readyNow (b :: bs) = do
+  can <- canCommit b
+  rest <- readyNow bs
+  pure (if can then b :: rest else rest)
+
+-- (a send committed, the channel's mutex held: a receiver waiting
+-- claimed, given the value and readied, and what comes after for the
+-- thread -- `Nothing` where no receiver's offer can be claimed)
+committedSend : {w : HFunctor}
+              -> {x a : Type}
+              -> {{dm : Domain.domain <: w}}
+              -> Sched w
+              -> SendOn w x a
+              -> Co w (Maybe (Unit -> x))
+committedSend st (MkSendOn (MkChan n mu senders receivers) v k) = do
+  rs <- Domain.get receivers
+  r <- claimedWaiter st receiverOffer rs
+  Domain.set receivers (snd r)
+  case fst r of
+    Just (MkReceiver off wake) -> do
+      wake v
+      pure (Just k)
+    Nothing -> pure Nothing
+
+-- (a receive committed, the channel's mutex held: a sender waiting
+-- claimed and readied, and what comes after for the thread, given its
+-- value -- `Nothing` where no sender's offer can be claimed)
+committedRecv : {w : HFunctor}
+              -> {x a : Type}
+              -> {{dm : Domain.domain <: w}}
+              -> Sched w
+              -> RecvOn w x a
+              -> Co w (Maybe (Unit -> x))
+committedRecv st (MkRecvOn (MkChan n mu senders receivers) k) = do
+  ss <- Domain.get senders
+  r <- claimedWaiter st senderOffer ss
+  Domain.set senders (snd r)
+  case fst r of
+    Just (MkSender off v wake) -> do
+      wake
+      pure (Just (\u -> k v))
+    Nothing -> pure Nothing
+
+-- (an ivar's read committed, its mutex held: what comes after for the
+-- thread, given what it holds -- `Nothing` where it is not written)
+committedRead : {w : HFunctor}
+              -> {x a : Type}
+              -> {{dm : Domain.domain <: w}}
+              -> ReadOn w x a
+              -> Co w (Maybe (Unit -> x))
+committedRead (MkReadOn (MkIVar n mu value readers) k) = do
+  held <- Domain.get value
+  pure (case held of
+    Just v -> Just (\u -> k v)
+    Nothing -> Nothing)
+
+-- (a base event committed, its mutex held, its partner, if one, claimed
+-- and readied: `Just` what comes after it, to be computed once the
+-- mutexes are let go of; `Nothing` where it cannot be now after all)
+committed : {w : HFunctor}
+          -> {x : Type}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
+          -> Base w x
+          -> Co w (Maybe (Unit -> x))
+committed st (AlwaysBase k) = pure (Just k)
+committed st (SendBase s) =
+  s (Co w (Maybe (Unit -> x))) (\a sd -> committedSend st sd)
+committed st (RecvBase s) =
+  s (Co w (Maybe (Unit -> x))) (\a rc -> committedRecv st rc)
+committed st (ReadBase s) =
+  s (Co w (Maybe (Unit -> x))) (\a rd -> committedRead rd)
+
+-- (one of the base events that can be committed now, drawn at random
+-- where there are several, committed: `Just` what comes after it; where
+-- it cannot be after all -- its partner's offer claimed meanwhile,
+-- through another channel -- it is dropped and another drawn; `Nothing`
+-- where none is left)
+committedAmong : {w : HFunctor}
+               -> {x : Type}
+               -> {{dm : Domain.domain <: w}}
+               -> Sched w
+               -> List (Base w x)
+               -> Co w (Maybe (Unit -> x))
+committedAmong st Nil = pure Nothing
+committedAmong st (b :: Nil) = committed st b
+committedAmong st bs = do
+  i <- drawn st (List.length bs)
+  case withoutIndex i bs of
+    MkPair (Just b) others -> do
+      r <- committed st b
+      case r of
+        Just k -> pure (Just k)
+        Nothing -> committedAmong st others
+    MkPair Nothing others -> pure Nothing
+
+-- (the base events, their mutexes held: those that can be committed now
+-- found, claiming nothing, then one of them drawn and committed -- `Just`
+-- what comes after it; where every one drawn could not be after all,
+-- the base events are asked again; `Nothing` where none can be)
+committedOne : {w : HFunctor}
+             -> {x : Type}
+             -> {{dm : Domain.domain <: w}}
+             -> Sched w
+             -> List (Base w x)
+             -> Co w (Maybe (Unit -> x))
+committedOne st bs = do
+  ready <- readyNow bs
+  case ready of
+    Nil -> pure Nothing
+    _ -> do
+      r <- committedAmong st ready
+      case r of
+        Just k -> pure (Just k)
+        Nothing -> committedOne st bs
 
 -- (the thread's offer left at the base event's channel or ivar, its
--- mutex held, with what readies the thread there)
+-- mutex held, with what readies the thread there: its continuation,
+-- left unapplied for the worker that takes it)
 offered : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
@@ -785,17 +1013,27 @@ offered st off (SendBase s) =
   s (Co w Unit) (\a sd -> case sd of
     MkSendOn (MkChan n mu senders receivers) v k -> do
       ss <- Domain.get senders
-      Domain.set senders (ss ++ [MkSender off v (readyAgain st (k MkUnit))]))
+      Domain.set
+          senders
+          (Deque.pushBack ss (MkSender off v (readyAgain st (deferred k)))))
 offered st off (RecvBase s) =
   s (Co w Unit) (\a rc -> case rc of
     MkRecvOn (MkChan n mu senders receivers) k -> do
       rs <- Domain.get receivers
-      Domain.set receivers (rs ++ [MkReceiver off (\v -> readyAgain st (k v))]))
+      Domain.set
+          receivers
+          (Deque.pushBack
+             rs
+             (MkReceiver off (\v -> readyAgain st (deferred (\u -> k v))))))
 offered st off (ReadBase s) =
   s (Co w Unit) (\a rd -> case rd of
     MkReadOn (MkIVar n mu value readers) k -> do
       rs <- Domain.get readers
-      Domain.set readers (rs ++ [MkReceiver off (\v -> readyAgain st (k v))]))
+      Domain.set
+          readers
+          (Deque.pushBack
+             rs
+             (MkReceiver off (\v -> readyAgain st (deferred (\u -> k v))))))
 
 offeredAll : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
@@ -813,7 +1051,7 @@ lockOf : {w : HFunctor}
        -> {x : Type}
        -> Base w x
        -> Maybe (Pair Int Domain.Mutex)
-lockOf (AlwaysBase x) = Nothing
+lockOf (AlwaysBase k) = Nothing
 lockOf (SendBase s) =
   s (Maybe (Pair Int Domain.Mutex)) (\a sd -> case sd of
     MkSendOn (MkChan n mu senders receivers) v k -> Just (MkPair n mu))
@@ -863,9 +1101,11 @@ unlockedAll (l :: ls) = do
 -- another)
 data Stepped (w : HFunctor) = GoesOn (Res w Unit) | Stopped
 
--- (a sync: the mutexes of its base events held, the first that can be
--- committed is, and the thread goes on; where none can, the thread's
--- offer is left at each, and it waits, one fewer running)
+-- (a sync: the mutexes of its base events held, one of those that can
+-- be committed is, drawn at random where there are several, and the
+-- thread goes on -- with what comes after computed once the mutexes
+-- are let go of; where none can, the thread's offer is left at each,
+-- and it waits, one fewer running)
 synced : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
@@ -874,11 +1114,12 @@ synced : {w : HFunctor}
 synced st bs = do
   let locks = locksOf bs
   lockedAll locks
-  r <- polledAll bs
+  r <- committedOne st bs
   case r of
     Just k -> do
       unlockedAll locks
-      pure (GoesOn k)
+      next <- later k
+      pure (GoesOn next)
     Nothing -> do
       claimed <- Domain.newAtomic False
       offeredAll st (MkOffer claimed) bs
@@ -889,7 +1130,7 @@ synced st bs = do
 -- (what comes after the first `always` among the base events, if one)
 firstAlways : {w : HFunctor} -> {x : Type} -> List (Base w x) -> Maybe x
 firstAlways Nil = Nothing
-firstAlways (AlwaysBase x :: bs) = Just x
+firstAlways (AlwaysBase k :: bs) = Just (k MkUnit)
 firstAlways (b :: bs) = firstAlways bs
 
 -- (a thread run alone to its end: what an operation of `w` holding
@@ -1064,6 +1305,7 @@ scheduled : {w : HFunctor}
           -> Co w (Maybe a)
 scheduled c = do
   numbers <- Domain.newAtomic 0
+  draws <- Domain.newAtomic 1
   live <- Domain.newAtomic 0
   ready <-
     Domain.newAtomic
@@ -1075,6 +1317,7 @@ scheduled c = do
   stopping <- Domain.newAtomic False
   let st : Sched w =
     { numbers = numbers
+    , draws = draws
     , live = live
     , ready = ready
     , mutex = mutex
