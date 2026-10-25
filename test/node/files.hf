@@ -11,21 +11,23 @@
 --                that kept it: EBADF, a value
 --   lines        the standard input a line at a time: `ping` answered
 --                at once, then how many lines and bytes there were
---   green        green threads: one reads the standard input, a pipe,
---                while another counts
+--   threaded     cml's threads, waiting on the world through the
+--                reactor: one reads the standard input, a pipe, while
+--                another counts
 
 module test.node.files
 
 import bytes as Bytes
 import co
 import exception
-import green
+import cml as CML
 import int as Int
 import std.file
 import std.filesystem
 import std.io
 import std.path as Path
 import std.process
+import std.domain as Domain
 import std.reactor as Reactor
 import uint8 as UInt8
 import resource
@@ -656,36 +658,36 @@ stdinLines = do
   print ("lines " ^ debug c.lines ^ " bytes " ^ debug c.bytes)
 
 -- (a thread counting to n, a yield at each)
-counting : {e : HFunctor}
-         -> {{gr : green <: e}}
-         -> Int
+counting : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
+         -> CML.Chan w Int
          -> Int
          -> Int
          -> Co e Unit
 counting ch n i =
-  if i >= n then send ch i
-  else bind yield (\u -> counting ch n (i + 1))
+  if i >= n then CML.send ch i
+  else bind CML.yield (\u -> counting ch n (i + 1))
 
 -- | A thread reading the standard input, a pipe, while another counts:
 -- | the count is written before any of the input comes (the test writes
 -- | none until it is).
-greenLines : {e : HFunctor}
-           -> {{gr : green <: e}}
-           -> {{disk : filesystem <: e}}
-           -> {{fx : exception FileError <: e}}
-           -> Co e Unit
-greenLines = do
+threadedLines : {e w : HFunctor}
+              -> {{cm : CML.cml w <: e}}
+              -> {{disk : filesystem <: e}}
+              -> {{fx : exception FileError <: e}}
+              -> Co e Unit
+threadedLines = do
   with withStdout as o do
-    counted <- newChan
-    read <- newChan
-    spawn
+    counted <- CML.newChan
+    read <- CML.newChan
+    CML.spawn
         (bind
            (foldStdinLines 0 (\n l -> pure (n + 1)))
-           (\r -> send read r))
-    spawn (counting counted 1000 0)
-    n <- recv counted
+           (\r -> CML.send read r))
+    CML.spawn (counting counted 1000 0)
+    n <- CML.recv counted
     writeString o ("counted while the reader waits: " ^ debug n ^ "\n")
-    m <- recv read
+    m <- CML.recv read
     writeString o ("read: " ^ debug m ^ " lines\n")
   pure MkUnit
 
@@ -732,10 +734,19 @@ linesMain = do
   r <- attempt FileError (stdinLines (io := _) (disk := _) (fx := _))
   unheard (io := _) r
 
-greenMain : Co (stdio <+> filesystem <+> Reactor.reactor <+> process) Unit
-greenMain = do
+threaded : Co
+           (stdio <+> filesystem <+> Reactor.reactor <+> process <+> Domain.domain)
+           Unit
+threaded = do
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
-      (attempt FileError (greenLines (gr := _) (disk := _) (fx := _)))
+      (attempt
+         FileError
+         (threadedLines
+            (w := stdio <+> filesystem <+> Reactor.reactor <+> process <+> Domain.domain)
+            (cm := _)
+            (disk := _)
+            (fx := _)))
   print (ev := _) (maybe "a deadlock" (\u -> "main done") r)

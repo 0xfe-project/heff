@@ -1,24 +1,35 @@
--- For outside operations begun now and finished later: what lets
--- green threads go on while one of them waits on a socket, a name being
--- resolved or an HTTP request.  The C backend's alone (its provider, and
--- the runtime's reactor): a page's providers do not wait.  Import it by a
--- name, `import std.reactor as Reactor`.
+-- For outside operations begun now and finished later: what lets a
+-- scheduler's threads go on while one of them waits on a socket, a name
+-- being resolved or an HTTP request.  The C backend's alone (its
+-- provider, and the runtime's reactor): a page's providers do not wait.
+-- Import it by a name, `import std.reactor as Reactor`.  A scheduler waits
+-- on the world through it -- cml's `scheduledWithReactor` -- and so does a
+-- program that starts several operations itself.
 --
 -- > [!CAUTION]
 -- > Unstable: concurrency in heff is not settled. What this module offers
 -- > may change, or go, in any release.
 --
 -- ```haskell
--- import green
 -- import std.reactor as Reactor
+-- import std.duration as Duration
+-- import std.time as Time
 --
--- served : {e : HFunctor} -> {{rx : Reactor.reactor <: e}} -> Co (green <+> e) Unit -> Co e (Maybe Unit)
--- served c = Reactor.scheduled c
+-- -- | three sleeps begun at once, waited for together: in about 100 ms
+-- slept : {e : HFunctor} -> {{rx : Reactor.reactor <: e}} -> {{tm : Time.time <: e}} -> Co e Int
+-- slept = do
+--   g <- Reactor.open
+--   _ <- Reactor.start g (bind (Time.sleep (Duration.milliseconds 100)) (\u -> pure 1))
+--   _ <- Reactor.start g (bind (Time.sleep (Duration.milliseconds 100)) (\u -> pure 2))
+--   _ <- Reactor.start g (bind (Time.sleep (Duration.milliseconds 100)) (\u -> pure 3))
+--   a <- Reactor.finished g True
+--   b <- Reactor.finished g True
+--   c <- Reactor.finished g True
+--   Reactor.close g
+--   pure (List.sum (a ++ b ++ c))
 -- ```
 --
--- `Reactor.scheduled c` is green threads scheduled so: green's
--- scheduler, its `Outside` this one; it needs `Reactor.reactor` in the
--- world.  While a thread waits for one of these, the others run:
+-- These wait in the reactor, where they are started in a group:
 --
 -- - std.net's `read`, `write`, `accept` and `withConnection`;
 -- - std.filesystem's reads and writes of a pipe, a terminal or a socket;
@@ -26,33 +37,30 @@
 -- - std.http's requests;
 -- - std.time's sleep.
 --
--- A regular file is read and written at once, the program waiting.  A
--- server can accept each connection in a thread of its own: std.http.server's
--- `serveConcurrently`.
+-- A regular file is read and written at once, the program waiting.
 --
--- A group is opened for a scheduler; each of its threads' outside
--- operations is started in it -- a computation of the world, run there
--- until it is done or until an operation of std.net or std.http would
--- wait, which is then pending, the rest of the computation kept with it --
--- and the group asked which of those pending are finished, each its
--- computation's value, run to its end once its operation was done.  When
--- no thread is ready, the scheduler waits for the first operation to
--- finish, in one `poll`.  Where no group is being started in, an operation
--- waits where it is, the whole program with it.  Each thread of the system
--- has its own reactor, so green threads inside a std.thread thread are
--- that thread's own.
+-- A group is opened, on a domain; each computation started in it -- one
+-- of the world, run there until it is done or until an operation of
+-- these would wait, which is then pending, the rest of the computation
+-- kept with it -- and the group asked which of those pending are
+-- finished, each its computation's value, run to its end once its
+-- operation was done.  `finished g True` waits for the first to finish,
+-- in one `poll`, or until another domain wakes it (`wake`).  A group
+-- within another (`openWithin`) is pending and finishes among the
+-- other's, and is closed apart, what is pending in it let go of.  Where
+-- no group is being started in, an operation waits where it is, the
+-- whole program with it.  Each thread of the system has its own reactor:
+-- a group is its domain's, started in, asked and closed there alone, but
+-- woken from any.
 --
 -- A computation is started between a `Begin` and an `End` of its group,
 -- in the world's own course, not held by an operation: a handler between
--- the scheduler and the world -- a state, std.chan's channels -- sees
--- what it does as it sees any other operation, and keeps it.
--- `Reactor.together c` is `Reactor.scheduled` joining every thread, as
--- green's `together`.
+-- the scheduler and the world -- a state -- sees what it does as it sees
+-- any other operation, and keeps it.
 
 module std.reactor
 
 import co
-import green
 
 -- | A group of computations started, each of which comes to a `t`.
 data Group t = MkGroup Int
@@ -189,37 +197,3 @@ wake : {e : HFunctor}
      -> Group t
      -> Co e Unit
 wake (MkGroup i) = op (rx (Wake i MkUnit)) val
-
--- | A scheduler's outside operations, begun, the other threads going on
--- | while they are pending.
-outside : {e : HFunctor} -> {{rx : reactor <: e}} -> Outside e
-outside =
-  { Group = Group
-  , group = open
-  , start = \g c -> start g c
-  , finished = \g wait -> finished g wait
-  , close = \g -> close g
-  }
-
--- | `c` and the threads it spawns, round robin, each
--- | thread's outside operations pending while the others go on: main's
--- | answer, or Nothing where every thread waits on a channel.
-scheduled : {e : HFunctor}
-          -> {{rx : reactor <: e}}
-          -> {a : Type}
-          -> Co (green <+> e) a
-          -> Co e (Maybe a)
-scheduled c = scheduledWith e outside c
-
--- | `c` and the threads it spawns, in the world around it, whichever
--- | that is, each thread's outside operations pending while the others
--- | go on, and every thread joined (green's `togetherWith`): main's
--- | answer once every thread has ended, or Nothing where every one left
--- | is parked.  The scheduler of the body of a `with` whose world is not
--- | named there, such as std.chan's.
-together : {e : HFunctor}
-         -> {{rx : reactor <: e}}
-         -> {a : Type}
-         -> Co (green <+> e) a
-         -> Co e (Maybe a)
-together c = togetherWith e outside c

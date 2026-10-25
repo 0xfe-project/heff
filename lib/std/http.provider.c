@@ -408,7 +408,7 @@ static struct {
   void (*slist_free_all)(void *);
   int (*getinfo)(void *, int, ...);   // (may be missing)
   const char *(*version)(void);       // (may be missing)
-  // (the multi interface, for green threads: may be missing)
+  // (the multi interface, for a group of the reactor's: may be missing)
   void *(*multi_init)(void);
   int (*multi_setopt)(void *, int, ...);
   int (*multi_add)(void *, void *);
@@ -645,12 +645,12 @@ static int http_curl(HttpReq *q, HttpGot *g) {
   return 1;
 }
 
-// Green threads: libcurl's multi interface
+// Requests pending in the reactor: libcurl's multi interface
 // ---------------------------------------------------------------------
 //
 // Where a scheduler of std.reactor's runs (the runtime's reactor, a
 // group being started in), a request is a transfer of this thread's
-// multi handle, pending while the other green threads go on: its easy
+// multi handle, pending while the other threads go on: its easy
 // handle added to the multi, the request's wait done when libcurl says
 // so.  The multi is a source of the reactor's: the sockets libcurl asks
 // to be watched (its socket function) and how long until it is to be
@@ -891,7 +891,7 @@ static V heff_provider_http(V p, V k) {
     HttpReq q;
     HttpGot g = {0};
     int ok = http_req(heff_field(p, 0), &q);
-    // (under a scheduler, pending while the other green threads go on)
+    // (in a group of the reactor's, pending while the other threads go on)
     if (ok && heff_group) {
       V r = http_transfer(&q, p, f, k);
       if (r) return r;

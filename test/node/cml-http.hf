@@ -1,6 +1,6 @@
--- std.http's requests from green threads, scheduled by std.reactor:
--- each pending while the others go on (libcurl's multi interface).  By
--- C alone.
+-- std.http's requests from cml's threads, waiting on the world through
+-- each domain's reactor (`CML.scheduledWithReactor`): each pending while
+-- the others go on (libcurl's multi interface).  By C alone.
 --
 --   main BASE N REFUSED   N requests of BASE/item/I at once, from a
 --                         thread each, to a server that takes its time
@@ -11,11 +11,12 @@
 --                         asked by ten threads at once, std.net's and
 --                         libcurl's sockets waited on together
 
-module test.node.green-http
+module test.node.cml-http
 
+import cml as CML
 import co
 import exception
-import green
+import std.domain as Domain
 import std.http as HTTP
 import std.http.server as Server
 import std.io
@@ -24,15 +25,16 @@ import std.process
 import std.reactor as Reactor
 import resource
 
-repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
-repeatG 0 c = pure MkUnit
-repeatG n c = bind c (\u -> repeatG (n - 1) c)
-
--- (n strings received on ch... as Ints: their sum)
-recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+-- (n values received on ch, added up)
+recvSum : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.Chan w Int
+        -> Int
+        -> Int
+        -> Co e Int
 recvSum ch 0 acc = pure acc
 recvSum ch n acc = do
-  x <- recv ch
+  x <- CML.recv ch
   recvSum ch (n - 1) (acc + x)
 
 -- (what came back, as the test checks it: 1 where it is the item's)
@@ -41,24 +43,37 @@ itemIs i (Right t) = if strEq t ("item " ^ debug i ^ "\n") then 1 else 0
 itemIs i (Left err) = 0
 
 -- (a thread fetching item i, saying on `back` whether it came)
-fetcher : {e : HFunctor}
-        -> {{gr : green <: e}}
+fetcher : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{web : HTTP.http <: e}}
         -> String
-        -> Int
+        -> CML.Chan w Int
         -> Int
         -> Co e Unit
 fetcher base back i = do
   r <- HTTP.getText (base ^ "/item/" ^ debug i)
-  send back (itemIs i r)
+  CML.send back (itemIs i r)
+
+-- (fetchers of items `i` down to 1, each a thread of its own)
+fetchers : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> String
+         -> CML.Chan w Int
+         -> Int
+         -> Co e Unit
+fetchers base back 0 = pure MkUnit
+fetchers base back i = do
+  CML.spawn (fetcher base back i)
+  fetchers base back (i - 1)
 
 -- (where no response came: curl's code)
 codeOf : Either HTTP.HttpError HTTP.Response -> String
 codeOf (Left err) = "code " ^ debug err.code
 codeOf (Right r) = "status " ^ debug r.status
 
-fetches : {e : HFunctor}
-        -> {{gr : green <: e}}
+fetches : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{web : HTTP.http <: e}}
         -> String
@@ -66,8 +81,8 @@ fetches : {e : HFunctor}
         -> Int
         -> Co e Unit
 fetches base n refused = do
-  back <- newChan
-  repeatG n (bind newChan (\i -> spawn (fetcher base back i)))
+  back <- CML.newChan
+  fetchers base back n
   r <- HTTP.get ("http://127.0.0.1:" ^ debug refused ^ "/")
   print ("refused, while the others wait: " ^ codeOf r)
   got <- recvSum back n 0
@@ -82,16 +97,20 @@ argsOf _ = Nothing
 ran : {e : HFunctor} -> {{io : stdio <: e}} -> Maybe Unit -> Co e Unit
 ran r = print (maybe "a deadlock" (\u -> "main done") r)
 
-main : Co (stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> process) Unit
+main : Co
+       (stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+       Unit
 main = do
   argv <- args (ev := _)
   case argsOf argv of
     Just (MkPair b (MkPair n r)) -> do
       done <-
-        Reactor.scheduled
+        CML.scheduledWithReactor
+          (dm := _)
           (rx := _)
           (fetches
-             (gr := _)
+             (w := stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+             (cm := _)
              (io := _)
              (web := _)
              b
@@ -108,6 +127,16 @@ must : {a : Type} -> Either Net.NetError a -> a
 must (Right x) = x
 must (Left err) = abandon
 
+-- (cml's threads, as `serveConcurrently` asks: a signal an ivar)
+threads : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Server.Threads e
+threads =
+  { spawn = \c -> CML.spawn c
+  , Signal = CML.IVar w Unit
+  , signal = CML.newIVar
+  , give = \sg -> CML.putIVar sg MkUnit
+  , awaited = \sg -> CML.readIVar sg
+  }
+
 -- (each item answered as the server of the test's answers it)
 item : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 item r =
@@ -117,9 +146,9 @@ item r =
        ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
 
 -- (the listener served by a thread of its own, and asked of by ten)
-askedOn : {e : HFunctor}
+askedOn : {e w : HFunctor}
         -> {s : Type}
-        -> {{gr : green <: e}}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{web : HTTP.http <: e}}
         -> {{nt : Net.net <: e}}
@@ -127,15 +156,15 @@ askedOn : {e : HFunctor}
         -> Co e Unit
 askedOn l = do
   at <- Net.local l
-  spawn (Server.serveConcurrently l item)
-  back <- newChan
+  CML.spawn (Server.serveConcurrently (th := threads) l item)
+  back <- CML.newChan
   let base = "http://127.0.0.1:" ^ debug (must at).port
-  repeatG 10 (bind newChan (\i -> spawn (fetcher base back i)))
+  fetchers base back 10
   got <- recvSum back 10 0
   print ("asked of its own server, at once: " ^ debug got)
 
-asked : {e : HFunctor}
-      -> {{gr : green <: e}}
+asked : {e w : HFunctor}
+      -> {{cm : CML.cml w <: e}}
       -> {{io : stdio <: e}}
       -> {{web : HTTP.http <: e}}
       -> {{nt : Net.net <: e}}
@@ -149,15 +178,19 @@ said Nothing = "a deadlock"
 said (Just (Left err)) = "not heard: " ^ show err
 said (Just (Right u)) = "main done"
 
-self : Co (stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> process) Unit
+self : Co
+       (stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> Domain.domain)
+       Unit
 self = do
   done <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (asked
-            (gr := _)
+            (w := stdio <+> HTTP.http <+> Net.net <+> Reactor.reactor <+> Domain.domain)
+            (cm := _)
             (io := _)
             (web := _)
             (nt := _)

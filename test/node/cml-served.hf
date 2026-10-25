@@ -1,7 +1,7 @@
--- std.http.server's `serveConcurrently`, a green thread for each
--- connection, each had by a `with` in its own, scheduled by
--- std.reactor: many clients held open at once, each answered in turn.
--- By C alone.
+-- std.http.server's `serveConcurrently`, a cml thread for each
+-- connection, each had by a `with` in its own, scheduled by cml waiting
+-- on the world through each domain's reactor: many clients held open
+-- at once, each answered in turn.  By C alone.
 --
 --   main     n clients, each its connection kept: a first request each,
 --            all answered while every connection is held open -- which a
@@ -10,19 +10,14 @@
 --   burst    PORT: served there until asked for `/stop`, by Node.js's
 --            clients, hundreds of connections opened at once: how many
 --            requests it answered
---   flat     n connections, one after another, each closed before the
---            next: the objects made while the first few are served and
---            while the last few are (built with `-DHEFF_COUNT_ALLOCS`),
---            about as many -- each connection's thread under no more
---            handlers than the first's
 
-module test.node.green-served
+module test.node.cml-served
 
-import bench
 import bytes as Bytes
+import cml as CML
 import co
 import exception
-import green
+import std.domain as Domain
 import std.http as HTTP
 import std.http.server as Server
 import std.io
@@ -45,11 +40,26 @@ repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
 repeatG 0 c = pure MkUnit
 repeatG n c = bind c (\u -> repeatG (n - 1) c)
 
+-- (cml's threads, as `serveConcurrently` asks: a signal an ivar)
+threads : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Server.Threads e
+threads =
+  { spawn = \c -> CML.spawn c
+  , Signal = CML.IVar w Unit
+  , signal = CML.newIVar
+  , give = \sg -> CML.putIVar sg MkUnit
+  , awaited = \sg -> CML.readIVar sg
+  }
+
 -- (n values received on ch, added up)
-recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.Chan w Int
+        -> Int
+        -> Int
+        -> Co e Int
 recvSum ch 0 acc = pure acc
 recvSum ch n acc = do
-  x <- recv ch
+  x <- CML.recv ch
   recvSum ch (n - 1) (acc + x)
 
 -- (n bytes read, in as many reads as they take)
@@ -90,41 +100,56 @@ asked c target = do
 -- (a client's connection: a first request, its answer said on `back`;
 -- then, once main says so on `go`, a second on the same connection:
 -- its answer)
-clientOn : {e : HFunctor}
+clientOn : {e w : HFunctor}
          -> {s : Type}
-         -> {{gr : green <: e}}
+         -> {{cm : CML.cml w <: e}}
          -> {{nt : Net.net <: e}}
-         -> Int
-         -> Int
+         -> CML.Chan w Int
+         -> CML.Chan w Int
          -> Int
          -> With s Net.TcpStream
          -> Co e Int
 clientOn back go i c = do
   first <- asked c ("/" ^ debug i ^ "/first")
-  send back first
-  x <- recv go
+  CML.send back first
+  x <- CML.recv go
   asked c ("/" ^ debug i ^ "/second")
 
 -- | A client: a first request, its answer said on `back`; then, once
 -- | main says so on `go`, a second on the same connection, which is
 -- | closed after, its answer said.
-client : {e : HFunctor}
-       -> {{gr : green <: e}}
+client : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
        -> {{nt : Net.net <: e}}
        -> {{ex : exception Net.NetError <: e}}
        -> Int
-       -> Int
-       -> Int
+       -> CML.Chan w Int
+       -> CML.Chan w Int
        -> Int
        -> Co e Unit
 client port back go i = do
   second <- Net.withConnection (here port) (\c -> clientOn back go i c)
-  send back second
+  CML.send back second
+
+-- (clients `i` down to 1, each a thread of its own)
+clients : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> CML.Chan w Int
+        -> CML.Chan w Int
+        -> Int
+        -> Co e Unit
+clients port back go 0 = pure MkUnit
+clients port back go i = do
+  CML.spawn (client port back go i)
+  clients port back go (i - 1)
 
 -- (the server, a thread of its own, and n clients, each one too)
-served : {e : HFunctor}
+served : {e w : HFunctor}
        -> {s : Type}
-       -> {{gr : green <: e}}
+       -> {{cm : CML.cml w <: e}}
        -> {{io : stdio <: e}}
        -> {{nt : Net.net <: e}}
        -> {{ex : exception Net.NetError <: e}}
@@ -133,18 +158,18 @@ served : {e : HFunctor}
        -> Co e Unit
 served n l = do
   at <- Net.local l
-  spawn (Server.serveConcurrently l answer)
-  back <- newChan
-  go <- newChan
-  repeatG n (bind newChan (\i -> spawn (client (must at).port back go i)))
+  CML.spawn (Server.serveConcurrently (th := threads) l answer)
+  back <- CML.newChan
+  go <- CML.newChan
+  clients (must at).port back go n
   first <- recvSum back n 0
   print ("first requests answered, every connection held open: " ^ debug first)
-  repeatG n (send go 1)
+  repeatG n (CML.send go 1)
   second <- recvSum back n 0
   print ("second requests answered, on the same connections: " ^ debug second)
 
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
+program : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> {{ex : exception Net.NetError <: e}}
@@ -158,15 +183,17 @@ said Nothing = "a deadlock"
 said (Just (Left err)) = "not heard: " ^ show err
 said (Just (Right u)) = "main done"
 
-main : Co (stdio <+> Net.net <+> Reactor.reactor) Unit
+main : Co (stdio <+> Net.net <+> Reactor.reactor <+> Domain.domain) Unit
 main = do
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (program
-            (gr := _)
+            (w := stdio <+> Net.net <+> Reactor.reactor <+> Domain.domain)
+            (cm := _)
             (io := _)
             (nt := _)
             (ex := _)
@@ -178,36 +205,40 @@ main = do
 
 -- (each request answered with its target, and said on `events`: 1, or
 -- 0 for `/stop`)
-counting : {e : HFunctor}
-         -> {{gr : green <: e}}
-         -> Int
+counting : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
+         -> CML.Chan w Int
          -> Server.Request
          -> Co e HTTP.Response
 counting events r = do
-  send events (if r.target == "/stop" then 0 else 1)
+  CML.send events (if r.target == "/stop" then 0 else 1)
   pure (Server.plain 200 r.target)
 
 -- (the requests said on `events`, added up, until a 0)
-answeredOn : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Co e Int
+answeredOn : {e w : HFunctor}
+           -> {{cm : CML.cml w <: e}}
+           -> CML.Chan w Int
+           -> Int
+           -> Co e Int
 answeredOn events n = do
-  x <- recv events
+  x <- CML.recv events
   if x == 0 then pure n else answeredOn events (n + x)
 
-burstAt : {e : HFunctor}
+burstAt : {e w : HFunctor}
         -> {s : Type}
-        -> {{gr : green <: e}}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> With s Net.TcpListener
         -> Co e Unit
 burstAt l = do
-  events <- newChan
-  spawn (Server.serveConcurrently l (counting events))
+  events <- CML.newChan
+  CML.spawn (Server.serveConcurrently (th := threads) l (counting events))
   n <- answeredOn events 0
   print ("answered " ^ debug n)
 
-burstProgram : {e : HFunctor}
-             -> {{gr : green <: e}}
+burstProgram : {e w : HFunctor}
+             -> {{cm : CML.cml w <: e}}
              -> {{io : stdio <: e}}
              -> {{nt : Net.net <: e}}
              -> {{sys : process <: e}}
@@ -218,93 +249,21 @@ burstProgram = do
   let port = fromMaybe 0 (parseInt (fromMaybe "" (List.head argv)))
   Net.withListener (here port) 128 (\l -> burstAt l)
 
-burst : Co (stdio <+> Net.net <+> Reactor.reactor <+> process) Unit
+burst : Co
+        (stdio <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+        Unit
 burst = do
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (burstProgram
-            (gr := _)
+            (w := stdio <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+            (cm := _)
             (io := _)
             (nt := _)
             (sys := _)
             (ex := _)))
-  print (ev := _) (said r)
-
--- One after another
---------------------------------------------------------------------------------
-
--- (connections i to n - 1, one after another, each asked once and
--- closed: how many were answered right)
-askedEach : {e : HFunctor}
-          -> {{nt : Net.net <: e}}
-          -> {{ex : exception Net.NetError <: e}}
-          -> Int
-          -> Int
-          -> Int
-          -> Int
-          -> Co e Int
-askedEach port i n acc =
-  if i >= n then pure acc
-  else bind
-      (Net.withConnection (here port) (\c -> asked c ("/" ^ debug i)))
-      (\ok -> askedEach port (i + 1) n (acc + ok))
-
--- (the objects made by connections i to n - 1: how many, and how many
--- answered right)
-counted : {e : HFunctor}
-        -> {{tm : timer <: e}}
-        -> {{nt : Net.net <: e}}
-        -> {{ex : exception Net.NetError <: e}}
-        -> Int
-        -> Int
-        -> Int
-        -> Co e (Pair Int Int)
-counted port i n = do
-  _ <- startTimer 1
-  ok <- askedEach port i n 0
-  t <- stopTimer RanThrough
-  pure (case t of
-    MkSample ns objects bytes -> MkPair objects ok)
-
-flatAt : {e : HFunctor}
-       -> {s : Type}
-       -> {{gr : green <: e}}
-       -> {{io : stdio <: e}}
-       -> {{tm : timer <: e}}
-       -> {{nt : Net.net <: e}}
-       -> {{ex : exception Net.NetError <: e}}
-       -> Int
-       -> Int
-       -> With s Net.TcpListener
-       -> Co e Unit
-flatAt n k l = do
-  at <- Net.local l
-  let port = (must at).port
-  spawn (Server.serveConcurrently l answer)
-  first <- counted port 0 k
-  middle <- askedEach port k (n - k) 0
-  last <- counted port (n - k) n
-  print ("answered " ^ debug (snd first + middle + snd last) ^ " of " ^ debug n)
-  print
-    ("the last "
-     ^ debug k
-     ^ " no costlier than the first: "
-     ^ debug (fst first > 0 && 2 * fst last <= 3 * fst first))
-
-flat : Co (stdio <+> timer <+> Net.net <+> Reactor.reactor) Unit
-flat = do
-  r <-
-    Reactor.scheduled
-      (rx := _)
-      (attempt
-         Net.NetError
-         (Net.withListener
-            (ev := _)
-            (ex := _)
-            (here 0)
-            128
-            (\l -> flatAt (gr := _) (io := _) (tm := _) (nt := _) (ex := _) 300 50 l)))
   print (ev := _) (said r)

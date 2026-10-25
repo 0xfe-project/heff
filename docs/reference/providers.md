@@ -195,8 +195,9 @@ The provider makes sure the thing is let go of:
 ## Operations that wait
 
 In C, an operation that must wait, such as a read from a socket that is
-not ready, is done in steps by the runtime's reactor, so green threads
-go on meanwhile. The provider's operation is a `HeffWait`, the first
+not ready, is done in steps by the runtime's reactor, so the other
+threads of a scheduler that waits through it (cml's
+`scheduledWithReactor`) go on meanwhile. The provider's operation is a `HeffWait`, the first
 member of a struct of its own:
 
 | Member | Meaning |

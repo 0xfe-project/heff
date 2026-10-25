@@ -12,22 +12,24 @@
 --                 as it was; and a client that sends nothing, its
 --                 connection served by `serveConnection` given an idle
 --                 limit of 300 ms, closed by it
---   green         the same, by green threads scheduled by std.reactor,
---                 the scheduler ending once they are done; and a client
---                 that sends nothing to a server of `serveConcurrently`
---                 given an idle limit of 300 ms, closed by it
+--   threads       the same, by cml's threads waiting on the world
+--                 through the reactor, the scheduler ending once main is
+--                 done; and a client that sends nothing to a server of
+--                 `serveConcurrently` given an idle limit of 300 ms,
+--                 closed by it
 --   http BASE     std.http, the connection to 10.255.255.1 given 300 ms,
 --                 curl's code 28; and BASE/item/1, of a server that
 --                 takes 500 ms over it, given 300 ms to connect and 10 s
 --                 in all, answered (built with `-DHEFF_HTTP_SPAWN` too,
 --                 the curl spawned)
---   multi BASE    the same, by a green thread: libcurl's multi interface
+--   multi BASE    the same, by cml's main thread: libcurl's multi interface
 
 module test.node.timeouts
 
+import cml as CML
 import co
 import exception
-import green
+import std.domain as Domain
 import std.filesystem
 import std.http as HTTP
 import std.http.server as Server
@@ -155,11 +157,21 @@ readLimited =
 hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 hello r = pure (Server.plain 200 "hello\n")
 
+-- (cml's threads, as `serveConcurrently` asks: a signal an ivar)
+cmlThreads : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Server.Threads e
+cmlThreads =
+  { spawn = \c -> CML.spawn c
+  , Signal = CML.IVar w Unit
+  , signal = CML.newIVar
+  , give = \sg -> CML.putIVar sg MkUnit
+  , awaited = \sg -> CML.readIVar sg
+  }
+
 -- | A client that sends nothing to a server of `serveConcurrently`,
 -- | given an idle limit of 300 ms: its connection closed by the server
 -- | in about that time, its read at the end, `b[]`.
-idleClosed : {e : HFunctor}
-           -> {{gr : green <: e}}
+idleClosed : {e w : HFunctor}
+           -> {{cm : CML.cml w <: e}}
            -> {{io : stdio <: e}}
            -> {{nt : Net.net <: e}}
            -> {{clock : time <: e}}
@@ -168,7 +180,7 @@ idleClosed : {e : HFunctor}
 idleClosed =
   Net.withListener (here 0) 16 (\l -> do
     at <- Net.local l
-    spawn (Server.serveConcurrently (idle := 300) l hello)
+    CML.spawn (Server.serveConcurrently (idle := 300) (th := cmlThreads) l hello)
     (ms, r) <-
       timed
         (Net.withConnection
@@ -228,18 +240,25 @@ main = do
   after <- openFds (disk := _)
   print (ev := _) (sameFds before after)
 
-green : Co (stdio <+> Net.net <+> time <+> filesystem <+> HTTP.http <+> Reactor.reactor <+> process) Unit
-green = do
+threads : Co (stdio <+> Net.net <+> time <+> filesystem <+> HTTP.http <+> Reactor.reactor <+> process <+> Domain.domain) Unit
+threads = do
   before <- openFds (disk := _)
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (do
            connectLimited (io := _) (nt := _) (clock := _) (ex := _)
            readLimited (io := _) (nt := _) (clock := _) (ex := _)
-           idleClosed (gr := _) (io := _) (nt := _) (clock := _) (ex := _)))
+           idleClosed
+             (w := stdio <+> Net.net <+> time <+> filesystem <+> HTTP.http <+> Reactor.reactor <+> process <+> Domain.domain)
+             (cm := _)
+             (io := _)
+             (nt := _)
+             (clock := _)
+             (ex := _)))
   print (ev := _) (said r)
   after <- openFds (disk := _)
   print (ev := _) (sameFds before after)
@@ -284,11 +303,12 @@ http = do
   argv <- args (ev := _)
   requests (io := _) (web := _) (clock := _) (baseOf argv)
 
-multi : Co (stdio <+> Net.net <+> time <+> filesystem <+> HTTP.http <+> Reactor.reactor <+> process) Unit
+multi : Co (stdio <+> Net.net <+> time <+> filesystem <+> HTTP.http <+> Reactor.reactor <+> process <+> Domain.domain) Unit
 multi = do
   argv <- args (ev := _)
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (requests (io := _) (web := _) (clock := _) (baseOf argv))
   print (ev := _) (maybe "a deadlock" (\u -> "scheduler done") r)

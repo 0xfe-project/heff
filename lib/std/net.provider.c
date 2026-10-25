@@ -12,8 +12,8 @@
 // (HEFF_STEP_WAIT: `fd` readable or writable, `events`), to be stepped again
 // once it is.  So every socket is non-blocking, and an operation waits
 // only in the runtime's reactor: where no scheduler runs, there and then, the whole
-// program waiting with it; where std.reactor's green threads run, the
-// op pending, the other threads going on, and its own once it is done.
+// program waiting with it; in a group of std.reactor's, the op
+// pending, the other threads going on, and its own once it is done.
 // The heff side is the same either way: each operation gives its
 // answer to a function.  A connection made, a read and a write may have
 // a time limit: their wait's deadline, kept either way (the reactor's,

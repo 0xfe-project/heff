@@ -1,6 +1,6 @@
 -- std.remote's both sides, by C alone: an API's
 -- server, over std.http.server, and its client, std.http's POSTs, in one
--- program, each a green thread scheduled by std.reactor.
+-- program, each a cml thread waiting on the world through the reactor.
 --
 --   main REFUSED   calls answered, the server's count kept between
 --                  them; a client of another build refused; a server
@@ -9,13 +9,14 @@
 
 module test.node.remote
 
+import cml as CML
 import co
 import exception
-import green
 import remote as Remote
 import std.http as HTTP
 import std.http.server as Server
 import std.io
+import std.domain as Domain
 import std.net as Net
 import std.process
 import std.reactor as Reactor
@@ -86,6 +87,16 @@ kept r (Shout s k) = pure (k (s ^ "!"))
 elsewhere : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 elsewhere r = pure (Server.plain 404 "no such thing\n")
 
+-- (cml's threads, as `serveConcurrently` asks: a signal an ivar)
+threads : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Server.Threads e
+threads =
+  { spawn = \c -> CML.spawn c
+  , Signal = CML.IVar w Unit
+  , signal = CML.newIVar
+  , give = \sg -> CML.putIVar sg MkUnit
+  , awaited = \sg -> CML.readIVar sg
+  }
+
 -- The client's program (a byte that is no UTF-8 in a string, sent and
 -- back as it is)
 session : {e : HFunctor} -> {{api : tally <: e}} -> Co e String
@@ -127,8 +138,8 @@ got url = do
          (\(res : HTTP.Response) -> debug res.status ^ " " ^ HTTP.text res)
          r)
 
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
+program : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> {{web : HTTP.http <: e}}
@@ -143,8 +154,9 @@ program = do
     at <- Net.local ln
     let port = either (\err -> 0) (\(a : Net.Address) -> a.port) at
     let url = "http://127.0.0.1:" ^ debug port ^ "/api"
-    spawn
+    CML.spawn
         (Server.serveConcurrently
+           (th := threads)
            ln
            (RemoteHTTP.routed "/api" tallyApi (kept r) elsewhere))
     first <- calls tallyApi url
@@ -167,15 +179,17 @@ said Nothing = "a deadlock"
 said (Just (Left err)) = "not heard: " ^ show err
 said (Just (Right u)) = "main done"
 
-main : Co (stdio <+> Net.net <+> HTTP.http <+> Reactor.reactor <+> process <+> reference Int) Unit
+main : Co (stdio <+> Net.net <+> HTTP.http <+> Reactor.reactor <+> process <+> reference Int <+> Domain.domain) Unit
 main = do
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (program
-            (gr := _)
+            (w := stdio <+> Net.net <+> HTTP.http <+> Reactor.reactor <+> process <+> reference Int <+> Domain.domain)
+            (cm := _)
             (io := _)
             (nt := _)
             (web := _)

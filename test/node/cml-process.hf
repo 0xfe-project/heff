@@ -1,54 +1,60 @@
--- Commands held by green threads, scheduled by std.reactor
--- (`Reactor.scheduled`): each thread a `withProcess` of its own, a
--- sleep of a second, waited for -- the wait pending while the other
--- threads go on, so that three sleeps are waited for in about a second,
--- not three.  By C alone.
+-- Commands held by cml's threads, waiting on the world through each
+-- domain's reactor (`CML.scheduledWithReactor`): each thread a
+-- `withProcess` of its own, a sleep of a second, waited for -- the wait
+-- pending while the other threads go on, so that three sleeps are
+-- waited for in about a second, not three.  By C alone.
 --
 --   main     three sleeps started at once, each waited for by its own
 --            thread, which then says so on a channel; main counts them
 
-module test.node.green-process
+module test.node.cml-process
 
+import cml as CML
 import co
 import exception
-import green
+import std.domain as Domain
 import std.io
 import std.process
 import std.reactor as Reactor
 
 -- (a command of a second, held by this thread and waited for; then
 -- `done` told)
-sleeper : {e : HFunctor}
-        -> {{gr : green <: e}}
+sleeper : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{sys : process <: e}}
         -> {{ex : exception ProcessError <: e}}
-        -> Int
+        -> CML.Chan w Int
         -> Co e Unit
 sleeper done = do
   withProcess { command = "sleep", args = ["1"] } (\p -> wait p)
-  send done 1
+  CML.send done 1
 
 repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
 repeatG 0 c = pure MkUnit
 repeatG n c = bind c (\u -> repeatG (n - 1) c)
 
 -- (n values received on ch, added up)
-recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.Chan w Int
+        -> Int
+        -> Int
+        -> Co e Int
 recvSum ch 0 acc = pure acc
 recvSum ch n acc = do
-  x <- recv ch
+  x <- CML.recv ch
   recvSum ch (n - 1) (acc + x)
 
 -- (n sleeps, a thread each, waited for at once: how many were)
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
+program : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{sys : process <: e}}
         -> {{ex : exception ProcessError <: e}}
         -> Int
         -> Co e Int
 program n = do
-  done <- newChan
-  repeatG n (spawn (sleeper done))
+  done <- CML.newChan
+  repeatG n (CML.spawn (sleeper done))
   recvSum done n 0
 
 -- (what main came to: a deadlock, a throw no thread heard, or the count)
@@ -57,15 +63,17 @@ said Nothing = "a deadlock"
 said (Just (Left err)) = "not heard: " ^ err.message
 said (Just (Right n)) = debug n ^ " sleeps waited for at once"
 
-main : Co (stdio <+> Reactor.reactor <+> process) Unit
+main : Co (stdio <+> Reactor.reactor <+> process <+> Domain.domain) Unit
 main = do
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          ProcessError
          (program
-            (gr := _)
+            (w := stdio <+> Reactor.reactor <+> process <+> Domain.domain)
+            (cm := _)
             (sys := _)
             (ex := _)
             3))

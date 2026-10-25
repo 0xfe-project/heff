@@ -1,7 +1,7 @@
 // Time's side of std.time, for the C backend: an effect provider.  A
 // sleep is a wait of the runtime's reactor with a deadline and no
-// descriptor: in a group of std.reactor's (green threads scheduled by
-// `Reactor.scheduled`) it is pending, the other threads going on until
+// descriptor: in a group of std.reactor's (cml's threads scheduled by
+// `scheduledWithReactor`) it is pending, the other threads going on until
 // its time has passed; elsewhere the program waits where it is.  A
 // clock is read there and then: the time of day (CLOCK_REALTIME), and
 // one that only goes forward (CLOCK_MONOTONIC), each in nanoseconds.

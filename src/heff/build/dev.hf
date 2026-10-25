@@ -6,8 +6,8 @@
 -- programs it builds run beside it, their output the terminal's, each
 -- held by a `with` (std.process's `withProcess`) until a build after a
 -- change has made them anew.  A page
--- is served by `heff dev-pages`, beside it too (std.http.server, by
--- green threads): `/NAME/` the program NAME's page -- its
+-- is served by `heff dev-pages`, beside it too (std.http.server, its
+-- connections served at once through std.reactor's group, no threads): `/NAME/` the program NAME's page -- its
 -- app/NAME/index.html, or one made for it -- `/NAME/NAME.js` its script
 -- as built, and the rest of app/NAME/ as it is; a page asks every half
 -- second whether it has been built again (`/.heff/built`), and loads
@@ -18,7 +18,6 @@ module heff.build.dev
 import bytes as Bytes
 import co
 import exception
-import green
 import heff.build.commands as Commands
 import heff.build.project as Project
 import heff.build.watch as Watch
@@ -34,6 +33,7 @@ import std.process
 import std.progress as Progress
 import rune as Rune
 import std.reactor as Reactor
+import resource
 import std.time as Time
 import std.duration as Duration
 
@@ -561,6 +561,82 @@ served st (Just to) req = do
   then answer st (partsOf (pathOf req.target))
   else forwarded to req
 
+-- (how many connections the pages' server serves at once: a browser
+-- opens six to a server at most)
+connectionsAtOnce : Int
+connectionsAtOnce = 16
+
+-- (a connection accepted and served until it is closed)
+accepted : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
+         -> With s Net.TcpListener
+         -> (Server.Request -> Co e HTTP.Response)
+         -> Co e Unit
+accepted l handle =
+  bind
+    (Net.accept l (\c -> Server.serveConnection (\r -> False) handle c))
+    (\after -> pure MkUnit)
+
+-- (a connection accepted and served, started in the reactor's group:
+-- pending while it waits on its socket, done once it is closed --
+-- `False` where accepting failed, the server to stop)
+connectionServed : {e : HFunctor}
+                 -> {s : Type}
+                 -> {{nt : Net.net <: e}}
+                 -> With s Net.TcpListener
+                 -> (Server.Request -> Co e HTTP.Response)
+                 -> Co e Bool
+connectionServed l handle =
+  bind
+    (attempt
+       Net.NetError
+       (accepted (nt := _) (ex := _) l (\r -> lift (inj := _) (handle r))))
+    (\r ->
+       pure (case r of
+         Left err -> False
+         Right u -> True))
+
+-- (the group's connections served, a new one started as each ends, `n`
+-- of them pending, until accepting fails: then those pending let go of)
+servedOn : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> Reactor.Group Bool
+         -> With s Net.TcpListener
+         -> (Server.Request -> Co e HTTP.Response)
+         -> Int
+         -> Co e Unit
+servedOn g l handle n =
+  if n < connectionsAtOnce
+  then do
+    r <- Reactor.start g (connectionServed l handle)
+    case r of
+      Just False -> Reactor.close g
+      Just True -> servedOn g l handle n
+      Nothing -> servedOn g l handle (n + 1)
+  else do
+    ended <- Reactor.finished g True
+    if List.all (\ok -> ok) ended
+    then servedOn g l handle (n - List.length ended)
+    else Reactor.close g
+
+-- (the listener's connections served at once, `connectionsAtOnce` of
+-- them at most, each a computation started in a group of the reactor's,
+-- waiting on its socket apart: no thread, the pages' server one domain's)
+servedAtOnce : {e : HFunctor}
+             -> {s : Type}
+             -> {{nt : Net.net <: e}}
+             -> {{rx : Reactor.reactor <: e}}
+             -> With s Net.TcpListener
+             -> (Server.Request -> Co e HTTP.Response)
+             -> Co e Unit
+servedAtOnce l handle = do
+  g <- Reactor.open
+  servedOn g l handle 0
+
 -- (the pages no longer served: the program ended, or it could not
 -- listen at the port -- said, and the program failed)
 -- | the pages served at the port, as `heff dev` has them served, what is
@@ -588,16 +664,7 @@ pagesCmd port proxy = do
            ^ port
            ^ "/"
            ^ maybe "" (\to -> ", the rest sent to " ^ to) proxy)
-      Reactor.scheduled
-          (Server.serveConcurrently
-             (gr := _)
-             (nt := _)
-             listener
-             (served
-                (disk := _)
-                (web := _)
-                st
-                proxy))
+      servedAtOnce listener (served st proxy)
     pure MkUnit
   catch (err : Net.NetError) ->
     printErr ("heff dev: cannot serve the pages at " ^ show err)

@@ -5,9 +5,9 @@
 // value, a `Started`, held by a `with` -- until it is waited for or
 // its `with` ends (`Release`: ended, if it has not, and waited for);
 // those not ended at the program's end are terminated then (atexit),
-// and asked to end where a signal ends it.  A green thread's wait on
-// one, scheduled by std.reactor, is pending while the other threads go
-// on: this provider is a source of the reactor's.
+// and asked to end where a signal ends it.  A wait on one started in a
+// group of std.reactor's is pending while the other threads go on: this
+// provider is a source of the reactor's.
 
 #ifdef _WIN32
 #include <direct.h>
@@ -1321,8 +1321,8 @@ static void heff_sub_close_input(HeffSub *s) {
 #endif
 
 #ifndef _WIN32
-// Waits on a started command, pending: a green thread's, scheduled by
-// std.reactor, which goes on once it is done while the other threads go
+// Waits on a started command, pending in a group of std.reactor's: a
+// thread's, which goes on once it is done while the other threads go
 // on meanwhile -- for its end (`Wait`, `Terminate`), for a portion of
 // what it writes (`ReadOutput`, `ReadErrors`), for its input to take
 // what is written (`WriteInput`).  Each is a wait of the reactor's with

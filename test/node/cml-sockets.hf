@@ -1,11 +1,11 @@
--- Green threads doing std.net's operations, scheduled by
--- std.reactor (`Reactor.scheduled`): while one waits on a socket, the
--- others go on.  Each connection is had by a `with`, in the thread that
--- uses it.  By C alone.
+-- cml's threads doing std.net's operations, waiting on the world through
+-- each domain's reactor (`CML.scheduledWithReactor`): while one waits on
+-- a socket, the others go on.  Each connection is had by a `with`, in
+-- the thread that uses it.  By C alone.
 --
 --   main     a thread blocked on a read lets another run, whose write
 --            it then reads; many clients echoed at once by a server of
---            green threads, a thread a connection, each accepted in its
+--            cml's threads, a thread a connection, each accepted in its
 --            own; a connection refused, a name resolved by a thread of
 --            its own and one not resolved -- each thrown by its `with`
 --            and heard -- while another thread counts;
@@ -13,14 +13,16 @@
 --            its own; and main done while a thread still waits to
 --            accept, let go of
 --
--- Each thread says what it does, in the order the schedule has it.
+-- Each thread says what it does, in an order its ivars and channels
+-- keep, whichever domains run them.
 
-module test.node.green-sockets
+module test.node.cml-sockets
 
 import bytes as Bytes
+import cml as CML
 import co
 import exception
-import green
+import std.domain as Domain
 import std.io
 import std.net as Net
 import std.process
@@ -59,10 +61,15 @@ repeatG 0 c = pure MkUnit
 repeatG n c = bind c (\u -> repeatG (n - 1) c)
 
 -- (n values received on ch, added up)
-recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> CML.Chan w Int
+        -> Int
+        -> Int
+        -> Co e Int
 recvSum ch 0 acc = pure acc
 recvSum ch n acc = do
-  x <- recv ch
+  x <- CML.recv ch
   recvSum ch (n - 1) (acc + x)
 
 -- A read lets a write run
@@ -70,35 +77,42 @@ recvSum ch n acc = do
 
 -- (a thread reads the client's side `c`, nothing written to it yet: it
 -- waits, and another runs meanwhile and writes to the server's side
--- `s`, which the first then reads)
-readWrite : {e : HFunctor}
+-- `s`, which the first then reads; each says so once the other has
+-- said what comes before, by an ivar)
+readWrite : {e w : HFunctor}
           -> {s t : Type}
-          -> {{gr : green <: e}}
+          -> {{cm : CML.cml w <: e}}
           -> {{io : stdio <: e}}
           -> {{nt : Net.net <: e}}
           -> With s Net.TcpStream
           -> With t Net.TcpStream
           -> Co e Unit
 readWrite c s = do
-  done <- newChan
-  spawn (do
+  done <- CML.newChan
+  reading <- (CML.newIVar : Co e (CML.IVar w Unit))
+  wrote <- (CML.newIVar : Co e (CML.IVar w Unit))
+  CML.spawn (do
     print "reader: reads"
+    CML.putIVar reading MkUnit
     got <- Net.read c 100
+    CML.readIVar wrote
     print ("reader: read " ^ showRead got)
-    send done 1)
-  spawn (do
+    CML.send done 1)
+  CML.spawn (do
+    CML.readIVar reading
     print "writer: runs while the reader waits"
     w <- Net.write s b["hello"]
     print ("writer: wrote, " ^ showFailed w)
-    send done 1)
+    CML.putIVar wrote MkUnit
+    CML.send done 1)
   n <- recvSum done 2 0
   print ("both done: " ^ debug n)
 
 -- | A connection to `l`, both sides had while two threads read one and
 -- | write the other.
-readThenWrite : {e : HFunctor}
+readThenWrite : {e w : HFunctor}
               -> {s : Type}
-              -> {{gr : green <: e}}
+              -> {{cm : CML.cml w <: e}}
               -> {{io : stdio <: e}}
               -> {{nt : Net.net <: e}}
               -> {{ex : exception Net.NetError <: e}}
@@ -137,9 +151,9 @@ echo c = bind (Net.read c 4096) (echoed (\u -> echo c) c)
 -- after, and this one echoed here, had by this thread's `with`; where
 -- none is accepted -- the listener's `with` ended -- its throw heard,
 -- done)
-echoServer : {e : HFunctor}
+echoServer : {e w : HFunctor}
            -> {s : Type}
-           -> {{gr : green <: e}}
+           -> {{cm : CML.cml w <: e}}
            -> {{nt : Net.net <: e}}
            -> {{ex : exception Net.NetError <: e}}
            -> With s Net.TcpListener
@@ -147,7 +161,7 @@ echoServer : {e : HFunctor}
 echoServer l = do
   try
     with Net.accept l as c do
-      spawn (echoServer l)
+      CML.spawn (echoServer l)
       echo c
   catch (err : Net.NetError) ->
     pure MkUnit
@@ -169,12 +183,12 @@ readN c n acc =
 -- (a client's line written on `c` and echoed back, 1 sent on `back`
 -- where the echo is the line; then, once main says so on `go`, what it
 -- said, the connection closed after)
-clientOn : {e : HFunctor}
+clientOn : {e w : HFunctor}
          -> {s : Type}
-         -> {{gr : green <: e}}
+         -> {{cm : CML.cml w <: e}}
          -> {{nt : Net.net <: e}}
-         -> Int
-         -> Int
+         -> CML.Chan w Int
+         -> CML.Chan w Int
          -> Int
          -> With s Net.TcpStream
          -> Co e Int
@@ -182,31 +196,46 @@ clientOn back go i c = do
   let line = Bytes.fromString ("client " ^ debug i ^ "\n")
   w <- Net.write c line
   got <- readN c (Bytes.length line) Bytes.empty
-  send back (if got == line then 1 else 0)
-  recv go
+  CML.send back (if got == line then 1 else 0)
+  CML.recv go
 
 -- | A client: its line written, echoed back; it holds its connection
 -- | until every client has had its echo (`all`, each of them sent one
 -- | on `back`, and main sends `go` once all have), then says it is done.
-client : {e : HFunctor}
-       -> {{gr : green <: e}}
+client : {e w : HFunctor}
+       -> {{cm : CML.cml w <: e}}
        -> {{nt : Net.net <: e}}
        -> {{ex : exception Net.NetError <: e}}
        -> Int
-       -> Int
-       -> Int
+       -> CML.Chan w Int
+       -> CML.Chan w Int
        -> Int
        -> Co e Unit
 client port back go i = do
   x <- Net.withConnection (here port) (\c -> clientOn back go i c)
-  send back x
+  CML.send back x
+
+-- (clients `i` down to 1, each a thread of its own)
+clients : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> CML.Chan w Int
+        -> CML.Chan w Int
+        -> Int
+        -> Co e Unit
+clients port back go 0 = pure MkUnit
+clients port back go i = do
+  CML.spawn (client port back go i)
+  clients port back go (i - 1)
 
 -- | n clients, each its line echoed, all holding their connections at
 -- | once: a server serving one connection at a time would never echo the
 -- | second.
-echoes : {e : HFunctor}
+echoes : {e w : HFunctor}
        -> {s : Type}
-       -> {{gr : green <: e}}
+       -> {{cm : CML.cml w <: e}}
        -> {{io : stdio <: e}}
        -> {{nt : Net.net <: e}}
        -> {{ex : exception Net.NetError <: e}}
@@ -215,13 +244,13 @@ echoes : {e : HFunctor}
        -> Int
        -> Co e Unit
 echoes l port n = do
-  spawn (echoServer l)
-  back <- newChan
-  go <- newChan
-  repeatG n (bind newChan (\i -> spawn (client port back go i)))
+  CML.spawn (echoServer l)
+  back <- CML.newChan
+  go <- CML.newChan
+  clients port back go n
   echoed <- recvSum back n 0
   print ("echoed, all held open at once: " ^ debug echoed)
-  repeatG n (send go 1)
+  repeatG n (CML.send go 1)
   closed <- recvSum back n 0
   print ("closed: " ^ debug closed)
 
@@ -229,15 +258,15 @@ echoes l port n = do
 --------------------------------------------------------------------------------
 
 -- (a thread counting to n, a yield at each)
-counting : {e : HFunctor}
-         -> {{gr : green <: e}}
-         -> Int
+counting : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
+         -> CML.Chan w Int
          -> Int
          -> Int
          -> Co e Unit
 counting ch n i =
-  if i >= n then send ch i
-  else bind yield (\u -> counting ch n (i + 1))
+  if i >= n then CML.send ch i
+  else bind CML.yield (\u -> counting ch n (i + 1))
 
 -- (a connection to `localhost` at the port picked for a listener on it:
 -- the name resolved, twice)
@@ -255,16 +284,16 @@ byName l = do
 
 -- | A connection refused, a name resolved (by a thread of its own) and
 -- | one not, each while another thread counts.
-failures : {e : HFunctor}
-         -> {{gr : green <: e}}
+failures : {e w : HFunctor}
+         -> {{cm : CML.cml w <: e}}
          -> {{io : stdio <: e}}
          -> {{nt : Net.net <: e}}
          -> {{ex : exception Net.NetError <: e}}
          -> Int
          -> Co e Unit
 failures refused = do
-  counted <- newChan
-  spawn (counting counted 1000 0)
+  counted <- CML.newChan
+  CML.spawn (counting counted 1000 0)
   r <-
     tried (Net.withConnection (here refused) (\c -> (pure MkUnit : Co e Unit)))
   print ("refused: " ^ r)
@@ -279,59 +308,59 @@ failures refused = do
   print
       ("a name not resolved: "
        ^ (if startsWith "EAI_" bad then "EAI_..." else bad))
-  n <- recv counted
+  n <- CML.recv counted
   print ("counted meanwhile: " ^ debug n)
 
 -- (a read of `c` by a thread of its own: what it came to, said, and
 -- `done` told)
-reading : {e : HFunctor}
+reading : {e w : HFunctor}
         -> {s : Type}
-        -> {{gr : green <: e}}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> String
-        -> Int
+        -> CML.Chan w Int
         -> With s Net.TcpStream
         -> Co e Unit
 reading what done c = do
   r <- Net.read c 100
   print (what ^ showRead r)
-  send done 1
+  CML.send done 1
 
 -- (the server's side `s` of the client's `c`: a thread reads `c`, and
 -- `s`'s `with` ends while it waits)
-otherSideEnds : {e : HFunctor}
+otherSideEnds : {e w : HFunctor}
               -> {s t : Type}
-              -> {{gr : green <: e}}
+              -> {{cm : CML.cml w <: e}}
               -> {{io : stdio <: e}}
               -> {{nt : Net.net <: e}}
-              -> Int
+              -> CML.Chan w Int
               -> With s Net.TcpStream
               -> With t Net.TcpStream
               -> Co e Unit
 otherSideEnds done c s = do
-  spawn (reading "read, the other side closed: " done c)
-  yield
+  CML.spawn (reading "read, the other side closed: " done c)
+  CML.yield
 
 -- (the server's side `t` of a connection: a thread reads it, and its
 -- own `with` ends while it waits)
-ownSideEnds : {e : HFunctor}
+ownSideEnds : {e w : HFunctor}
             -> {t : Type}
-            -> {{gr : green <: e}}
+            -> {{cm : CML.cml w <: e}}
             -> {{io : stdio <: e}}
             -> {{nt : Net.net <: e}}
-            -> Int
+            -> CML.Chan w Int
             -> With t Net.TcpStream
             -> Co e Unit
 ownSideEnds done t = do
-  spawn (reading "read, its socket closed: " done t)
-  yield
+  CML.spawn (reading "read, its socket closed: " done t)
+  CML.yield
 
 -- | A read the other side ends by its `with` ending, and a read whose
 -- | own connection's `with` ends.
-closings : {e : HFunctor}
+closings : {e w : HFunctor}
          -> {s : Type}
-         -> {{gr : green <: e}}
+         -> {{cm : CML.cml w <: e}}
          -> {{io : stdio <: e}}
          -> {{nt : Net.net <: e}}
          -> {{ex : exception Net.NetError <: e}}
@@ -339,38 +368,38 @@ closings : {e : HFunctor}
          -> Int
          -> Co e Unit
 closings l port = do
-  done <- newChan
+  done <- CML.newChan
   with Net.withConnection (here port) as c do
     Net.accept l (\s -> otherSideEnds done c s)
-    recv done
+    CML.recv done
   Net.withConnection (here port) (\d -> Net.accept l (\t -> ownSideEnds done t))
-  y <- recv done
+  y <- CML.recv done
   pure MkUnit
 
 -- | Main done while a thread waits to accept, inside its listener's
 -- | `with`: the schedule ends, the accept let go of, the listener with
 -- | it.
-abandoned : {e : HFunctor}
-          -> {{gr : green <: e}}
+abandoned : {e w : HFunctor}
+          -> {{cm : CML.cml w <: e}}
           -> {{nt : Net.net <: e}}
           -> {{ex : exception Net.NetError <: e}}
           -> Co e Int
 abandoned = do
-  spawn
+  CML.spawn
       (Net.withListener
          (here 0)
          4
          (\l -> Net.accept l (\c -> (pure MkUnit : Co e Unit))))
-  yield
+  CML.yield
   pure 7
 
 -- The program
 --------------------------------------------------------------------------------
 
 -- (the listener had: each part of the test on it)
-onListener : {e : HFunctor}
+onListener : {e w : HFunctor}
            -> {s : Type}
-           -> {{gr : green <: e}}
+           -> {{cm : CML.cml w <: e}}
            -> {{io : stdio <: e}}
            -> {{nt : Net.net <: e}}
            -> {{ex : exception Net.NetError <: e}}
@@ -385,8 +414,8 @@ onListener refused l = do
   closings l port
   echoes l port 50
 
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
+program : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> {{ex : exception Net.NetError <: e}}
@@ -409,28 +438,32 @@ said sh Nothing = "a deadlock"
 said sh (Just (Left err)) = "not heard: " ^ show err
 said sh (Just (Right x)) = sh x
 
-main : Co (stdio <+> Net.net <+> Reactor.reactor <+> process) Unit
+main : Co (stdio <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain) Unit
 main = do
   refused <- refusedPort (sys := _)
   r <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (program
-            (gr := _)
+            (w := stdio <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+            (cm := _)
             (io := _)
             (nt := _)
             (ex := _)
             refused))
   print (ev := _) (said (\u -> "main done") r)
   a <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (abandoned
-            (gr := _)
+            (w := stdio <+> Net.net <+> Reactor.reactor <+> process <+> Domain.domain)
+            (cm := _)
             (nt := _)
             (ex := _)))
   print (ev := _) ("abandoned, main's answer: " ^ said debug a)

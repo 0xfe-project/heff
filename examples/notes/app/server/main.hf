@@ -1,7 +1,8 @@
 -- The notes' server: the API (notes.api) answered at `/api`, by its real
 -- handler, the notes in a cell of the world; the page at `/`, and its
 -- script at `/client.js`, as `heff build` makes it.  Each connection is
--- a green thread of its own.  Run from the project's root:
+-- a thread of its own, cml's, waiting on the world through each domain's
+-- reactor.  Run from the project's root:
 --
 --   .heff/bin/server [PORT]      (8080 where none is given)
 
@@ -10,7 +11,7 @@ module app.server.main
 import bytes as Bytes
 import co
 import exception
-import green
+import cml as CML
 import notes.api
 import std.filesystem
 import std.http as HTTP
@@ -18,6 +19,7 @@ import std.http.server as Server
 import std.io
 import std.net as Net
 import std.path as Path
+import std.domain as Domain
 import std.process
 import std.reactor as Reactor
 import std.reference
@@ -94,11 +96,22 @@ page : {e : HFunctor}
      -> Co e HTTP.Response
 page r = pageAt (RemoteHTTP.pathOf r.target)
 
+-- (cml's threads, as std.http.server's `serveConcurrently` asks: a
+-- signal an ivar)
+threads : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Server.Threads e
+threads =
+  { spawn = \c -> CML.spawn c
+  , Signal = CML.IVar w Unit
+  , signal = CML.newIVar
+  , give = \sg -> CML.putIVar sg MkUnit
+  , awaited = \sg -> CML.readIVar sg
+  }
+
 -- (the listener's connections served, each a thread of its own, until
 -- one cannot be accepted)
-listening : {e : HFunctor}
+listening : {e w : HFunctor}
           -> {s : Type}
-          -> {{gr : green <: e}}
+          -> {{cm : CML.cml w <: e}}
           -> {{io : stdio <: e}}
           -> {{nt : Net.net <: e}}
           -> {{disk : filesystem <: e}}
@@ -112,7 +125,10 @@ listening r l = do
   print
       ("listening on http://127.0.0.1:"
        ^ either (\err -> "?") (\(a : Net.Address) -> debug a.port) at)
-  Server.serveConcurrently l (RemoteHTTP.routed "/api" notesApi (kept r) page)
+  Server.serveConcurrently
+      (th := threads)
+      l
+      (RemoteHTTP.routed "/api" notesApi (kept r) page)
   printErr "server: a connection could not be accepted"
 
 -- (the port the arguments say, 8080 where they say none)
@@ -120,8 +136,8 @@ portOf : List String -> Int
 portOf (p :: rest) = fromMaybe 8080 (parseInt p)
 portOf Nil = 8080
 
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
+program : {e w : HFunctor}
+        -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> {{sys : process <: e}}
@@ -147,18 +163,27 @@ main : Co
         <+> Reactor.reactor
         <+> process
         <+> filesystem
-        <+> reference (List Note))
+        <+> reference (List Note)
+        <+> Domain.domain)
        Unit
 main = do
   done <-
-    Reactor.scheduled
+    CML.scheduledWithReactor
+      (dm := _)
       (rx := _)
       (attempt
          Net.NetError
          (attempt
             FileError
             (program
-               (gr := _)
+               (w := stdio
+               <+> Net.net
+               <+> Reactor.reactor
+               <+> process
+               <+> filesystem
+               <+> reference (List Note)
+               <+> Domain.domain)
+               (cm := _)
                (io := _)
                (nt := _)
                (sys := _)
