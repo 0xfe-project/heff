@@ -1,21 +1,14 @@
--- `heff dev`: the project built as `heff build` builds it, its C
--- programs run, and its pages' scripts served -- then, at each change of
--- its files (package.hf, src/, app/), built again, and what runs started
--- again.  heff is run as `heff build` for each build, so that a build
--- that fails says why and is waited past, not the end of `heff dev`; the
--- programs it builds run beside it, their output the terminal's, each
--- held by a `with` (std.process's `withProcess`) until a build after a
--- change has made them anew.  A page
--- is served by `heff dev-pages`, beside it too (std.http.server, its
--- connections served at once through std.reactor's group, no threads): `/NAME/` the program NAME's page -- its
--- app/NAME/index.html, or one made for it -- `/NAME/NAME.js` its script
--- as built, and the rest of app/NAME/ as it is; a page asks every half
--- second whether it has been built again (`/.heff/built`), and loads
--- itself again where it has.
+-- `heff dev`: the project built as `heff build` builds it, and its C
+-- programs run -- then, at each change of its files (package.hf, src/,
+-- app/), built again, and what runs started again.  heff is run as
+-- `heff build` for each build, so that a build that fails says why and is
+-- waited past, not the end of `heff dev`; the programs it builds run
+-- beside it, their output the terminal's, each held by a `with`
+-- (std.process's `withProcess`) until a build after a change has made
+-- them anew.
 
 module heff.build.dev
 
-import bytes as Bytes
 import co
 import exception
 import heff.build.commands as Commands
@@ -24,16 +17,10 @@ import heff.build.watch as Watch
 import heff.util.hostpath as HostPath
 import std.filesystem
 import heff.util.files as Files
-import std.http as HTTP
-import std.http.server as Server
 import std.io
-import std.net as Net
 import std.path as Path
 import std.process
 import std.progress as Progress
-import rune as Rune
-import std.reactor as Reactor
-import resource
 import std.time as Time
 import std.duration as Duration
 
@@ -44,36 +31,19 @@ import std.duration as Duration
 -- | whether it has ended, asked of the `with`
 type Running (e : HFunctor) = { name : String, ended : Co e (Maybe Ran) }
 
--- | where `heff dev` is: how many builds there have been, the programs
--- | to run (all, where none is named), the port the pages are served
--- | at, where what is not theirs is sent (`--proxy`), and whether the
--- | pages' server runs (once there are pages, to the end)
-type Dev =
-  { builds : Int
-  , wanted : List String
-  , port : String
-  , proxy : Maybe String
-  , pages : Bool
-  }
+-- | where `heff dev` is: how many builds there have been, and the
+-- | programs to run (all, where none is named)
+type Dev = { builds : Int, wanted : List String }
 
 -- | a build that went well: where `heff dev` is after it, the programs it
 -- | is to run, and the project's files as stamped
 type Built = { dev : Dev, apps : List Commands.App, stamp : String }
-
--- | where a build that went well is said to have been made, for the
--- | pages to see: `.heff/dev/built`, the number of the build
-builtFile : Path.Style -> String
-builtFile st = HostPath.join st (HostPath.join st ".heff" "dev") "built"
 
 -- (the program, to be run: one of C's, among those wanted)
 isRun : List String -> Commands.App -> Bool
 isRun wanted a =
   strEq a.build.backend "c"
   && (List.null wanted || List.elem a.name wanted)
-
--- (a page's program)
-isPage : Commands.App -> Bool
-isPage a = strEq a.build.backend "page"
 
 -- (the command, to be started beside `heff dev`: its standard streams
 -- `heff dev`'s)
@@ -228,32 +198,21 @@ held st d stamp running (a :: rest) = do
     printErr ("heff dev: cannot run " ^ show err)
     held st d stamp running rest
 
--- (a build that went well, said: where it is said to have been made, for
--- the pages, and what is run)
+-- (a build that went well, said: what is run)
 builtSaid : {e : HFunctor}
           -> {{io : stdio <: e}}
-          -> {{disk : filesystem <: e}}
-          -> Path.Style
           -> Dev
           -> List Commands.App
           -> Co e Unit
-builtSaid st d apps = do
-  _ <- Files.makeDirectory (HostPath.join st ".heff" "dev")
-  _ <- Files.writeFile (builtFile st) (debug d.builds)
+builtSaid d apps =
   printErr
-      ("heff dev: built ("
-       ^ debug d.builds
-       ^ "); running "
-       ^ namesSaid (List.keepIf (isRun d.wanted) apps))
+    ("heff dev: built ("
+     ^ debug d.builds
+     ^ "); running "
+     ^ namesSaid (List.keepIf (isRun d.wanted) apps))
 
--- (the pages' server, to be started beside `heff dev`)
-pagesServer : String -> Dev -> Invocation
-pagesServer self d =
-  beside self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy)
-
--- | from a build that went well on: the pages' server started, held by a
--- | `with` to the end, once there are pages; the build said, its programs
--- | run, held by `with`s, until the next build that goes well; then that
+-- | from a build that went well on: the build said, its programs run,
+-- | held by `with`s, until the next build that goes well; then that
 -- | one's, and so on -- until the program is ended
 cycle : {e : HFunctor}
       -> {{io : stdio <: e}}
@@ -267,22 +226,12 @@ cycle : {e : HFunctor}
       -> String
       -> List Commands.App
       -> Co e Unit
-cycle st d stamp apps =
-  if List.any isPage apps && not d.pages
-  then do
-    self <- Commands.selfPath
-    try
-      with withProcess (pagesServer self d) as pg do
-        cycle st { d | pages = True } stamp apps
-    catch (err : ProcessError) ->
-      printErr ("heff dev: cannot serve the pages: " ^ show err)
-      cycle st { d | pages = True } stamp apps
-  else do
-    builtSaid st d apps
-    next <- held st d stamp Nil (List.keepIf (isRun d.wanted) apps)
-    cycle st next.dev next.stamp next.apps
+cycle st d stamp apps = do
+  builtSaid d apps
+  next <- held st d stamp Nil (List.keepIf (isRun d.wanted) apps)
+  cycle st next.dev next.stamp next.apps
 
--- | `heff dev [APP...] [--port N] [--proxy URL]`, at the project's root
+-- | `heff dev [APP...]`, at the project's root
 devCmd : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
@@ -291,10 +240,8 @@ devCmd : {e : HFunctor}
        -> {{clock : Time.time <: e}}
        -> {{ex : exception ProcessError <: e}}
        -> List String
-       -> Maybe String
-       -> Maybe String
        -> Co e Unit
-devCmd wanted port proxy = do
+devCmd wanted = do
   text <- Files.readFile "package.hf"
   st <- Commands.styleNow
   case text of
@@ -303,369 +250,10 @@ devCmd wanted port proxy = do
       exit 1
     Just _ -> do
       stamp <- Watch.stamped st Watch.project
-      let d : Dev =
-        { builds = 0
-        , wanted = wanted
-        , port = fromMaybe "8000" port
-        , proxy = proxy
-        , pages = False
-        }
+      let d : Dev = { builds = 0, wanted = wanted }
       first <- rebuilt st
       case first of
         Just apps -> cycle st { d | builds = 1 } stamp apps
         Nothing -> do
           next <- watched st d stamp Nil
           cycle st next.dev next.stamp next.apps
-
--- The pages
---------------------------------------------------------------------------------
-
--- | what a page loads, to load itself again when the project is built
--- | again: it asks every half second
-reloadScript : String
-reloadScript =
-  unlines
-    [ "<script>"
-    , "(function () {"
-    , "  var seen = null;"
-    , "  setInterval(function () {"
-    , "    fetch(\"/.heff/built\", { cache: \"no-store\" })"
-    , "      .then(function (r) { return r.text(); })"
-    , "      .then(function (t) { if (seen === null) seen = t; else if (t !== seen) location.reload(); })"
-    , "      .catch(function () {});"
-    , "  }, 500);"
-    , "})();"
-    , "</script>"
-    ]
-
--- | a page's HTML, the script that reloads it put before its `</body>`
--- | (at its end, where it has none)
--- | >>> withReload "<body>x</body>" == "<body>x" ^ reloadScript ^ "</body>"
--- | True
-withReload : String -> String
-withReload html = case indexOf "</body>" html 0 of
-  Just i -> strSlice html 0 i ^ reloadScript ^ strSlice html i (strLength html)
-  Nothing -> html ^ reloadScript
-
--- | the page made for the program NAME, where it has no index.html: an
--- | element `#NAME` for it, and its script
-madePage : String -> String
-madePage name =
-  unlines
-    [ "<!doctype html>"
-    , "<html lang=\"en\">"
-    , "<head><meta charset=\"utf-8\"><title>" ^ name ^ "</title></head>"
-    , "<body>"
-    , "<div id=\"" ^ name ^ "\"></div>"
-    , "<script src=\"" ^ name ^ ".js\"></script>"
-    , "</body>"
-    , "</html>"
-    ]
-
--- | a file's type, by its extension
--- | >>> List.map typeOf ["a.html", "a.js", "a.css", "a.bin"]
--- | ["text/html; charset=utf-8", "text/javascript; charset=utf-8", "text/css; charset=utf-8", "application/octet-stream"]
-typeOf : String -> String
-typeOf p =
-  if endsWith ".html" p then "text/html; charset=utf-8"
-  else if endsWith ".js" p || endsWith ".mjs" p
-  then "text/javascript; charset=utf-8"
-  else if endsWith ".css" p then "text/css; charset=utf-8"
-  else if endsWith ".json" p then "application/json"
-  else if endsWith ".svg" p then "image/svg+xml"
-  else if endsWith ".png" p then "image/png"
-  else if endsWith ".jpg" p || endsWith ".jpeg" p then "image/jpeg"
-  else if endsWith ".wasm" p then "application/wasm"
-  else if endsWith ".txt" p then "text/plain; charset=utf-8"
-  else "application/octet-stream"
-
--- (a response of the text, of the type, never kept by the browser)
-fresh : Int -> String -> String -> HTTP.Response
-fresh status kind text =
-  { status = status
-  , headers = [MkPair "Content-Type" kind, MkPair "Cache-Control" "no-store"]
-  , body = Bytes.fromString text
-  }
-
--- (a file's response, of its type, or 404)
-fileAnswer : String -> Maybe String -> HTTP.Response
-fileAnswer p (Just text) = fresh 200 (typeOf p) text
-fileAnswer p Nothing = Server.plain 404 ("no " ^ p ^ "\n")
-
--- (a page's response: its HTML with the script that reloads it -- one
--- made for it, where it has none and its script is built; else 404)
-pageAnswer : String -> Bool -> Maybe String -> HTTP.Response
-pageAnswer name built (Just html) = fresh 200 (typeOf ".html") (withReload html)
-pageAnswer name True Nothing =
-  fresh 200 (typeOf ".html") (withReload (madePage name))
-pageAnswer name False Nothing = Server.plain 404 ("no page " ^ name ^ "\n")
-
--- (the index: the pages built, each linked)
-indexAnswer : Maybe (List String) -> HTTP.Response
-indexAnswer found =
-  fresh
-    200
-    (typeOf ".html")
-    (unlines
-       (List.append
-          [ "<!doctype html>"
-          , "<title>heff dev</title>"
-          , "<h1>the pages</h1>"
-          , "<ul>"
-          ]
-          (List.append
-             (List.map
-                (\js ->
-                   "<li><a href=\"/"
-                   ^ strSlice js 0 (strLength js - 3)
-                   ^ "/\">"
-                   ^ strSlice js 0 (strLength js - 3)
-                   ^ "</a></li>")
-                (List.keepIf
-                   (\n ->
-                      endsWith ".js" n && not (startsWith (prefix := ".") n))
-                   (fromMaybe Nil found)))
-             ["</ul>", reloadScript])))
-
--- (a request's path, its query left out)
-pathOf : String -> String
-pathOf target = case indexOf "?" target 0 of
-  Just i -> strSlice target 0 i
-  Nothing -> target
-
--- (a path's parts, from its first `/` on)
-partsOf : String -> List String
-partsOf path = split "/" (strSlice path 1 (strLength path))
-
--- (a part that goes nowhere it should not: no `..`, nothing empty)
-safePart : String -> Bool
-safePart p = not (strEq p "..") && not (strEq p "") && not (strEq p ".")
-
--- | what is asked for, answered: the pages' server
-answer : {e : HFunctor}
-       -> {{disk : filesystem <: e}}
-       -> Path.Style
-       -> List String
-       -> Co e HTTP.Response
-answer st (".heff" :: "built" :: Nil) = do
-  n <- Files.readFile (builtFile st)
-  pure (fresh 200 (typeOf ".txt") (fromMaybe "0" n))
-answer st ("" :: Nil) = do
-  found <- Files.readDirectory (Commands.binDir st)
-  pure (indexAnswer found)
-answer st (name :: Nil) =
-  pure
-    { status = 301
-    , headers = [MkPair "Location" ("/" ^ name ^ "/")]
-    , body = Bytes.fromString ""
-    }
-answer st (name :: "" :: Nil) = do
-  html <-
-    Files.readFile (HostPath.join st (HostPath.join st "app" name) "index.html")
-  built <- isFile (HostPath.join st (Commands.binDir st) (name ^ ".js"))
-  pure (pageAnswer name built html)
-answer st (name :: rest) =
-  if not (List.all safePart (name :: rest))
-  then pure (Server.plain 404 "no such file\n")
-  else if strEq (joinWith "/" rest) (name ^ ".js")
-  then do
-    js <- Files.readFile (HostPath.join st (Commands.binDir st) (name ^ ".js"))
-    pure (fileAnswer (name ^ ".js") js)
-  else do
-    text <-
-      Files.readFile
-        (List.foldl
-           (\p x -> HostPath.join st p x)
-           (HostPath.join st "app" name)
-           rest)
-    pure (fileAnswer (joinWith "/" rest) text)
-answer st Nil = pure (Server.plain 404 "no such file\n")
-
--- (the first part of a path)
-firstPart : List String -> String
-firstPart (x :: _) = x
-firstPart Nil = ""
-
--- (a path the pages' server answers itself, whatever is sent elsewhere)
-ownPath : List String -> Bool
-ownPath (".heff" :: "built" :: Nil) = True
-ownPath ("" :: Nil) = True
-ownPath ps = False
-
--- (a header's name, its case not minded)
-lowered : String -> String
-lowered s = fromRunes (List.map Rune.toLower (runes s))
-
--- | the headers passed on, from a client to where it is sent and back:
--- | not the connection's own, which each side writes for itself
--- | >>> passed [MkPair "Host" "x", MkPair "Content-Type" "a", MkPair "content-length" "3"]
--- | [MkPair "Content-Type" "a"]
-passed : List (Pair String String) -> List (Pair String String)
-passed hs =
-  List.keepIf
-    (\h ->
-       not
-         (List.elem
-            (lowered (fst h))
-            [ "host"
-            , "content-length"
-            , "connection"
-            , "transfer-encoding"
-            , "keep-alive"
-            ]))
-    hs
-
--- (what came back from where a request was sent: passed on, or why
--- nothing came, 502)
-relayed : String -> Either HTTP.HttpError HTTP.Response -> HTTP.Response
-relayed to (Right res) = { res | headers = passed res.headers }
-relayed to (Left err) =
-  Server.plain
-    502
-    ("heff dev: nothing from " ^ show err ^ "\n")
-
--- | a request sent on to `to` (`http://127.0.0.1:8080`, say), as it came,
--- | and its response given back
-forwarded : {e : HFunctor}
-          -> {{web : HTTP.http <: e}}
-          -> String
-          -> Server.Request
-          -> Co e HTTP.Response
-forwarded to req = do
-  r <-
-    HTTP.send
-      { url = to ^ req.target
-      , method = req.method
-      , headers = passed req.headers
-      , body = req.body
-      , follow = False
-      }
-  pure (relayed to r)
-
--- | a request to the pages' server: its own (the built count, the index,
--- | a program's page and files), or, where there is somewhere to send
--- | what is not, sent there
-served : {e : HFunctor}
-       -> {{disk : filesystem <: e}}
-       -> {{web : HTTP.http <: e}}
-       -> Path.Style
-       -> Maybe String
-       -> Server.Request
-       -> Co e HTTP.Response
-served st Nothing req = answer st (partsOf (pathOf req.target))
-served st (Just to) req = do
-  mine <-
-    isDirectory
-      (HostPath.join st "app" (firstPart (partsOf (pathOf req.target))))
-  if mine || ownPath (partsOf (pathOf req.target))
-  then answer st (partsOf (pathOf req.target))
-  else forwarded to req
-
--- (how many connections the pages' server serves at once: a browser
--- opens six to a server at most)
-connectionsAtOnce : Int
-connectionsAtOnce = 16
-
--- (a connection accepted and served until it is closed)
-accepted : {e : HFunctor}
-         -> {s : Type}
-         -> {{nt : Net.net <: e}}
-         -> {{ex : exception Net.NetError <: e}}
-         -> With s Net.TcpListener
-         -> (Server.Request -> Co e HTTP.Response)
-         -> Co e Unit
-accepted l handle =
-  bind
-    (Net.accept l (\c -> Server.serveConnection (\r -> False) handle c))
-    (\after -> pure MkUnit)
-
--- (a connection accepted and served, started in the reactor's group:
--- pending while it waits on its socket, done once it is closed --
--- `False` where accepting failed, the server to stop)
-connectionServed : {e : HFunctor}
-                 -> {s : Type}
-                 -> {{nt : Net.net <: e}}
-                 -> With s Net.TcpListener
-                 -> (Server.Request -> Co e HTTP.Response)
-                 -> Co e Bool
-connectionServed l handle =
-  bind
-    (attempt
-       Net.NetError
-       (accepted (nt := _) (ex := _) l (\r -> lift (inj := _) (handle r))))
-    (\r ->
-       pure (case r of
-         Left err -> False
-         Right u -> True))
-
--- (the group's connections served, a new one started as each ends, `n`
--- of them pending, until accepting fails: then those pending let go of)
-servedOn : {e : HFunctor}
-         -> {s : Type}
-         -> {{nt : Net.net <: e}}
-         -> {{rx : Reactor.reactor <: e}}
-         -> Reactor.Group Bool
-         -> With s Net.TcpListener
-         -> (Server.Request -> Co e HTTP.Response)
-         -> Int
-         -> Co e Unit
-servedOn g l handle n =
-  if n < connectionsAtOnce
-  then do
-    r <- Reactor.start g (connectionServed l handle)
-    case r of
-      Just False -> Reactor.close g
-      Just True -> servedOn g l handle n
-      Nothing -> servedOn g l handle (n + 1)
-  else do
-    ended <- Reactor.finished g True
-    if List.all (\ok -> ok) ended
-    then servedOn g l handle (n - List.length ended)
-    else Reactor.close g
-
--- (the listener's connections served at once, `connectionsAtOnce` of
--- them at most, each a computation started in a group of the reactor's,
--- waiting on its socket apart: no thread, the pages' server one domain's)
-servedAtOnce : {e : HFunctor}
-             -> {s : Type}
-             -> {{nt : Net.net <: e}}
-             -> {{rx : Reactor.reactor <: e}}
-             -> With s Net.TcpListener
-             -> (Server.Request -> Co e HTTP.Response)
-             -> Co e Unit
-servedAtOnce l handle = do
-  g <- Reactor.open
-  servedOn g l handle 0
-
--- (the pages no longer served: the program ended, or it could not
--- listen at the port -- said, and the program failed)
--- | the pages served at the port, as `heff dev` has them served, what is
--- | not theirs sent to `proxy` where it is given, until the program is
--- | ended (`heff dev-pages PORT [PROXY]`)
-pagesCmd : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> {{disk : filesystem <: e}}
-         -> {{nt : Net.net <: e}}
-         -> {{rx : Reactor.reactor <: e}}
-         -> {{web : HTTP.http <: e}}
-         -> {{nx : exception Net.NetError <: e}}
-         -> String
-         -> Maybe String
-         -> Co e Unit
-pagesCmd port proxy = do
-  st <- Commands.styleNow
-  try
-    with Net.withListener
-           { host = "127.0.0.1", port = fromMaybe 8000 (parseInt port) }
-           64 as listener do
-      printErr
-          ("heff dev: the pages at http://127.0.0.1:"
-           ^ port
-           ^ "/"
-           ^ maybe "" (\to -> ", the rest sent to " ^ to) proxy)
-      servedAtOnce listener (served st proxy)
-    pure MkUnit
-  catch (err : Net.NetError) ->
-    printErr ("heff dev: cannot serve the pages at " ^ show err)
-    exit 1

@@ -14,7 +14,7 @@ Each directory of `examples/` in the repository is a project:
   statements, unit tests and a property.
 - `todos/`: a terminal app; a cursor effect handled on a zipper.
 - `pages/`: four web pages: a counter, a clock, a greeting, and a sum
-  of vectors on the GPU. `heff dev` serves each at `/NAME/`.
+  of vectors on the GPU.
 - `notes/`: a page and its server, in one project.
 - `testbridge/`: a Linux program that makes network devices by
   rtnetlink, with a provider of its own.

@@ -12,7 +12,7 @@ title: Commands
 | `heff install [DIR]` | build the project to run fastest, into `~/.heff/bin/` |
 | `heff get [PATH[@VERSION]]` | fetch the packages required; with PATH, require it first: at VERSION, a branch's or a commit's pseudo-version, else its newest |
 | `heff publish VERSION` | check the project, tag it `vVERSION`, and push the tag |
-| `heff dev [APP...]` | build, run and serve the project, again at each change |
+| `heff dev [APP...]` | build and run the project, again at each change |
 | `heff fmt [--check] FILE...` | format files in place |
 | `heff check FILE` | print a file's interface and its errors |
 | `heff doc [FILE...] [--out DIR]` | write each module's reference page; no FILE: `src/` |
@@ -95,17 +95,15 @@ published.
 
 ```sh
 cd examples/notes
-heff dev --proxy http://127.0.0.1:8080
+heff dev
 ```
 
-`heff dev` builds the project, runs its C programs (the APPs named, or
-all), and serves its pages. When a file of `package.hf`, `src/` or
-`app/` changes, it builds again and restarts what runs.
+`heff dev` builds the project and runs its C programs (the APPs named,
+or all). When a file of `package.hf`, `src/` or `app/` changes, it
+builds again and restarts what runs.
 
-- A page is served at `http://127.0.0.1:8000/NAME/` (`--port` to change
-  the port), and reloads itself after each build.
-- `--proxy URL` sends every request that is not for a page to URL, such
-  as the API a page calls on its server.
+- A page's script is built as `heff build` builds it; serve the page
+  with any file server.
 - Ctrl-C stops it and what it runs.
 
 ## Formatting

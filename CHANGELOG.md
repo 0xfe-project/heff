@@ -94,6 +94,7 @@
 
 ### Compiler and tools
 
+- `heff dev` builds and runs, and no longer serves pages: `heff dev-pages`, `--port` and `--proxy` are gone, and heff links no network or HTTP client.
 - `heff dev-pages` serves up to 16 connections at once, each a computation of its own in a group of std.reactor's, no threads (it was green threads), so heff stays a program of one thread.
 - The interpreter (doc tests, watches, `heff eval`) tells a loop from a recursion: a call in a tail position, a function's body applied or a match's arm, nests no deeper, so a loop runs as long as it takes up to a hundred million steps, and only what waits for a value nests, up to a million (#128). A tail loop of ten million turns, or JSON nested 500000 deep, is no longer `<diverged>`; `spin x = spin (x + 1)` still is, after about 7 s.
 - `heff fmt`: a block that is an application's last argument, `f x (case y of`, laid out on a line of its own (after `=`, or a lambda's arrow), has its items indented from that line, as a statement's are, not under the application's first token.
