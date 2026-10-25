@@ -831,6 +831,36 @@ fits e sp goal w = do
     putSt before
     pure (fitOf w inst after r)
 
+-- | a candidate whose conclusion is the goal without deciding any of
+-- | the goal's metavariables `ms`: unified the other way round, so that
+-- | where one of the candidate's binders meets a metavariable of the
+-- | goal, the binder's is the one solved.  Where it fits so, the goal's
+-- | metavariables are not what picked it, and solving them later only
+-- | takes candidates away
+fitsLeaving : ElabEnv
+            -> Params.Span
+            -> Value.Ty
+            -> List Int
+            -> Witness
+            -> Elab (Maybe Fit)
+fitsLeaving e sp goal ms w = do
+  before <- gets (\c -> c)
+  inst <- instantiate e sp w
+  mc2 <- gets (\c -> c.metas)
+  r <-
+    Meta.unifyTy
+      e.globals
+      (shape e.scope)
+      (unspecTy mc2 inst.conclusion)
+      goal
+  after <- gets (\c -> c)
+  putSt before
+  let left =
+    List.all
+      (\m -> maybe True (\v -> False) (Value.solutionOf after.metas m))
+      ms
+  pure (if left then fitOf w inst after r else Nothing)
+
 -- (a candidate that fits, if it does, before the others that do)
 withFit : Maybe Fit -> List Fit -> List Fit
 withFit (Just f) fs = Cons f fs
@@ -1049,12 +1079,14 @@ checkSettings e sp w goal found (Cons st rest) = do
 -- | `T args`, and an instance declared specialised is a candidate as one
 -- | of its theory; the one found has then its field `x` unified with `v`
 -- | (E0354 where it is not).  A goal not determined yet -- a
--- | metavariable in it -- waits, but for two cases, where the one
--- | witness that unifies with it is taken and solves it, as Agda's
--- | instance search solves metavariables by its one candidate (solving
--- | a metavariable only takes candidates away, so one unique now stays
--- | so): evidence, `boc ?w <: ?e`, at once (`isEvidence`); any other
--- | at the end, once no literal is left to
+-- | metavariable in it -- waits, but for three cases, where the one
+-- | witness that unifies with it is taken, as Agda's instance search
+-- | solves metavariables by its one candidate (solving a metavariable
+-- | only takes candidates away, so one unique now stays so): at once,
+-- | where it fits the goal without deciding any of its metavariables
+-- | (`Binder (Co ?e a)` by an instance for `Co e a`: what `?e` comes to
+-- | is not the instance's to say); evidence, `boc ?w <: ?e`, at once
+-- | (`isEvidence`); any other at the end, once no literal is left to
 -- | guess a type for (a literal's guess, `1 : Int`, comes before an
 -- | instance's say).  Where none or more than one fits, it waits, and
 -- | at the end is E0340.
@@ -1087,14 +1119,61 @@ resolveWanted e sp search hm holeVal goal final = do
            ^ wantedByWhom e mc search)
           "give the argument explicitly, or annotate so the implicits around it are solved"
       else pure False
+  -- (the one candidate committed to, and its own instance arguments
+  -- searched for, one deeper)
+  let taken : Fit -> Elab Bool = \one -> do
+    inst <- committed e sp hm holeVal goal one
+    eachSubgoal
+        (\sg -> do
+         mcNow <- gets (\c -> c.metas)
+         traceE
+             sp
+             "instance"
+             (\u ->
+                "wanted "
+                ^ goalShown e mcNow sg.goal
+                ^ "  [by "
+                ^ nameOf one.witness
+                ^ " for "
+                ^ goalShown e mc goal
+                ^ "]")
+         done <-
+           resolveWanted
+             e
+             sp
+             (deeperSearch search one.witness goal)
+             (metaOf sg.hole.stx)
+             sg.hole.val
+             sg.goal
+             final
+         -- (one whose type is not determined yet waits, as any)
+         if done then pure MkUnit
+         else want
+             sp
+             (\later ->
+                resolveWanted
+                  e
+                  sp
+                  (deeperSearch search one.witness goal)
+                  (metaOf sg.hole.stx)
+                  sg.hole.val
+                  sg.goal
+                  later))
+        inst.subgoals
+    mcNow <- gets (\c -> c.metas)
+    checkSettings
+        e
+        sp
+        one.witness
+        goal
+        (Memoed.valN inst.applied)
+        (settingsWanted mcNow goal)
+    pure True
+  let candidates = List.append (instLocals e) (instGlobals e)
   if undetermined && earlier && final
   then failElsewhere
       sp
       "an instance argument's type is left undetermined by an error before"
-  -- (a goal still waiting is not matched against the witnesses at every
-  -- wake: the matching is the costly part, and its answer would be the
-  -- same)
-  else if undetermined && not eager then undecided MkUnit
   else if search.depth > instanceDepthLimit
   then failWithNote
       (a := Bool)
@@ -1102,62 +1181,28 @@ resolveWanted e sp search hm holeVal goal final = do
       49
       (tooDeep e mc search goal)
       "an instance's instance arguments are found by searches of their own, and one that wants an instance of a type no smaller than its own may want them without end: give the argument explicitly, `(x := e)`"
-  else do
-    matches <-
-      witnessMatches
-        e
-        sp
-        (unspecTy mc goal)
-        (List.append (instLocals e) (instGlobals e))
+  -- (a goal still waiting is taken by its one candidate where that one
+  -- fits it without deciding any of its metavariables; else it waits)
+  else if undetermined && not eager
+  then do
+    matches <- witnessMatches e sp (unspecTy mc goal) candidates
     case matches of
       Cons one Nil -> do
-        inst <- committed e sp hm holeVal goal one
-        eachSubgoal
-            (\sg -> do
-             mcNow <- gets (\c -> c.metas)
-             traceE
-                 sp
-                 "instance"
-                 (\u ->
-                    "wanted "
-                    ^ goalShown e mcNow sg.goal
-                    ^ "  [by "
-                    ^ nameOf one.witness
-                    ^ " for "
-                    ^ goalShown e mc goal
-                    ^ "]")
-             done <-
-               resolveWanted
-                 e
-                 sp
-                 (deeperSearch search one.witness goal)
-                 (metaOf sg.hole.stx)
-                 sg.hole.val
-                 sg.goal
-                 final
-             -- (one whose type is not determined yet waits, as any)
-             if done then pure MkUnit
-             else want
-                 sp
-                 (\later ->
-                    resolveWanted
-                      e
-                      sp
-                      (deeperSearch search one.witness goal)
-                      (metaOf sg.hole.stx)
-                      sg.hole.val
-                      sg.goal
-                      later))
-            inst.subgoals
-        mcNow <- gets (\c -> c.metas)
-        checkSettings
+        leaving <-
+          fitsLeaving
             e
             sp
+            (unspecTy mc goal)
+            (metasLeft e mc (unspecTy mc goal))
             one.witness
-            goal
-            (Memoed.valN inst.applied)
-            (settingsWanted mcNow goal)
-        pure True
+        case leaving of
+          Just fit -> taken fit
+          Nothing -> undecided MkUnit
+      _ -> undecided MkUnit
+  else do
+    matches <- witnessMatches e sp (unspecTy mc goal) candidates
+    case matches of
+      Cons one Nil -> taken one
       Nil ->
         -- (not an error of its own where an instance that may have
         -- been the one wanted did not elaborate: that is reported)
