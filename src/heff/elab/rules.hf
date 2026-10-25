@@ -151,6 +151,7 @@ withScope e sc =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 withFor : ElabEnv -> ElabFor -> ElabEnv
@@ -161,6 +162,7 @@ withFor e ef =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 intoLam : ElabEnv -> Scope -> Value.V -> ElabEnv
@@ -171,6 +173,7 @@ intoLam e sc v =
   , lams = e.lams + 1
   , self = e.self
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 intoLamQuiet : ElabEnv -> Scope -> Value.V -> ElabEnv
@@ -181,6 +184,7 @@ intoLamQuiet e sc v =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 -- | under an implicit or instance binder, bound silently: an instance
@@ -203,6 +207,7 @@ intoSilent e implicit y dom sc v counted =
       if Params.eqPlicity implicit Inst
       then Cons { name = y, ty = dom, v = v } e.insts
       else e.insts
+  , evidence = e.evidence
   }
 
 -- | an error hole of a type: what did not elaborate, in its place
@@ -492,6 +497,11 @@ recovering c =
     waiting <- saveDelayed
     catchE (runChk c e a) (\d -> recoverWith e a d saved waiting))
 
+explicitPi : Value.Ty -> Bool
+explicitPi t = case Value.behavior t of
+  LikeFunction level dom cod implicit -> Params.eqPlicity implicit Expl
+  _ -> False
+
 isImplicitPi : Value.Ty -> Bool
 isImplicitPi t = case Value.behavior t of
   LikeFunction level dom cod implicit -> not (Params.eqPlicity implicit Expl)
@@ -513,12 +523,13 @@ evidenceGoal k sp = False
 -- | whether a goal is evidence that an effect is in a world, `h <: e`,
 -- | determined or not (`boc ?w <: ?e`, in a `do` whose world is known
 -- | only once the whole of it is elaborated).  An instance argument of
--- | evidence is found among the witnesses in scope alone, never by the
--- | world's shape (that is `(x := _)`'s), so the one witness that fits
--- | it is the only answer there could be, whatever the world turns out
--- | to be: it is taken as soon as it is wanted, and says what the
--- | effect's parameters are and which world it is in; an argument
--- | coming after could make no other fit, only none
+-- | evidence is found among the witnesses in scope, and by the world's
+-- | shape where none is (as `(x := _)` finds it): where its world is
+-- | known, the one witness that fits it is taken as soon as it is
+-- | wanted, and says what the effect's parameters are; where it is not,
+-- | which evidence it is waits for the world (that may be one the
+-- | witness is in no leaf of), the parameters said by the witness of its
+-- | effect all the same (`effectSaid`)
 -- (whether an argument of the goal's theory is a metavariable itself,
 -- `Num ?a`: no candidate fits it without deciding that metavariable, so
 -- it is not matched before it is known)
@@ -543,6 +554,77 @@ isEvidence mc goal = case Value.forceTy mc goal of
     evidenceGoal k (Params.forceTh spTh)
   VDecode (HGlobal k) sp u described el -> evidenceGoal k sp
   _ -> False
+
+-- (`k h w`'s effect and world, where it is `co.<:`'s `h <: w`)
+effectAndWorldIn : String
+                 -> Value.Spine Value.V
+                 -> Maybe (Pair Value.V Value.V)
+effectAndWorldIn k (SpApp (SpApp SpId h) w) =
+  if strEq k "co.<:" then Just (MkPair h w) else Nothing
+effectAndWorldIn k sp = Nothing
+
+-- | evidence's effect and world: `h` and `e` of `h <: e`
+effectAndWorld : Value.MetaCtx -> Value.Ty -> Maybe (Pair Value.V Value.V)
+effectAndWorld mc goal = case Value.forceTy mc goal of
+  VFunction level dom cod implicit dflt (Just (MkFolded (HGlobal k) spTh)) ->
+    effectAndWorldIn k (Params.forceTh spTh)
+  VDecode (HGlobal k) sp u described el -> effectAndWorldIn k sp
+  _ -> Nothing
+
+-- (the metavariables left in a value)
+metasLeftEl : ElabEnv -> Value.MetaCtx -> Value.V -> List Int
+metasLeftEl e mc v = (Unify.metasK mc).mel 20 e.scope.len v
+
+-- | whether a goal is evidence whose world is not known yet: `stdio <:
+-- | ?e`, in a `do` whose world is known only once the whole of it is
+-- | elaborated, or `stdio <: exception FileError <+> ?e`, an `attempt`'s
+-- | before what its result is used as is
+worldWaits : ElabEnv -> Value.MetaCtx -> Value.Ty -> Bool
+worldWaits e mc goal = case effectAndWorld mc goal of
+  Just (MkPair h w) -> not (List.null (metasLeftEl e mc w))
+  Nothing -> False
+
+-- (a metavariable's solution: `Just Nothing` where it has none yet)
+solutionTerm : Value.MetaCtx -> Int -> Maybe (Maybe Syntax.Tm)
+solutionTerm mc m = case OrdMap.lookup mc m of
+  Just entry -> Just entry.solStx
+  Nothing -> Nothing
+
+-- (`unsolvedWorld`, of a solution's term, `depth` solutions deep at most)
+unsolvedWorldTm : Value.MetaCtx -> Int -> Syntax.Tm -> Bool
+unsolvedWorldTm mc depth (SLam _ (MkAbs _ body)) = unsolvedWorldTm mc depth body
+unsolvedWorldTm mc depth (SIs t) = unsolvedWorldTm mc depth t
+unsolvedWorldTm mc depth (SMetaApp k _ _) = case solutionTerm mc k of
+  Just Nothing -> True
+  Just (Just s) -> depth > 0 && unsolvedWorldTm mc (depth - 1) s
+  Nothing -> False
+unsolvedWorldTm mc depth (SApp (SApp (SGlobal k) a) b) =
+  strEq k "co.<+>"
+  && (unsolvedWorldTm mc depth a || unsolvedWorldTm mc depth b)
+unsolvedWorldTm mc depth t = False
+
+-- | whether a world is a metavariable not solved yet, or a sum with one
+-- | at a leaf: told by the solutions' terms alone, nothing evaluated, so
+-- | that evidence waiting for its world is tried again for nothing at no
+-- | cost (its goal, in a long `do`, is of metavariables applied to every
+-- | local in scope, and looked at whole, costly)
+unsolvedWorld : Value.MetaCtx -> Value.V -> Bool
+unsolvedWorld mc (VNeu (HMeta m) sp ty expansion desc) = case solutionTerm
+    mc
+    m of
+  Just Nothing -> True
+  Just (Just s) -> unsolvedWorldTm mc 64 s
+  Nothing -> False
+unsolvedWorld mc (VNeu (HGlobal k) (SpApp (SpApp SpId a) b) ty expansion desc) =
+  strEq k "co.<+>" && (unsolvedWorld mc a || unsolvedWorld mc b)
+unsolvedWorld mc v = False
+
+-- | whether a goal is evidence whose world is not solved yet
+-- | (`unsolvedWorld`): nothing tried again finds it
+stillWaiting : Value.MetaCtx -> Value.Ty -> Bool
+stillWaiting mc goal = case effectAndWorld mc goal of
+  Just (MkPair h w) -> unsolvedWorld mc w
+  Nothing -> False
 
 instShown : ElabEnv -> Value.MetaCtx -> Value.Ty -> String
 instShown e mc goal =
@@ -895,6 +977,62 @@ witnessMatches e sp goal (Cons w rest) = do
   more <- witnessMatches e sp goal rest
   pure (withFit fit more)
 
+-- (whether `h` is evidence `w`'s effect, tried, the state put back: one
+-- that leaves a problem postponed is not)
+effectFits : ElabEnv -> Value.V -> Witness -> Elab Bool
+effectFits e h w = do
+  before <- gets (\c -> c)
+  case effectAndWorld before.metas w.ty of
+    Just (MkPair hw _) -> do
+      r <- Meta.unifyEl e.globals (shape e.scope) h hw
+      after <- gets (\c -> c)
+      putSt before
+      pure (case r of
+        Right _ -> List.length after.postponed == List.length before.postponed
+        Left _ -> False)
+    Nothing -> pure False
+
+-- | evidence wanted before its world is known (`worldWaits`): the
+-- | evidence in scope of its effect, where there is one, says what the
+-- | effect's parameters are (`boc ?w <: ?e` by `bc : boc w <: e`: `w`),
+-- | so that they are known to what follows; but not which world it is
+-- | in, nor which evidence it is, as where in the world the effect is
+-- | may be another's (in `attempt err c`, `c`'s world is `exception err
+-- | <+> e`, and its evidence of `stdio` goes through the `io` in scope,
+-- | not `io` itself).  An effect with no metavariable in it, or one that
+-- | is a metavariable itself, says nothing so
+effectSaid : ElabEnv -> Value.Ty -> Elab Unit
+effectSaid e goal = do
+  mc <- gets (\c -> c.metas)
+  case effectAndWorld mc goal of
+    Just (MkPair h _) ->
+      if List.null (metasLeftEl e mc h) || bareMeta (Value.forceEl mc h)
+      then pure MkUnit
+      else do
+        fitting <-
+          filterM
+            (\(w : Witness) -> effectFits e h w)
+            (instLocals e)
+        case fitting of
+          Cons one Nil -> case effectAndWorld mc one.ty of
+            Just (MkPair hw _) -> do
+              r <- Meta.unifyEl e.globals (shape e.scope) h hw
+              pure MkUnit
+            Nothing -> pure MkUnit
+          _ -> pure MkUnit
+    Nothing -> pure MkUnit
+  where
+  bareMeta : Value.V -> Bool
+  bareMeta (VNeu (HMeta m) sp ty expansion desc) = True
+  bareMeta v = False
+
+  filterM : (Witness -> Elab Bool) -> List Witness -> Elab (List Witness)
+  filterM p Nil = pure Nil
+  filterM p (Cons w rest) = do
+    ok <- p w
+    more <- filterM p rest
+    pure (if ok then Cons w more else more)
+
 -- | an instance found that wants an instance argument: its name, and
 -- | the goal it was found for
 type WantedBy = { name : String, goal : Value.Ty }
@@ -1103,11 +1241,17 @@ checkSettings e sp w goal found (Cons st rest) = do
 -- | only takes candidates away, so one unique now stays so): at once,
 -- | where it fits the goal without deciding any of its metavariables
 -- | (`Binder (Co ?e a)` by an instance for `Co e a`: what `?e` comes to
--- | is not the instance's to say); evidence, `boc ?w <: ?e`, at once
--- | (`isEvidence`); any other at the end, once no literal is left to
--- | guess a type for (a literal's guess, `1 : Int`, comes before an
--- | instance's say).  Where none or more than one fits, it waits, and
--- | at the end is E0340.
+-- | is not the instance's to say); evidence, `boc ?w <: e`, at once
+-- | (`isEvidence`), where its world is known -- where it is not, the
+-- | evidence in scope of its effect says the effect's parameters
+-- | (`effectSaid`), and it waits for the world; any other at the end,
+-- | once no literal is left to guess a type for (a literal's guess, `1 :
+-- | Int`, comes before an instance's say).  Where none or more than one
+-- | fits, it waits, and at the end is E0340.  Where no witness in scope
+-- | is the evidence wanted, it is found as `(x := _)` finds it, by where
+-- | the effect is in the world (`evidenceFound`), once the world is
+-- | known: so a call needs no `(x := _)` where `(x := _)` would find the
+-- | evidence.
 resolveWanted : ElabEnv
               -> Params.Span
               -> InstanceSearch
@@ -1123,7 +1267,8 @@ resolveWanted e sp search hm holeVal goal final = do
   earlier <- gets (\c -> not (List.null c.recovered))
   let undetermined = not (List.null (metasLeft e mc (unspecTy mc goal)))
   can <- if undetermined && final then canGuess else pure False
-  let eager = isEvidence mc goal || (final && not can)
+  let evidence = isEvidence mc goal
+  let eager = evidence || (final && not can)
   -- (a goal still waiting: at the end, refused; the message is made only
   -- there, showing the goal being costly)
   let undecided : Unit -> Elab Bool = \u ->
@@ -1202,6 +1347,13 @@ resolveWanted e sp search hm holeVal goal final = do
       49
       (tooDeep e mc search goal)
       "an instance's instance arguments are found by searches of their own, and one that wants an instance of a type no smaller than its own may want them without end: give the argument explicitly, `(x := e)`"
+  -- (evidence whose world is not known yet waits for it, the effect's
+  -- parameters said by the evidence in scope of it; at the end, the
+  -- one witness that fits is taken)
+  else if not final && evidence && worldWaits e mc goal
+  then do
+    effectSaid e goal
+    pure False
   -- (a goal still waiting is taken by its one candidate where that one
   -- fits it without deciding any of its metavariables; else it waits.
   -- One whose argument is a metavariable itself waits unmatched: the
@@ -1229,9 +1381,13 @@ resolveWanted e sp search hm holeVal goal final = do
     case matches of
       Cons one Nil -> taken one
       Nil ->
-        -- (not an error of its own where an instance that may have
-        -- been the one wanted did not elaborate: that is reported)
-        if undetermined
+        -- (evidence where no witness in scope is it: found by where the
+        -- effect is in the world, as `(x := _)` finds it, once the world
+        -- is known.  Not an error of its own where an instance that may
+        -- have been the one wanted did not elaborate: that is reported)
+        if evidence && not (brokenInstanceIn e)
+        then searchEvidence e sp hm holeVal goal False final
+        else if undetermined
         then undecided MkUnit
         else if brokenInstanceIn e
         then failElsewhere
@@ -1309,6 +1465,12 @@ insertInstance e sp goal name = do
             else "  [waits for implicits]"))
   found <- if ready || evidence then searchedNow e sp hole goal else pure False
   if found then pure MkUnit
+  else if evidence
+  then want
+      sp (\final -> do
+    mc <- gets (\c -> c.metas)
+    if not final && stillWaiting mc goal then pure False
+    else resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal final)
   else want
       sp
       (\final ->
@@ -1869,8 +2031,8 @@ functionElimNamed sp x callee arg =
 
 -- | a candidate for `(x := _)`'s evidence, by where it puts an operation
 -- | (`False` the left of a `<+>`, `True` the right) and the evidence it
--- | goes through there, if any (`Presyntax.evidenceCandidate`)
-type Candidates = List Bool -> Maybe String -> Elab Chk
+-- | goes through there, if any (`evidenceCandidate`)
+type Candidates = List Bool -> Maybe String -> Chk
 
 -- | the paths from a world's root to its leaves, through its `<+>`s: a
 -- | definition seen through, as `heff.elab.effect` sees one
@@ -1938,46 +2100,46 @@ pathSaid path w = "\\p -> " ^ down path
 
 -- (each candidate that puts the operation at a leaf of the world as it
 -- is)
-bareCandidates : Candidates
-               -> List (List Bool)
-               -> Elab (List (Pair String Chk))
-bareCandidates cand Nil = pure Nil
-bareCandidates cand (Cons path rest) = do
-  bare <- cand path Nothing
-  more <- bareCandidates cand rest
-  pure (Cons (MkPair (pathSaid path Nothing) bare) more)
+bareCandidates : Candidates -> List (List Bool) -> List (Pair String Chk)
+bareCandidates cand paths =
+  List.map
+    (\(path : List Bool) -> MkPair (pathSaid path Nothing) (cand path Nothing))
+    paths
 
 -- (each that puts it at a leaf through an instance argument in scope)
 throughCandidates : ElabEnv
                   -> Candidates
                   -> List (List Bool)
-                  -> Elab (List (Pair String Chk))
-throughCandidates e cand Nil = pure Nil
-throughCandidates e cand (Cons path rest) = do
-  through <-
-    traverse
-      (mo := instanceMonadCo)
-      (\(w : Witness) -> do
-       c <- cand path (Just (nameOf w))
-       pure (MkPair (pathSaid path (Just (nameOf w))) c))
-      (instLocals e)
-  more <- throughCandidates e cand rest
-  pure (List.append through more)
+                  -> List (Pair String Chk)
+throughCandidates e cand Nil = Nil
+throughCandidates e cand (Cons path rest) =
+  List.append
+    (List.map
+       (\(w : Witness) ->
+          MkPair
+            (pathSaid path (Just (nameOf w)))
+            (cand path (Just (nameOf w))))
+       (instLocals e))
+    (throughCandidates e cand rest)
 
 -- | `(x := _)`'s evidence found, once its goal `h <: e` is known: where
 -- | in the world `e` -- a sum by `<+>` -- `h` is, the operation put
 -- | there by `InL`s and `InR`s -- or, where it is at no leaf as it is,
 -- | through the instance argument in scope that says where it is in a
 -- | leaf that is a world of its own.  Exactly one place: none is E0355,
--- | more than one E0356; a goal that is no `h <: e` is E0357.
+-- | more than one E0356; a goal that is no `h <: e` is E0357.  So too
+-- | an instance argument's, where no witness in scope is the evidence
+-- | (`written` false: no `(x := _)`, and the messages say so)
 evidenceFound : ElabEnv
               -> Params.Span
-              -> Hole
+              -> Int
+              -> Value.V
               -> Value.Ty
               -> Candidates
               -> Bool
+              -> Bool
               -> Elab Bool
-evidenceFound e sp hole goal cand final = do
+evidenceFound e sp hm holeVal goal cand written final = do
   mc <- gets (\c -> c.metas)
   if not (List.null (metasLeft e mc goal))
   then if final
@@ -1985,7 +2147,9 @@ evidenceFound e sp hole goal cand final = do
         (a := Bool)
         sp
         57
-        ("the world `_` finds evidence in is not determined here: "
+        ((if written then "the world `_` finds evidence in"
+          else "the world an instance argument's evidence is found in")
+         ^ " is not determined here: "
          ^ goalShown e mc goal)
         "annotate where the world is said, as `main : Co (a <+> b) Unit`, or give the argument"
     else pure False
@@ -1999,13 +2163,14 @@ evidenceFound e sp hole goal cand final = do
          ^ goalShown e mc goal)
         "give the argument"
     Just w -> do
-      bare <- bareCandidates cand (sumPaths e.globals w)
-      okBare <- checkingCandidates e goal bare
+      okBare <-
+        checkingCandidates e goal (bareCandidates cand (sumPaths e.globals w))
       ok <-
         if List.null okBare
-        then do
-          through <- throughCandidates e cand (sumPaths e.globals w)
-          checkingCandidates e goal through
+        then checkingCandidates
+            e
+            goal
+            (throughCandidates e cand (sumPaths e.globals w))
         else pure okBare
       case ok of
         Cons one Nil -> do
@@ -2014,12 +2179,17 @@ evidenceFound e sp hole goal cand final = do
             solveHole
               e.globals
               (shape e.scope)
-              (metaOf hole.stx)
-              hole.val
+              hm
+              holeVal
               el.stx
               (Memoed.valN el)
           case r of
-            Right _ -> pure True
+            Right _ -> do
+              traceE
+                  sp
+                  "instance"
+                  (\u -> "found " ^ fst one ^ " : " ^ goalShown e mc goal)
+              pure True
             Left err ->
               failWithNote
                 sp
@@ -2032,7 +2202,9 @@ evidenceFound e sp hole goal cand final = do
             sp
             55
             ("the effect is in no place of the world: " ^ goalShown e mc goal)
-            "the world has each effect it is given, once: add it, or give the argument"
+            (if written
+             then "the world has each effect it is given, once: add it, or give the argument"
+             else "the world has each effect it is given, once: add it, bind the evidence, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`")
         _ ->
           failWithNote
             (a := Bool)
@@ -2045,32 +2217,30 @@ evidenceFound e sp hole goal cand final = do
             "give the argument: the one place meant"
 
 -- | `(x := _)`: a hole, its evidence found once its goal is known
-evidenceArg : ElabEnv
-            -> Params.Span
-            -> Value.Ty
-            -> String
-            -> Candidates
-            -> Elab Memoed.El
-evidenceArg e sp goal name cand = do
+evidenceArg : ElabEnv -> Params.Span -> Value.Ty -> String -> Elab Memoed.El
+evidenceArg e sp goal name = do
   hole <- freshMeta e.scope.len e.scope.locals goal name sp
-  want sp (\final -> evidenceFound e sp hole goal cand final)
+  want
+      sp (\final -> do
+    mc <- gets (\c -> c.metas)
+    if not final && stillWaiting mc goal then pure False
+    else searchEvidence e sp (metaOf hole.stx) hole.val goal True final)
   pure (mEl hole.stx hole.val)
 
 -- | `f (x := _)`: as `namedGo`, the argument named `x` its evidence found
 evidenceGo : Params.Span
            -> String
-           -> Candidates
            -> ElabEnv
            -> Memoed.El
            -> Value.Ty
            -> Elab (Pair Memoed.El Value.Ty)
-evidenceGo sp x cand e m ty0 = do
+evidenceGo sp x e m ty0 = do
   ty <- Meta.forceT ty0
   case Value.behavior ty of
     LikeFunction level dom cod implicit ->
       if nameIs (Value.cloName cod) x
       then do
-        earg <- evidenceArg e sp dom x cand
+        earg <- evidenceArg e sp dom x
         pure
             (MkPair
                (if Params.eqPlicity implicit Expl then Memoed.app m earg
@@ -2082,7 +2252,6 @@ evidenceGo sp x cand e m ty0 = do
         evidenceGo
             sp
             x
-            cand
             e
             (Memoed.iapp (cloNameOr cod) m iarg)
             (Value.nom (Value.appClo cod (\u -> Memoed.valN iarg)))
@@ -2092,7 +2261,6 @@ evidenceGo sp x cand e m ty0 = do
         evidenceGo
             sp
             x
-            cand
             e
             (Memoed.iapp (cloNameOr cod) m earg)
             (Value.nom (Value.appClo cod (\u -> Memoed.valN earg)))
@@ -2110,12 +2278,12 @@ evidenceGo sp x cand e m ty0 = do
        ^ x
        ^ " here")
 
-functionElimEvidence : Params.Span -> String -> Syn -> Candidates -> Syn
-functionElimEvidence sp x callee cand =
+functionElimEvidence : Params.Span -> String -> Syn -> Syn
+functionElimEvidence sp x callee =
   MkSyn (\e -> do
     pc <- runSyn callee e
     case pc of
-      MkPair ecallee a0 -> evidenceGo sp x cand e ecallee a0)
+      MkPair ecallee a0 -> evidenceGo sp x e ecallee a0)
 
 elimPlain : ElabEnv
           -> Memoed.El
@@ -2371,6 +2539,76 @@ escapeAt e sp a a' (Escapes _) l Nothing =
 escapeAt e sp a a' err l Nothing =
   plainMismatch e sp a a' (prettyEqErr e.globals err)
 
+-- (the region a `with`'s resource, of type `With s a`, is in: the local
+-- `s`, its level)
+regionOf : Value.MetaCtx -> Value.Ty -> Maybe Int
+regionOf mc (VDecode (HGlobal k) (SpApp (SpApp SpId sv) _) _ _ _) =
+  if strEq k "With" || endsWith ".With" k
+  then case Value.forceEl mc sv of
+    VNeu (HLocal l) SpId _ _ _ -> Just l
+    _ -> Nothing
+  else Nothing
+regionOf mc t = Nothing
+
+-- (the resources in scope the text names, newest first: each one's
+-- name, its region and its type)
+heldInScope : Value.MetaCtx
+            -> List String
+            -> Ctx
+            -> List (Pair String (Pair Int Value.Ty))
+heldInScope mc names (CUndelay c) = heldInScope mc names c
+heldInScope mc (Cons x xs) (CBind c bm t) = case regionOf
+    mc
+    (Value.forceTy mc t) of
+  Just l ->
+    if contains "#" x then heldInScope mc xs c
+    else Cons (MkPair x (MkPair l (Value.forceTy mc t))) (heldInScope mc xs c)
+  Nothing -> heldInScope mc xs c
+heldInScope mc _ _ = Nil
+
+-- (whether a type names the local of level `l`)
+namesLevel : ElabEnv -> Value.MetaCtx -> Int -> Value.Ty -> Bool
+namesLevel e mc l t =
+  (mentionsLocal (e.scope.len - 1 - l)).ty
+    0
+    (Unify.zonkTy mc (Readback.readbTy e.scope.len (Value.forceTy mc t)))
+
+-- | a resource whose region the type given, `a'`, names and the type
+-- | expected, `a`, does not: what is given holds a resource of a `with`
+-- | where it is to leave the body (a type expected from outside the
+-- | body, known before what the body gives)
+heldGiven : ElabEnv
+          -> Value.MetaCtx
+          -> Value.Ty
+          -> Value.Ty
+          -> List (Pair String (Pair Int Value.Ty))
+          -> Maybe (Pair String (Pair Int Value.Ty))
+heldGiven e mc a a' Nil = Nothing
+heldGiven e mc a a' (Cons held rest) = case held of
+  MkPair x (MkPair l t) ->
+    if namesLevel e mc l a' && not (namesLevel e mc l a) then Just held
+    else heldGiven e mc a a' rest
+
+-- (a mismatch where what is given holds a resource leaving its body:
+-- said as that; else as `otherwise` says it)
+heldOrNot : {r : Type}
+          -> ElabEnv
+          -> Params.Span
+          -> Value.Ty
+          -> Value.Ty
+          -> Conversion.EqErr
+          -> Value.MetaCtx
+          -> Elab r
+          -> Elab r
+heldOrNot e sp a a' err mc otherwise = case heldGiven
+    e
+    mc
+    a
+    a'
+    (heldInScope mc e.scope.names e.scope.ctx) of
+  Just (MkPair x (MkPair l t)) -> resourceEscapes e sp (levelName e.scope l) x t
+  Nothing -> otherwise
+
 -- | the type expected, `a`, and the one given, `a'`, not unified: what
 -- | was expected and what was given, and why -- or, a `with`'s resource
 -- | leaving its body, said as that
@@ -2381,11 +2619,21 @@ mismatch : {r : Type}
          -> Value.Ty
          -> Conversion.EqErr
          -> Elab r
-mismatch e sp a a' err = case escapeLevel err of
-  Just l -> do
-    mc <- gets (\c -> c.metas)
-    escapeAt e sp a a' err l (heldLocal mc l e.scope.names e.scope.ctx)
-  Nothing -> plainMismatch e sp a a' (prettyEqErr e.globals err)
+mismatch e sp a a' err = do
+  mc <- gets (\c -> c.metas)
+  case escapeLevel err of
+    Just l -> case heldLocal mc l e.scope.names e.scope.ctx of
+      Just held -> escapeAt e sp a a' err l (Just held)
+      Nothing -> heldOrNot e sp a a' err mc (escapeAt e sp a a' err l Nothing)
+    Nothing ->
+      heldOrNot
+        e
+        sp
+        a
+        a'
+        err
+        mc
+        (plainMismatch e sp a a' (prettyEqErr e.globals err))
 
 -- | the prelude's `Coe from to`, of the types `from` and `to`, where the
 -- | prelude has it (not in the prelude before its `theory Coe`, nor in
@@ -2475,6 +2723,121 @@ apply sp syn =
           if isImplicitPi a then pure (MkPair m0 a1)
           else insertImplicits e sp m0 a1
         applyGo sp e a pi)
+
+-- (the type of what `k` explicit arguments are applied to, `t`, comes
+-- to whatever they are: where each is taken by a function that does not
+-- depend on it, and no implicit argument comes between)
+resultAfter : Value.Ty -> Int -> Elab (Maybe Value.Ty)
+resultAfter t k = do
+  ft <- Meta.forceT t
+  if k <= 0
+  then pure (if isImplicitPi ft then Nothing else Just ft)
+  else case Value.behavior ft of
+    LikeFunction level dom cod Expl -> case Value.cloName cod of
+      Nothing ->
+        resultAfter
+          (Value.nom (Value.appClo cod (\u -> Value.errorHole dom)))
+          (k - 1)
+      Just _ -> pure Nothing
+    _ -> pure Nothing
+
+-- (`a` and `t` unified, where they are so without a problem postponed;
+-- else nothing of it is kept): whether they are
+unifiedFirst : ElabEnv -> Params.Span -> Value.Ty -> Value.Ty -> Elab Bool
+unifiedFirst e sp a t = do
+  before <- gets (\c -> c)
+  waiting <- saveDelayed
+  r <- Meta.unifyTy e.globals (shape e.scope) a t
+  after <- gets (\c -> c)
+  case r of
+    Right _ ->
+      if List.length after.postponed == List.length before.postponed
+      then do
+        traceE
+            sp
+            "unify"
+            (\u ->
+               instShown e after.metas a
+               ^ "  =?=  "
+               ^ instShown e after.metas t
+               ^ "   ok, before the arguments")
+        pure True
+      else do
+        modify (Meta.undoTo before)
+        restoreWaiting waiting
+        pure False
+    Left _ -> do
+      modify (Meta.undoTo before)
+      restoreWaiting waiting
+      pure False
+
+-- | an application of `head` to `n` explicit arguments (`elims`, each
+-- | one's elimination), checked at a function type `a` known whole (a
+-- | computation's, `Co e a`), its type said first: the head's
+-- | implicit arguments inserted, and where its type says what the
+-- | application's is whatever the arguments are, that unified with `a`,
+-- | before any argument is elaborated, so that the arguments are
+-- | checked knowing it -- a `do` block's `bind` knows its world before
+-- | its statements, and a statement's evidence is found as it is wanted
+-- | (where the two do not unify so, as an application at a type it is
+-- | coerced to, nothing of it is kept, and they are unified after, as
+-- | `apply` does).  `nominal`: in descriptive position, the application
+-- | elaborated as nominal and its result marked so; `firstSp`, where the
+-- | head's implicit arguments are said to be, as its first argument's
+-- | elimination says them
+applyResultFirst : Params.Span
+                 -> Params.Span
+                 -> Bool
+                 -> Syn
+                 -> Int
+                 -> (Syn -> Syn)
+                 -> Chk
+applyResultFirst sp firstSp nominal head n elims =
+  MkChk (\e a0 -> do
+    a <- Meta.forceT a0
+    -- (only a computation's type, a function's, is said first: a value
+    -- of another type may be coerced to it once it is elaborated, as a
+    -- `String` given where a `Path` is, and the arguments are not to be
+    -- held to the type it is coerced to)
+    if not (explicitPi a) then runChk (apply sp (markedIf (elims head))) e a0
+    else do
+      pm <- runSyn head (headEnv e)
+      t0 <- Meta.forceT (snd pm)
+      -- (a head of no implicit arguments says nothing the arguments do
+      -- not know already: its type is theirs as it is)
+      if not (isImplicitPi t0)
+      then runChk (apply sp (markedIf (elims (MkSyn (\e2 -> pure pm))))) e a0
+      else do
+        pi <- insertImplicits (headEnv e) firstSp (fst pm) t0
+        r <- resultAfter (snd pi) n
+        mc <- gets (\c -> c.metas)
+        -- (and only one known whole, so that what is said first decides
+        -- the head's metavariables alone, none of what is around it)
+        first <- case r of
+          Just t ->
+            if List.null (metasLeft e mc a) then unifiedFirst e sp a t
+            else pure False
+          Nothing -> pure False
+        let applied = markedIf (elims (MkSyn (\e2 -> pure pi)))
+        if first
+        then do
+          -- (the type said already: what the arguments come to is of it)
+          pm2 <- runSyn applied e
+          Meta.runDelayed False
+          pure (fst pm2)
+        else runChk (apply sp applied) e a0)
+  where
+  headEnv : ElabEnv -> ElabEnv
+  headEnv e = if nominal then withFor e ForNominative else e
+
+  markedIf : Syn -> Syn
+  markedIf s =
+    if nominal
+    then MkSyn (\e -> do
+      pr <- runSyn s (withFor e ForNominative)
+      case pr of
+        MkPair res t -> pure (MkPair (Memoed.isM res) t))
+    else s
 
 -- | an application of a value whose type is not known yet waits for it,
 -- | as a lambda does: a hole of a type of its own stands for it, and it
@@ -4233,6 +4596,7 @@ fixEnv e x a =
   , lams = 0
   , self = e.self
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 -- | extension: a local definition (`where`), `x : T` by `body`, which may
@@ -4852,3 +5216,70 @@ lazyChk sp c s =
           e
           a
       Nothing -> lazyOther sp c s e a)
+
+-- Evidence found, by these rules
+--------------------------------------------------------------------------------
+
+-- (a local, `x`, by its name: noted nowhere, written nowhere)
+localNamed : Params.Span -> String -> Syn
+localNamed sp x =
+  MkSyn (\e -> case findLocal e x of
+    Right found -> pure found
+    Left _ -> failWith sp 8 ("no such variable " ^ x ^ " in scope"))
+
+-- | a candidate for evidence found (`Candidates`): `\p -> InR (InL (w
+-- | p))`, an operation put down `path` (`False` the left of a `<+>`,
+-- | `True` the right), through the evidence `w` where it is given (a leaf
+-- | that is a world of its own, `e`, and `w : h <: e`); `p` a name no
+-- | text writes
+evidenceCandidate : Params.Span -> List Bool -> Maybe String -> Chk
+evidenceCandidate sp path w = implicitLams (functionIntro sp p (down path))
+  where
+  p : String
+  p = "p#" ^ debug sp.start
+  leaf : Chk
+  leaf = case w of
+    Just x ->
+      apply sp (functionElim sp (localNamed sp x) (apply sp (localNamed sp p)))
+    Nothing -> apply sp (localNamed sp p)
+  down : List Bool -> Chk
+  down Nil = leaf
+  down (Cons b rest) = sumIntro sp sp (if b then "InR" else "InL") [down rest]
+
+-- (the search, in the environment of parts `parts`, itself its search:
+-- the evidence elaborated as nominal, an argument, wherever it is
+-- wanted -- an instance argument of the variable a definition is, `main
+-- = flush`, is wanted in descriptive position)
+evidenceSearchF : ElabEnvParts
+                -> Params.Span
+                -> Int
+                -> Value.V
+                -> Value.Ty
+                -> Bool
+                -> Bool
+                -> Elab Bool
+evidenceSearchF parts sp hm holeVal goal written final =
+  evidenceFound
+    (withFor
+       (envOfParts
+          parts
+          (MkEvidenceSearch
+             (\parts2 sp2 hm2 holeVal2 goal2 written2 final2 ->
+                evidenceSearchF parts2 sp2 hm2 holeVal2 goal2 written2 final2)))
+       ForNominative)
+    sp
+    hm
+    holeVal
+    goal
+    (evidenceCandidate sp)
+    written
+    final
+
+-- | the environment's evidence search (`ElabEnv.evidence`):
+-- | `evidenceFound`, its candidates made by these rules -- that of
+-- | `(x := _)`, and of an instance argument no witness in scope is
+evidenceSearch : EvidenceSearch
+evidenceSearch =
+  MkEvidenceSearch
+    (\parts sp hm holeVal goal written final ->
+       evidenceSearchF parts sp hm holeVal goal written final)

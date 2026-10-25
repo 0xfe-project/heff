@@ -37,7 +37,7 @@ act _ = pure MkUnit
 
 step : Widget.Key -> Zipper Todo -> Widget.Step (Zipper Todo) (List Todo)
 step (Char 'q') z = Done (toList z)
-step k z = Continue (runCursor (act (cur := _) k) z)
+step k z = Continue (runCursor (act k) z)
 ```
 
 `act` says what each key does with the cursor: the arrows move it, and
@@ -95,7 +95,7 @@ program = do
     Nothing -> pure MkUnit
 
 main : Co (Terminal.console <+> stdio) Unit
-main = program (con := _) (io := _)
+main = program
 ```
 
 `Terminal.interact` runs the app on the terminal: it draws the view,

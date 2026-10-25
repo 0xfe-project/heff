@@ -12,6 +12,7 @@ Operations with Judgemental Monadic Laws" (POPL 2026).
 import co
 import std.filesystem
 import std.io
+import std.path
 
 look : {e : HFunctor}
      -> {{io : stdio <: e}}
@@ -22,7 +23,7 @@ look = do
   print (if there then "hello.txt is there" else "no hello.txt")
 
 main : Co (stdio <+> filesystem) Unit
-main = look (io := _) (disk := _)
+main = look
 ```
 
 - `Co e a` is a computation in the world `e` that gives back an `a`.
@@ -36,18 +37,20 @@ main = look (io := _) (disk := _)
 
 ### Giving the evidence
 
-`(x := _)` lets heff find the evidence: where the world is a sum by
-`<+>`, known at the call (`main`'s, say), the one place of `h` in it,
-put there by `InL`s and `InR`s.
+Evidence asked for and not given is found: the evidence in scope that
+is it, else, where the world is a sum by `<+>`, known at the call
+(`main`'s, say), the one place of `h` in it, put there by `InL`s and
+`InR`s. `(x := _)` asks for the place in the world, even where evidence
+in scope would do.
 
 A part of the world that is a world of its own, `e`, is reached through
 the evidence in scope that says where `h` is in `e`: in `attempt
-FileError (c (io := _) (fx := _))`, whose world is `exception FileError
-<+> e`, `fx` is `\p -> InL p`, and `io`
-is `\p -> InR (io p)`, through the `io` in scope. An effect in no place
-of the world is E0355; in more than one, E0356 (give the evidence
-there); an argument that is no `h <: e`, or a world not known where the
-call is, E0357.
+FileError c`, whose world is `exception FileError <+> e`, `c`'s `fx :
+exception FileError <: exception FileError <+> e` is `\p -> InL p`, and
+its `io` is `\p -> InR (io p)`, through the `io` in scope. An effect in
+no place of the world is E0355; in more than one, E0356 (give the
+evidence there); an argument that is no `h <: e`, given `(x := _)`, or a
+world not known where the call is, E0357.
 
 A value of `h <: e` is a function, and shows where `h` is in `e`:
 
@@ -60,7 +63,7 @@ A value of `h <: e` is a function, and shows where `h` is in `e`:
 
 `<+>` groups to the left, and `<:` binds looser than it: `h <+> k <+> j`
 is `(h <+> k) <+> j`, and `h <: h <+> k` is `h <: (h <+> k)`. Give it
-by hand only where `_` cannot choose: an effect in two places of the
+by hand only where heff cannot choose: an effect in two places of the
 world.
 
 ## Defining an effect
@@ -140,7 +143,7 @@ thrice = do
 -- | >>> ticks
 -- | 3
 ticks : Int
-ticks = snd (handle counted (thrice (ev := _)) 0)
+ticks = snd (handle counted thrice 0)
 ```
 
 A `Handler h` is a monad, `M`, `ret` and `bind`, and `malg`, which says
@@ -209,7 +212,7 @@ every =
       Choose k -> c (k True) ++ c (k False)
   }
 
--- | >>> handle every (heads (ev := _) 2) (\n -> [n])
+-- | >>> handle every (heads 2) (\n -> [n])
 -- | [2, 1, 1, 0]
 ```
 
@@ -227,8 +230,8 @@ handler outside. For a handler of `choice <+> state Int`, `M` is `\a ->
 val (xs ++ ys)))`, and does each operation of the state again:
 
 ```haskell
-InR (Get k) -> bind (get (ev := _)) (\s -> c (k s))
-InR (Put s x) -> bind (put (ev := _) s) (\u -> c x)
+InR (Get k) -> bind get (\s -> c (k s))
+InR (Put s x) -> bind (put s) (\u -> c x)
 ```
 
 The state, handled outside, is not restored between the two ways.

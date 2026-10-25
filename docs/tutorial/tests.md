@@ -46,12 +46,12 @@ cursorTests =
     [ unit
       "the second marked done"
       (assertEqual
-         (shown (runCursor (markSecond (cur := _)) three))
+         (shown (runCursor markSecond three))
          ["[ ] write", "[x] read", "[ ] test"])
     , unit
       "no previous at the start"
       (assertEqual
-         (shown (runCursor (previous (ev := _)) three))
+         (shown (runCursor previous three))
          ["[ ] write", "[ ] read", "[ ] test"])
     ]
 ```

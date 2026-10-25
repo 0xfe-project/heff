@@ -82,7 +82,7 @@ program : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
 program = print (greeting "world")
 
 main : Co stdio Unit
-main = program (io := _)
+main = program
 ```
 
 `import hello.greeting` brings in the module above. A module's name is

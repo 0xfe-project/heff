@@ -196,12 +196,7 @@ elimF tk start s (At (ArgNamed x c) sp) = do
   a <- argumentF tk c
   pure (Rules.functionElimNamed { start = start, end = sp.end } x s a)
 elimF tk start s (At (ArgEvidence x) sp) =
-  pure
-    (Rules.functionElimEvidence
-       { start = start, end = sp.end }
-       x
-       s
-       (\path w -> tk.chkJ (Presyntax.evidenceCandidate sp path w)))
+  pure (Rules.functionElimEvidence { start = start, end = sp.end } x s)
 elimF tk start s (At (ArgExplicit c) sp) = do
   a <- argumentF tk c
   pure
@@ -875,6 +870,78 @@ nominalInf : Presyntax.Inferable -> Bool
 nominalInf (At (INominal _) _) = True
 nominalInf _ = False
 
+-- (an application whose arguments are each explicit, `f a b`: its head
+-- and arguments)
+explicitApp : Presyntax.Inferable
+            -> Maybe
+              (Pair
+                 Presyntax.Inferable
+                 (List (Params.Spanned (Presyntax.Arg Presyntax.Checkable))))
+explicitApp (At (IApp h args) _) =
+  if not (List.null args) && allL isExplicitArg args then Just (MkPair h args)
+  else Nothing
+  where
+  isExplicitArg : Params.Spanned (Presyntax.Arg Presyntax.Checkable) -> Bool
+  isExplicitArg (At (ArgExplicit _) _) = True
+  isExplicitArg _ = False
+explicitApp _ = Nothing
+
+-- (an explicit argument, its check, as `elimF` makes it)
+explicitArgChk : TK
+               -> Params.Spanned (Presyntax.Arg Presyntax.Checkable)
+               -> Elab (Pair (Pair Presyntax.Checkable Params.Span) Rules.Chk)
+explicitArgChk tk (At (ArgExplicit c) sp) = do
+  a <- argumentF tk c
+  pure (MkPair (MkPair c sp) a)
+explicitArgChk tk (At _ sp) =
+  failP sp 0 "an explicit argument was expected here"
+
+-- | an application of explicit arguments checked at a type: the type
+-- | said before the arguments are elaborated (`Rules.applyResultFirst`),
+-- | each argument as `elimF` elaborates it
+appChk : TK
+       -> Presyntax.Inferable
+       -> Presyntax.Inferable
+       -> List (Params.Spanned (Presyntax.Arg Presyntax.Checkable))
+       -> Elab Rules.Chk
+appChk tk i h args = do
+  s0 <- tk.infJ h
+  argChks <- traverseEL (\a -> explicitArgChk tk a) args
+  pure
+      (headRec
+         (Rules.applyResultFirst
+            (Params.spanOf i)
+            { start = (Params.spanOf h).start, end = firstEnd args }
+            (nominalInf i)
+            s0
+            (List.length args)
+            (\s -> applied (Params.spanOf h).start s argChks)))
+  where
+  firstEnd : List (Params.Spanned (Presyntax.Arg Presyntax.Checkable)) -> Int
+  firstEnd (Cons (At _ sp) _) = sp.end
+  firstEnd Nil = (Params.spanOf i).end
+
+  headRec : Rules.Chk -> Rules.Chk
+  headRec j = case (Presyntax.infSpineOf (Presyntax.unNominal i)).head of
+    At (IVar x) _ -> Rules.autoRec (Params.spanOf i) x j
+    _ -> j
+
+  applied : Int
+          -> Rules.Syn
+          -> List (Pair (Pair Presyntax.Checkable Params.Span) Rules.Chk)
+          -> Rules.Syn
+  applied start s Nil = s
+  applied start s (Cons (MkPair (MkPair c sp) a) rest) =
+    applied
+      start
+      (Rules.functionElimC
+         (checksOnly c)
+         (explicitLambda c)
+         { start = start, end = sp.end }
+         s
+         a)
+      rest
+
 -- | a term that infers its type, checked against one: a literal by that
 -- | type (`5` at `Int32` is an `Int32`), any other by its own
 chkInf : TK -> Presyntax.Inferable -> Elab Rules.Chk
@@ -885,9 +952,13 @@ chkInf tk i = case literalOf (Presyntax.unNominal i) of
          (if nominalInf i
           then nominalChk (Rules.numLitChk (Params.spanOf i) lit)
           else Rules.numLitChk (Params.spanOf i) lit))
-  Nothing -> do
-    s <- tk.infJ i
-    pure (Rules.implicitLams (chkHeadOf i s))
+  Nothing -> case explicitApp (Presyntax.unNominal i) of
+    Just (MkPair h args) -> do
+      j <- appChk tk i h args
+      pure (Rules.implicitLams j)
+    Nothing -> do
+      s <- tk.infJ i
+      pure (Rules.implicitLams (chkHeadOf i s))
 
 -- | a type as a term, of a universe: a record type too large for it says
 -- | which field is
@@ -1402,6 +1473,7 @@ withSelf e k sc =
   , lams = e.lams
   , self = Just k
   , insts = e.insts
+  , evidence = e.evidence
   }
 
 -- | the definition mentions itself as the global it will be; pattern
@@ -1409,14 +1481,14 @@ withSelf e k sc =
 bodyEnv : Globals.Globals -> String -> String -> Value.Ty -> ElabEnv
 bodyEnv gSelf k name aval =
   withSelf
-    (emptyElabEnvFor gSelf k)
+    (emptyElabEnvFor Rules.evidenceSearch gSelf k)
     k
     (letAt
        (BDelayedBy 1)
        name
        (Value.reflect (HGlobal k) (\u -> SpId) (\u -> aval) Nothing)
        aval
-       (emptyElabEnvFor gSelf k).scope)
+       (emptyElabEnvFor Rules.evidenceSearch gSelf k).scope)
 
 -- (a failure, reported where it comes from: no diagnostic's code)
 elsewhereD : Diag -> Diag
@@ -1634,7 +1706,7 @@ elabDecl : (String -> String)
 elabDecl key g n = do
   modify (setSelfKey Nothing)
   d <- declJ n
-  a <- Rules.runTyp d.ty (emptyElabEnv g)
+  a <- Rules.runTyp d.ty (emptyElabEnv Rules.evidenceSearch g)
   -- (a type with an error hole is no type to give the definition)
   recoveredCheck
   instanceType (instanceTypeAt n) a
@@ -1681,7 +1753,7 @@ watchPhase g sp (MkPair t ty) = do
 elabWatch : Globals.Globals -> Presyntax.Checkable -> Elab Globals.Entry
 elabWatch g n = do
   s <- watchSyn (Presyntax.markTerm N n)
-  pr <- Rules.runSyn s (emptyElabEnv g)
+  pr <- Rules.runSyn s (emptyElabEnv Rules.evidenceSearch g)
   watchPhase g (Params.spanOf n) pr
 
 -- The module

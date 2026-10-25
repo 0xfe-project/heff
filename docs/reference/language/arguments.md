@@ -108,7 +108,11 @@ The prelude's instances are in scope everywhere.
 
 Exactly one instance in scope must fit the type wanted. None is E0341;
 more than one is E0342, whatever their values. So an import can turn a
-search into an error, but never into a different answer.
+search into an error, but never into a different answer. Evidence that
+an effect is in a world, `h <: e`, that no instance in scope is, is
+found by where `h` is in the world instead, as `(x := _)` finds it (see
+[giving the evidence](effects.md#giving-the-evidence)): none is E0355,
+more than one E0356.
 
 An instance may take implicit and instance arguments of its own:
 
