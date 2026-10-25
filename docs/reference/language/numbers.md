@@ -17,7 +17,7 @@ title: Numbers
 ```haskell
 import uint8 as UInt8
 
--- | >>> show mask
+-- | >>> debug mask
 -- | "240"
 mask : UInt8
 mask = 0xf0
@@ -40,8 +40,8 @@ mode = 0o644
   1, not 1.0, as it would be rounded to a `Float64` first. Below half
   the least float of its type it is `0.0`; beyond the greatest, an
   error, as is any literal that does not fit its type.
-- `show` writes a float as such a literal, the fewest digits that read
-  back as it: `show 1.0e23` is `"1.0e23"`, `show (neg 0.0)` is
+- `debug` writes a float as such a literal, the fewest digits that read
+  back as it: `debug 1.0e23` is `"1.0e23"`, `debug (neg 0.0)` is
   `"-0.0"`.
 - `parseFloat s` reads such a decimal back, at run time, as a literal is
   read: `parseFloat "0.1"` is `Just 0.1`, and float32's `parseFloat32`

@@ -10,7 +10,7 @@ echo : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
 echo = do
   input <- readStdin
   let n = strLength input
-  print ("read " ^ show n ^ " bytes")
+  print ("read " ^ debug n ^ " bytes")
 ```
 
 A `do` block is a computation written as statements:

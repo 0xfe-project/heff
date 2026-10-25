@@ -50,15 +50,15 @@ A function can have one equation per pattern.
 ## As text
 
 ```haskell
-instance toStringStatus : ToString Status
-toStringStatus = { toString = mark }
+instance toStringStatus : Show Status
+toStringStatus = { show = mark }
   where
   mark : Status -> String
   mark Open = "[ ]"
   mark Done = "[x]"
 
-instance toStringTodo : ToString Todo
-toStringTodo = { toString = \t -> toString t.status ^ " " ^ t.title }
+instance toStringTodo : Show Todo
+toStringTodo = { show = \t -> show t.status ^ " " ^ t.title }
 ```
 
 `toStringStatus` comes before `toStringTodo` because a definition only

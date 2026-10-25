@@ -52,7 +52,7 @@ the app ends, with the list as it is then.
 ```haskell
 -- (a todo's row)
 row : (String -> Widget.Span) -> Todo -> Widget.Row
-row shown t = [shown (toString t)]
+row shown t = [shown (show t)]
 
 view : Widget.Size -> Zipper Todo -> Widget.Frame
 view size z =
@@ -91,7 +91,7 @@ program : {e : HFunctor}
 program = do
   r <- Terminal.interact app
   case r of
-    Just ts -> print (joinWith "\n" (List.map toString ts))
+    Just ts -> print (joinWith "\n" (List.map show ts))
     Nothing -> pure MkUnit
 
 main : Co (Terminal.console <+> stdio) Unit

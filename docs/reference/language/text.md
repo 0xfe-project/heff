@@ -29,7 +29,7 @@ A `Rune` is a Unicode code point, as Go's `rune` is.
 - A rune literal can be a pattern.
 - A rune is not an integer: `'a'` is no `Int`, and `97` is no `Rune`.
 
-`show 'a'` is `"'a'"`; `toString 'a'` is `"a"`.
+`debug 'a'` is `"'a'"`; `show 'a'` is `"a"`.
 
 ## Strings
 
@@ -42,7 +42,7 @@ bytes), but a string may hold any bytes, such as what a file gave, or
   `\xHH` (one byte), and `\` before any other character, which is that
   character: `\"`, `\\`.
 
-`show "hi"` is `"\"hi\""`; `toString "hi"` is `"hi"`.
+`debug "hi"` is `"\"hi\""`; `show "hi"` is `"hi"`.
 
 ## Operations
 

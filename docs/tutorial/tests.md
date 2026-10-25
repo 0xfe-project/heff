@@ -37,7 +37,7 @@ markSecond = do
 
 -- (the todos, as they are shown)
 shown : Zipper Todo -> List String
-shown z = List.map toString (toList z)
+shown z = List.map show (toList z)
 
 cursorTests : Test
 cursorTests =

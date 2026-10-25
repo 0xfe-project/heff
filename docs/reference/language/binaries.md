@@ -23,8 +23,8 @@ read, a file's content. They never change once made.
 What is done with them is in [`bytes`](../../api/bytes.md), imported as
 `import bytes as Bytes`; `==` works without importing it.
 
-`toString` of bytes is their UTF-8 text, with U+FFFD for what is not
-UTF-8. `show` writes them as a binary.
+`show` of bytes is their UTF-8 text, with U+FFFD for what is not
+UTF-8. `debug` writes them as a binary.
 
 ## Bits
 
@@ -34,7 +34,7 @@ bytes, kept apart because it is the common one.
 What is done with them is in [`bits`](../../api/bits.md), imported as
 `import bits as Bits`.
 
-`toString` of bits is each bit, `0` or `1`: `toString b[5::3]` is
+`show` of bits is each bit, `0` or `1`: `show b[5::3]` is
 `"101"`.
 
 ## Binaries
@@ -100,8 +100,8 @@ whole bytes, end with an empty `bits` segment: `b[1, 2, b[]::bits]`.
 -- | >>> List.map method [b["GET /"], b[1, 255, 255], Bytes.fromString "PUT"]
 -- | ["get /", "-1", "other"]
 method : Bytes -> String
-method b["GET ", path::binary] = "get " ^ toString path
-method b[1, n::16-little-signed] = show n
+method b["GET ", path::binary] = "get " ^ show path
+method b[1, n::16-little-signed] = debug n
 method _ = "other"
 
 -- | >>> field b[3::4, 5::3, 1::2]
@@ -123,7 +123,7 @@ right:
 
 ## How they are shown
 
-`show` writes bytes as a binary: runs of printable ASCII as strings,
-other bytes as numbers. `show b["GET \xff\r\n"]` is
+`debug` writes bytes as a binary: runs of printable ASCII as strings,
+other bytes as numbers. `debug b["GET \xff\r\n"]` is
 `"b[\"GET \", 255, 13, 10]"`. Bits are written the same, then the bits
 left, `b["GET", 5::3]`.

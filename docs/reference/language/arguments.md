@@ -78,14 +78,14 @@ yourself, name it: `member (eq := myEquality) x xs`.
 ```haskell
 data Color = Red | Green
 
-instance instanceShowColor : Show Color
-instanceShowColor = { show = written }
+instance instanceDebugColor : Debug Color
+instanceDebugColor = { debug = written }
   where
   written : Color -> String
   written Red = "Red"
   written Green = "Green"
 
--- | >>> show ([Red, Green] : List Color)
+-- | >>> debug ([Red, Green] : List Color)
 -- | "[Red, Green]"
 colors : List Color
 colors = [Red, Green]
@@ -196,11 +196,11 @@ The prelude has three theories most types have:
 | Theory | Use | `"hi"` | `'a'` |
 |---|---|---|---|
 | [`Equality`](../../api/prelude.md#Equality) | `==`, `/=`, `equal` | | |
-| [`Show`](../../api/prelude.md#Show) | `show x`: the value as source code | `"\"hi\""` | `"'a'"` |
-| [`ToString`](../../api/prelude.md#ToString) | `toString x`: the value as text for a reader | `"hi"` | `"a"` |
+| [`Debug`](../../api/prelude.md#Debug) | `debug x`: the value as source code | `"\"hi\""` | `"'a'"` |
+| [`Show`](../../api/prelude.md#Show) | `show x`: the value as text for a reader | `"hi"` | `"a"` |
 
-`Show` is what tests use to print values, so two different values never
-look the same. `ToString` is Rust's `Display`; `Show` is its `Debug`.
+`Debug` is what tests use to print values, so two different values never
+look the same. `Show` is Rust's `Display`; `Debug` is its `Debug`.
 
 Which types have instances of them is on the
 [prelude's page](../../api/prelude.md); a fixed-width number's

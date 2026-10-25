@@ -2,7 +2,7 @@
 title: Theories
 ---
 
-A theory says what a type has: `Equality` a type's equality, `Show`
+A theory says what a type has: `Equality` a type's equality, `Debug`
 how its values are written, `Coe` how one type is taken as another. An
 instance is a value of a theory, and an
 [instance argument](arguments.md#instance-arguments) asks for one.

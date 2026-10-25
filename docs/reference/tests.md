@@ -73,7 +73,7 @@ A property that fails is shrunk to a small counterexample, which is
 printed with the seed to run it again (`--seed N`). The default seed is
 fixed, so every run is the same.
 
-Values are compared and printed by their `Show`. A type of your own needs
+Values are compared and printed by their `Debug`. A type of your own needs
 an instance: see [Implicit and instance arguments](language/arguments.md#declaring-an-instance).
 
 `agree` runs a program of commands on a system and on a model of it, and
@@ -153,7 +153,7 @@ with no `/`.
 
 ```haskell
 pretty : Test
-pretty = unit "laid out" (golden "list.txt" (show ([1, 2] : List Int)))
+pretty = unit "laid out" (golden "list.txt" (debug ([1, 2] : List Int)))
 ```
 
 `golden NAME text` holds `text` to the file `NAME` in the directory

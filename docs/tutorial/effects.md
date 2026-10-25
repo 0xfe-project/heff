@@ -18,7 +18,7 @@ import std.io
 printTodos : {e : HFunctor} -> {{io : stdio <: e}} -> List Todo -> Co e Unit
 printTodos [] = pure MkUnit
 printTodos (t :: ts) = do
-  print (toString t)
+  print (show t)
   printTodos ts
 
 main : Co stdio Unit
@@ -92,7 +92,7 @@ main : Co (stdio <+> filesystem) Unit
 main = do
   r <- attempt FileError (program (io := _) (disk := _) (ex := _))
   case r of
-    Left err -> print (ev := _) (showFileError err)
+    Left err -> print (ev := _) (show err)
     Right _ -> pure MkUnit
 ```
 
@@ -134,7 +134,7 @@ what it printed written now. The standard error keeps nothing.
 gives its `Bytes`, as they are. A string is written as its bytes are, so
 `write (Bytes.asString b)` writes the bytes `b` to the output unchanged,
 and so does std.file's `withStdout` with `writeBytes`.
-`Bytes.toString` is for text: it reads the bytes as UTF-8, and what is
+`show` of bytes is for text: it reads them as UTF-8, and what is
 not UTF-8 becomes U+FFFD, which is not what a PNG wants.
 
 std.time has [`sleep`](../api/std/time.md#sleep), for a `Duration`
