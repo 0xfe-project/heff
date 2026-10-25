@@ -136,6 +136,30 @@ static void *dm_thread(void *u) {
   return NULL;
 }
 
+// (`c` run here, under `heff_try`, its answer kept where the
+// continuation's one field says: `Right` it, or `Left` why it failed;
+// `c` consumed)
+static V dm_tried_answered(V self, V *a) {
+  V *at = (V *)(intptr_t)INT_OF(heff_env(self)[0]);
+  *at = a[0];
+  heff_drop(self);
+  return NTAG(TAG_MkUnit);
+}
+
+static V dm_tried(V c) {
+  V answer = 0;
+  V env = MK_INT((int64_t)(intptr_t)&answer);
+  V out;
+  const char *why = heff_try(c, heff_clo(dm_tried_answered, 1, 1, &env), &out);
+  if (why) {
+    V x = heff_str_text(why);
+    return heff_tag_n(TAG_Left, 1, &x);
+  }
+  heff_drop(out);
+  if (!answer) heff_fail("domain: a computation tried ended without an answer");
+  return heff_tag_n(TAG_Right, 1, &answer);
+}
+
 // (a domain running `c`, moved to it where held alone; `c` consumed)
 static DmDomain *dm_spawn(V c) {
   DmDomain *d = heff_alloc(sizeof(DmDomain));
@@ -397,6 +421,14 @@ static V heff_provider_domain(V p, V k) {
     V v = dm_join(DM_DOMAIN(d));
     heff_drop(j);
     x = heff_answer(g, v);
+    break;
+  }
+  case TAG_Tried: {
+    V t = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V c = heff_dup(heff_field(t, 0)), g = heff_dup(heff_field(t, 1));
+    heff_drop(t);
+    x = heff_answer(g, dm_tried(c));
     break;
   }
   case TAG_Cores: {

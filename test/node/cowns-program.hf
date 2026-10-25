@@ -4,7 +4,10 @@
 -- said.  A counter many behaviours add to; money moved round accounts,
 -- two cowns a behaviour; behaviours on one cown in the order they were
 -- spawned; a behaviour spawned in a behaviour's body, on its cown and
--- another; what is read out by a behaviour of its own.
+-- another; a behaviour that fails among others on its cown.  Each is
+-- run by a `scheduled` of its own, and what its cowns
+-- hold at the end is read out by a last behaviour on them, into a cell
+-- read once `scheduled` is done.
 
 module test.node.cowns-program
 
@@ -12,8 +15,9 @@ import boc as BOC
 import co
 import std.domain as Domain
 
--- (what the cowns hold, once every behaviour before is done: read out
--- by a behaviour of its own)
+-- (what the cowns hold once every behaviour before is done: written by
+-- a behaviour of its own, spawned after them, to a cell for main to
+-- read)
 readOut : {c : Type}
         -> {e : HFunctor}
         -> c
@@ -21,14 +25,13 @@ readOut : {c : Type}
         -> {{bc : BOC.boc cw.World <: e}}
         -> {{dm : Domain.domain <: e}}
         -> cw.Contents
-        -> Co e cw.Contents
+        -> Co e (Domain.Atomic cw.Contents)
 readOut cs first = do
   out <- Domain.newAtomic first
   BOC.when cs (\v -> do
     Domain.set out v
     pure v)
-  BOC.drained
-  Domain.get out
+  pure out
 
 -- (`k` behaviours, each adding 1)
 adding : {e w : HFunctor}
@@ -45,7 +48,7 @@ adding c k = do
 counted : {e w : HFunctor}
         -> {{bc : BOC.boc w <: e}}
         -> {{dm : Domain.domain <: e}}
-        -> Co e Int
+        -> Co e (Domain.Atomic Int)
 counted = do
   c <- BOC.newCown 0
   adding c 1000
@@ -80,20 +83,18 @@ rounds a b c d k = do
   rounds a b c d (k - 1)
 
 -- | four accounts of 100, 250 rounds of moves among them: what each
--- | has, and all of them
+-- | has
 accounts : {e w : HFunctor}
          -> {{bc : BOC.boc w <: e}}
          -> {{dm : Domain.domain <: e}}
-         -> Co e (List Int)
+         -> Co e (Domain.Atomic (Int, Int, Int, Int))
 accounts = do
   a <- BOC.newCown 100
   b <- BOC.newCown 100
   c <- BOC.newCown 100
   d <- BOC.newCown 100
   rounds a b c d 250
-  held <- readOut (a, b, c, d) (0, 0, 0, 0)
-  case held of
-    (p, q, r, s) -> pure [p, q, r, s, p + q + r + s]
+  readOut (a, b, c, d) (0, 0, 0, 0)
 
 -- (behaviours `i` to `n`, each putting its number on the list)
 logged : {e w : HFunctor}
@@ -113,53 +114,85 @@ logged c i n =
 ordered : {e w : HFunctor}
         -> {{bc : BOC.boc w <: e}}
         -> {{dm : Domain.domain <: e}}
-        -> Co e Bool
+        -> Co e (Domain.Atomic (List Int))
 ordered = do
   c <- BOC.newCown Nil
   logged c 1 100
-  xs <- readOut c Nil
-  pure (List.reverse xs == List.range 1 100)
+  readOut c Nil
 
 -- (the body of a behaviour on `a`: one on `a` and `b` spawned, which
--- comes after it on `a`; 1 added)
+-- comes after it on `a`, and after that one on both, reading out what
+-- they hold then; 1 added)
 spawning : {e w : HFunctor}
          -> {{bc : BOC.boc w <: e}}
+         -> {{dm : Domain.domain <: e}}
          -> BOC.Cown w Int
          -> BOC.Cown w Int
+         -> Domain.Atomic (Int, Int)
          -> Int
          -> Co e Int
-spawning a b x = do
+spawning a b out x = do
   BOC.when (a, b) (\(x, y) -> pure (x * 2, y + 1))
+  BOC.when (a, b) (\v -> do
+    Domain.set out v
+    pure v)
   pure (x + 1)
 
 -- | a behaviour on `a` spawning one on `a` and `b`, which comes after
--- | it on `a`: 1 then doubled, and 1 added to `b` of 5.  Read out once
--- | every behaviour is done: one spawned now would come before the one
--- | spawned in the body
+-- | it on `a`: 1 then doubled, and 1 added to `b` of 5.  Read out by
+-- | a behaviour spawned in the body after it: one spawned by main
+-- | would come before the one spawned in the body
 nested : {e w : HFunctor}
        -> {{bc : BOC.boc w <: e}}
        -> {{dm : Domain.domain <: e}}
-       -> Co e (Int, Int)
+       -> Co e (Domain.Atomic (Int, Int))
 nested = do
   a <- BOC.newCown 0
   b <- BOC.newCown 5
-  BOC.when a (spawning a b)
-  BOC.drained
-  readOut (a, b) (0, 0)
+  out <- Domain.newAtomic (0, 0)
+  BOC.when a (spawning a b out)
+  pure out
 
--- | what the program says, line by line
-said : {e w : HFunctor}
-     -> {{bc : BOC.boc w <: e}}
-     -> {{dm : Domain.domain <: e}}
-     -> Co e (List String)
+-- | three behaviours on one cown of 0: 1 added, the second abandons,
+-- | 1 added -- the one that failed leaves the cown as it was, the
+-- | others run, and read out to `out`: 2.  `scheduled` abandons once
+-- | they are done, so `out` is made outside it
+failing : {e w : HFunctor}
+        -> {{bc : BOC.boc w <: e}}
+        -> {{dm : Domain.domain <: e}}
+        -> Domain.Atomic Int
+        -> Co e Unit
+failing out = do
+  c <- BOC.newCown (0 : Int)
+  BOC.when c (\n -> pure (n + 1))
+  BOC.when c (\n -> if n == 1 then abandon else pure (n + 100))
+  BOC.when c (\n -> pure (n + 1))
+  BOC.when c (\n -> do
+    Domain.set out n
+    pure n)
+
+-- | what the program says, line by line: each part run by a
+-- | `scheduled` of its own, its cell read once every behaviour is done
+said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
 said = do
-  n <- counted
-  xs <- accounts
-  o <- ordered
-  (x, y) <- nested
+  failedOut <- Domain.newAtomic 0
+  outcome <- Domain.tried (BOC.scheduled (failing (w := e) (bc := _) (dm := _) failedOut))
+  f <- Domain.get failedOut
+  nOut <- BOC.scheduled (counted (w := e) (bc := _) (dm := _))
+  n <- Domain.get nOut
+  heldOut <- BOC.scheduled (accounts (w := e) (bc := _) (dm := _))
+  (p, q, r, s) <- Domain.get heldOut
+  xsOut <- BOC.scheduled (ordered (w := e) (bc := _) (dm := _))
+  xs <- Domain.get xsOut
+  pairOut <- BOC.scheduled (nested (w := e) (bc := _) (dm := _))
+  (x, y) <- Domain.get pairOut
   pure
       [ "added by 1000: " ^ show n
-      , "accounts: " ^ unwords (List.map show xs)
-      , "in the order spawned: " ^ (if o then "yes" else "no")
+      , "accounts: " ^ unwords (List.map show [p, q, r, s, p + q + r + s])
+      , "in the order spawned: " ^ (if List.reverse xs == List.range 1 100 then "yes" else "no")
       , "nested: " ^ show x ^ " " ^ show y
+      , "a failing behaviour: " ^ show f ^ " added by the others, scheduled "
+        ^ (case outcome of
+             Left why -> why
+             Right u -> "gave an answer")
       ]

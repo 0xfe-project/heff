@@ -42,6 +42,7 @@
 -- --- | ---
 -- `spawn c` | `c` run on a domain of its own; this one goes on
 -- `join d` | the domain's answer, waiting for it to end
+-- `tried c` | `c` run here: `Right` its answer, or `Left why` where it fails
 -- `cores` | how many domains the machine runs at once
 -- `newAtomic v` | a cell holding `v`, for every domain
 -- `get a` / `set a v` | what it holds; ... and it holds `v` now
@@ -58,7 +59,10 @@
 -- number of a word or a constructor without fields is itself, anything
 -- else the value that was read, not an equal one built again.  A `wait` may end
 -- without a signal: what it waits for is checked again, in a loop.  A
--- domain's failure is its joiner's, as it failed.  What is put in a queue
+-- domain's failure is its joiner's, as it failed -- unless the join is
+-- in a `tried`, which gives the failure back as a `Left` instead: so a
+-- failure of this domain's own (an `abandon`, a runtime's), or of one
+-- it joins, is caught where it is to be.  What is put in a queue
 -- is handed to the one domain that takes it, first in first out: a
 -- `take` waits while the queue is empty, a `put` never waits.
 --
@@ -94,6 +98,7 @@ module std.domain
   , Queue
   , spawn
   , join
+  , tried
   , cores
   , newAtomic
   , get
@@ -150,6 +155,8 @@ data Spawning (m : Type -> Type) x a = MkSpawning (m a) (Domain a -> x)
 
 data Joining x a = MkJoining (Domain a) (a -> x)
 
+data Trying (m : Type -> Type) x a = MkTrying (m a) (Either String a -> x)
+
 data Making x a = MkMaking a (Atomic a -> x)
 
 data Reading x a = MkReading (Atomic a) (a -> x)
@@ -181,6 +188,20 @@ spawningBy nt (MkSpawning c k) = MkSpawning (nt c) k
 joiningThen : {x y a : Type} -> (x -> y) -> Joining x a -> Joining y a
 joiningThen g (MkJoining d k) = MkJoining d (\v -> g (k v))
 
+tryingThen : {m : Type -> Type}
+           -> {x y a : Type}
+           -> (x -> y)
+           -> Trying m x a
+           -> Trying m y a
+tryingThen g (MkTrying c k) = MkTrying c (\r -> g (k r))
+
+tryingBy : {m n : Type -> Type}
+         -> {x a : Type}
+         -> ({t : Type} -> m t -> n t)
+         -> Trying m x a
+         -> Trying n x a
+tryingBy nt (MkTrying c k) = MkTrying (nt c) k
+
 makingThen : {x y a : Type} -> (x -> y) -> Making x a -> Making y a
 makingThen g (MkMaking v k) = MkMaking v (\at -> g (k at))
 
@@ -209,6 +230,7 @@ takingThen g (MkTaking q k) = MkTaking q (\v -> g (k v))
 data DomainF (m : Type -> Type) x
   = Spawn (Some (Spawning m x))
   | Join (Some (Joining x))
+  | Tried (Some (Trying m x))
   | Cores (Int -> x)
   | NewAtomic (Some (Making x))
   | GetAtomic (Some (Reading x))
@@ -233,6 +255,7 @@ domain =
   , hfmap = \m g p -> case p of
       Spawn s -> Spawn (someThen (spawningThen g) s)
       Join s -> Join (someThen (joiningThen g) s)
+      Tried s -> Tried (someThen (tryingThen g) s)
       Cores k -> Cores (\n -> g (k n))
       NewAtomic s -> NewAtomic (someThen (makingThen g) s)
       GetAtomic s -> GetAtomic (someThen (readingThen g) s)
@@ -252,6 +275,7 @@ domain =
   , hmap = \m n nt p -> case p of
       Spawn s -> Spawn (someThen (spawningBy nt) s)
       Join s -> Join s
+      Tried s -> Tried (someThen (tryingBy nt) s)
       Cores k -> Cores k
       NewAtomic s -> NewAtomic s
       GetAtomic s -> GetAtomic s
@@ -290,6 +314,18 @@ join : {e : HFunctor}
      -> Domain a
      -> Co e a
 join d = op (dm (Join (\r use -> use a (MkJoining d (\v -> v))))) val
+
+-- | `c` run here, on this domain, its failure caught: `Right` its
+-- | answer, or `Left why` where it fails -- abandons (`heff:abandon`),
+-- | fails in the runtime, or joins a domain that failed -- the rest of
+-- | `c` not run.  (Provisional: the name and the `Either String` may
+-- | change.)
+tried : {e : HFunctor}
+      -> {a : Type}
+      -> {{dm : domain <: e}}
+      -> Co e a
+      -> Co e (Either String a)
+tried c = op (dm (Tried (\r use -> use a (MkTrying c (\r -> r))))) val
 
 -- | How many domains the machine runs at once: its cores, as the system
 -- | says (1 where it does not).

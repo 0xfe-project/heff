@@ -26,11 +26,12 @@
 --      -> Co e Unit
 -- paid from to n = BOC.when (from, to) (\(x, y) -> pure (x - n, y + n))
 --
--- -- | alice given 10, then 5 paid to bob: what bob has, 5
+-- -- | alice given 10, then 5 paid to bob; what bob has then, written
+-- -- | by a last behaviour on bob, which comes after the others on him
 -- bobs : {e w : HFunctor}
 --      -> {{bc : BOC.boc w <: e}}
 --      -> {{dm : Domain.domain <: e}}
---      -> Co e Int
+--      -> Co e (Domain.Atomic Int)
 -- bobs = do
 --   alice <- BOC.newCown 0
 --   bob <- BOC.newCown 0
@@ -40,7 +41,12 @@
 --   BOC.when bob (\b -> do
 --     Domain.set seen b
 --     pure b)
---   BOC.drained
+--   pure seen
+--
+-- -- | the behaviours run, every one done: what bob has, 5
+-- bobHas : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+-- bobHas = do
+--   seen <- BOC.scheduled (bobs (w := e) (bc := _) (dm := _))
 --   Domain.get seen
 -- ```
 --
@@ -48,8 +54,7 @@
 -- --- | ---
 -- `newCown v` | a cown holding `v`
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
--- `drained` | waits until no behaviour is left to run
--- `scheduled c` | `c` and its behaviours run, on domains, the last behaviour waited for
+-- `scheduled c` | `c` and its behaviours run, on domains, every behaviour waited for
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
@@ -59,8 +64,18 @@
 -- behaviours, on its own cowns too (they run after it), and do what
 -- else its effects allow, whose providers must then be safe on threads.
 -- A body that waits holds its cowns while it waits, and every behaviour
--- behind it on them waits too.  The same cown twice in one `when` is
--- abandoned when the `when` runs.
+-- behind it on them waits too.  There is no barrier: a behaviour that
+-- is to come after others on a cown is spawned after them on it, and
+-- `scheduled` gives main's answer once every behaviour is done.  The
+-- same cown twice in one `when` is abandoned when the `when` runs.
+--
+-- A behaviour whose body fails -- abandons, or fails in the runtime --
+-- is done with that: its cowns are handed on as if it had ended, and
+-- hold what they held, since what they are to hold is written after
+-- the body (`Domain.tried` catches the failure).  The other behaviours,
+-- and main, go on.  The failures are counted, and `scheduled`, once
+-- every behaviour is done, abandons instead of giving main's answer
+-- where any behaviour failed.
 --
 -- The scheduling is the paper's, as Verona's runtime has it: each cown
 -- has a queue, kept as the last request for it, and a behaviour is
@@ -71,10 +86,17 @@
 -- counts the cowns it still waits for (and one more, for its spawning)
 -- and runs when none is left.  When it ends, each of its requests hands
 -- its cown to the one linked behind it, or, where none is, takes itself
--- out as the last.  No lock is held for any of it: a request's links
--- are cells (`Domain.Atomic`), changed by `cas`.  A behaviour whose
--- turn has come is put among those ready, which the domains running
--- behaviours take from, waiting on a condition while there are none.
+-- out as the last.  No lock is held for any of it: a request is a cell
+-- (`Domain.Atomic`) holding its link, changed by `cas`, and told from
+-- the others by the cell it is.  A behaviour whose turn has come is put
+-- in a queue (`Domain.Queue`) the domains running behaviours take from
+-- -- unless its turn came by a behaviour running on one of those
+-- domains, spawning it or ending and handing it a cown: then that
+-- domain keeps it, one at a time, and runs it next itself, as the
+-- paper's threads keep a batch of their own, until it has run 64 in a
+-- row, when it puts the next in the queue, so the others are not
+-- starved.  No domain steals from another's batch, which is one
+-- behaviour; a behaviour spawned by main is put in the queue.
 
 module boc
   ( Cown
@@ -84,7 +106,6 @@ module boc
   , boc
   , newCown
   , when
-  , drained
   , scheduled
   )
 
@@ -95,19 +116,40 @@ import std.domain as Domain
 --------------------------------------------------------------------------------
 
 -- (a behaviour spawned: how many of its cowns it still waits for, and
--- one more until its spawning is done; and what it does when it runs)
-data Behaviour (w : HFunctor) = MkBehaviour (Domain.Atomic Int) (Co w Unit)
+-- one more until its spawning is done; and its turn, given the domain
+-- it runs on -- a worker's slot for the behaviour it is to run next,
+-- or nothing, for main, which runs none)
+data Behaviour (w : HFunctor)
+  = MkBehaviour (Domain.Atomic Int) (Maybe (Domain.Atomic (Maybe (Behaviour w)))
+                                     -> Co w Unit)
 
--- (a behaviour's request for one cown: the behaviour linked behind it,
--- once one is, and whether it has come to all its cowns' queues; or
--- none, what a cown's queue holds while no behaviour waits for it)
-data Request (w : HFunctor)
-  = MkRequest (Domain.Atomic (Maybe (Behaviour w))) (Domain.Atomic Bool)
+-- (a worker's slot: the behaviour it is to run next, where one is)
+type Slot (w : HFunctor) = Domain.Atomic (Maybe (Behaviour w))
+
+-- (the domain a computation of the scheduler's runs on: a worker, as
+-- its slot, or main, with none)
+type Runner (w : HFunctor) = Maybe (Slot w)
+
+-- (what a request holds -- a behaviour's request for one cown is a
+-- cell holding its link: it has not come to all its cowns' queues yet;
+-- it has, and none is linked behind it; or the behaviour linked behind
+-- it.  `NoRequest` is held by the one cell a cown's queue keeps as its
+-- last while no behaviour waits for it, which no behaviour's request
+-- is)
+data Link (w : HFunctor)
+  = NotCome
+  | Come
+  | Behind (Behaviour w)
   | NoRequest
 
+-- (a request: compared only as the cell it is, never rebuilt)
+type Request (w : HFunctor) = Domain.Atomic (Link w)
+
 -- (a cown, as its queue: its number, which orders the cowns of a
--- behaviour, and the last request for it, `NoRequest` while none is)
-data Handle (w : HFunctor) = MkHandle Int (Domain.Atomic (Request w))
+-- behaviour; the last request for it; and the request it keeps as the
+-- last while no behaviour waits for it)
+data Handle (w : HFunctor)
+  = MkHandle Int (Domain.Atomic (Request w)) (Request w)
 
 -- | A cown holding an `a`, of behaviours run in the world `w`.
 data Cown (w : HFunctor) a = MkCown (Handle w) (Domain.Atomic a)
@@ -119,7 +161,7 @@ cellOf : {w : HFunctor} -> {a : Type} -> Cown w a -> Domain.Atomic a
 cellOf (MkCown h at) = at
 
 numberOf : {w : HFunctor} -> Handle w -> Int
-numberOf (MkHandle n last) = n
+numberOf (MkHandle n last none) = n
 
 -- | What a behaviour can be on: a cown, or a tuple of them (`(a, b, c)`,
 -- | nesting to the left); the world their behaviours run in, what they
@@ -175,13 +217,13 @@ someThen h s = \r use -> s r (\a v -> use a (h v))
 
 data Making (w : HFunctor) x a = MkMaking a (Cown w a -> x)
 
--- (a behaviour asked for: its cowns' queues, how what they hold is read
--- and written, its body, and what comes after the asking)
 -- (how a behaviour reads what its cowns hold, and writes it)
 type Reading (w : HFunctor) t = (Domain.domain <: w) -> Co w t
 
 type Writing (w : HFunctor) t = (Domain.domain <: w) -> t -> Co w Unit
 
+-- (a behaviour asked for: its cowns' queues, how what they hold is read
+-- and written, its body, and what comes after the asking)
 data Behaving (w : HFunctor) (m : Type -> Type) x t
   = MkBehaving (List (Handle w)) (Reading w t) (Writing w t) (t -> m t) x
 
@@ -212,7 +254,6 @@ behavingBy nt (MkBehaving hs rd wr body x) =
 data BocF (w : HFunctor) (m : Type -> Type) x
   = NewCown (Some (Making w x))
   | When (Some (Behaving w m x))
-  | Drained x
 
 -- | Behaviours run in the world `w`, as an effect.
 boc : HFunctor -> HFunctor
@@ -221,11 +262,9 @@ boc w =
   , hfmap = \m g p -> case p of
       NewCown s -> NewCown (someThen (makingThen g) s)
       When s -> When (someThen (behavingThen g) s)
-      Drained x -> Drained (g x)
   , hmap = \m n nt p -> case p of
       NewCown s -> NewCown s
       When s -> When (someThen (behavingBy nt) s)
-      Drained x -> Drained x
   }
 
 -- | A cown holding `v`.
@@ -263,52 +302,62 @@ when cs body =
                   MkUnit))))
     val
 
--- | Waiting until no behaviour is left to run: every one spawned, and
--- | every one they spawn, done.
-drained : {e w : HFunctor} -> {{bc : boc w <: e}} -> Co e Unit
-drained = op (bc (Drained MkUnit)) val
-
 -- The scheduler
 --------------------------------------------------------------------------------
 
 -- (what the domains running behaviours share: the next cown's number;
--- how many behaviours are not yet done; those ready, a queue, its front
--- and its back reversed; the mutex they are taken under, the condition
--- the domains wait on for one, and the one waited on until none is
--- left; and whether the domains are to stop)
+-- how many behaviours are not yet done, main's own run one of them;
+-- how many failed; those ready, which the domains take from, `Nothing`
+-- telling a domain to stop; and where the last behaviour done says so,
+-- once, for `scheduled` to wait on)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
   , live : Domain.Atomic Int
-  , ready : Domain.Atomic (Pair (List (Co w Unit)) (List (Co w Unit)))
-  , mutex : Domain.Mutex
-  , work : Domain.Condition
-  , idle : Domain.Condition
-  , stopping : Domain.Atomic Bool
+  , failed : Domain.Atomic Int
+  , ready : Domain.Queue (Maybe (Behaviour w))
+  , done : Domain.Queue Unit
   }
 
--- (`work` put among those ready, a domain waiting for one woken)
+-- (how many behaviours in a row a domain runs from its slot, before it
+-- puts the next among those ready instead)
+batchLimit : Int
+batchLimit = 64
+
+-- (`b` put among those ready, for any domain to take)
 readied : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
+        -> Behaviour w
         -> Co w Unit
-        -> Co w Unit
-readied st work = do
-  Domain.lock st.mutex
-  q <- Domain.get st.ready
-  Domain.set st.ready (MkPair (fst q) (work :: snd q))
-  Domain.signal st.work
-  Domain.unlock st.mutex
+readied st b = Domain.put st.ready (Just b)
+
+-- (`b`'s turn come, on `runner`: kept in the worker's slot where it is
+-- a worker's and the slot is empty, else put among those ready)
+ready : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Runner w
+      -> Behaviour w
+      -> Co w Unit
+ready st Nothing b = readied st b
+ready st (Just slot) b = do
+  kept <- Domain.get slot
+  case kept of
+    Nothing -> Domain.set slot (Just b)
+    Just k -> readied st b
 
 -- (one fewer cown, or the spawning, waited for: where none is left, its
 -- turn come)
 resolved : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
+         -> Runner w
          -> Behaviour w
          -> Co w Unit
-resolved st (MkBehaviour count work) = do
-  n <- Domain.fetchAdd count (0 - 1)
-  if n == 1 then readied st work else pure ()
+resolved st runner b = case b of
+  MkBehaviour count turn -> do
+    n <- Domain.fetchAdd count (0 - 1)
+    if n == 1 then ready st runner b else pure ()
 
 -- (the cell holds `v` now: what it held)
 swapped : {w : HFunctor}
@@ -322,30 +371,31 @@ swapped at v = do
   ok <- Domain.cas at old v
   if ok then pure old else swapped at v
 
--- (waiting until the request whose flag this is has come to all its
--- behaviour's queues)
-come : {w : HFunctor}
-     -> {{dm : Domain.domain <: w}}
-     -> Domain.Atomic Bool
-     -> Co w Unit
-come flag = do
-  b <- Domain.get flag
-  if b then pure () else come flag
+-- (the request's link, waiting until its behaviour has come to all its
+-- cowns' queues)
+linkOnceCome : {w : HFunctor}
+             -> {{dm : Domain.domain <: w}}
+             -> Request w
+             -> Co w (Link w)
+linkOnceCome r = do
+  link <- Domain.get r
+  case link of
+    NotCome -> linkOnceCome r
+    _ -> pure link
 
 -- (the behaviour linked behind the request, waiting until one is)
 linkedBehind : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
-             -> Domain.Atomic (Maybe (Behaviour w))
+             -> Request w
              -> Co w (Behaviour w)
-linkedBehind next = do
-  nb <- Domain.get next
-  case nb of
-    Just b -> pure b
-    Nothing -> linkedBehind next
+linkedBehind r = do
+  link <- Domain.get r
+  case link of
+    Behind b -> pure b
+    _ -> linkedBehind r
 
 -- (a request, as a behaviour holds it: its cown's queue, and the very
--- request swapped in as the last, which only it takes out again -- the
--- request itself, compared by identity, no box round it)
+-- cell swapped in as the last, which only it takes out again)
 type Held (w : HFunctor) = Pair (Handle w) (Request w)
 
 -- (a new request for the cown)
@@ -354,9 +404,8 @@ requested : {w : HFunctor}
           -> Handle w
           -> Co w (Held w)
 requested h = do
-  next <- Domain.newAtomic Nothing
-  flag <- Domain.newAtomic False
-  pure (MkPair h (MkRequest next flag))
+  r <- Domain.newAtomic (NotCome : Link w)
+  pure (MkPair h r)
 
 requestedAll : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
@@ -374,18 +423,18 @@ requestedAll (h :: hs) = do
 queued : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
+       -> Runner w
        -> Behaviour w
        -> List (Held w)
        -> Co w Unit
-queued st b Nil = pure ()
-queued st b (MkPair (MkHandle n last) r :: rest) = do
+queued st runner b Nil = pure ()
+queued st runner b (MkPair (MkHandle n last none) r :: rest) = do
   prev <- swapped last r
-  case prev of
-    NoRequest -> resolved st b
-    MkRequest next flag -> do
-      come flag
-      Domain.set next (Just b)
-  queued st b rest
+  link <- linkOnceCome prev
+  case link of
+    NoRequest -> resolved st runner b
+    _ -> Domain.set prev (Behind b)
+  queued st runner b rest
 
 -- (the second phase: each request marked come)
 markedCome : {w : HFunctor}
@@ -393,10 +442,9 @@ markedCome : {w : HFunctor}
            -> List (Held w)
            -> Co w Unit
 markedCome Nil = pure ()
-markedCome (MkPair h (MkRequest next flag) :: rest) = do
-  Domain.set flag True
+markedCome (MkPair h r :: rest) = do
+  Domain.set r Come
   markedCome rest
-markedCome (MkPair h NoRequest :: rest) = markedCome rest
 
 -- (the behaviour done with the cown: handed to the one linked behind
 -- it; where none is, the request taken out as the last, unless one has
@@ -404,41 +452,37 @@ markedCome (MkPair h NoRequest :: rest) = markedCome rest
 released : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
+         -> Runner w
          -> Held w
          -> Co w Unit
-released st (MkPair (MkHandle n last) r) = case r of
-  MkRequest next flag -> do
-    nb <- Domain.get next
-    case nb of
-      Just b -> resolved st b
-      Nothing -> do
-        out <- Domain.cas last r NoRequest
-        if out then pure ()
-        else do
-          b <- linkedBehind next
-          resolved st b
-  NoRequest -> pure ()
+released st runner (MkPair (MkHandle n last none) r) = do
+  link <- Domain.get r
+  case link of
+    Behind b -> resolved st runner b
+    _ -> do
+      out <- Domain.cas last r none
+      if out then pure ()
+      else do
+        b <- linkedBehind r
+        resolved st runner b
 
 releasedAll : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> Sched w
+            -> Runner w
             -> List (Held w)
             -> Co w Unit
-releasedAll st Nil = pure ()
-releasedAll st (r :: rs) = do
-  released st r
-  releasedAll st rs
+releasedAll st runner Nil = pure ()
+releasedAll st runner (r :: rs) = do
+  released st runner r
+  releasedAll st runner rs
 
--- (a behaviour done: where none is left, those waiting until then told)
+-- (a behaviour done, or main: where none is left, said once, for
+-- `scheduled`)
 finished : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
 finished st = do
   n <- Domain.fetchAdd st.live (0 - 1)
-  if n == 1
-  then do
-    Domain.lock st.mutex
-    Domain.broadcast st.idle
-    Domain.unlock st.mutex
-  else pure ()
+  if n == 1 then Domain.put st.done MkUnit else pure ()
 
 -- (no number twice, of numbers in order)
 distinct : List Int -> Bool
@@ -446,33 +490,43 @@ distinct (a :: b :: rest) = a /= b && distinct (b :: rest)
 distinct _ = True
 
 -- (a behaviour spawned on its cowns' queues, `rd` and `wr` reading and
--- writing what they hold, `body` its work)
+-- writing what they hold, `body` its work: what they hold is written
+-- after the body, by its answer; a body that fails leaves them as they
+-- were, counted among the failed)
 spawnedOn : {w : HFunctor}
           -> {t : Type}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
+          -> Runner w
           -> List (Handle w)
           -> Reading w t
           -> Writing w t
-          -> (t -> Co w t)
+          -> (t -> Runner w -> Co w t)
           -> Co w Unit
-spawnedOn st hs rd wr body = do
+spawnedOn st runner hs rd wr body = do
   let ordered = List.sortOn (\h -> numberOf h) hs
   if not (distinct (List.map numberOf ordered)) then abandon
   else do
     _ <- Domain.fetchAdd st.live 1
     held <- requestedAll ordered
     count <- Domain.newAtomic (List.length held + 1)
-    let work = do
+    let turn : Runner w -> Co w Unit = \on -> do
       v <- rd dm
-      after <- body v
-      wr dm after
-      releasedAll st held
+      -- (the body applied when the computation tried runs, not where
+      -- it is built: a body that fails as it is applied fails there,
+      -- caught)
+      outcome <- Domain.tried (bind (later (\u -> body v on)) (\c -> c))
+      case outcome of
+        Right after -> wr dm after
+        Left why -> do
+          _ <- Domain.fetchAdd st.failed 1
+          pure ()
+      releasedAll st on held
       finished st
-    let b : Behaviour w = MkBehaviour count work
-    queued st b held
+    let b : Behaviour w = MkBehaviour count turn
+    queued st runner b held
     markedCome held
-    resolved st b
+    resolved st runner b
 
 -- (a cown made)
 madeCown : {w : HFunctor}
@@ -483,90 +537,81 @@ madeCown : {w : HFunctor}
          -> Co w x
 madeCown st (MkMaking v k) = do
   n <- Domain.fetchAdd st.numbers 1
-  last <- Domain.newAtomic (NoRequest : Request w)
+  none <- Domain.newAtomic (NoRequest : Link w)
+  last <- Domain.newAtomic none
   cell <- Domain.newAtomic v
-  pure (k (MkCown (MkHandle n last) cell))
+  pure (k (MkCown (MkHandle n last none) cell))
 
--- (waiting, the mutex held, until no behaviour is left)
-idleUntilDone : {w : HFunctor}
-              -> {{dm : Domain.domain <: w}}
-              -> Sched w
-              -> Co w Unit
-idleUntilDone st = do
-  n <- Domain.get st.live
-  if n > 0
-  then do
-    Domain.wait st.idle st.mutex
-    idleUntilDone st
-  else pure ()
+-- (the handler's monad, a computation given the domain it runs on, as
+-- a functor)
+runnerFunctor : (w : HFunctor) -> RawFunctor
+runnerFunctor w =
+  { f = \a -> Runner w -> Co w a
+  , fmap = \g m -> \runner -> bind (m runner) (\x -> val (g x))
+  }
 
-drainedIn : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Co w Unit
-drainedIn st = do
-  Domain.lock st.mutex
-  idleUntilDone st
-  Domain.unlock st.mutex
-
+-- (an operation, on `runner`: the world's own forwarded, their
+-- computations given the runner)
 bocAlg : {w : HFunctor}
        -> {x : Type}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
-       -> (boc w <+> w).f (\a -> Co w a) x
+       -> Runner w
+       -> (boc w <+> w).f (\a -> Runner w -> Co w a) x
        -> Co w x
-bocAlg st (InL (NewCown s)) = s (Co w x) (\a mk -> madeCown st mk)
-bocAlg st (InL (When s)) =
+bocAlg st runner (InL (NewCown s)) = s (Co w x) (\a mk -> madeCown st mk)
+bocAlg st runner (InL (When s)) =
   s (Co w x) (\t bh -> case bh of
     MkBehaving hs rd wr body k ->
-      bind (spawnedOn st hs rd wr body) (\u -> pure k))
-bocAlg st (InL (Drained x)) = bind (drainedIn st) (\u -> pure x)
-bocAlg st (InR q) = op q val
+      bind (spawnedOn st runner hs rd wr body) (\u -> pure k))
+bocAlg st runner (InR q) =
+  op (w.hmap (runnerFunctor w) (coFunctor w) (\m -> m runner) q) val
 
+-- (the handler: a computation given the domain it runs on, so that a
+-- body's spawning knows the worker's slot)
 bocHandler : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
            -> Handler (boc w <+> w)
 bocHandler st =
-  { M = \a -> Co w a
-  , ret = \v -> pure v
-  , bind = \m f -> bind m f
-  , malg = \p -> bocAlg st p
+  { M = \a -> Runner w -> Co w a
+  , ret = \v -> \runner -> pure v
+  , bind = \m f -> \runner -> bind (m runner) (\x -> f x runner)
+  , malg = \p -> \runner -> bocAlg st runner p
   }
 
--- (the next behaviour ready, the mutex held: waiting for one while none
--- is; `Nothing` once the domains are to stop and none is left)
-taken : {w : HFunctor}
-      -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Co w (Maybe (Co w Unit))
-taken st = do
-  q <- Domain.get st.ready
-  case q of
-    MkPair (x :: xs) back -> do
-      Domain.set st.ready (MkPair xs back)
-      pure (Just x)
-    MkPair Nil Nil -> do
-      stop <- Domain.get st.stopping
-      if stop then pure Nothing
-      else do
-        Domain.wait st.work st.mutex
-        taken st
-    MkPair Nil back -> do
-      Domain.set st.ready (MkPair (List.reverse back) Nil)
-      taken st
-
--- (a domain running behaviours, each ready one it takes, until it is
--- to stop)
-worker : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
-worker st = do
-  Domain.lock st.mutex
-  next <- taken st
-  Domain.unlock st.mutex
+-- (the behaviour run on the worker whose slot this is, and after it the
+-- one left in the slot, and so on, `n` run so far in a row: the limit
+-- reached, the next is put among those ready instead)
+ran : {w : HFunctor}
+    -> {{dm : Domain.domain <: w}}
+    -> Sched w
+    -> Slot w
+    -> Behaviour w
+    -> Int
+    -> Co w Unit
+ran st slot (MkBehaviour count turn) n = do
+  turn (Just slot)
+  next <- Domain.get slot
   case next of
-    Just work -> do
-      work
-      worker st
+    Just b -> do
+      Domain.set slot (Nothing : Maybe (Behaviour w))
+      if n < batchLimit then ran st slot b (n + 1) else readied st b
+    Nothing -> pure ()
+
+-- (a domain running behaviours, each ready one it takes and those left
+-- in its slot after, until it is told to stop)
+worker : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> Sched w
+       -> Slot w
+       -> Co w Unit
+worker st slot = do
+  next <- Domain.take st.ready
+  case next of
+    Just b -> do
+      ran st slot b 1
+      worker st slot
     Nothing -> pure ()
 
 workers : {w : HFunctor}
@@ -577,9 +622,22 @@ workers : {w : HFunctor}
 workers st n =
   if n <= 0 then pure Nil
   else do
-    d <- Domain.spawn (worker st)
+    slot <- Domain.newAtomic (Nothing : Maybe (Behaviour w))
+    d <- Domain.spawn (worker st slot)
     ds <- workers st (n - 1)
     pure (d :: ds)
+
+-- (each domain told to stop, once no behaviour is left: one `Nothing`
+-- a domain, whichever takes it)
+stoppedAll : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> List (Domain.Domain Unit)
+           -> Co w Unit
+stoppedAll st Nil = pure ()
+stoppedAll st (d :: ds) = do
+  Domain.put st.ready (Nothing : Maybe (Behaviour w))
+  stoppedAll st ds
 
 joinedAll : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
@@ -591,8 +649,10 @@ joinedAll (d :: ds) = do
   joinedAll ds
 
 -- | `c` and the behaviours it spawns, run on as many domains as the
--- | machine has cores (`Domain.cores`), the last behaviour waited for:
--- | main's answer.  A behaviour that fails fails it, once main is done.
+-- | machine has cores (`Domain.cores`), every behaviour waited for:
+-- | main's answer.  A behaviour whose body fails is done with that, its
+-- | cowns holding what they held; the others go on, and once every one
+-- | is done this abandons, instead of giving the answer.
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
@@ -600,30 +660,23 @@ scheduled : {w : HFunctor}
           -> Co w a
 scheduled c = do
   numbers <- Domain.newAtomic 0
-  live <- Domain.newAtomic 0
-  ready <-
-    Domain.newAtomic
-      (MkPair Nil Nil : Pair (List (Co w Unit)) (List (Co w Unit)))
-  mutex <- Domain.newMutex
-  work <- Domain.newCondition
-  idle <- Domain.newCondition
-  stopping <- Domain.newAtomic False
+  live <- Domain.newAtomic 1
+  failed <- Domain.newAtomic 0
+  ready <- (Domain.newQueue : Co w (Domain.Queue (Maybe (Behaviour w))))
+  done <- (Domain.newQueue : Co w (Domain.Queue Unit))
   let st : Sched w =
     { numbers = numbers
     , live = live
+    , failed = failed
     , ready = ready
-    , mutex = mutex
-    , work = work
-    , idle = idle
-    , stopping = stopping
+    , done = done
     }
   n <- Domain.cores
   ds <- workers st n
-  x <- handle (bocHandler st) c
-  drainedIn st
-  Domain.lock mutex
-  Domain.set stopping True
-  Domain.broadcast work
-  Domain.unlock mutex
+  x <- handle (bocHandler st) c Nothing
+  finished st
+  Domain.take done
+  stoppedAll st ds
   joinedAll ds
-  pure x
+  k <- Domain.get failed
+  if k > 0 then abandon else pure x
