@@ -24,6 +24,7 @@ import heff.build.testing as Testing
 import heff.lsp.lsp as LSP
 import heff.lsp.report as Report
 import heff.lsp.rpc as RPC
+import heff.util.files as Util
 import std.cli as CLI
 import std.cli.interactive as Interactive
 import std.filesystem
@@ -517,8 +518,43 @@ dispatch argv = case CLI.readLine
     writeErr text
     exit 1
 
--- (what the commands' app came to: a command line, said as a shell
--- would be given it, then run; or nothing, the app left)
+-- (a command line chosen in the commands' app, as a shell would be given
+-- it: written to the file the shell's function names (std.cli's
+-- `chosenVariable`), for the shell to keep in its history and run; else
+-- said, then run)
+chosenTo : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{wire : RPC.rpc <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> {{clock : Time.time <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> {{ex : exception ProcessError <: e}}
+         -> {{nx : exception Net.NetError <: e}}
+         -> List String
+         -> String
+         -> Co e Unit
+chosenTo ws file =
+  if strEq file ""
+  then do
+    printErr ("$ " ^ unwords ("heff" :: List.map Interactive.quoted ws))
+    dispatch ws
+  else do
+    ok <-
+      Util.writeFile
+        (Path.parse file)
+        (unwords ("heff" :: List.map Interactive.quoted ws))
+    if ok then pure MkUnit
+    else do
+      printErr ("heff: cannot write the command line chosen to " ^ file)
+      exit 1
+
+-- (what the commands' app came to: a command line, run as chosen; or
+-- nothing, the app left -- and then `left` done)
 explored : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -532,12 +568,13 @@ explored : {e : HFunctor}
          -> {{web : HTTP.http <: e}}
          -> {{ex : exception ProcessError <: e}}
          -> {{nx : exception Net.NetError <: e}}
+         -> Co e Unit
          -> Maybe (Maybe (List String))
          -> Co e Unit
-explored (Just (Just ws)) = do
-  printErr ("$ " ^ unwords ("heff" :: List.map Interactive.quoted ws))
-  dispatch ws
-explored chosen = pure MkUnit
+explored left (Just (Just ws)) = do
+  file <- getEnv (CLI.chosenVariable "heff")
+  chosenTo ws (fromMaybe "" file)
+explored left chosen = left
 
 -- | heff with no words, on a terminal: its commands, to pick one of and
 -- | fill in (std.cli.interactive), the command line made then run --
@@ -568,7 +605,39 @@ explore True = do
             (commands
                (r := Co e Unit)
                { build = build, project = project, tool = tool })))
-  explored chosen
+  explored (pure MkUnit) chosen
+
+-- | words that lack only what a command wants, on a terminal: the
+-- | command's form, filled in with them, to fill in the rest of
+-- | (std.cli.interactive's `prompt`), the command line made then run;
+-- | left, or elsewhere, the words run as they are -- what they lack said
+prompted : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{wire : RPC.rpc <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> {{con : Terminal.console <: e}}
+         -> {{clock : Time.time <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> {{ex : exception ProcessError <: e}}
+         -> {{nx : exception Net.NetError <: e}}
+         -> List String
+         -> Maybe Interactive.Form
+         -> Co e Unit
+prompted argv Nothing = dispatch argv
+prompted argv (Just fm) = do
+  tty <- Terminal.interactive
+  if tty
+  then do
+    chosen <-
+      Terminal.interact
+        (Interactive.prompt "heff" (Interactive.entries (commands said)) fm)
+    explored (dispatch argv) chosen
+  else dispatch argv
 
 -- | heff: its commands, given what they are to run with
 program : {e : HFunctor}
@@ -592,7 +661,9 @@ program = do
   then do
     tty <- Terminal.interactive
     explore tty
-  else dispatch argv
+  else prompted
+      argv
+      (Interactive.lacking (Interactive.entries (commands said)) argv)
 
 -- (the program ended by a throw no command heard: what was thrown
 -- said, and heff failed)

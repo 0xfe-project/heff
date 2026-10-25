@@ -7,8 +7,11 @@
 -- to run as if they had been given it (`CLI.readLine`).  An app of
 -- std.terminal.widget's, pure: std.terminal runs it on the terminal
 -- (`Terminal.interact (Interactive.app "heff" (Interactive.entries
--- cs))`); `heff` with no words runs heff's own.  Import it by a name,
--- `import std.cli.interactive as Interactive`.
+-- cs))`); `heff` with no words runs heff's own.  A command line that
+-- lacks only what its command wants (`heff run`, no file) opens on the
+-- command's form alone, filled in with what it has (`lacking`,
+-- `prompt`).  Import it by a name, `import std.cli.interactive as
+-- Interactive`.
 --
 -- Keys: on the list, up and down (or `j` and `k`, Ctrl-N and Ctrl-P) to
 -- move, a page, Home and End; anything typed filters it by the
@@ -18,7 +21,7 @@
 -- before; a field of words is typed in as a shell's line is, a choice
 -- turned by left and right (or space); Enter ends, with the command
 -- line, once nothing is wrong with it; Esc goes back to the list (and
--- `q`, on a choice).
+-- `q`, on a choice), or, on a form alone, ends.
 
 module std.cli.interactive
   ( Entry
@@ -30,6 +33,7 @@ module std.cli.interactive
   , formOf
   , formWords
   , formProblem
+  , lacking
   , quoted
   , commandLine
   , Model
@@ -40,6 +44,7 @@ module std.cli.interactive
   , step
   , view
   , app
+  , prompt
   )
 import rune as Rune
 import std.cli as CLI
@@ -170,6 +175,133 @@ formWords fm =
 formProblem : Form -> Maybe CLI.Problem
 formProblem fm = CLI.problemOf fm.entry.shape (formWords fm)
 
+-- The form of what a command line lacks
+--------------------------------------------------------------------------------
+
+-- (the words each positional is given, as far as there are words: the
+-- positionals that take one, one each, the one that takes many the rest)
+posGiven : List CLI.Pos -> List String -> List (List String)
+posGiven Nil ws = Nil
+posGiven ({ arity = One } :: ps) ws =
+  List.take 1 ws :: posGiven ps (List.drop 1 ws)
+posGiven ({ arity = Optional } :: ps) ws =
+  List.take 1 ws :: posGiven ps (List.drop 1 ws)
+posGiven (p :: ps) ws = ws :: posGiven ps Nil
+
+-- (the values a flag was given, in order)
+flagGiven : List (Pair String String) -> CLI.Flag -> List String
+flagGiven fs f =
+  List.map
+    snd
+    (List.keepIf (\(p : Pair String String) -> strEq (fst p) f.long) fs)
+
+-- (a positional's field, its words typed in)
+posFilled : CLI.Pos -> List String -> Slot
+posFilled p ws =
+  { part = Positional p, input = Typed (Widget.field (unwords ws)) }
+
+-- (a choice turned to the value, where it is one of its values)
+turnedTo : String -> Widget.Choice -> Widget.Choice
+turnedTo v c = { c | at = fromMaybe c.at (List.indexWhere (strEq v) c.options) }
+
+-- (a flag's field, its last value given put in: a switch on, a value
+-- chosen, words typed)
+flagFilled : List (Pair String String) -> CLI.Flag -> Slot
+flagFilled fs f = case List.last (flagGiven fs f) of
+  Nothing -> flagSlot f
+  Just v -> case (flagSlot f).input of
+    Picked c ->
+      { part = Flagged f
+      , input = Picked (turnedTo (if strEq f.meta "" then "on" else v) c)
+      }
+    Typed t -> { part = Flagged f, input = Typed (Widget.field v) }
+
+-- (a positional must be given a word)
+wanted : CLI.Arity -> Bool
+wanted One = True
+wanted Some = True
+wanted a = False
+
+-- (a field is lacking: a positional that is wanted, nothing typed in it;
+-- a flag that is wanted, not given)
+lacks : List (Pair String String) -> Slot -> Bool
+lacks fs { part = Positional p, input = Typed t } =
+  wanted p.arity && strEq (trim (Widget.fieldText t)) ""
+lacks fs { part = Flagged f } = f.required && List.null (flagGiven fs f)
+lacks fs s = False
+
+-- (the command's form, filled in with the words split, the first field
+-- lacking being filled in)
+formFilled : Entry -> CLI.Split -> Form
+formFilled e sp =
+  { entry = e
+  , slots = slots
+  , at = fromMaybe 0 (List.indexWhere (lacks sp.flags) slots)
+  }
+  where
+  slots : List Slot
+  slots =
+    List.append
+      (List.zipWith posFilled e.shape.pos (posGiven e.shape.pos sp.pos))
+      (List.map (flagFilled sp.flags) e.shape.flags)
+
+-- (each value a flag was given is one of its values, where it has them)
+valuesAllowed : CLI.Shape -> CLI.Split -> Bool
+valuesAllowed sh sp =
+  List.all
+    (\(f : CLI.Flag) ->
+       List.null f.values
+       || List.all (\v -> List.elem v f.values) (flagGiven sp.flags f))
+    sh.flags
+
+-- (no positional is given a word too many)
+noneExtra : Either CLI.Problem (List (List String)) -> Bool
+noneExtra (Left (Extra _)) = False
+noneExtra gs = True
+
+-- (the words, split, if what is wrong with them is what they lack alone)
+lackingOnly : CLI.Shape -> List String -> Maybe CLI.Split
+lackingOnly sh ws = case CLI.problemOf sh ws of
+  Just (Missing _) -> fitting
+  Just (MissingFlag _) -> fitting
+  _ -> Nothing
+  where
+  fitting : Maybe CLI.Split
+  fitting = case CLI.splitWords sh ws of
+    Right sp ->
+      if valuesAllowed sh sp && noneExtra (CLI.groupsGo sh.pos sp.pos)
+      then Just sp
+      else Nothing
+    Left p -> Nothing
+
+-- | The form of the command the words call, filled in with them, where
+-- | all that is wrong with them is a positional or a flag wanted
+-- | (`Missing`, `MissingFlag`): the first field still wanted is the one
+-- | being filled in.
+-- | >>> maybe Nil formWords (lacking (entries CLI.commandsEx) ["compile", "a.hf", "-bc"])
+-- | ["a.hf", "--backend=c"]
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["compile", "a.hf", "-bc"])
+-- | 1
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["compile", "a.hf", "a.mjs"])
+-- | 3
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["compile", "a.hf", "a.mjs", "b", "-bc"])
+-- | -1
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["compile", "a.hf", "-b", "wasm"])
+-- | -1
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["compile", "-h"])
+-- | -1
+-- | >>> maybe (0 - 1) (\(fm : Form) -> fm.at) (lacking (entries CLI.commandsEx) ["run"])
+-- | 0
+lacking : List Entry -> List String -> Maybe Form
+lacking es Nil = Nothing
+lacking es (name :: ws) = case List.find
+    (\(e : Entry) -> strEq e.name name)
+    es of
+  Just e -> case lackingOnly e.shape ws of
+    Just sp -> Just (formFilled e sp)
+    Nothing -> Nothing
+  Nothing -> Nothing
+
 -- (a byte a shell takes as it is)
 plainByte : Int -> Bool
 plainByte b =
@@ -202,7 +334,8 @@ commandLine prog name ws = unwords (prog :: name :: List.map quoted ws)
 -- | Where the app is: the program's name, its commands, the filter
 -- | typed and whether it is being typed (`j`, `k` and `q` are then
 -- | letters of it), which of the commands it lets through is picked,
--- | and the form open, if one is.
+-- | the form open, if one is, and whether the form is all there is (no
+-- | list to go back to: `prompt`).
 type Model =
   { prog : String
   , entries : List Entry
@@ -210,6 +343,7 @@ type Model =
   , typing : Bool
   , menu : Widget.Menu
   , form : Maybe Form
+  , alone : Bool
   }
 
 -- | The list of the commands, nothing typed.
@@ -221,6 +355,7 @@ start prog es =
   , typing = False
   , menu = Widget.menu
   , form = Nothing
+  , alone = False
   }
 
 -- | The commands the filter lets through: those whose names have it.
@@ -331,6 +466,10 @@ nextSlot d fm =
       else (fm.at + d + List.length fm.slots) % List.length fm.slots
   }
 
+-- (the form left: back to the list, or, where there is none, the end)
+leftForm : Model -> Widget.Step Model Result
+leftForm m = if m.alone then Done Nothing else Continue { m | form = Nothing }
+
 -- (the model with its form)
 withForm : Model -> Form -> Widget.Step Model Result
 withForm m fm = Continue { m | form = Just fm }
@@ -345,7 +484,7 @@ entered m fm (Just p) = Continue m
 -- back and `j` and `k` move, as nothing is typed there)
 slotStep : Widget.Key -> Model -> Form -> Widget.Step Model Result
 slotStep (Char c) m fm =
-  if isPicked (focused fm) && c == 'q' then Continue { m | form = Nothing }
+  if isPicked (focused fm) && c == 'q' then leftForm m
   else if isPicked (focused fm) && c == 'j' then withForm m (nextSlot 1 fm)
   else if isPicked (focused fm) && c == 'k'
   then withForm m (nextSlot (0 - 1) fm)
@@ -359,7 +498,7 @@ slotStep k m fm =
 
 -- (a key on a form)
 formStep : Widget.Key -> Model -> Form -> Widget.Step Model Result
-formStep Escape m fm = Continue { m | form = Nothing }
+formStep Escape m fm = leftForm m
 formStep Enter m fm = entered m fm (formProblem fm)
 formStep Tab m fm = withForm m (nextSlot 1 fm)
 formStep ArrowDown m fm = withForm m (nextSlot 1 fm)
@@ -505,10 +644,17 @@ helpRows w (Just s) =
   List.map (\l -> [Widget.dim l]) (Widget.wrap w (partSaid s.part))
 helpRows w Nothing = Nil
 
+-- (what Esc does on a form: goes back, or leaves where the form is all
+-- there is)
+escSaid : Bool -> String
+escSaid alone = if alone then "leave" else "back"
+
 -- (what the form's status line says: what is wrong yet, or the keys)
-formStatus : Maybe CLI.Problem -> String
-formStatus (Just p) = "not yet: " ^ CLI.problemSaid p ^ "  (Esc: back)"
-formStatus Nothing = "Enter: run it  ·  Tab ↑ ↓: another field  ·  Esc: back"
+formStatus : Bool -> Maybe CLI.Problem -> String
+formStatus alone (Just p) =
+  "not yet: " ^ CLI.problemSaid p ^ "  (Esc: " ^ escSaid alone ^ ")"
+formStatus alone Nothing =
+  "Enter: run it  ·  Tab ↑ ↓: another field  ·  Esc: " ^ escSaid alone
 
 -- (where the cursor is shown: in the field being filled in, if words are
 -- typed there)
@@ -549,7 +695,7 @@ formView size m fm =
                         (commandLine m.prog fm.entry.name (formWords fm))
                       ]
                     ]))))
-        [Widget.status size.columns (formStatus (formProblem fm))]
+        [Widget.status size.columns (formStatus m.alone (formProblem fm))]
   , cursor =
       formCursor
         (List.length (Widget.wrap size.columns fm.entry.doc) + 2)
@@ -569,3 +715,13 @@ view size m = listView size m
 -- | command's name first), or nothing, where it was left.
 app : String -> List Entry -> Widget.App Model Result
 app prog es = { start = start prog es, step = step, view = view }
+
+-- | The app opened on the form, for what a command line lacks: as the
+-- | app, but where it would go back to the list (Esc, `q` on a choice)
+-- | it ends, with nothing.
+prompt : String -> List Entry -> Form -> Widget.App Model Result
+prompt prog es fm =
+  { start = { start prog es | form = Just fm, alone = True }
+  , step = step
+  , view = view
+  }

@@ -23,14 +23,20 @@ title: Commands
 | `heff lsp` | run the language server on stdin and stdout |
 | `heff version` | print heff's version |
 | `heff help [COMMAND]` | list the commands, or one command's flags |
-| `heff completions SHELL` | print completions for `fish`, `bash` or `zsh` |
+| `heff completions SHELL` | print completions for `fish`, `bash` or `zsh`, and the shell function that keeps the command chosen in `heff`'s app in the history |
 
 `heff help COMMAND` lists a command's flags. Flags go anywhere among the
 words, as `getopt_long` reads them: `-b c`, `--backend=c`, `--`.
 
 `heff` alone, on a terminal, opens an app of the commands: type to
 filter them, Enter to fill in a command's arguments in a form, and
-Enter again to run it.
+Enter again to run it. A command missing what it needs (`heff run`, no
+FILE) opens its form, filled in with what was given; Esc leaves it.
+
+The shell runs what is chosen there, and keeps it in its history, when
+it has sourced the completions (`heff completions fish | source`, `eval
+"$(heff completions bash)"`). zsh keeps the command chosen in addition
+to what was typed, except for `heff` alone.
 
 ## Building and running
 

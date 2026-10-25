@@ -70,6 +70,7 @@ module std.cli
   , problemSaid
   , findCommand
   , completeLine
+  , chosenVariable
   , fishScript
   , bashScript
   , zshScript
@@ -80,6 +81,8 @@ module std.cli
   , runArgs
   , commandsEx
   )
+import rune as Rune
+
 -- The shape
 --------------------------------------------------------------------------------
 
@@ -963,6 +966,25 @@ lastOf (x :: xs) = lastOf xs
 completeLine : {r : Type} -> List (Command r) -> List String -> String
 completeLine cs ws = completeWords cs (initOf ws) (lastOf ws)
 
+-- Choosing a command line
+--------------------------------------------------------------------------------
+-- The scripts also put a function in the program's place, for the shell
+-- to keep in its history the command line chosen in the program's app
+-- (std.cli.interactive), not the program's name alone: on a terminal it
+-- names a file in `chosenVariable prog`, and the program, where its app
+-- comes to a command line, writes it there and runs nothing; the
+-- function keeps the line in the history in the place of what was typed
+-- (zsh, which takes none out, keeps no `PROG` typed alone) and runs it.
+
+-- | The environment variable in which the shell's function names the
+-- | file the command line chosen in the program's app is written to.
+-- | >>> chosenVariable "fs-tree"
+-- | "FS_TREE_CHOSEN"
+chosenVariable : String -> String
+chosenVariable prog =
+  mapRunes (\c -> if Rune.isAlphaNum c then Rune.toUpper c else '_') prog
+  ^ "_CHOSEN"
+
 -- | fish's script: it asks `PROG complete` for the words before the
 -- | cursor and the one at it
 fishScript : String -> String
@@ -984,6 +1006,25 @@ fishScript prog =
     , "end"
     , "complete -c " ^ prog ^ " -e"
     , "complete -c " ^ prog ^ " -f -a '(__" ^ prog ^ "_complete)'"
+    , "function " ^ prog
+    , "    if isatty stdin; and isatty stdout"
+    , "        set -l f (mktemp (set -q TMPDIR; and echo $TMPDIR; or echo /tmp)/"
+    ^ prog
+    ^ ".XXXXXX)"
+    , "        " ^ chosenVariable prog ^ "=$f command " ^ prog ^ " $argv"
+    , "        set -l s $status"
+    , "        set -l line (string collect < $f)"
+    , "        rm -f $f"
+    , "        if test -n \"$line\""
+    , "            history append -- $line"
+    , "            and history delete --exact --case-sensitive -- (status current-commandline)"
+    , "            eval $line"
+    , "            return"
+    , "        end"
+    , "        return $s"
+    , "    end"
+    , "    command " ^ prog ^ " $argv"
+    , "end"
     ]
 
 -- | bash's script (bash 3.2 and on): the words are the line up to the
@@ -1015,6 +1056,31 @@ bashScript prog =
     , "  esac"
     , "}"
     , "complete -o filenames -F _" ^ prog ^ " " ^ prog
+    , prog ^ "() {"
+    , "  if [[ -t 0 && -t 1 ]]; then"
+    , "    local f s line last"
+    , "    f=$(mktemp \"${TMPDIR:-/tmp}/"
+    ^ prog
+    ^ ".XXXXXX\") || { command "
+    ^ prog
+    ^ " \"$@\"; return; }"
+    , "    " ^ chosenVariable prog ^ "=$f command " ^ prog ^ " \"$@\"; s=$?"
+    , "    line=$(<\"$f\"); rm -f \"$f\""
+    , "    if [[ -n $line ]]; then"
+    , "      last=$(HISTTIMEFORMAT= builtin history 1)"
+    , "      read -r _ last <<< \"$last\""
+    , "      [[ $last == "
+    ^ prog
+    ^ " || $last == \""
+    ^ prog
+    ^ " \"* ]] && history -s -- \"$line\""
+    , "      eval \"$line\""
+    , "      return"
+    , "    fi"
+    , "    return $s"
+    , "  fi"
+    , "  command " ^ prog ^ " \"$@\""
+    , "}"
     ]
 
 -- | zsh's script
@@ -1046,11 +1112,29 @@ zshScript prog =
     ^ prog
     ^ " ]; then _"
     ^ prog
-    ^ " \"$@\"; else compdef _"
+    ^ " \"$@\"; else"
+    , "compdef _" ^ prog ^ " " ^ prog
+    , prog ^ "() {"
+    , "  if [[ -t 0 && -t 1 ]]; then"
+    , "    local f s line"
+    , "    f=$(mktemp \"${TMPDIR:-/tmp}/"
     ^ prog
-    ^ " "
+    ^ ".XXXXXX\") || { command "
     ^ prog
-    ^ "; fi"
+    ^ " \"$@\"; return }"
+    , "    {"
+    , "      " ^ chosenVariable prog ^ "=$f command " ^ prog ^ " \"$@\"; s=$?"
+    , "      line=$(<$f)"
+    , "    } always { rm -f $f }"
+    , "    if [[ -n $line ]]; then print -rs -- \"$line\"; eval \"$line\"; return; fi"
+    , "    return $s"
+    , "  fi"
+    , "  command " ^ prog ^ " \"$@\""
+    , "}"
+    , "__" ^ prog ^ "_history() { [[ $1 != " ^ prog ^ "$'\\n' ]] }"
+    , "autoload -Uz add-zsh-hook"
+    , "add-zsh-hook zshaddhistory __" ^ prog ^ "_history"
+    , "fi"
     ]
 
 -- The command line

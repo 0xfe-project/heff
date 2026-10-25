@@ -4,8 +4,10 @@
 -- it has been: the list drawn on the alternate screen, filtered, a
 -- command's form filled in and its command line run once the app has
 -- put the terminal back as it was; Esc and `q` leaving it, with nothing
--- run; Ctrl-C ending heff with the terminal put back.  On a terminal
--- that is `dumb` heff says its usage, as before.  Run by the heff that
+-- run; Ctrl-C ending heff with the terminal put back; a command line
+-- that lacks what its command wants opening on the command's form; the
+-- line chosen written to the file a shell's function names, not run.  On
+-- a terminal that is `dumb` heff says its usage, as before.  Run by the heff that
 -- runs the tests (`HEFF`); not on Windows, which has no such terminal:
 --
 --   heff test --run terminal/form test/terminal.hf
@@ -145,9 +147,38 @@ ended p (MkPair raw False) = do
       r <- wait p
       pure { r | out = all ^ r.out }
 
+-- | heff given the words on the terminal, `TERM` as given, the file for
+-- | the command line chosen (`HEFF_CHOSEN`, a shell's function's: none,
+-- | where it is empty), each of `keys` typed once what it drew before
+-- | has been drawn: all it drew, as its output, and how it ended
+onTerminalWith : {e : HFunctor}
+               -> {{chk : check <: e}}
+               -> {{sys : process <: e}}
+               -> {{disk : filesystem <: e}}
+               -> {{ex : exception ProcessError <: e}}
+               -> {{fx : exception FileError <: e}}
+               -> String
+               -> String
+               -> List String
+               -> List String
+               -> Co e Ran
+onTerminalWith term chosenTo words keys = do
+  pty <- ptyBuilt
+  heff <- given "HEFF"
+  writeFile "a.hf" "module a\n\nx : Int\nx = 1\n"
+  withProcess
+      { command = pty
+      , args = List.append ["100", "30", heff] words
+      , env = [MkPair "TERM" term, MkPair "HEFF_CHOSEN" chosenTo]
+      , input = Piped
+      , output = Piped
+      , group = True
+      } (\p -> do
+    drawn <- typed p keys (MkPair "" False)
+    ended p drawn)
+
 -- | heff with no words on the terminal, `TERM` as given, each of `keys`
--- | typed once what it drew before has been drawn: all it drew, as its
--- | output, and how it ended
+-- | typed as above
 onTerminal : {e : HFunctor}
            -> {{chk : check <: e}}
            -> {{sys : process <: e}}
@@ -157,20 +188,7 @@ onTerminal : {e : HFunctor}
            -> String
            -> List String
            -> Co e Ran
-onTerminal term keys = do
-  pty <- ptyBuilt
-  heff <- given "HEFF"
-  writeFile "a.hf" "module a\n\nx : Int\nx = 1\n"
-  withProcess
-      { command = pty
-      , args = ["100", "30", heff]
-      , env = [MkPair "TERM" term]
-      , input = Piped
-      , output = Piped
-      , group = True
-      } (\p -> do
-    drawn <- typed p keys (MkPair "" False)
-    ended p drawn)
+onTerminal term keys = onTerminalWith term "" Nil keys
 
 -- The screen
 --------------------------------------------------------------------------------
@@ -418,6 +436,204 @@ dumb = do
        && startsWith "usage: heff COMMAND ..." r.out)
       (strSlice r.out 0 200)
 
+-- | a command line that lacks what its command wants: the command's form
+-- | alone, filled in with what it has, the first field wanted being
+-- | filled in; once filled in, the command line said, then run
+lacked : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> {{ex : exception ProcessError <: e}}
+       -> Co e Unit
+lacked = do
+  r <-
+    onTerminalWith
+      "xterm-256color"
+      ""
+      ["compile", "a.hf", "--backend=c"]
+      ["a.c", "\r"]
+  first <- pure (frameAt 0 (eachFrame r.out))
+  holds
+      "the form, filled in with what was given"
+      (strEq (row 0 first) "heff compile"
+       && someLine "^  FILE +a\\.hf$" first
+       && someLine "^> OUT$" first
+       && List.any
+         (\l -> strEq l "$ heff compile a.hf --backend=c")
+         first
+       && startsWith "not yet: expected OUT  (Esc: leave)" (row 29 first))
+      (unlines first)
+  holds
+      "its command line run (a.hf has no main to compile)"
+      (exitedWith 1 r.ended
+       && restored r.out
+       && strEq
+         (afterwards r.out)
+         "$ heff compile a.hf a.c --backend=c\nheff: a.hf: no definition main\n")
+      (endedSaid r.ended ^ "\n" ^ afterwards r.out)
+
+-- | Esc on the form of what a command line lacks: what it lacks said, as
+-- | where there is no terminal
+leftLacking : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
+            -> {{ex : exception ProcessError <: e}}
+            -> Co e Unit
+leftLacking = do
+  r <- onTerminalWith "xterm-256color" "" ["check"] ["\u{1b}"]
+  holds
+      "Esc: what is lacking said"
+      (exitedWith 1 r.ended
+       && restored r.out
+       && startsWith "heff check: expected FILE\n" (afterwards r.out))
+      (endedSaid r.ended ^ "\n" ^ afterwards r.out)
+
+-- | the file for the command line chosen named (a shell's function's):
+-- | the line written there, nothing run nor said
+chosenWritten : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> {{fx : exception FileError <: e}}
+              -> {{ex : exception ProcessError <: e}}
+              -> Co e Unit
+chosenWritten = do
+  working <- workingDir
+  let file = show working ^ "/chosen"
+  r <- onTerminalWith "xterm-256color" file Nil ["che", "\r", "a b.hf", "\r"]
+  line <- readFile file
+  holds
+      "the line chosen written, not run"
+      (exitedWith 0 r.ended
+       && restored r.out
+       && strEq (afterwards r.out) ""
+       && strEq line "heff check 'a b.hf'")
+      (endedSaid r.ended ^ "\n" ^ afterwards r.out ^ "\n" ^ line)
+
+-- | a shell on the terminal, its words given it, heff on its PATH (by
+-- | the shell's function its completions put there), its home the
+-- | test's directory and its history kept nowhere; in heff's app, `heff
+-- | version` chosen, its keys typed as above
+shellOnTerminal : {e : HFunctor}
+                -> {{chk : check <: e}}
+                -> {{sys : process <: e}}
+                -> {{disk : filesystem <: e}}
+                -> {{ex : exception ProcessError <: e}}
+                -> {{fx : exception FileError <: e}}
+                -> String
+                -> List String
+                -> Co e Ran
+shellOnTerminal shell words = do
+  pty <- ptyBuilt
+  heff <- given "HEFF"
+  working <- workingDir
+  let here = show working
+  path <- getEnv "PATH"
+  makeDirectory "bin"
+  writeFile "bin/heff" ("#!/bin/sh\nexec \"" ^ heff ^ "\" \"$@\"\n")
+  makeExecutable "bin/heff"
+  withProcess
+      { command = pty
+      , args = List.append ["100", "30", shell] words
+      , env =
+          [ MkPair "TERM" "xterm-256color"
+          , MkPair "HOME" here
+          , MkPair "HISTFILE" "/dev/null"
+          , MkPair "PATH" (here ^ "/bin:" ^ fromMaybe "" path)
+          , MkPair "HEFF_CHOSEN" ""
+          ]
+      , input = Piped
+      , output = Piped
+      , group = True
+      } (\p -> do
+    drawn <- typed p ["version", "\r", "\r"] (MkPair "" False)
+    ended p drawn)
+
+-- (was it there to run)
+wasRun : Ran -> Bool
+wasRun r = case r.ended of
+  NotRun _ -> False
+  _ -> True
+
+-- (the shell's history, after heff's app was left with `heff version`:
+-- that line in it, and run)
+historyHolds : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> String
+             -> Ran
+             -> (List String -> Bool)
+             -> Co e Unit
+historyHolds shell r kept =
+  holds
+      (shell ^ ": the line chosen kept in its history, and run")
+      (exitedWith 0 r.ended
+       && kept (lines (afterwards r.out))
+       && someLine "^heff [0-9]+\\.[0-9]+\\.[0-9]+$" (lines (afterwards r.out)))
+      (endedSaid r.ended ^ "\n" ^ afterwards r.out)
+
+-- (a shell's subtest, where the shell is)
+whereThere : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> String
+           -> Co e Unit
+           -> Co e Unit
+whereThere shell body = do
+  there <- run { command = shell, args = ["-c", "exit 0"] }
+  subtest shell (if wasRun there then body else skip ("no " ^ shell ^ " to run"))
+
+-- | heff in a shell that sourced its completions: the line chosen in its
+-- | app kept in the shell's history in the place of `heff`, then run
+-- | (zsh, which takes no line out, keeps no `heff` typed alone); fish
+-- | and zsh where they are
+histories : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
+          -> {{ex : exception ProcessError <: e}}
+          -> Co e Unit
+histories = do
+  subtest "bash" (do
+    r <-
+      shellOnTerminal
+        "bash"
+        [ "--norc"
+        , "--noprofile"
+        , "-c"
+        , "set -o history\neval \"$(heff completions bash)\"\nheff\nhistory"
+        ]
+    historyHolds
+        "bash"
+        r
+        (\ls ->
+           List.any (\l -> endsWith "  heff version" l) ls
+           && not (List.any (\l -> endsWith "  heff" l) ls)))
+  whereThere "zsh" (do
+    r <-
+      shellOnTerminal
+        "zsh"
+        [ "-f"
+        , "-c"
+        , "HISTSIZE=100\nautoload -Uz compinit\ncompinit -u -d $HOME/zcompdump\neval \"$(heff completions zsh)\"\nheff\nfc -ln 1\n__heff_history $'heff\\n' || echo dropped"
+        ]
+    historyHolds
+        "zsh"
+        r
+        (\ls -> List.elem "heff version" ls && List.elem "dropped" ls))
+  whereThere "fish" (do
+    r <-
+      shellOnTerminal
+        "fish"
+        [ "--no-config"
+        , "-c"
+        , "heff completions fish | source\nheff\necho kept: $history[1]"
+        ]
+    historyHolds "fish" r (\ls -> List.elem "kept: heff version" ls))
+
 -- (each test passed over where there is no such terminal, on Windows)
 posix : ({e : HFunctor}
          -> {{chk : check <: e}}
@@ -448,4 +664,8 @@ terminal =
     , integration "version" (posix version)
     , integration "interrupt" (posix interrupted)
     , integration "dumb" (posix dumb)
+    , integration "lacking" (posix lacked)
+    , integration "lacking-left" (posix leftLacking)
+    , integration "chosen" (posix chosenWritten)
+    , integration "history" (posix histories)
     ]
