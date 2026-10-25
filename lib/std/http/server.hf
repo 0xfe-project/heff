@@ -1,21 +1,24 @@
 -- An HTTP/1.1 server, written over std.net's sockets: a listener's
--- connections accepted, one at a time or each by a thread of its own
--- (`serveConcurrently`, of whichever model of threads gives `Threads`), each one's requests read in turn -- the request
--- line, the headers, and a body of the length its `Content-Length` says --
--- each given to a handler, and its response written with its length, the
--- connection kept for the next request unless it is to be closed (HTTP/1.0,
--- or `Connection: close`), and closed by the `with` holding it when it is
--- done.  So it is the C backend's alone, as std.net is.  Import it by a
--- name, `import std.http.server as Server`, beside `import std.http as
--- Http`, whose `Response` a handler gives.
+-- connections accepted one at a time, each one's requests read in turn
+-- -- the request line, the headers, and a body of the length its
+-- `Content-Length` says -- each given to a handler, and its response
+-- written with its length, the connection kept for the next request
+-- unless it is to be closed (HTTP/1.0, or `Connection: close`), and
+-- closed by the `with` holding it when it is done.  So it is the C
+-- backend's alone, as std.net is.  Import it by a name, `import
+-- std.http.server as Server`, beside `import std.http as HTTP`, whose
+-- `Response` a handler gives.  A server of many connections at once
+-- serves each by `serveConnection`, on threads: std.http.cmlserver's,
+-- each a cml thread, and std.http.bocserver's, each a boc behaviour.
 --
 -- ```haskell
+-- import co
 -- import exception
 -- import std.http as HTTP
 -- import std.http.server as Server
 -- import std.net as Net
 --
--- hello : {e : HFunctor} -> Server.Request -> Co e Http.Response
+-- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 -- hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 --
 -- -- | `hello` served on the port, until a connection cannot be accepted:
@@ -61,8 +64,6 @@ module std.http.server
   , serveConnection
   , serveUntil
   , serve
-  , Threads
-  , serveConcurrently
   )
 import bytes as Bytes
 import co
@@ -636,101 +637,3 @@ serve l handle =
   bind
     (Net.accept l (serveConnection (idle := idle) (\r -> False) handle))
     (\stop -> serve (idle := idle) l handle)
-
--- | What `serveConcurrently` asks of a model of threads, in the world
--- | `e`: a computation spawned as a thread of its own, this one going on;
--- | and a signal, made, given once -- never waiting -- and waited for,
--- | at once where it was given.
-theory Threads (e : HFunctor) where
-  spawn : Co e Unit -> Co e Unit
-  Signal : Type
-  signal : Co e Signal
-  give : Signal -> Co e Unit
-  awaited : Signal -> Co e Unit
-
--- (the threads, in the world where `Net.NetError` is thrown too: a
--- thread spawned there is spawned in `e`, with a handler of its own for
--- what it throws, which lets it go)
-liftedThreads : {e : HFunctor}
-              -> {{th : Threads e}}
-              -> Threads (exception Net.NetError <+> e)
-liftedThreads =
-  { spawn = \c ->
-        lift
-          (inj := _)
-          (th.spawn (bind (attempt Net.NetError c) (\r -> pure MkUnit)))
-  , Signal = th.Signal
-  , signal = lift (inj := _) th.signal
-  , give = \sg -> lift (inj := _) (th.give sg)
-  , awaited = \sg -> lift (inj := _) (th.awaited sg)
-  }
-
--- (where accepting failed: the server stopping, its signal given)
-stoppedOn : {e : HFunctor}
-          -> {{th : Threads e}}
-          -> th.Signal
-          -> Either Net.NetError Unit
-          -> Co e Unit
-stoppedOn stopped (Left err) = th.give stopped
-stoppedOn stopped (Right u) = pure MkUnit
-
--- (a thread accepting the listener's next connection: a thread spawned
--- to accept the one after it, then the connection served, and closed as
--- the thread ends; where accepting failed, `stopped` given.  The throw
--- is heard in this thread, by a `recover` of its own -- not by a `try`
--- of the scheduler's caller, which would run the body alone, its spawn
--- dropped.  The thread spawned is this one again, in the same world:
--- not under a handler of this thread's, which the one after it would
--- be under too, and so on, each connection's thread under one more)
-acceptor : {e : HFunctor}
-         -> {s : Type}
-         -> {{th : Threads e}}
-         -> {{nt : Net.net <: e}}
-         -> {{ex : exception Net.NetError <: e}}
-         -> Int
-         -> th.Signal
-         -> With s Net.TcpListener
-         -> (Request -> Co e HTTP.Response)
-         -> Co e Unit
-acceptor idle stopped l handle =
-  recover
-    (Net.accept l (\c -> do
-     th.spawn (acceptor idle stopped l handle)
-     _ <- serveConnection (idle := idle) (\r -> False) handle c
-     pure MkUnit))
-    (\(err : Net.NetError) -> th.give stopped)
-
--- | The listener's connections served at once, each by a thread of its
--- | own, `th`'s (`serveConnection`): the connection is had by `Net.accept`'s
--- | body in that thread, closed as it ends, and the body spawns the
--- | thread accepting the next, so that one is always waiting to
--- | accept.  Until one fails to be accepted: the listener left as it
--- | is, the connections being served going on.  A connection whose
--- | client sends nothing for `idle` milliseconds is closed, its thread
--- | done.  A scheduler that waits on the world through std.reactor (cml's
--- | `scheduledWithReactor`) has each connection wait on its socket apart,
--- | the others served meanwhile.
-serveConcurrently : {e : HFunctor}
-                  -> {s : Type}
-                  -> {idle : Int := 30000}
-                  -> {{th : Threads e}}
-                  -> {{nt : Net.net <: e}}
-                  -> With s Net.TcpListener
-                  -> (Request -> Co e HTTP.Response)
-                  -> Co e Unit
-serveConcurrently l handle = do
-  stopped <- th.signal
-  th.spawn
-      (bind
-         (attempt
-            Net.NetError
-            (acceptor
-               (th := liftedThreads)
-               (nt := _)
-               (ex := _)
-               idle
-               stopped
-               l
-               (\r -> lift (inj := _) (handle r))))
-         (stoppedOn stopped))
-  th.awaited stopped

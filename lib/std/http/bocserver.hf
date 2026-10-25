@@ -1,0 +1,160 @@
+-- An HTTP/1.1 server of many connections at once, on boc's behaviours:
+-- a listener's connections each served by a behaviour of its own, on a
+-- cown of its own, by std.http.server's `serveConnection`, so the
+-- connections are served in parallel, on as many domains as the machine
+-- has cores.  It is the C backend's alone, as std.net is.  Import it by
+-- a name, `import std.http.bocserver as BocServer`.
+--
+-- > [!CAUTION]
+-- > Unstable: concurrency in heff is not settled. What this module offers
+-- > may change, or go, in any release.
+--
+-- ```haskell
+-- import boc as BOC
+-- import co
+-- import exception
+-- import std.domain as Domain
+-- import std.http as HTTP
+-- import std.http.bocserver as BocServer
+-- import std.http.server as Server
+-- import std.net as Net
+--
+-- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
+-- hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
+--
+-- -- | `hello` served on the port, each connection a behaviour of its
+-- -- | own, until one cannot be accepted
+-- helloAt : {e w : HFunctor}
+--         -> {{bc : BOC.boc w <: e}}
+--         -> {{dm : Domain.domain <: e}}
+--         -> {{nt : Net.net <: e}}
+--         -> {{ex : exception Net.NetError <: e}}
+--         -> Int
+--         -> Co e Unit
+-- helloAt port =
+--   Net.withListener
+--       { host = "127.0.0.1", port = port }
+--       128
+--       (\l -> BocServer.serve l hello)
+--
+-- -- | the behaviours run, on domains, by main
+-- main : Co (Net.net <+> Domain.domain) Unit
+-- main = do
+--   r <-
+--     BOC.scheduled
+--       (dm := _)
+--       (\why -> pure ())
+--       (attempt
+--          Net.NetError
+--          (helloAt
+--             (w := Net.net <+> Domain.domain)
+--             (bc := _)
+--             (dm := _)
+--             (nt := _)
+--             (ex := _)
+--             8080))
+--   pure ()
+-- ```
+--
+-- A connection is had by `Net.accept`'s body in its behaviour, and
+-- closed as that behaviour ends.  `serve` is run by main, the
+-- computation `BOC.scheduled` is given, whose behaviours are put among
+-- those ready, for any domain to take: it spawns a behaviour to accept
+-- the next connection, waits for it to have one, and spawns the next,
+-- so one is always waiting to accept while a domain is free.  (In a
+-- behaviour's body, the behaviour spawned to accept would be kept for
+-- that domain, to run after the body, which waits for it: `serve` is
+-- not to be run there.)
+--
+-- A behaviour runs to its end on its domain, and what it waits for on
+-- the world -- an accept, a read -- it waits for there: so at most as
+-- many connections are served at once as there are domains, one of
+-- them accepting, and the next wait in the listener's queue until a
+-- domain is free.  A connection whose client sends nothing for `idle`
+-- milliseconds -- 30 seconds unless another is given, by name,
+-- `BocServer.serve (idle := 5000) l handle`; 0 for no limit -- is
+-- closed, its behaviour done, its domain free.  Where a connection
+-- cannot be accepted (the program out of descriptors, `EMFILE`; the
+-- listener closed, `EBADF`) the server stops: `serve` comes back, the
+-- connections being served going on, the listener left as it is.  A
+-- behaviour whose handler fails is done with that, its connection
+-- closed, and `BOC.scheduled`'s `failed` is given why.
+
+module std.http.bocserver (serve)
+import boc as BOC
+import co
+import exception
+import std.domain as Domain
+import std.http as HTTP
+import std.http.server as Server
+import std.net as Net
+import resource
+
+-- (a behaviour's body: the listener's next connection accepted, `True`
+-- put on `turns` once it is, and served, then closed as the body ends;
+-- where none is accepted, `False` put)
+accepting : {e : HFunctor}
+          -> {s : Type}
+          -> {{dm : Domain.domain <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Int
+          -> Domain.Queue Bool
+          -> With s Net.TcpListener
+          -> (Server.Request -> Co e HTTP.Response)
+          -> Co e Unit
+accepting idle turns l handle = do
+  outcome <-
+    attempt
+      Net.NetError
+      (Net.accept (ev := _) (ex := _) l (\c -> do
+       lift (h := e) (inj := _) (Domain.put turns True)
+       _ <-
+         Server.serveConnection
+           (idle := idle)
+           (nt := _)
+           (\r -> False)
+           (\r -> lift (inj := _) (handle r))
+           c
+       pure ()))
+  case outcome of
+    Left err -> Domain.put turns False
+    Right u -> pure ()
+
+-- (a behaviour accepting the next connection, on a cown of its own, and
+-- the one after it once that one has one, until one is not accepted)
+acceptors : {e w : HFunctor}
+          -> {s : Type}
+          -> {{bc : BOC.boc w <: e}}
+          -> {{dm : Domain.domain <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Int
+          -> Domain.Queue Bool
+          -> With s Net.TcpListener
+          -> (Server.Request -> Co e HTTP.Response)
+          -> Co e Unit
+acceptors idle turns l handle = do
+  own <- BOC.newCown ()
+  BOC.when own (\u -> accepting idle turns l handle)
+  accepted <- Domain.take turns
+  if accepted then acceptors idle turns l handle else pure ()
+
+-- | The listener's connections served at once, each by a boc behaviour
+-- | of its own, on a cown of its own (`Server.serveConnection`): the
+-- | connection is had by `Net.accept`'s body in that behaviour, closed
+-- | as it ends, and once it has one, the behaviour accepting the next
+-- | is spawned.  Until one fails to be accepted: the listener left as
+-- | it is, the connections being served going on.  A connection whose
+-- | client sends nothing for `idle` milliseconds is closed, its
+-- | behaviour done.  Run by main, not in a behaviour's body.
+serve : {e w : HFunctor}
+      -> {s : Type}
+      -> {idle : Int := 30000}
+      -> {{bc : BOC.boc w <: e}}
+      -> {{dm : Domain.domain <: e}}
+      -> {{nt : Net.net <: e}}
+      -> With s Net.TcpListener
+      -> (Server.Request -> Co e HTTP.Response)
+      -> Co e Unit
+serve l handle = do
+  turns <- Domain.newQueue
+  acceptors idle turns l handle

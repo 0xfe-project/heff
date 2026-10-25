@@ -1,0 +1,77 @@
+-- std.http.bocserver's `serve`, a boc behaviour for each connection,
+-- had by a `with` in its own, the connections served on as many domains
+-- as the machine has cores.  By C alone.
+--
+--   burst    PORT: served there by Node.js's clients, hundreds of
+--            connections, many opened at once; asked for `/stop`, how
+--            many requests it answered, said
+
+module test.node.boc-served
+
+import boc as BOC
+import co
+import exception
+import std.domain as Domain
+import std.http as HTTP
+import std.http.bocserver as BocServer
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.process
+import resource
+
+-- (127.0.0.1's `port`)
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
+
+-- (each request answered with its target, and counted; `/stop`, the
+-- count said, and written out at once, the program not ending)
+counting : {e : HFunctor}
+         -> {{dm : Domain.domain <: e}}
+         -> {{io : stdio <: e}}
+         -> Domain.Atomic Int
+         -> Server.Request
+         -> Co e HTTP.Response
+counting count r =
+  if r.target == "/stop" then do
+    n <- Domain.get count
+    print ("answered " ^ debug n)
+    flush
+    pure (Server.plain 200 r.target)
+  else do
+    _ <- Domain.fetchAdd count 1
+    pure (Server.plain 200 r.target)
+
+burstProgram : {e w : HFunctor}
+             -> {{bc : BOC.boc w <: e}}
+             -> {{dm : Domain.domain <: e}}
+             -> {{io : stdio <: e}}
+             -> {{nt : Net.net <: e}}
+             -> {{sys : process <: e}}
+             -> {{ex : exception Net.NetError <: e}}
+             -> Co e Unit
+burstProgram = do
+  argv <- args
+  let port = fromMaybe 0 (parseInt (fromMaybe "" (List.head argv)))
+  count <- Domain.newAtomic 0
+  Net.withListener (here port) 128 (\l -> BocServer.serve l (counting count))
+
+-- | served until the program is ended, or a connection cannot be
+-- | accepted
+burst : Co (stdio <+> Net.net <+> process <+> Domain.domain) Unit
+burst = do
+  r <-
+    BOC.scheduled
+      (dm := _)
+      (\why -> printErr (ev := _) ("a behaviour failed: " ^ why))
+      (attempt
+         Net.NetError
+         (burstProgram
+            (w := stdio <+> Net.net <+> process <+> Domain.domain)
+            (bc := _)
+            (dm := _)
+            (io := _)
+            (nt := _)
+            (sys := _)
+            (ex := _)))
+  printErr (ev := _) (either show (\u -> "main done") r)
