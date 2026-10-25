@@ -256,6 +256,14 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[]; } Str
 // (`Bytes` written in the program, a binary written whole, `b["hi", 255]`,
 // static as a string is)
 #define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
+// (a tag, a record of a definition's value of constants, static as a
+// string written in the program is, its `size` fields -- more than none,
+// none flat -- after it (the compiler's heff.compile.statics: one with
+// flat fields it writes as a struct of its own))
+#define HEFF_TAG_LIT(name, id, size, ...) \
+  static struct { Obj h; int32_t n; uint32_t flat; V f[size]; } name = {{0x80000000u, K_TAG, id}, size, 0, {__VA_ARGS__}}
+#define HEFF_REC_LIT(name, size, shape, ...) \
+  static struct { Obj h; int32_t n; uint32_t flat; uint32_t *lbl; V f[size]; } name = {{0x80000000u, K_REC, 0}, size, 0, shape, {__VA_ARGS__}}
 typedef struct { Obj h; double d; } Flt;
 // (a foreign value: a pointer of the host's, the function that lets it
 // go, called when the program drops the last reference)

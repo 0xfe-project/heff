@@ -1,0 +1,176 @@
+-- A definition's value of constants laid out as static data (#127), for
+-- the C backend.  Tags and records of numbers, strings and `Bytes`, and
+-- of other such values -- nothing computed, no variable -- are built by
+-- the C compiler, as a string written in the program is (`HEFF_LIT`),
+-- each object immortal: never counted, never freed, never built in
+-- (`heff_alone` is never true of one) and shared between threads as it
+-- is.  Built at run time, a cell at a time, a big one is a long function
+-- that C takes long to compile (std.html's entities, 2231 pairs: 30 s of
+-- zig's), and allocated besides.
+--
+-- Only a definition's value (`DVal`), computed once, and only where its
+-- body starts: the values of constants bound there, one after another,
+-- and what it gives, if it is one too.  One of them given whole to
+-- another (`RLocal`) is put in it; one counted again in one (`RDup`), or
+-- given to anything else, stays bound, to its static object, which those
+-- holding it name (`RStatic x`).
+
+module heff.compile.statics
+
+import heff.elab.fixed as Fixed
+import heff.compile.ir as IR
+import heff.compile.refcount as RefCount
+import heff.compile.repr as Repr
+import std.ordmap as OrdMap
+
+-- (a set of names)
+type Names = OrdMap.OrdMap String Unit
+
+among : Names -> String -> Bool
+among m x = case OrdMap.lookup m x of
+  Just _ -> True
+  Nothing -> False
+
+namesOf : List String -> Names
+namesOf xs = OrdMap.fromList (List.map (\x -> MkPair x MkUnit) xs)
+
+-- What is a constant
+--------------------------------------------------------------------------------
+
+-- (an integer the runtime keeps in a word)
+wordInt : Int -> Bool
+wordInt n = n < 4611686018427387904 && n >= (0 - 4611686018427387904)
+
+-- (a flat field's bits, a constant of 64 bits: of a `Float64`, an
+-- `Int64` or a `UInt64`)
+flatConst : RefCount.Value -> Bool
+flatConst (RWord RepF64 (RF64U _)) = True
+flatConst (RWord (RepFix w) (RFixU _ _)) =
+  Fixed.fixedBits w == 64 && not (Fixed.isFloat32 w)
+flatConst e = False
+
+-- (a constant that is no object to lay out: a word, a flat field's bits,
+-- or a string, static already)
+constant : RefCount.Value -> Bool
+constant (RInt n) = wordInt n
+constant (RNTag _) = True
+constant (RStr _) = True
+constant (RBytes _) = True
+constant (RFixed w n) = Fixed.fixedBits w < 64 || wordInt n
+constant e = flatConst e
+
+-- | whether a value is of constants alone, the variables `vs` bound to
+-- | such values: as a field of one (`field`), a constant or a variable
+-- | too; else as an object to lay out, a tag (not a tuple), a record or a
+-- | float
+ofConstants : Names -> Bool -> RefCount.Value -> Bool
+ofConstants vs field (RLocal x) = field && among vs x
+ofConstants vs field (RDup x) = field && among vs x
+ofConstants vs field (RTag t _ es) =
+  not (IR.isTupleTag t) && List.all (\e -> ofConstants vs True e) es
+ofConstants vs field (RRec _ _ es) = List.all (\e -> ofConstants vs True e) es
+ofConstants vs field (RFloat _) = True
+ofConstants vs field e = field && constant e
+
+-- What the body starts with
+--------------------------------------------------------------------------------
+
+-- | the values of constants a body starts with, each bound to its
+-- | variable, in order; and what it gives, if it is one too
+type Start =
+  { lets : List (Pair String RefCount.Value)
+  , gives : Maybe RefCount.Value
+  }
+
+startOf : Names -> List RefCount.Statement -> Start
+startOf vs (Cons (CLet x e) rest) =
+  if ofConstants vs False e
+  then (let st : Start = startOf (OrdMap.insert vs x MkUnit) rest
+        in { lets = Cons (MkPair x e) st.lets, gives = st.gives })
+  else { lets = Nil, gives = Nothing }
+startOf vs (Cons (CReturn e) Nil) =
+  if ofConstants vs False e then { lets = Nil, gives = Just e }
+  else { lets = Nil, gives = Nothing }
+startOf vs ss = { lets = Nil, gives = Nothing }
+
+-- (the variables a value of constants gives whole, `RLocal`, and those it
+-- counts again, `RDup`, onto theirs)
+usesOf : Pair (List String) (List String)
+       -> RefCount.Value
+       -> Pair (List String) (List String)
+usesOf (MkPair gs ds) (RLocal x) = MkPair (Cons x gs) ds
+usesOf (MkPair gs ds) (RDup x) = MkPair gs (Cons x ds)
+usesOf u (RTag _ _ es) = List.foldl usesOf u es
+usesOf u (RRec _ _ es) = List.foldl usesOf u es
+usesOf u e = u
+
+-- Laid out
+--------------------------------------------------------------------------------
+
+-- (a value of constants, each variable in it that is `put` -- given
+-- whole to it alone -- replaced by its value, laid out in it; any other
+-- named, `RLocal`, by its static object)
+laidOut : OrdMap.OrdMap String RefCount.Value
+        -> Names
+        -> RefCount.Value
+        -> RefCount.Value
+laidOut lets put (RLocal x) =
+  if among put x
+  then (case OrdMap.lookup lets x of
+        Just e -> laidOut lets put e
+        Nothing -> RLocal x)
+  else RLocal x
+laidOut lets put (RDup x) = RLocal x
+laidOut lets put (RTag t b es) = RTag t b (List.map (laidOut lets put) es)
+laidOut lets put (RRec ls b es) = RRec ls b (List.map (laidOut lets put) es)
+laidOut lets put e = e
+
+-- (what a body gives, if a value of constants, as a list)
+givenOf : Start -> List RefCount.Value
+givenOf st = case st.gives of
+  Just e -> Cons e Nil
+  Nothing -> Nil
+
+-- (each value bound, unless put in another; laid out, bound to its
+-- static object)
+boundAs : OrdMap.OrdMap String RefCount.Value
+        -> Names
+        -> Pair String RefCount.Value
+        -> List RefCount.Statement
+boundAs lets put (MkPair x e) =
+  if among put x then Nil
+  else Cons (CLet x (RStatic x (laidOut lets put e))) Nil
+
+-- (the statements a body starts with, laid out: each value bound that is
+-- given whole to another alone put in it, the others bound to their
+-- static objects; what it gives, laid out too, or the rest of the body)
+laidStart : Start
+          -> Pair (List String) (List String)
+          -> List RefCount.Statement
+          -> List RefCount.Statement
+laidStart st (MkPair gs ds) rest =
+  let counted = namesOf ds
+  in let put = namesOf (List.keepIf (\x -> not (among counted x)) gs)
+  in let lets = OrdMap.fromList st.lets
+  in List.append
+    (List.concatMap (boundAs lets put) st.lets) (case st.gives of
+  Just e -> Cons (CReturn (RStatic "" (laidOut lets put e))) Nil
+  Nothing -> rest)
+
+-- | a definition, the values of constants its value starts with laid out
+-- | as static data
+staticDef : RefCount.Def -> RefCount.Def
+staticDef (DVal x ss rs) =
+  let st = startOf OrdMap.empty ss
+  in if List.null st.lets && List.null (givenOf st) then DVal x ss rs
+  else DVal
+      x
+      (laidStart
+         st
+         (List.foldl
+            usesOf
+            (MkPair Nil Nil)
+            (List.append (List.map snd st.lets) (givenOf st)))
+         (List.drop (List.length st.lets) ss))
+      rs
+staticDef d = d

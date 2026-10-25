@@ -21,6 +21,8 @@
 --            `LBL_x`), a record's fields in the order it is written in
 --   a string  ~>  a static object, its bytes (`HEFF_LIT`, a C string
 --            literal of them); a `Bytes` literal too (`HEFF_BYTES`)
+--   a definition's value of constants (heff.compile.statics)  ~>  static
+--            objects, as a string's are, immortal: its init a pointer
 --   a call last of an unknown function  ~>  `heff_tail` (counted, a
 --            bounce every so often); a call not last, its value through
 --            `heff_tr` -- as the JavaScript backend does (`Emit.bouncing`),
@@ -347,6 +349,38 @@ strLit mac str = \s ->
                s.owner
                (strDef mac (s.owner ^ "_str" ^ debug s.nstr) str))
             s.strs
+      , shapes = s.shapes
+      , prims = s.prims
+      }
+
+-- (a static object of the definition being emitted (heff.compile.statics):
+-- named by the variable it is bound to, else by the count strings are)
+litName : String -> C String
+litName x = \s ->
+    if strLength x > 0 then MkPair (s.owner ^ "_lit_" ^ cLocal x) s
+    else MkPair
+        (s.owner ^ "_lit" ^ debug s.nstr)
+        { owner = s.owner
+        , nlam = s.nlam
+        , lams = s.lams
+        , protos = s.protos
+        , nstr = s.nstr + 1
+        , strs = s.strs
+        , shapes = s.shapes
+        , prims = s.prims
+        }
+
+-- (... its C, put with the definition's strings, after what it holds)
+litDef : String -> C Unit
+litDef l = \s ->
+    MkPair
+      MkUnit
+      { owner = s.owner
+      , nlam = s.nlam
+      , lams = s.lams
+      , protos = s.protos
+      , nstr = s.nstr
+      , strs = Cons (MkPair s.owner l) s.strs
       , shapes = s.shapes
       , prims = s.prims
       }
@@ -984,6 +1018,111 @@ testC k (CondLet x e c drops) = do
 wrapC : CK -> String -> String -> RefCount.Value -> C String
 wrapC k pre post e = bind (k.exp e) (\v -> pure (pre ^ v ^ post))
 
+-- Values of constants, static (heff.compile.statics): each tag, record and
+-- float a static object, immortal, as a string written in the program is
+-- (`HEFF_LIT`; `HEFF_TAG_LIT`, `HEFF_REC_LIT`) -- or a struct laid out as
+-- the runtime's (`Tag`, `Rec`), its fields each of its own C type, a flat
+-- one's its number's -- written before what holds it
+
+-- (a static object's C: named `name`, its header's fields `decl` and
+-- their values `head`, then its fields, each of its C type)
+staticText : String -> String -> String -> List (Pair String String) -> String
+staticText name decl head fs =
+  "static struct { "
+  ^ decl
+  ^ joinWith
+    ""
+    (List.zipWith
+       (\f i -> fst f ^ " f" ^ debug i ^ "; ")
+       fs
+       (List.range 0 (List.length fs - 1)))
+  ^ "} "
+  ^ name
+  ^ " = {"
+  ^ joinWith ", " (Cons head (List.map snd fs))
+  ^ "};"
+
+-- (a field of a static object: its C type and its value -- a flat
+-- field's bits its number's, a variable's its static object, an object's
+-- laid out by `go`)
+staticField : (RefCount.Value -> C String)
+            -> CK
+            -> RefCount.Value
+            -> C (Pair String String)
+staticField go k (RWord r e) = do
+  v <- k.exp e
+  pure (MkPair (cType r) v)
+staticField go k (RLocal x) = \s ->
+    MkPair (MkPair "V" ("((V)&" ^ s.owner ^ "_lit_" ^ cLocal x ^ ")")) s
+staticField go k e = do
+  v <- go e
+  pure (MkPair "V" v)
+
+-- (a value of constants, its root named by `x` (else by the count): its
+-- objects written, it named)
+staticOf : CK -> String -> RefCount.Value -> C String
+staticOf k x (RTag t flat es) = do
+  fs <- traverseC (staticField (\e -> staticOf k "" e) k) es
+  name <- litName x
+  litDef
+      (if flat == 0 && not (List.null fs)
+       then "HEFF_TAG_LIT("
+         ^ joinWith
+           ", "
+           (Cons
+              name
+              (Cons
+                 (tagName t)
+                 (Cons (debug (List.length fs)) (List.map snd fs))))
+         ^ ");"
+       else staticText
+           name
+           "Obj h; int32_t n; uint32_t flat; "
+           ("{IMMORTAL, "
+            ^ (if flat == 0 then "K_TAG, " else "K_TAGF, ")
+            ^ tagName t
+            ^ "}, "
+            ^ debug (List.length es)
+            ^ ", "
+            ^ debug flat
+            ^ "u")
+           fs)
+  pure ("((V)&" ^ name ^ ")")
+staticOf k x (RRec ls flat es) = do
+  fs <- traverseC (staticField (\e -> staticOf k "" e) k) es
+  shape <- shapeLit ls
+  name <- litName x
+  litDef
+      (if flat == 0 && not (List.null fs)
+       then "HEFF_REC_LIT("
+         ^ joinWith
+           ", "
+           (Cons
+              name
+              (Cons (debug (List.length fs)) (Cons shape (List.map snd fs))))
+         ^ ");"
+       else staticText
+           name
+           "Obj h; int32_t n; uint32_t flat; uint32_t *lbl; "
+           ("{IMMORTAL, K_REC, 0}, "
+            ^ debug (List.length es)
+            ^ ", "
+            ^ debug flat
+            ^ "u, "
+            ^ shape)
+           fs)
+  pure ("((V)&" ^ name ^ ")")
+staticOf k x (RFloat d) = do
+  name <- litName x
+  litDef
+      ("static Flt "
+       ^ name
+       ^ " = {{IMMORTAL, K_FLT, 0}, "
+       ^ doubleConst d
+       ^ "};")
+  pure ("((V)&" ^ name ^ ")")
+staticOf k x e = k.exp e
+
 expF : CK -> RefCount.Value -> C String
 expF k (RLocal x) = pure (cLocal x)
 expF k (RDup x) = pure ("heff_dup(" ^ cLocal x ^ ")")
@@ -1013,6 +1152,7 @@ expF k (RTag t flat es) = do
          ^ (if flat == 0 then ", " else ", " ^ debug flat ^ "u, ")
          ^ argsArr vs
          ^ ")")
+expF k (RStatic x e) = staticOf k x e
 expF k (RTagIn ru t flat es) = do
   vs <- traverseC k.exp (Cons ru es)
   pure
@@ -2344,9 +2484,9 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                      (List.append
                         (Cons "static V heff_perform(V p, V k);" Nil)
                         (List.append
-                           (List.map snd (List.reverse s.strs))
+                           (List.map shapeDef (usedOnce s.shapes))
                            (List.append
-                              (List.map shapeDef (usedOnce s.shapes))
+                              (List.map snd (List.reverse s.strs))
                               (List.append
                                  (List.concatMap
                                     (\(e : Emitted1) -> e.protos)

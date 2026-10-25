@@ -3271,6 +3271,101 @@ domains = do
          Nil
          { out = Just "spawned\n", err = Just "heff:abandon\n", status = Exited 1 })
 
+-- (a module of a big value of constants, `n` records in a list, its codes
+-- summed by four domains at once -- two changing each record first -- and
+-- by main after them)
+staticsSource : Int -> String
+staticsSource n =
+  joinWith
+    "\n"
+    (List.append
+       [ "module big"
+       , ""
+       , "import co"
+       , "import std.domain as Domain"
+       , "import std.io"
+       , ""
+       , "type Entry = { name : String, code : Int }"
+       , ""
+       , "table : List Entry"
+       , "table ="
+       ]
+       (List.append
+          (List.map
+             (\i ->
+                (if i == 0 then "  [ " else "  , ")
+                ^ "{ name = \"e"
+                ^ debug i
+                ^ "\", code = "
+                ^ debug i
+                ^ " }")
+             (List.range 0 (n - 1)))
+          [ "  ]"
+          , ""
+          , "codes : Bool -> Int"
+          , "codes bump ="
+          , "  List.foldl"
+          , "    (\\s (e : Entry) -> s + e.code)"
+          , "    0"
+          , "    (if bump then List.map (\\(e : Entry) -> { e | code = e.code + 1 }) table"
+          , "     else List.reverse table)"
+          , ""
+          , "summing : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Domain.Atomic Int -> Bool -> Co e Int"
+          , "summing started bump = do"
+          , "  _ <- Domain.fetchAdd started 1"
+          , "  pure (codes bump)"
+          , ""
+          , "program : {e : HFunctor} -> {{io : stdio <: e}} -> {{dm : Domain.domain <: e}} -> Co e Unit"
+          , "program = do"
+          , "  started <- Domain.newAtomic 0"
+          , "  a <- Domain.spawn (summing started True)"
+          , "  b <- Domain.spawn (summing started False)"
+          , "  c <- Domain.spawn (summing started True)"
+          , "  d <- Domain.spawn (summing started False)"
+          , "  ra <- Domain.join a"
+          , "  rb <- Domain.join b"
+          , "  rc <- Domain.join c"
+          , "  rd <- Domain.join d"
+          , "  print (unwords [debug ra, debug rb, debug rc, debug rd, \"then\", debug (codes False), \"of\", debug (List.length table)])"
+          , ""
+          , "main : Co (stdio <+> Domain.domain) Unit"
+          , "main = program (io := _) (dm := _)"
+          , ""
+          ]))
+
+-- | a definition's value of constants, static data (#127): a list of
+-- | 3000 records, the C backend's init of it one pointer to it -- nothing
+-- | built at run time, a cell at a time -- and the program built (by zig,
+-- | at once: built a cell at a time, its init takes zig long), the
+-- | value read by four domains at once, two of them changing each record,
+-- | and by main after them, as it was.  `HEFF_TSAN=1`: built with
+-- | ThreadSanitizer too, and run again
+statics : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> Co e Unit
+statics = do
+  working <- workingDir
+  let here = show working
+  let file = here ^ "/big.hf"
+  written <- writeFile file (staticsSource 3000)
+  threadedRun
+      file
+      "main"
+      Nil
+      { out = Just "4501500 4498500 4501500 4498500 then 4498500 of 3000\n" }
+  cCode <- readFile (here ^ "/big-main.c")
+  failingWith
+      (case definitionsOf "g_big_2etable_init(void)" "\n}\n" cCode of
+         [body] ->
+           if List.length (split "\n" body) == 2
+              && contains "return ((V)&g_big_2etable_lit" body
+           then Nil
+           else ["the table's init builds it:" ^ body]
+         ds -> ["the table's init, " ^ debug (List.length ds) ^ " of them"])
+
 -- (what boc's program says, test/node/cowns-program.hf's: on threads
 -- here, and the same in JavaScript's one domain, test/apps.hf's)
 cownsSaid : String
@@ -3579,6 +3674,7 @@ backends =
       , integration "processes" processes
       , integration "threads" threads
       , integration "domains" domains
+      , integration "a value of constants, static" statics
       , integration "cowns" cowns
       , withinTime 180000 (integration "cml" cml)
       , integration "deep loops" deepLoops
