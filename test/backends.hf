@@ -2771,12 +2771,12 @@ cmlBurst = do
             { out = Just "answered 500\nmain done\n", err = Just "" }
             (snd both)))
 
--- | std.http.bocserver's `serve`, by C alone: Node.js's clients, a
--- | hundred one after another, then a hundred whose connections are
--- | opened at once, each connection a behaviour of its own, on as many
--- | domains as the machine has cores: every one answered, and the
--- | server's count of them, asked for at `/stop`, the same; the server
--- | ended by its `with`, as a server of boc's does not end by itself
+-- | std.http.bocserver's `serve`, by C alone, under boc's
+-- | `scheduledWithReactor`: Node.js's clients, three hundred one after
+-- | another, then two hundred whose connections are opened at once,
+-- | every one answered; then `/stop`, which closes the listener, and the
+-- | server, its connections closed, ends by itself, its count of them
+-- | the same
 bocBurst : {e : HFunctor}
            -> {{chk : check <: e}}
            -> {{sys : process <: e}}
@@ -2788,24 +2788,67 @@ bocBurst = do
   bin <- built "test/node/boc-served.hf" "burst" Nil ""
   both <-
     withProcess
-      { command = bin, args = List.take 1 ports, output = Piped, timeout = 60000 } (\p -> do
+      { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
     client <-
       run
         { command = "node"
-        , args = [root ^ "/test/peers.mjs", "burst", firstOf ports, "100", "100"]
+        , args = [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
         , timeout = 60000
         }
-    said <- readOutput p (Through "\n") 30000
-    pure (MkPair client said))
-  server <- peerLine (snd both)
+    server <- wait p
+    pure (MkPair client server))
   failingWith
       (List.append
          (against
             "boc server, a burst: the clients"
-            { out = Just "answered 100 of 100\n", err = Just "" }
+            { out = Just "answered 200 of 200\n", err = Just "" }
             (fst both))
-         (if server == "answered 200" then Nil
-          else ["boc server, a burst: " ^ server ^ ", wanted answered 200"]))
+         (against
+            "boc server, a burst"
+            { out = Just "answered 500\nmain done\n", err = Just "" }
+            (snd both)))
+
+-- | std.http.bocserver's `serve`, by C alone, under boc's
+-- | `scheduledWithReactor`, every wait an act awaited, driven by
+-- | Node.js: two hundred clients holding their connections open at
+-- | once, far more than the machine has cores, each answered, then
+-- | asked again on the same connection; a handler that awaits a sleep of
+-- | its own; a silent client closed by the idle limit, 500 ms; SIGTERM
+-- | with a request in flight, which is answered, a connection kept open
+-- | idle closed, and the server ended by itself
+bocServed : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> Co e Unit
+bocServed = do
+  root <- given "HEFF_TEST_ROOT"
+  bin <- built "test/node/boc-served.hf" "main" Nil ""
+  r <-
+    run
+      { command = "node"
+      , args = [root ^ "/test/peers.mjs", "boc", bin, "500", "200"]
+      , timeout = 60000
+      }
+  failingWith
+      (against
+         "boc server"
+         { out =
+             Just
+               (linesOf
+                  [ "first requests answered, every connection held open: 200 of 200"
+                  , "second requests answered, on the same connections: 200 of 200"
+                  , "slow, its handler awaiting a sleep: answered, in time"
+                  , "a silent client: closed in time"
+                  , "SIGTERM, a request in flight: answered"
+                  , "a connection kept open, idle: closed by the stop"
+                  , "the server: ended, status 0"
+                  , "the server said: stopping on SIGTERM"
+                  , "the server said: answered 403"
+                  , "the server said: main done"
+                  ])
+         , err = Just ""
+         }
+         r)
 
 -- | an API over HTTP, both sides of std.remote, by C alone: calls
 -- | answered, the server's count kept between them; a client of another
@@ -3842,6 +3885,7 @@ backends =
       , withinTime 180000 (integration "cml server" cmlServer)
       , withinTime 180000 (integration "cml server, a burst" cmlBurst)
       , withinTime 180000 (integration "boc server, a burst" bocBurst)
+      , withinTime 180000 (integration "boc server" bocServed)
       , withinTime 180000 (integration "remote" remote)
       , integration "http server" httpServer
       , integration "a module named main, as parts" mainParts

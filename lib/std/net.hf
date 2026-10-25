@@ -7,6 +7,7 @@
 --
 -- ```haskell
 -- import bytes as Bytes
+-- import co
 -- import std.net as Net
 -- import resource
 --
@@ -29,7 +30,14 @@
 -- to it.  So a connection is had only by the operations here, in its body,
 -- and never past it.  A server of many connections at once accepts each in
 -- a thread of its own (cml's), its `with` inside that thread, the threads
--- talking over channels.
+-- talking over channels.  One whose connections are served a piece at a
+-- time, each piece a computation of its own -- boc's behaviours, each
+-- read awaited -- has each by `accepted listener`, in the listener's
+-- region, past any one body but not past the listener's `with`, and
+-- closes it by `close`; `closeListener` closes the listener before its
+-- `with` ends, an `accept` waiting on it done at once, so that such a
+-- server stops.  A thing closed so is closed once: its `with` closing
+-- it again does nothing.
 --
 -- An operation that fails gives a value, an `Either NetError a`, the
 -- system's errno, what it says of it and the address -- never data: a read at the end
@@ -72,6 +80,9 @@ module std.net
   , thisSide
   , withListener
   , accept
+  , accepted
+  , close
+  , closeListener
   , local
   , instanceShowNetError
   , showAddress
@@ -289,11 +300,11 @@ withListener address backlog body =
 
 -- (the next connection made to the listener, the host's own, waited
 -- for; or why none was accepted)
-accepted : {e : HFunctor}
-         -> {{ev : net <: e}}
-         -> TcpListener
-         -> Co e (Either NetError TcpStream)
-accepted l = op (ev (Accept l (\r -> r))) val
+acceptedBy : {e : HFunctor}
+           -> {{ev : net <: e}}
+           -> TcpListener
+           -> Co e (Either NetError TcpStream)
+acceptedBy l = op (ev (Accept l (\r -> r))) val
 
 -- | The next connection made to the listener, waiting for one, held by
 -- | `body` in a region of its own and shut down and closed when `body`
@@ -312,7 +323,47 @@ accept : {e : HFunctor}
        -> With s TcpListener
        -> ({s2 : Type} -> With s2 TcpStream -> Co e a)
        -> Co e a
-accept l body = scoped (accepted (inside l)) released body
+accept l body = scoped (acceptedBy (inside l)) released body
+
+-- | The next connection made to the listener, waiting for one, had in
+-- | the listener's region -- no longer than its `with` -- not by a
+-- | `with` of its own: so it is kept past one body, by a server whose
+-- | connections are served a piece at a time, each piece a computation
+-- | of its own (boc's behaviours), and closed by `close`, or where the
+-- | program drops its last reference to it.  Where none is accepted, a
+-- | `Left` (`EMFILE`; `EBADF`, the listener closed).
+accepted : {e : HFunctor}
+         -> {s : Type}
+         -> {{ev : net <: e}}
+         -> With s TcpListener
+         -> Co e (Either NetError (With s TcpStream))
+accepted l =
+  bind
+    (acceptedBy (inside l))
+    (\r -> pure (case r of
+      Left err -> Left err
+      Right c -> Right (beside l c)))
+
+-- | The connection shut down and closed, before its `with` ends, or
+-- | one `accepted` gives: an operation on it after is `EBADF`, and what
+-- | waits on it -- a read, on any domain -- is done so at once.  Closed
+-- | again, by this or by its `with`, nothing is done.
+close : {e : HFunctor}
+      -> {s : Type}
+      -> {{ev : net <: e}}
+      -> With s TcpStream
+      -> Co e (Either NetError Unit)
+close c = released (inside c)
+
+-- | The listener closed before its `with` ends: an `accept` waiting on
+-- | it, on any domain, is done at once, `EBADF` -- so a server serving
+-- | it stops.  Closed again, by this or by its `with`, nothing is done.
+closeListener : {e : HFunctor}
+              -> {s : Type}
+              -> {{ev : net <: e}}
+              -> With s TcpListener
+              -> Co e (Either NetError Unit)
+closeListener l = listenerReleased (inside l)
 
 -- | Where the listener is: its port, where the system picked it.
 local : {e : HFunctor}

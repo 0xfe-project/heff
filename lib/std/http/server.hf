@@ -7,9 +7,11 @@
 -- closed by the `with` holding it when it is done.  So it is the C
 -- backend's alone, as std.net is.  Import it by a name, `import
 -- std.http.server as Server`, beside `import std.http as HTTP`, whose
--- `Response` a handler gives.  A server of many connections at once
--- serves each by `serveConnection`, on threads: std.http.cmlserver's,
--- each a cml thread, and std.http.bocserver's, each a boc behaviour.
+-- `Response` a handler gives.  A server of many connections at once is
+-- a module of its own: std.http.cmlserver's serves each by
+-- `serveConnection`, a cml thread a connection; std.http.bocserver's
+-- reads each a piece at a time, by `requestIn`, every wait an act boc's
+-- behaviours await.
 --
 -- ```haskell
 -- import co
@@ -57,6 +59,7 @@ module std.http.server
   , BodyIs(..)
   , Head(..)
   , Got(..)
+  , requestIn
   , reason
   , responseBytes
   , keptAlive
@@ -307,6 +310,31 @@ bodied : Request -> Int -> Maybe Bytes -> Got
 bodied r n Nothing = Ended
 bodied r n (Just b) =
   Asked { r | body = Bytes.slice b 0 n } (Bytes.slice b n (Bytes.length b))
+
+-- | What the bytes read so far of a connection's next request come to,
+-- | read all at once, not waiting for more (a server that reads a piece
+-- | at a time asks after each): the request, and what was read after
+-- | it (`Asked`), or the status it is answered with (`Refused`); else,
+-- | not all read yet, `Left`: its head, where that is read -- the
+-- | request, its body to come -- and how many bytes in all it wants at
+-- | least.
+-- | >>> either (\(p : (Maybe Request, Int)) -> debug (snd p)) (\g -> "got") (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nab"])
+-- | "40"
+-- | >>> either (\(p : (Maybe Request, Int)) -> "more") (\g -> "whole") (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET"])
+-- | "whole"
+requestIn : Net.Address -> Bytes -> Either (Maybe Request, Int) Got
+requestIn peer buf =
+  let i = headEnd buf 0
+  in if i < 0
+  then (if Bytes.length buf > headMost then Right (Refused 431)
+        else Left (Nothing, Bytes.length buf + 1))
+  else case parseHead peer (show (Bytes.slice buf 0 i)) of
+    Nothing -> Right (Refused 400)
+    Just r -> case bodyOf r of
+      Refuse status -> Right (Refused status)
+      Length n ->
+        if Bytes.length buf < i + 4 + n then Left (Just r, i + 4 + n)
+        else Right (bodied r n (Just (Bytes.slice buf (i + 4) (Bytes.length buf))))
 
 -- (the request whose head ends at `i` of `buf`, its body read)
 withBody : {e : HFunctor}

@@ -1,9 +1,13 @@
--- An HTTP/1.1 server of many connections at once, on boc's behaviours:
--- a listener's connections each served by a behaviour of its own, on a
--- cown of its own, by std.http.server's `serveConnection`, so the
--- connections are served in parallel, on as many domains as the machine
--- has cores.  It is the C backend's alone, as std.net is.  Import it by
--- a name, `import std.http.bocserver as BocServer`.
+-- For an HTTP/1.1 server on boc's behaviours: a listener's connections
+-- served at once, as many as come, each a cown of its own, each step
+-- of each a behaviour -- a request parsed and handed to the handler, a
+-- response written, the next request read -- and every wait (an
+-- accept, a read, a write) an act awaited (`BOC.await`), so no domain
+-- and no cown is held while a client is slow.  Run under boc's
+-- `scheduledWithReactor`, each act waits in the reactor of a domain,
+-- and the connections are served in parallel on as many domains as the
+-- machine has cores.  It is the C backend's alone, as std.net is.
+-- Import it by a name, `import std.http.bocserver as BocServer`.
 --
 -- > [!CAUTION]
 -- > Unstable: concurrency in heff is not settled. What this module offers
@@ -18,143 +22,580 @@
 -- import std.http.bocserver as BocServer
 -- import std.http.server as Server
 -- import std.net as Net
+-- import std.reactor as Reactor
+-- import std.signal as Signal
+-- import resource
 --
--- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
--- hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
+-- -- | each request answered at once
+-- hello : {e : HFunctor}
+--       -> Server.Request
+--       -> (HTTP.Response -> Co e Unit)
+--       -> Co e Unit
+-- hello r respond = respond (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 --
--- -- | `hello` served on the port, each connection a behaviour of its
--- -- | own, until one cannot be accepted
--- helloAt : {e w : HFunctor}
---         -> {{bc : BOC.boc w <: e}}
---         -> {{dm : Domain.domain <: e}}
---         -> {{nt : Net.net <: e}}
---         -> {{ex : exception Net.NetError <: e}}
---         -> Int
---         -> Co e Unit
--- helloAt port =
---   Net.withListener
---       { host = "127.0.0.1", port = port }
---       128
---       (\l -> BocServer.serve l hello)
+-- -- | the listener served until SIGTERM or Ctrl-C: then closed, the
+-- -- | requests in hand answered, and every connection closed
+-- served : {e w : HFunctor}
+--        -> {s : Type}
+--        -> {{bc : BOC.boc w <: e}}
+--        -> {{nt : Net.net <: w}}
+--        -> {{sg : Signal.signals <: w}}
+--        -> With s Net.TcpListener
+--        -> Co e Unit
+-- served l = do
+--   BocServer.serve l hello
+--   with _ := BOC.await (Signal.wait [Terminate, Interrupt]) do
+--     with _ := BOC.await (Net.closeListener l) do
+--       pure ()
 --
--- -- | the behaviours run, on domains, by main
--- main : Co (Net.net <+> Domain.domain) Unit
--- main = do
+-- -- | served on port 8080, its behaviours run on domains, each waiting
+-- -- | on the world through a reactor of its own; done once they are
+-- helloServed : {e : HFunctor}
+--             -> {{nt : Net.net <: e}}
+--             -> {{sg : Signal.signals <: e}}
+--             -> {{rx : Reactor.reactor <: e}}
+--             -> {{dm : Domain.domain <: e}}
+--             -> Co e Unit
+-- helloServed = do
 --   r <-
---     BOC.scheduled
---       (dm := _)
---       (\why -> pure ())
---       (attempt
---          Net.NetError
---          (helloAt
---             (w := Net.net <+> Domain.domain)
---             (bc := _)
---             (dm := _)
---             (nt := _)
---             (ex := _)
---             8080))
+--     attempt
+--       Net.NetError
+--       (Net.withListener
+--          (ev := _)
+--          (ex := _)
+--          { host = "127.0.0.1", port = 8080 }
+--          128
+--          (\l ->
+--             lift
+--               (h := e)
+--               (inj := _)
+--               (BOC.scheduledWithReactor
+--                  (\why -> pure ())
+--                  (served (w := e) (bc := _) (nt := _) (sg := _) l))))
 --   pure ()
 -- ```
 --
--- A connection is had by `Net.accept`'s body in its behaviour, and
--- closed as that behaviour ends.  `serve` is run by main, the
--- computation `BOC.scheduled` is given, whose behaviours are put among
--- those ready, for any domain to take: it spawns a behaviour to accept
--- the next connection, waits for it to have one, and spawns the next,
--- so one is always waiting to accept while a domain is free.  (In a
--- behaviour's body, the behaviour spawned to accept would be kept for
--- that domain, to run after the body, which waits for it: `serve` is
--- not to be run there.)
+-- `serve l handle` comes back at once, the server running in its
+-- behaviours: the listener is held by a `with` around the scheduler,
+-- which ends once the server is done.  A connection is had by
+-- std.net's `accepted`, in the listener's region, and closed by the
+-- server: when its client ends it or fails, when a request asks
+-- (HTTP/1.0, `Connection: close`), or when the server stops.  The
+-- handler is given each request in a behaviour on its connection's
+-- cown, and a responder: it may answer there and then, or later, from
+-- another behaviour -- after acts of its own awaited, a request of
+-- std.http, a query -- the connection meanwhile waiting, read no
+-- further.  Its first response is written; one after it is not.  A
+-- handler that never responds leaves its connection open until the
+-- program lets go of it.
 --
--- A behaviour runs to its end on its domain, and what it waits for on
--- the world -- an accept, a read -- it waits for there: so at most as
--- many connections are served at once as there are domains, one of
--- them accepting, and the next wait in the listener's queue until a
--- domain is free.  A connection whose client sends nothing for `idle`
+-- Requests are read as std.http.server reads them, by its `requestIn`,
+-- a piece at a time, each piece an act: a body by `Content-Length`, a
+-- `100 Continue` written where the client waits for one, a request
+-- refused as std.http.server refuses it (`400`, `413`, `431`, `501`,
+-- `505`), what the client still sends then read, up to a mebibyte, and
+-- let go of before its connection is closed.  Requests sent one after
+-- another on a connection without waiting (pipelined) are answered in
+-- turn.  A connection whose client sends nothing for `idle`
 -- milliseconds -- 30 seconds unless another is given, by name,
 -- `BocServer.serve (idle := 5000) l handle`; 0 for no limit -- is
--- closed, its behaviour done, its domain free.  Where a connection
--- cannot be accepted (the program out of descriptors, `EMFILE`; the
--- listener closed, `EBADF`) the server stops: `serve` comes back, the
--- connections being served going on, the listener left as it is.  A
--- behaviour whose handler fails is done with that, its connection
--- closed, and `BOC.scheduled`'s `failed` is given why.
+-- closed, within a request or between two; a response not taken in that
+-- time too.
+--
+-- The server stops where a connection cannot be accepted: the listener
+-- closed (`Net.closeListener`, as above on a signal), or the program
+-- out of descriptors (`EMFILE`).  Then the connections waiting for a
+-- request are closed at once, and the others once the request in hand
+-- is answered: once the last is closed, nothing of the server is
+-- pending, and `scheduledWithReactor` ends, if nothing else is.  A
+-- handler that fails fails its behaviour, which boc's `failed` hears:
+-- its request is not answered, and its connection, read no further, is
+-- closed where the program lets go of it, at the run's end.
 
 module std.http.bocserver (serve)
 import boc as BOC
+import bytes as Bytes
 import co
-import exception
-import std.domain as Domain
 import std.http as HTTP
 import std.http.server as Server
 import std.net as Net
+import std.ordmap as OrdMap
 import resource
 
--- (a behaviour's body: the listener's next connection accepted, `True`
--- put on `turns` once it is, and served, then closed as the body ends;
--- where none is accepted, `False` put)
-accepting : {e : HFunctor}
-          -> {s : Type}
-          -> {{dm : Domain.domain <: e}}
-          -> {{nt : Net.net <: e}}
-          -> Int
-          -> Domain.Queue Bool
-          -> With s Net.TcpListener
-          -> (Server.Request -> Co e HTTP.Response)
-          -> Co e Unit
-accepting idle turns l handle = do
-  outcome <-
-    attempt
-      Net.NetError
-      (Net.accept (ev := _) (ex := _) l (\c -> do
-       lift (h := e) (inj := _) (Domain.put turns True)
-       _ <-
-         Server.serveConnection
-           (idle := idle)
-           (nt := _)
-           (\r -> False)
-           (\r -> lift (inj := _) (handle r))
-           c
-       pure ()))
-  case outcome of
-    Left err -> Domain.put turns False
-    Right u -> pure ()
+-- (how much is read at a time, at least)
+readSize : Int
+readSize = 65536
 
--- (a behaviour accepting the next connection, on a cown of its own, and
--- the one after it once that one has one, until one is not accepted)
-acceptors : {e w : HFunctor}
-          -> {s : Type}
+-- (how much of what a client still sends, after a request refused, is
+-- read and let go of before its connection is closed)
+drainMost : Int
+drainMost = 1048576
+
+-- The server's state
+--------------------------------------------------------------------------------
+
+-- (where a connection is: reading its next request; that request with
+-- the handler, to be answered; its response being written; or closed,
+-- or being closed)
+data Phase = Reading | Answering | Writing | Closing
+
+-- (a connection's cown: what it is doing; what is read of its next
+-- request, the last read first, `got` bytes in all, and how many in all
+-- are wanted before it is read again; whether a `100 Continue` was
+-- written for it; and whether the server has stopped, for the
+-- connection to be closed once the request in hand is answered)
+type Conn =
+  { phase : Phase
+  , parts : List Bytes
+  , got : Int
+  , want : Int
+  , continued : Bool
+  , stopping : Bool
+  }
+
+-- (a connection, as the server keeps it: its socket, its number among
+-- the server's, where its other side is, and its cown)
+type Connection (w : HFunctor) (rg : Type) =
+  { socket : With rg Net.TcpStream
+  , number : Int
+  , peer : Net.Address
+  , state : BOC.Cown w Conn
+  }
+
+-- (the server's cown: its connections open, by their numbers; the next
+-- number; and whether it has stopped)
+type Served (w : HFunctor) (rg : Type) =
+  { open : OrdMap.OrdMap Int (Connection w rg)
+  , next : Int
+  , stopped : Bool
+  }
+
+-- (what every behaviour of the server knows: the time limit, the
+-- server's cown, and the handler)
+type Serving (e : HFunctor) (w : HFunctor) (rg : Type) =
+  { idle : Int
+  , served : BOC.Cown w (Served w rg)
+  , handler : Server.Request -> (HTTP.Response -> Co e Unit) -> Co e Unit
+  }
+
+-- (the server's state, the connection made by `made`, given the next
+-- number, among its connections open: and that connection)
+added : {w : HFunctor}
+      -> {rg : Type}
+      -> Served w rg
+      -> (Int -> Connection w rg)
+      -> (Served w rg, Connection w rg)
+added sv made =
+  let cn = made sv.next
+  in ({ sv | open = OrdMap.insert sv.open sv.next cn, next = sv.next + 1 }, cn)
+
+-- (the server's state, the connection numbered `n` no longer open)
+without : {w : HFunctor} -> {rg : Type} -> Served w rg -> Int -> Served w rg
+without sv n = { sv | open = OrdMap.delete sv.open n }
+
+-- (the server's state, stopped: its connections open)
+stopped : {w : HFunctor}
+        -> {rg : Type}
+        -> Served w rg
+        -> (Served w rg, List (Pair Int (Connection w rg)))
+stopped sv = ({ sv | stopped = True }, OrdMap.toList sv.open)
+
+-- (a connection just accepted: nothing read of it)
+fresh : Conn
+fresh =
+  { phase = Reading
+  , parts = Nil
+  , got = 0
+  , want = 1
+  , continued = False
+  , stopping = False
+  }
+
+-- (how much the next read asks for: what is wanted still, a body's, or
+-- `readSize`, whichever is more)
+sizeFor : Conn -> Int
+sizeFor st = if st.want - st.got > readSize then st.want - st.got else readSize
+
+-- The acts
+--------------------------------------------------------------------------------
+
+-- (the next connection accepted, and where its other side is: `Left`
+-- where none is accepted; `Nothing` where it was, but closed at once,
+-- its other side gone)
+acceptedFrom : {w : HFunctor}
+             -> {rg : Type}
+             -> {{nt : Net.net <: w}}
+             -> With rg Net.TcpListener
+             -> Co w (Either Net.NetError (Maybe (With rg Net.TcpStream, Net.Address)))
+acceptedFrom l = do
+  r <- Net.accepted l
+  case r of
+    Left err -> pure (Left err)
+    Right c -> do
+      p <- Net.peer c
+      case p of
+        Right a -> pure (Right (Just (c, a)))
+        Left err -> do
+          _ <- Net.close c
+          pure (Right Nothing)
+
+-- (what the client still sends read and let go of, `got` bytes of it
+-- already, until it ends or there has been `drainMost` of it)
+drained : {w : HFunctor}
+        -> {rg : Type}
+        -> {{nt : Net.net <: w}}
+        -> Int
+        -> With rg Net.TcpStream
+        -> Int
+        -> Co w Unit
+drained idle c got =
+  if got >= drainMost then pure ()
+  else do
+    r <- Net.read (timeout := idle) c readSize
+    case r of
+      Right b ->
+        if Bytes.length b == 0 then pure ()
+        else drained idle c (got + Bytes.length b)
+      Left err -> pure ()
+
+-- (a refusal written, then this side shut down, so that the client reads
+-- it to its end, and what the client still sends drained, so that the
+-- connection closed with bytes unread -- a reset, which may come before
+-- the client has read the refusal -- is not what it is sent)
+refused : {w : HFunctor}
+        -> {rg : Type}
+        -> {{nt : Net.net <: w}}
+        -> Int
+        -> With rg Net.TcpStream
+        -> Int
+        -> Co w Unit
+refused idle c status = do
+  r <-
+    Net.write
+      (timeout := idle)
+      c
+      (Server.responseBytes
+         "close"
+         True
+         (Server.plain status (Server.reason status ^ "\n")))
+  case r of
+    Right u -> do
+      _ <- Net.shutdown c
+      drained idle c 0
+    Left err -> pure ()
+
+-- Responses
+--------------------------------------------------------------------------------
+
+-- (whether a `Connection` header of these has the token, its case not
+-- minded)
+connectionSays : String -> List (Pair String String) -> Bool
+connectionSays token Nil = False
+connectionSays token (MkPair n v :: rest) =
+  (HTTP.sameName n "Connection"
+   && List.any (\t -> HTTP.sameName (trim t) token) (split "," v))
+  || connectionSays token rest
+
+-- (what a response says of its connection: closed, or kept where
+-- HTTP/1.0 has to be told so)
+connectionWord : Server.Request -> Bool -> String
+connectionWord r True = "close"
+connectionWord r False = if strEq r.version "HTTP/1.0" then "keep-alive" else ""
+
+-- (whether the client waits for `100 Continue` before it sends the body
+-- of the request whose head is read)
+expects : Maybe Server.Request -> Bool
+expects Nothing = False
+expects (Just r) =
+  strEq r.version "HTTP/1.1"
+  && maybe False (\v -> HTTP.sameName v "100-continue") (Server.header "expect" r)
+
+-- The behaviours
+--------------------------------------------------------------------------------
+
+-- (the connection closed, and taken from the server's: its cown's
+-- phase set to closing by the caller, so that what comes back to it
+-- after does nothing)
+closing : {e w : HFunctor}
+        -> {rg : Type}
+        -> {{bc : BOC.boc w <: e}}
+        -> {{nt : Net.net <: w}}
+        -> Serving e w rg
+        -> Connection w rg
+        -> Co e Unit
+closing sg cn = do
+  with sv := sg.served
+       _ := BOC.await (Net.close cn.socket) do
+    sv := without sv cn.number
+
+-- (a refusal written, what the client still sends drained, then the
+-- connection closed)
+refusing : {e w : HFunctor}
+         -> {rg : Type}
+         -> {{bc : BOC.boc w <: e}}
+         -> {{nt : Net.net <: w}}
+         -> Serving e w rg
+         -> Connection w rg
+         -> Int
+         -> Co e Unit
+refusing sg cn status = do
+  with _ := BOC.await (refused sg.idle cn.socket status) do
+    closing sg cn
+
+mutual
+  -- (more of the connection read, `size` bytes at most, in `idle`
+  -- milliseconds: what it comes to added to what was read)
+  reading : {e w : HFunctor}
+          -> {rg : Type}
           -> {{bc : BOC.boc w <: e}}
-          -> {{dm : Domain.domain <: e}}
-          -> {{nt : Net.net <: e}}
+          -> {{nt : Net.net <: w}}
+          -> Serving e w rg
+          -> Connection w rg
           -> Int
-          -> Domain.Queue Bool
-          -> With s Net.TcpListener
-          -> (Server.Request -> Co e HTTP.Response)
           -> Co e Unit
-acceptors idle turns l handle = do
-  own <- BOC.newCown ()
-  BOC.when own (\u -> accepting idle turns l handle)
-  accepted <- Domain.take turns
-  if accepted then acceptors idle turns l handle else pure ()
+  reading sg cn size = do
+    with st := cn.state
+         got := BOC.await (Net.read (timeout := sg.idle) cn.socket size) do
+      case st.phase of
+        Closing -> pure ()
+        _ -> case got of
+          Right b ->
+            if Bytes.length b == 0
+            then do
+              closing sg cn
+              st := { st | phase = Closing }
+            else
+              st :=
+                (<- advanced
+                      sg
+                      cn
+                      { st
+                        | parts = b :: st.parts
+                        , got = st.got + Bytes.length b
+                        })
+          Left err -> do
+            closing sg cn
+            st := { st | phase = Closing }
 
--- | The listener's connections served at once, each by a boc behaviour
--- | of its own, on a cown of its own (`Server.serveConnection`): the
--- | connection is had by `Net.accept`'s body in that behaviour, closed
--- | as it ends, and once it has one, the behaviour accepting the next
--- | is spawned.  Until one fails to be accepted: the listener left as
--- | it is, the connections being served going on.  A connection whose
--- | client sends nothing for `idle` milliseconds is closed, its
--- | behaviour done.  Run by main, not in a behaviour's body.
+  -- (a `100 Continue` written, then the body read)
+  continuing : {e w : HFunctor}
+             -> {rg : Type}
+             -> {{bc : BOC.boc w <: e}}
+             -> {{nt : Net.net <: w}}
+             -> Serving e w rg
+             -> Connection w rg
+             -> Co e Unit
+  continuing sg cn = do
+    with st := cn.state
+         sent :=
+           BOC.await
+             (Net.write
+                (timeout := sg.idle)
+                cn.socket
+                b["HTTP/1.1 100 Continue\r\n\r\n"]) do
+      case st.phase of
+        Closing -> pure ()
+        _ -> case sent of
+          Right u -> reading sg cn (sizeFor st)
+          Left err -> do
+            closing sg cn
+            st := { st | phase = Closing }
+
+  -- (the response written, `close` whether the connection is then
+  -- closed: else its next request read -- from what was read after the
+  -- last, where that holds one)
+  writing : {e w : HFunctor}
+          -> {rg : Type}
+          -> {{bc : BOC.boc w <: e}}
+          -> {{nt : Net.net <: w}}
+          -> Serving e w rg
+          -> Connection w rg
+          -> Bool
+          -> Bytes
+          -> Co e Unit
+  writing sg cn close bytes = do
+    with st := cn.state
+         sent := BOC.await (Net.write (timeout := sg.idle) cn.socket bytes) do
+      case st.phase of
+        Closing -> pure ()
+        _ -> case sent of
+          Right u ->
+            if close || st.stopping
+            then do
+              closing sg cn
+              st := { st | phase = Closing }
+            else
+              st :=
+                (<- advanced
+                      sg
+                      cn
+                      { st
+                        | phase = Reading
+                        , want = if st.got > 0 then 0 else 1
+                        })
+          Left err -> do
+            closing sg cn
+            st := { st | phase = Closing }
+
+  -- (what is read of the connection, `st`, taken as far as it goes: more
+  -- read, where too little is; a `100 Continue` written, where the
+  -- client waits for one; a request handed to the handler; or refused:
+  -- the connection's state after)
+  advanced : {e w : HFunctor}
+           -> {rg : Type}
+           -> {{bc : BOC.boc w <: e}}
+           -> {{nt : Net.net <: w}}
+           -> Serving e w rg
+           -> Connection w rg
+           -> Conn
+           -> Co e Conn
+  advanced sg cn st =
+    if st.got < st.want
+    then do
+      reading sg cn (sizeFor st)
+      pure st
+    else do
+      let buf = Bytes.concat (List.reverse st.parts)
+      case Server.requestIn cn.peer buf of
+        Left (head, want) -> do
+          let more = { st | parts = [buf], got = Bytes.length buf, want = want }
+          if expects head && not st.continued
+          then do
+            continuing sg cn
+            pure { more | continued = True }
+          else do
+            reading sg cn (sizeFor more)
+            pure more
+        Right (Asked r rest) -> do
+          sg.handler r (responder sg cn r)
+          pure
+            { st
+              | phase = Answering
+              , parts = [rest]
+              , got = Bytes.length rest
+              , want = 0
+              , continued = False
+              }
+        Right (Refused status) -> do
+          refusing sg cn status
+          pure { st | phase = Closing }
+        Right Ended -> do
+          closing sg cn
+          pure { st | phase = Closing }
+
+  -- (what the handler is given to answer `r` by: its first response
+  -- written, the connection closed after where the request or the
+  -- response asks, or the server has stopped)
+  responder : {e w : HFunctor}
+            -> {rg : Type}
+            -> {{bc : BOC.boc w <: e}}
+            -> {{nt : Net.net <: w}}
+            -> Serving e w rg
+            -> Connection w rg
+            -> Server.Request
+            -> HTTP.Response
+            -> Co e Unit
+  responder sg cn r res = do
+    with st := cn.state do
+      case st.phase of
+        Answering -> do
+          let close =
+            st.stopping
+            || not (Server.keptAlive r)
+            || connectionSays "close" res.headers
+          writing
+              sg
+              cn
+              close
+              (Server.responseBytes
+                 (connectionWord r close)
+                 (not (strEq r.method "HEAD"))
+                 res)
+          st := { st | phase = Writing }
+        _ -> pure ()
+
+-- (the server stopped, for a connection: closed at once where it waits
+-- for a request; else once the one in hand is answered)
+stoppedFor : {e w : HFunctor}
+           -> {rg : Type}
+           -> {{bc : BOC.boc w <: e}}
+           -> {{nt : Net.net <: w}}
+           -> Serving e w rg
+           -> Connection w rg
+           -> Co e Unit
+stoppedFor sg cn = do
+  with st := cn.state do
+    case st.phase of
+      Reading ->
+        if st.got == 0
+        then do
+          closing sg cn
+          st := { st | phase = Closing }
+        else st := { st | stopping = True }
+      Closing -> pure ()
+      _ -> st := { st | stopping = True }
+
+stoppedAll : {e w : HFunctor}
+           -> {rg : Type}
+           -> {{bc : BOC.boc w <: e}}
+           -> {{nt : Net.net <: w}}
+           -> Serving e w rg
+           -> List (Pair Int (Connection w rg))
+           -> Co e Unit
+stoppedAll sg Nil = pure ()
+stoppedAll sg (MkPair n cn :: rest) = do
+  stoppedFor sg cn
+  stoppedAll sg rest
+
+-- (the listener's next connection accepted, and given a cown, its
+-- requests read; then the one after it; where none is accepted, the
+-- server stopped)
+accepting : {e w : HFunctor}
+          -> {rg : Type}
+          -> {{bc : BOC.boc w <: e}}
+          -> {{nt : Net.net <: w}}
+          -> Serving e w rg
+          -> With rg Net.TcpListener
+          -> Co e Unit
+accepting sg l = do
+  with sv := sg.served
+       c := BOC.await (acceptedFrom l) do
+    case c of
+      Right (Just (sock, peer)) -> do
+        state <- BOC.newCown fresh
+        let (more, cn) =
+          added
+            sv
+            (\n -> { socket = sock, number = n, peer = peer, state = state })
+        sv := more
+        reading sg cn readSize
+        accepting sg l
+      Right Nothing -> accepting sg l
+      Left err -> do
+        let (done, open) = stopped sv
+        sv := done
+        stoppedAll sg open
+
+-- | The listener's connections served, each request given to `handle`
+-- | with a responder, every wait an act awaited -- so as many
+-- | connections are served at once as come, none holding a domain while
+-- | it waits.  Comes back at once, the server running in behaviours of
+-- | its own, until a connection cannot be accepted (the listener closed,
+-- | `EMFILE`): then the connections waiting for a request are closed,
+-- | and the others once the request in hand is answered.  A client that
+-- | sends nothing for `idle` milliseconds, or takes no response in that
+-- | time, is closed.  For `scheduledWithReactor`: under `scheduled`,
+-- | each act holds a domain until it is done.
 serve : {e w : HFunctor}
-      -> {s : Type}
+      -> {rg : Type}
       -> {idle : Int := 30000}
       -> {{bc : BOC.boc w <: e}}
-      -> {{dm : Domain.domain <: e}}
-      -> {{nt : Net.net <: e}}
-      -> With s Net.TcpListener
-      -> (Server.Request -> Co e HTTP.Response)
+      -> {{nt : Net.net <: w}}
+      -> With rg Net.TcpListener
+      -> (Server.Request -> (HTTP.Response -> Co e Unit) -> Co e Unit)
       -> Co e Unit
 serve l handle = do
-  turns <- Domain.newQueue
-  acceptors idle turns l handle
+  served <-
+    BOC.newCown
+      ({ open = OrdMap.empty, next = 0, stopped = False } : Served w rg)
+  accepting { idle = idle, served = served, handler = handle } l

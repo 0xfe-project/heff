@@ -191,7 +191,8 @@ which decides what the names are in the body, when and where the body
 runs, and what happens at its end: here one behaviour on both cowns, `a`
 and `b` what they hold, written back when it ends; with
 `std.file`'s `open path`, a file opened, the body run with it,
-and closed.
+and closed; with boc's `r := BOC.await act` last, `act` run outside
+every behaviour, and the body a behaviour once it has come to `r`.
 
 - The names are the body's variables: they can be set, `a := a - n`.
   The handler is told which ones the body sets, and is given what they

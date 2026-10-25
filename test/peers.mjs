@@ -20,7 +20,15 @@
 //                                   opened at once, a request each, then
 //                                   /stop; says how many of the N were
 //                                   answered
-import { spawnSync } from "node:child_process";
+//   node test/peers.mjs boc BIN IDLE N
+//                                   std.http.bocserver's server, BIN
+//                                   PORT IDLE, started and driven: N
+//                                   clients holding their connections
+//                                   open, asked twice each; `/slow`; a
+//                                   silent client; SIGTERM with a
+//                                   request in flight; says what each
+//                                   came to, and what the server said
+import { spawn, spawnSync } from "node:child_process";
 import { Agent, createServer, request } from "node:http";
 import { connect } from "node:net";
 
@@ -208,4 +216,90 @@ if (mode === "burst") {
   const answered = all.filter((b, i) => b.startsWith("HTTP/1.1 200 ") && b.endsWith(`\r\n\r\n/${i}`)).length;
   console.log(`answered ${answered} of ${n}`);
   await got("/stop");
+}
+
+if (mode === "boc") {
+  const bin = arg, idle = Number(process.argv[4]), n = Number(process.argv[5]);
+  const [port] = await freePorts(1);
+  const server = spawn(bin, [String(port), String(idle)], { stdio: ["ignore", "pipe", "pipe"] });
+  let said = "", saidErr = "";
+  server.stdout.setEncoding("utf8").on("data", (d) => { said += d; });
+  server.stderr.setEncoding("utf8").on("data", (d) => { saidErr += d; });
+  const exited = new Promise((ok) => server.on("exit", (code, signal) => ok({ code, signal })));
+  // (a connection kept: `ask(target)`, one request on it, its response's
+  // body once it is all come, or null where the connection ended first;
+  // `ended`, once the other side closed it)
+  const opened = () => new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    s.setEncoding("latin1");
+    let buf = "", waiting = null, closed = false;
+    const ended = new Promise((done) => s.on("close", () => { closed = true; if (waiting) { waiting(null); waiting = null; } done(); }));
+    const take = () => {
+      if (!waiting) return;
+      const h = buf.indexOf("\r\n\r\n");
+      if (h < 0) return;
+      const m = /content-length: *(\d+)/i.exec(buf.slice(0, h));
+      const len = m ? Number(m[1]) : 0;
+      if (buf.length < h + 4 + len) return;
+      const body = buf.slice(h + 4, h + 4 + len);
+      buf = buf.slice(h + 4 + len);
+      const w = waiting; waiting = null; w(body);
+    };
+    s.on("data", (d) => { buf += d; take(); });
+    s.on("error", () => {});
+    const ask = (target) => new Promise((back) => {
+      if (closed) return back(null);
+      waiting = back;
+      s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\n\r\n`);
+      take();
+    });
+    s.on("connect", () => ok({ ask, ended, end: () => s.end(), s }));
+    s.on("error", () => ok(null));
+  });
+  let up = null;
+  for (let i = 0; i < 600 && !up; i++) {
+    up = await opened();
+    if (!up) await new Promise((ok) => setTimeout(ok, 50));
+  }
+  if (!up) { console.log("no server"); server.kill("SIGKILL"); process.exit(0); }
+  up.end();
+  await up.ended;
+  // (N connections at once, a request each, answered while all are held
+  // open; then a second request each, on the same connection)
+  const cs = await Promise.all(Array.from({ length: n }, () => opened()));
+  const first = await Promise.all(cs.map((c, i) => (c ? c.ask(`/a/${i}`) : null)));
+  console.log(`first requests answered, every connection held open: ${first.filter((b, i) => b === `/a/${i}`).length} of ${n}`);
+  const second = await Promise.all(cs.map((c, i) => (c ? c.ask(`/b/${i}`) : null)));
+  console.log(`second requests answered, on the same connections: ${second.filter((b, i) => b === `/b/${i}`).length} of ${n}`);
+  await Promise.all(cs.map((c) => { if (c) { c.end(); return c.ended; } }));
+  // (a handler that awaits a sleep of its own)
+  const slow = await opened();
+  const t0 = Date.now();
+  const sb = await slow.ask("/slow");
+  const ms = Date.now() - t0;
+  console.log(`slow, its handler awaiting a sleep: ${sb === "slow" && ms >= 280 && ms < 2000 ? "answered, in time" : `${sb} in ${ms} ms`}`);
+  // (a client that sends nothing: closed by the server in `idle`)
+  const silent = await opened();
+  const t1 = Date.now();
+  await silent.ended;
+  const idled = Date.now() - t1;
+  console.log(`a silent client: ${idled >= idle - 50 && idled < idle + 1500 ? "closed in time" : `closed in ${idled} ms`}`);
+  // (SIGTERM with a request in flight, and a connection kept open idle:
+  // the request answered, the idle one closed, the server ended)
+  const kept = await opened();
+  await kept.ask("/kept");
+  const flight = await opened();
+  const answer = flight.ask("/slow");
+  await new Promise((ok) => setTimeout(ok, 100));
+  server.kill("SIGTERM");
+  const fb = await answer;
+  console.log(`SIGTERM, a request in flight: ${fb === "slow" ? "answered" : fb}`);
+  const keptClosed = await Promise.race([kept.ended.then(() => true), new Promise((ok) => setTimeout(() => ok(false), 3000))]);
+  console.log(`a connection kept open, idle: ${keptClosed ? "closed by the stop" : "still open"}`);
+  const end = await Promise.race([exited, new Promise((ok) => setTimeout(() => ok(null), 5000))]);
+  if (!end) server.kill("SIGKILL");
+  console.log(`the server: ${end ? `ended, status ${end.code}` : "still running"}`);
+  await exited;
+  process.stdout.write(said.split("\n").filter((l) => l).map((l) => `the server said: ${l}\n`).join(""));
+  if (saidErr) process.stdout.write(`the server's errors: ${saidErr}`);
 }

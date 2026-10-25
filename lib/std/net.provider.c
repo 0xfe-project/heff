@@ -697,13 +697,18 @@ static V heff_provider_net(V p, V k) {
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
-  // (the `with`'s release: a connection's writing ended -- its other
-  // side reads to the end -- and it closed; a listener closed)
+  // (the `with`'s release, or `close`: a connection's writing ended --
+  // its other side reads to the end -- and it closed; a listener
+  // closed.  One closed already is left as it is)
   case TAG_Release:
   case TAG_ReleaseListener: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) return net_closed(p, s, f, k);
+    if (s->fd < 0) {
+      heff_drop(p);
+      V x = heff_answer(f, net_right(NTAG(TAG_MkUnit)));
+      return heff_tail(k, 1, &x);
+    }
     if (heff_tag_of(p) == TAG_Release) shutdown(s->fd, SHUT_WR);
     V r = net_close(s) < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
