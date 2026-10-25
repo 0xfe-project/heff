@@ -519,6 +519,24 @@ evidenceGoal k sp = False
 -- | to be: it is taken as soon as it is wanted, and says what the
 -- | effect's parameters are and which world it is in; an argument
 -- | coming after could make no other fit, only none
+-- (whether an argument of the goal's theory is a metavariable itself,
+-- `Num ?a`: no candidate fits it without deciding that metavariable, so
+-- it is not matched before it is known)
+bareArgument : Value.MetaCtx -> Value.Ty -> Bool
+bareArgument mc goal = case Value.forceTy mc goal of
+  VDecode (HGlobal k) sp u described el -> bareIn sp
+  _ -> False
+  where
+  isMetaEl : Value.V -> Bool
+  isMetaEl (VNeu (HMeta m) sp ty expansion desc) = True
+  isMetaEl v = False
+
+  bareIn : Value.Spine Value.V -> Bool
+  bareIn SpId = False
+  bareIn (SpApp sp a) = isMetaEl (Value.forceEl mc a) || bareIn sp
+  bareIn (SpProj sp l) = bareIn sp
+  bareIn (SpSpec sp l a) = bareIn sp
+
 isEvidence : Value.MetaCtx -> Value.Ty -> Bool
 isEvidence mc goal = case Value.forceTy mc goal of
   VFunction level dom cod implicit dflt (Just (MkFolded (HGlobal k) spTh)) ->
@@ -1169,7 +1187,10 @@ resolveWanted e sp search hm holeVal goal final = do
         (Memoed.valN inst.applied)
         (settingsWanted mcNow goal)
     pure True
-  let candidates = List.append (instLocals e) (instGlobals e)
+  -- (every instance in scope, gathered only where a goal is matched:
+  -- a goal that waits does not pay for it)
+  let candidates : Unit -> List Witness = \u ->
+      List.append (instLocals e) (instGlobals e)
   if undetermined && earlier && final
   then failElsewhere
       sp
@@ -1182,10 +1203,14 @@ resolveWanted e sp search hm holeVal goal final = do
       (tooDeep e mc search goal)
       "an instance's instance arguments are found by searches of their own, and one that wants an instance of a type no smaller than its own may want them without end: give the argument explicitly, `(x := e)`"
   -- (a goal still waiting is taken by its one candidate where that one
-  -- fits it without deciding any of its metavariables; else it waits)
+  -- fits it without deciding any of its metavariables; else it waits.
+  -- One whose argument is a metavariable itself waits unmatched: the
+  -- matching, at every wake, is the costly part)
+  else if undetermined && not eager && bareArgument mc (unspecTy mc goal)
+  then undecided MkUnit
   else if undetermined && not eager
   then do
-    matches <- witnessMatches e sp (unspecTy mc goal) candidates
+    matches <- witnessMatches e sp (unspecTy mc goal) (candidates MkUnit)
     case matches of
       Cons one Nil -> do
         leaving <-
@@ -1200,7 +1225,7 @@ resolveWanted e sp search hm holeVal goal final = do
           Nothing -> undecided MkUnit
       _ -> undecided MkUnit
   else do
-    matches <- witnessMatches e sp (unspecTy mc goal) candidates
+    matches <- witnessMatches e sp (unspecTy mc goal) (candidates MkUnit)
     case matches of
       Cons one Nil -> taken one
       Nil ->
