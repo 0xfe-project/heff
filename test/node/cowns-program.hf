@@ -4,7 +4,8 @@
 -- said.  A counter many behaviours add to; money moved round accounts,
 -- two cowns a behaviour; behaviours on one cown in the order they were
 -- spawned; a behaviour spawned in a behaviour's body, on its cown and
--- another; a behaviour that fails among others on its cown.  Each is
+-- another; a behaviour that fails among others on its cown; one
+-- spawned on a free cown in a body that goes on long after.  Each is
 -- run by a `scheduled` of its own, and what its cowns
 -- hold at the end is read out by a last behaviour on them, into a cell
 -- read once `scheduled` is done.
@@ -171,6 +172,63 @@ failing out = do
     Domain.set out n
     pure n)
 
+-- (how many operations at most the long body does)
+longBound : Int
+longBound = 100000
+
+-- (the long body's operations from the `i`th: each counted in `done`,
+-- until the behaviour it spawned has run, which writes the count it
+-- saw to `seenAt`, or `longBound` are done)
+counting : {e : HFunctor}
+         -> {{dm : Domain.domain <: e}}
+         -> Domain.Atomic Int
+         -> Domain.Atomic Int
+         -> Int
+         -> Co e Unit
+counting done seenAt i =
+  if i >= longBound then pure ()
+  else do
+    seen <- Domain.get seenAt
+    if seen >= 0 then pure ()
+    else do
+      Domain.set done (i + 1)
+      counting done seenAt (i + 1)
+
+-- (the body of a behaviour on `a`: one on the free `b` spawned, which
+-- its domain keeps to run next, and after it many operations, until
+-- that one has run)
+longBody : {e w : HFunctor}
+         -> {{bc : BOC.boc w <: e}}
+         -> {{dm : Domain.domain <: e}}
+         -> BOC.Cown w Int
+         -> Domain.Atomic Int
+         -> Domain.Atomic Int
+         -> Int
+         -> Co e Int
+longBody b done seenAt x = do
+  BOC.when b (\y -> do
+    n <- Domain.get done
+    Domain.set seenAt n
+    pure (y + 1))
+  counting done seenAt 0
+  pure x
+
+-- | a behaviour spawned on a free cown in a body that goes on long
+-- | after: kept by the body's domain, and let out to another, where
+-- | one is, before the body ends.  What `done` was when it ran is
+-- | written to the cell given back, -1 until then
+kept : {e w : HFunctor}
+     -> {{bc : BOC.boc w <: e}}
+     -> {{dm : Domain.domain <: e}}
+     -> Co e (Domain.Atomic Int)
+kept = do
+  a <- BOC.newCown 0
+  b <- BOC.newCown 0
+  done <- Domain.newAtomic 0
+  seenAt <- Domain.newAtomic (0 - 1)
+  BOC.when a (longBody b done seenAt)
+  pure seenAt
+
 -- | what the program says, line by line: each part run by a
 -- | `scheduled` of its own, its cell read once every behaviour is done
 said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
@@ -186,6 +244,9 @@ said = do
   xs <- Domain.get xsOut
   pairOut <- BOC.scheduled (nested (w := e) (bc := _) (dm := _))
   (x, y) <- Domain.get pairOut
+  seenOut <- BOC.scheduled (kept (w := e) (bc := _) (dm := _))
+  seen <- Domain.get seenOut
+  cores <- Domain.cores
   pure
       [ "added by 1000: " ^ show n
       , "accounts: " ^ unwords (List.map show [p, q, r, s, p + q + r + s])
@@ -195,4 +256,7 @@ said = do
         ^ (case outcome of
              Left why -> why
              Right u -> "gave an answer")
+      , "kept in a long body's slot: " ^ (if seen >= 0 then "run" else "not run")
+        ^ (if cores == 1 || seen < longBound then ", before its end where another domain is"
+           else ", only after its end")
       ]

@@ -97,6 +97,16 @@
 -- row, when it puts the next in the queue, so the others are not
 -- starved.  No domain steals from another's batch, which is one
 -- behaviour; a behaviour spawned by main is put in the queue.
+--
+-- A behaviour is never stopped partway -- its body runs to its end,
+-- holding its cowns -- so the one a domain keeps would wait for the
+-- end of the body it runs, however long that goes on.  The domain
+-- counts the operations of that body as it hands them on (the world's,
+-- and `when` and `newCown`), and at every 256th puts the behaviour it
+-- keeps in the queue, which wakes a domain waiting there to take it:
+-- a behaviour kept waits for at most 256 operations of the body.  A
+-- body that computes long doing none holds its domain, and the one
+-- kept, until it ends; that is the program's to avoid.
 
 module boc
   ( Cown
@@ -115,20 +125,22 @@ import std.domain as Domain
 -- Behaviours, requests and cowns
 --------------------------------------------------------------------------------
 
+-- (a worker, as the computations of the scheduler's on it see it: its
+-- slot, for the behaviour -- a `b` -- it is to run next, where one is;
+-- and how many operations the body it runs may still do before the
+-- slot is let out.  Cells only that worker touches)
+type Worker (b : Type) =
+  { slot : Domain.Atomic (Maybe b), fuel : Domain.Atomic Int }
+
 -- (a behaviour spawned: how many of its cowns it still waits for, and
 -- one more until its spawning is done; and its turn, given the domain
--- it runs on -- a worker's slot for the behaviour it is to run next,
--- or nothing, for main, which runs none)
+-- it runs on -- a worker, or nothing, for main, which runs none)
 data Behaviour (w : HFunctor)
-  = MkBehaviour (Domain.Atomic Int) (Maybe (Domain.Atomic (Maybe (Behaviour w)))
-                                     -> Co w Unit)
+  = MkBehaviour (Domain.Atomic Int) (Maybe (Worker (Behaviour w)) -> Co w Unit)
 
--- (a worker's slot: the behaviour it is to run next, where one is)
-type Slot (w : HFunctor) = Domain.Atomic (Maybe (Behaviour w))
-
--- (the domain a computation of the scheduler's runs on: a worker, as
--- its slot, or main, with none)
-type Runner (w : HFunctor) = Maybe (Slot w)
+-- (the domain a computation of the scheduler's runs on: a worker, or
+-- main, with neither)
+type Runner (w : HFunctor) = Maybe (Worker (Behaviour w))
 
 -- (what a request holds -- a behaviour's request for one cown is a
 -- cell holding its link: it has not come to all its cowns' queues yet;
@@ -323,6 +335,11 @@ type Sched (w : HFunctor) =
 batchLimit : Int
 batchLimit = 64
 
+-- (how many operations a body does, on a worker, before the worker
+-- lets its slot out: puts the behaviour in it among those ready)
+fuelLimit : Int
+fuelLimit = 256
+
 -- (`b` put among those ready, for any domain to take)
 readied : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
@@ -340,11 +357,33 @@ ready : {w : HFunctor}
       -> Behaviour w
       -> Co w Unit
 ready st Nothing b = readied st b
-ready st (Just slot) b = do
-  kept <- Domain.get slot
+ready st (Just worker) b = do
+  kept <- Domain.get worker.slot
   case kept of
-    Nothing -> Domain.set slot (Just b)
+    Nothing -> Domain.set worker.slot (Just b)
     Just k -> readied st b
+
+-- (one operation of the body on `runner` charged to its fuel: on a
+-- worker whose body has used its fuel, the behaviour in the slot, where
+-- one is, put among those ready, which wakes a domain waiting for one,
+-- and the fuel filled again)
+charged : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Runner w
+        -> Co w Unit
+charged st Nothing = pure ()
+charged st (Just worker) = do
+  left <- Domain.fetchAdd worker.fuel (0 - 1)
+  if left > 1 then pure ()
+  else do
+    Domain.set worker.fuel fuelLimit
+    kept <- Domain.get worker.slot
+    case kept of
+      Just b -> do
+        Domain.set worker.slot (Nothing : Maybe (Behaviour w))
+        readied st b
+      Nothing -> pure ()
 
 -- (one fewer cown, or the spawning, waited for: where none is left, its
 -- turn come)
@@ -550,8 +589,8 @@ runnerFunctor w =
   , fmap = \g m -> \runner -> bind (m runner) (\x -> val (g x))
   }
 
--- (an operation, on `runner`: the world's own forwarded, their
--- computations given the runner)
+-- (an operation, on `runner`, charged to the body's fuel: the world's
+-- own forwarded, their computations given the runner)
 bocAlg : {w : HFunctor}
        -> {x : Type}
        -> {{dm : Domain.domain <: w}}
@@ -559,12 +598,16 @@ bocAlg : {w : HFunctor}
        -> Runner w
        -> (boc w <+> w).f (\a -> Runner w -> Co w a) x
        -> Co w x
-bocAlg st runner (InL (NewCown s)) = s (Co w x) (\a mk -> madeCown st mk)
-bocAlg st runner (InL (When s)) =
+bocAlg st runner (InL (NewCown s)) = do
+  charged st runner
+  s (Co w x) (\a mk -> madeCown st mk)
+bocAlg st runner (InL (When s)) = do
+  charged st runner
   s (Co w x) (\t bh -> case bh of
     MkBehaving hs rd wr body k ->
       bind (spawnedOn st runner hs rd wr body) (\u -> pure k))
-bocAlg st runner (InR q) =
+bocAlg st runner (InR q) = do
+  charged st runner
   op (w.hmap (runnerFunctor w) (coFunctor w) (\m -> m runner) q) val
 
 -- (the handler: a computation given the domain it runs on, so that a
@@ -580,38 +623,39 @@ bocHandler st =
   , malg = \p -> \runner -> bocAlg st runner p
   }
 
--- (the behaviour run on the worker whose slot this is, and after it the
--- one left in the slot, and so on, `n` run so far in a row: the limit
--- reached, the next is put among those ready instead)
+-- (the behaviour run on the worker, its body given the fuel in full,
+-- and after it the one left in the slot, and so on, `n` run so far in a
+-- row: the limit reached, the next is put among those ready instead)
 ran : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
-    -> Slot w
+    -> Worker (Behaviour w)
     -> Behaviour w
     -> Int
     -> Co w Unit
-ran st slot (MkBehaviour count turn) n = do
-  turn (Just slot)
-  next <- Domain.get slot
+ran st worker (MkBehaviour count turn) n = do
+  Domain.set worker.fuel fuelLimit
+  turn (Just worker)
+  next <- Domain.get worker.slot
   case next of
     Just b -> do
-      Domain.set slot (Nothing : Maybe (Behaviour w))
-      if n < batchLimit then ran st slot b (n + 1) else readied st b
+      Domain.set worker.slot (Nothing : Maybe (Behaviour w))
+      if n < batchLimit then ran st worker b (n + 1) else readied st b
     Nothing -> pure ()
 
 -- (a domain running behaviours, each ready one it takes and those left
 -- in its slot after, until it is told to stop)
-worker : {w : HFunctor}
-       -> {{dm : Domain.domain <: w}}
-       -> Sched w
-       -> Slot w
-       -> Co w Unit
-worker st slot = do
+working : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Worker (Behaviour w)
+        -> Co w Unit
+working st worker = do
   next <- Domain.take st.ready
   case next of
     Just b -> do
-      ran st slot b 1
-      worker st slot
+      ran st worker b 1
+      working st worker
     Nothing -> pure ()
 
 workers : {w : HFunctor}
@@ -623,7 +667,8 @@ workers st n =
   if n <= 0 then pure Nil
   else do
     slot <- Domain.newAtomic (Nothing : Maybe (Behaviour w))
-    d <- Domain.spawn (worker st slot)
+    fuel <- Domain.newAtomic fuelLimit
+    d <- Domain.spawn (working st { slot = slot, fuel = fuel })
     ds <- workers st (n - 1)
     pure (d :: ds)
 
