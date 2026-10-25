@@ -396,8 +396,10 @@ data MakingChan (w : HFunctor) x a = MkMakingChan (Chan w a -> x)
 -- (an ivar made: what comes after, given it)
 data MakingIVar (w : HFunctor) x a = MkMakingIVar (IVar w a -> x)
 
--- (an ivar written: the ivar, the value, and what comes after)
-data Putting (w : HFunctor) x a = MkPutting (IVar w a) a x
+-- (an ivar written: the ivar, the value, and what comes after -- a
+-- function, computed where the write is done, not where a
+-- continuation is put after it, as `Base`'s are)
+data Putting (w : HFunctor) x a = MkPutting (IVar w a) a (Unit -> x)
 
 makingChanThen : {w : HFunctor}
                -> {x y a : Type}
@@ -418,11 +420,11 @@ puttingThen : {w : HFunctor}
             -> (x -> y)
             -> Putting w x a
             -> Putting w y a
-puttingThen g (MkPutting iv v x) = MkPutting iv v (g x)
+puttingThen g (MkPutting iv v k) = MkPutting iv v (\u -> g (k u))
 
 data CmlF (w : HFunctor) (m : Type -> Type) x
-  = Spawn (m Unit) x
-  | Yield x
+  = Spawn (m Unit) (Unit -> x)
+  | Yield (Unit -> x)
   | NewChan (Some (MakingChan w x))
   | NewIVar (Some (MakingIVar w x))
   | PutIVar (Some (Putting w x))
@@ -435,8 +437,8 @@ stepThen : {w : HFunctor}
          -> (x -> y)
          -> CmlF w m x
          -> CmlF w m y
-stepThen g (Spawn c x) = Spawn c (g x)
-stepThen g (Yield x) = Yield (g x)
+stepThen g (Spawn c k) = Spawn c (\u -> g (k u))
+stepThen g (Yield k) = Yield (\u -> g (k u))
 stepThen g (NewChan s) = NewChan (someThen (makingChanThen g) s)
 stepThen g (NewIVar s) = NewIVar (someThen (makingIVarThen g) s)
 stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
@@ -448,8 +450,8 @@ cml w =
   { f = CmlF w
   , hfmap = \m g p -> stepThen g p
   , hmap = \m n nt p -> case p of
-      Spawn c x -> Spawn (nt c) x
-      Yield x -> Yield x
+      Spawn c k -> Spawn (nt c) k
+      Yield k -> Yield k
       NewChan s -> NewChan s
       NewIVar s -> NewIVar s
       PutIVar s -> PutIVar s
@@ -461,11 +463,11 @@ cml w =
 
 -- | `c`, a thread of its own; this one goes on.
 spawn : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit -> Co e Unit
-spawn c = op (cm (Spawn c MkUnit)) val
+spawn c = op (cm (Spawn c (\u -> u))) val
 
 -- | The next thread's turn; this one's again after those ready.
 yield : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit
-yield = op (cm (Yield MkUnit)) val
+yield = op (cm (Yield (\u -> u))) val
 
 -- Channels and ivars
 --------------------------------------------------------------------------------
@@ -492,7 +494,8 @@ putIVar : {e w : HFunctor}
         -> IVar w a
         -> a
         -> Co e Unit
-putIVar iv v = op (cm (PutIVar (\r use -> use a (MkPutting iv v MkUnit)))) val
+putIVar iv v =
+  op (cm (PutIVar (\r use -> use a (MkPutting iv v (\u -> u))))) val
 
 -- Events
 --------------------------------------------------------------------------------
@@ -887,7 +890,7 @@ written runner (MkPutting (MkIVar n mu value readers) v k) = do
       Domain.set readers Deque.empty
       Domain.unlock mu
       wokenAll runner (Deque.toList rs) v
-      pure k
+      later k
 
 -- (the offers at the front of those waiting that are stale -- claimed
 -- already, through this channel or another -- dropped, up to the first
@@ -1321,9 +1324,10 @@ stepped st turnOf runner (RAct m) = do
   bind m (\r -> pure (GoesOn r))
 stepped st turnOf runner (RStep (Spawn c k)) = do
   readyAgain st runner (turnOf (\u -> c))
-  pure (GoesOn k)
+  next <- later k
+  pure (GoesOn next)
 stepped st turnOf runner (RStep (Yield k)) = do
-  yielded st runner (turnOf (\u -> k))
+  yielded st runner (turnOf k)
   pure Stopped
 stepped st turnOf runner (RStep (NewChan s)) =
   s (Co w (Stepped w)) (\a mk -> case mk of
@@ -1383,8 +1387,8 @@ alone st (RDone x) = pure x
 alone st (RAct m) = bind m (\r -> alone st r)
 alone st (RStep (Spawn c k)) = do
   readyAgain st Nothing (\on -> run st on c)
-  alone st k
-alone st (RStep (Yield k)) = alone st k
+  alone st (k MkUnit)
+alone st (RStep (Yield k)) = alone st (k MkUnit)
 alone st (RStep (NewChan s)) =
   s (Co w a) (\t mk -> case mk of
     MkMakingChan k -> bind (madeChan st) (\ch -> alone st (k ch)))
