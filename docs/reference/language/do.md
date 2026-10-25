@@ -129,39 +129,35 @@ total words = do
   variables as they were when the `try` began.
 
 Releasing a resource is not `try`'s job: a resource is held by a `with`
-of its own effect, such as `std.filesystem`'s `withFile`.
+of its own effect, such as `with f := File.open path do` of `std.file`.
 
 ## with
 
 ```haskell
 import exception
-import std.filesystem
+import std.process
 
-lineCount : {e : HFunctor}
-          -> {{disk : filesystem <: e}}
-          -> {{ex : exception FileError <: e}}
-          -> String
-          -> Co e Int
-lineCount path = do
-  let mut n = 0
-  with withFile path { access = Read } as f do
-    let mut more : Bool = True
-    while more do
-      l <- readLine f
-      case l of
-        Right (Just _) -> n := n + 1
-        _ -> more := False
-  return n
+said : {e : HFunctor}
+     -> {{sys : process <: e}}
+     -> {{ex : exception ProcessError <: e}}
+     -> Invocation
+     -> Co e String
+said c = do
+  let mut out = ""
+  with withProcess c as p do
+    r <- wait p
+    out := r.out
+  return out
 ```
 
 `with e as x do` runs the statements under it as the body of the
-[`with`](../../api/resource.md) `e`, such as `withFile path o`, with `x`
-the `With s r` it holds. It is `e (\x -> do ...)`, written as a
+[`with`](../../api/resource.md) `e`, such as `withProcess c`, with `x`
+what it holds. It is `e (\x -> do ...)`, written as a
 statement. Where `e` hands its body a tuple, `with e as (a, b) do`
 takes it apart: `e (\p -> case p of (a, b) -> do ...)`.
 
-- `x` is in scope in the statements under it alone, and cannot leave
-  them (E0311).
+- `x` is in scope in the statements under it alone; a `With s r`, as a
+  `with` made by `scoped` holds, cannot leave them (E0311).
 - The statements belong to the block, as a `try`'s do: they can set
   its variables, `break`, `continue` and `return`. The thing is let go
   of on the way out.
@@ -194,7 +190,7 @@ whole group is handed to the handler that owns what they are bound to,
 which decides what the names are in the body, when and where the body
 runs, and what happens at its end: here one behaviour on both cowns, `a`
 and `b` what they hold, written back when it ends; with
-`std.filesystem`'s `open path o`, a file opened, the body run with it,
+`std.file`'s `open path`, a file opened, the body run with it,
 and closed.
 
 - The names are the body's variables: they can be set, `a := a - n`.

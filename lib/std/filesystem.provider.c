@@ -1053,7 +1053,12 @@ static V fs_set_mode(const FsPath *p, int64_t mode) {
 // or `Left` why not -- a directory's, EISDIR)
 static V fs_open(const FsPath *p, int64_t access, int create, int truncate, int exclusive, int64_t mode) {
   const char *path = p->full;
-  int flags = access == 0 ? O_RDONLY : access == 1 ? O_WRONLY : access == 2 ? (O_WRONLY | O_APPEND) : O_RDWR;
+  // (0 read, 1 write, 2 append, 3 read and write, 4 read and append)
+  int flags = access == 0 ? O_RDONLY
+            : access == 1 ? O_WRONLY
+            : access == 2 ? (O_WRONLY | O_APPEND)
+            : access == 3 ? O_RDWR
+                          : (O_RDWR | O_APPEND);
   if (create) flags |= O_CREAT;
   if (truncate) flags |= O_TRUNC;
   if (exclusive) flags |= O_CREAT | O_EXCL;

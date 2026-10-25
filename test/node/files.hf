@@ -21,6 +21,7 @@ import co
 import exception
 import green
 import int as Int
+import std.file
 import std.filesystem
 import std.io
 import std.path as Path
@@ -83,15 +84,15 @@ roundTrip : {e : HFunctor}
           -> String
           -> Co e Unit
 roundTrip path = do
-  let mut w = ""
-  with withFile path { access = Write } as h do
-    a <- writeString h "hello, "
-    b <- writeBytes h b["world", 10]
-    w := failed a ^ " " ^ failed b
+  w <- with h := open (access := Write { exists = Truncate }) path do
+    a <- tried (writeString h "hello, ")
+    b <- tried (writeBytes h b["world", 10])
+    pure (failed a ^ " " ^ failed b)
   back <- readFile path
   print ("written: " ^ w)
   print ("read back: " ^ show back)
-  withFile path { access = Append } (\h -> writeString h "again\n")
+  with h := open (access := Write { exists = Append }) path do
+    writeString h "again\n"
   again <- readFile path
   print ("appended: " ^ show again)
 
@@ -103,9 +104,9 @@ byteSum b i acc =
 
 -- (a block written `n` times)
 writeTimes : {e : HFunctor}
-           -> {s : Type}
            -> {{disk : filesystem <: e}}
-           -> With s OpenFile
+           -> {{fx : exception FileError <: e}}
+           -> File
            -> Bytes
            -> Int
            -> Co e Unit
@@ -116,17 +117,16 @@ writeTimes h block n =
 -- (chunks of `n` read to the end: how many bytes, their sum, how many
 -- chunks)
 readAll : {e : HFunctor}
-        -> {s : Type}
         -> {{disk : filesystem <: e}}
-        -> With s OpenFile
+        -> {{fx : exception FileError <: e}}
+        -> File
         -> Int
         -> Int
         -> Int
         -> Int
         -> Co e String
 readAll h n size total chunks = do
-  r <- readChunk h n
-  let b = must r
+  b <- readChunk h n
   if Bytes.length b == 0
     then pure
         (show size
@@ -147,24 +147,23 @@ chunks : {e : HFunctor}
        -> Co e Unit
 chunks path = do
   let block = Bytes.fromString (joinWith "" (List.replicate 100 "0123456789"))
-  with withFile path { access = Write } as h do
+  with h := open (access := Write { exists = Truncate }) path do
     writeTimes h block 3000
     writeString h "tail"
-  s <- withFile path { access = Read } (\h -> readAll h 4096 0 0 0)
+  s <- with h := open path do
+    readAll h 4096 0 0 0
   print ("in chunks of 4096: " ^ s)
-  l <- withFile path { access = Read } (\h -> readAll h 1000000 0 0 0)
+  l <- with h := open path do
+    readAll h 1000000 0 0 0
   print ("in chunks of 1000000: " ^ l)
-  n <-
-    withFile
-      path
-      { access = Read }
-      (\from ->
-         withFile (path ^ ".copy") { access = Write } (\to -> copyOpen from to))
+  n <- with from := open path do
+    with to := open (access := Write { exists = Truncate }) (path ^ ".copy") do
+      copyOpen from to
   a <- readFile path
   b <- readFile (path ^ ".copy")
   print
       ("copied: "
-       ^ show (must n)
+       ^ show n
        ^ " bytes, the same "
        ^ show (a == b))
 
@@ -182,11 +181,8 @@ linesOf : {e : HFunctor}
         -> String
         -> Co e (Either FileError (List String))
 linesOf path = do
-  ls <-
-    withFile
-      path
-      { access = Read }
-      (\h -> foldLines h Nil (\acc l -> pure (l :: acc)))
+  ls <- with h := open path do
+    tried (foldLines h Nil (\acc l -> pure (l :: acc)))
   pure (inOrder ls)
 
 -- (the lines of a file, from its start, read `n` bytes at a time)
@@ -197,11 +193,8 @@ linesBy : {e : HFunctor}
         -> String
         -> Co e (Either FileError (List String))
 linesBy n path = do
-  ls <-
-    withFile
-      path
-      { access = Read }
-      (\h -> foldLinesBy n h Nil (\acc l -> pure (l :: acc)))
+  ls <- with h := open path do
+    tried (foldLinesBy n h Nil (\acc l -> pure (l :: acc)))
   pure (inOrder ls)
 
 -- (whether a file's lines, read a few bytes at a time, are `want`)
@@ -288,10 +281,10 @@ seeking : {e : HFunctor}
 seeking dir = do
   let path = dir ^ "/seek.txt"
   writeFile path "hello, world\nsecond line\n"
-  with withFile path { access = ReadWrite } as h do
-    a <- seek h FromStart 7
-    w <- readChunk h 5
-    t <- tell h
+  with h := open (access := ReadWrite { exists = Update }) path do
+    a <- tried (seek h FromStart 7)
+    w <- tried (readChunk h 5)
+    t <- tried (tell h)
     print
         ("sought to "
          ^ show (must a)
@@ -299,10 +292,10 @@ seeking dir = do
          ^ textOf w
          ^ ", now at "
          ^ show (must t))
-    e <- seek h FromEnd -5
-    l <- readLine h
-    c <- seek h FromCurrent -12
-    m <- readLine h
+    e <- tried (seek h FromEnd -5)
+    l <- tried (readLine h)
+    c <- tried (seek h FromCurrent -12)
+    m <- tried (readLine h)
     print
         ("from the end "
          ^ show (must e)
@@ -352,7 +345,8 @@ status dir = do
        ^ either (\(err : FileError) -> err.name) toString says
        ^ ", not one: "
        ^ failed notLink)
-  hs <- withFile path { access = Read } (\h -> fileStatus h)
+  hs <- with h := open path do
+    tried (stat h)
   print
       ("an open file's: "
        ^ showKindOf hs
@@ -443,11 +437,10 @@ temporary = do
        ^ ", named "
        ^ show (contains "heff-files-" (Path.basename (must a))))
   t <- tried (temporaryFile "heff-file-")
-  r <-
-    withFile (must t) { access = ReadWrite } (\file -> do
+  r <- with file := open (access := ReadWrite { exists = Update }) (must t) do
     w <- writeString file "kept for a while"
     s <- seek file FromStart 5
-    readChunk file 100)
+    tried (readChunk file 100)
   print
       ("a temporary file: "
        ^ textOf r
@@ -471,6 +464,17 @@ cameTo : {a : Type} -> String -> Either FileError a -> String
 cameTo dir (Left err) = namedIn dir err
 cameTo dir (Right _) = "ok"
 
+-- (a file held by a `with` and let go of at once, opened for `access`)
+heldOnce : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
+         -> {access : Access := Read}
+         -> String
+         -> Co e Unit
+heldOnce path = do
+  with h := open (access := access) path do
+    pure ()
+
 -- | What fails: an operation's failure a value, a `with`'s thrown, each
 -- | its errno's name.
 failures : {e : HFunctor}
@@ -480,26 +484,15 @@ failures : {e : HFunctor}
          -> String
          -> Co e Unit
 failures dir = do
-  a <-
-    tried
-      (withFile
-         (dir ^ "/missing/file")
-         { access = Read }
-         (\h -> (pure MkUnit : Co e Unit)))
-  b <- tried (withFile dir { access = Write } (\h -> (pure MkUnit : Co e Unit)))
-  c <- tried (withFile dir { access = Read } (\h -> (pure MkUnit : Co e Unit)))
+  a <- tried (heldOnce (dir ^ "/missing/file"))
+  b <- tried (heldOnce (access := Write { exists = Truncate }) dir)
+  c <- tried (heldOnce dir)
   let secret = dir ^ "/secret"
   writeFile secret "no"
   setMode secret 0
-  d <-
-    tried (withFile secret { access = Read } (\h -> (pure MkUnit : Co e Unit)))
+  d <- tried (heldOnce secret)
   setMode secret 0x1a4
-  x <-
-    tried
-      (withFile
-         secret
-         { access = Write, exclusive = True }
-         (\h -> (pure MkUnit : Co e Unit)))
+  x <- tried (heldOnce (access := Write {}) secret)
   print
       ("failed: "
        ^ failed a
@@ -511,7 +504,8 @@ failures dir = do
        ^ failed d
        ^ " "
        ^ failed x)
-  r <- withFile secret { access = Write } (\h -> readChunk h 10)
+  r <- with h := open (access := Write { exists = Truncate }) secret do
+    tried (readChunk h 10)
   s <- tried (pathStatus (dir ^ "/missing"))
   m <- tried (setMode (dir ^ "/missing") 0x1a4)
   p <- tried (realPath (dir ^ "/missing"))
@@ -567,11 +561,12 @@ named dir = do
 standard : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
          -> Co e Unit
 standard = do
   print "std.io before"
-  w <- withStdout (\o -> writeString o "the standard output, a file\n")
-  again <- withStdout (\o -> writeString o "and again\n")
+  w <- tried (withStdout (\o -> writeString o "the standard output, a file\n"))
+  again <- tried (withStdout (\o -> writeString o "and again\n"))
   print ("std.io after: " ^ failed w ^ " " ^ failed again)
 
 program : {e : HFunctor}
@@ -598,14 +593,14 @@ firstArg : List String -> String
 firstArg (a :: _) = a
 firstArg Nil = "."
 
--- (a function that kept the file: what the body came to may hold it,
--- as a function's type does not name the region)
+-- (a function that kept the file: what the body came to holds it past
+-- the `with`)
 keeper : {e : HFunctor}
-       -> {s : Type}
        -> {{disk : filesystem <: e}}
-       -> With s OpenFile
+       -> {{fx : exception FileError <: e}}
+       -> File
        -> Co e (Unit -> Co e (Either FileError Unit))
-keeper h = pure (\u -> writeString h "never")
+keeper h = pure (\u -> tried (writeString h "never"))
 
 -- | A file used after its `with` closed it, by a function that kept it:
 -- | EBADF, a value.
@@ -616,7 +611,8 @@ afterClose : {e : HFunctor}
            -> String
            -> Co e Unit
 afterClose dir = do
-  kept <- withFile (dir ^ "/closed.txt") { access = Write } keeper
+  kept <- with h := open (access := Write { exists = Truncate }) (dir ^ "/closed.txt") do
+    keeper h
   print "closed"
   let f : Unit -> Co e (Either FileError Unit) = kept
   w <- f MkUnit
@@ -630,9 +626,9 @@ type Counted = { lines : Int, bytes : Int }
 
 -- (a line counted; `ping` answered at once)
 countLine : {e : HFunctor}
-          -> {s : Type}
           -> {{disk : filesystem <: e}}
-          -> With s OpenFile
+          -> {{fx : exception FileError <: e}}
+          -> File
           -> Counted
           -> String
           -> Co e Counted
@@ -647,6 +643,7 @@ countLine out c line =
 stdinLines : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> Co e Unit
 stdinLines = do
   r <-
@@ -655,7 +652,7 @@ stdinLines = do
          withStdout
            (\o ->
               foldLines i ({ lines = 0, bytes = 0 } : Counted) (countLine o)))
-  let c : Counted = must r
+  let c : Counted = r
   print ("lines " ^ show c.lines ^ " bytes " ^ show c.bytes)
 
 -- (a thread counting to n, a yield at each)
@@ -675,6 +672,7 @@ counting ch n i =
 greenLines : {e : HFunctor}
            -> {{gr : green <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> Co e Unit
 greenLines = do
   with withStdout as o do
@@ -683,7 +681,7 @@ greenLines = do
     spawn
         (bind
            (foldStdinLines 0 (\n l -> pure (n + 1)))
-           (\r -> send read (must r)))
+           (\r -> send read r))
     spawn (counting counted 1000 0)
     n <- recv counted
     writeString o ("counted while the reader waits: " ^ show n ^ "\n")
@@ -730,12 +728,14 @@ closed = do
   unheard (io := _) r
 
 linesMain : Co (stdio <+> filesystem <+> Reactor.reactor <+> process) Unit
-linesMain = stdinLines (io := _) (disk := _)
+linesMain = do
+  r <- attempt FileError (stdinLines (io := _) (disk := _) (fx := _))
+  unheard (io := _) r
 
 greenMain : Co (stdio <+> filesystem <+> Reactor.reactor <+> process) Unit
 greenMain = do
   r <-
     Reactor.scheduled
       (rx := _)
-      (greenLines (gr := _) (disk := _))
+      (attempt FileError (greenLines (gr := _) (disk := _) (fx := _)))
   print (ev := _) (maybe "a deadlock" (\u -> "main done") r)

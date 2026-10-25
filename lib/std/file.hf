@@ -1,0 +1,586 @@
+-- Files open, read and written a piece at a time: a file opened by
+-- `open` and closed by `close`, or held by a `with` that closes it when
+-- its body ends (`with f := File.open path do ...`); read a chunk or a
+-- line at a time, written, sought in; what the system says of it
+-- (`stat`); and the standard streams, as open files.  Use it by a name,
+-- `import std.file as File`, as its names are short.
+--
+-- ```haskell
+-- import co
+-- import exception
+-- import std.file as File
+-- import std.filesystem
+-- import std.path
+--
+-- -- | the words of the standard input, read a line at a time
+-- wordsIn : {e : HFunctor}
+--         -> {{disk : filesystem <: e}}
+--         -> {{ex : exception FileError <: e}}
+--         -> Co e Int
+-- wordsIn = File.foldStdinLines 0 (\n line -> pure (n + List.length (words line)))
+--
+-- -- | a file's first line, the file opened and closed again
+-- firstLine : {e : HFunctor}
+--           -> {{disk : filesystem <: e}}
+--           -> {{ex : exception FileError <: e}}
+--           -> Path
+--           -> Co e (Maybe String)
+-- firstLine path = do
+--   f <- File.open path
+--   line <- File.readLine f
+--   File.close f
+--   pure line
+--
+-- -- | a file's lines, the file closed when the `with` ends
+-- linesOf : {e : HFunctor}
+--         -> {{disk : filesystem <: e}}
+--         -> {{ex : exception FileError <: e}}
+--         -> Path
+--         -> Co e (List String)
+-- linesOf path = do
+--   with f := File.open path do
+--     File.foldLines f Nil (\ls l -> pure (l :: ls))
+--
+-- -- | a line added to the end of a file
+-- logged : {e : HFunctor}
+--        -> {{disk : filesystem <: e}}
+--        -> {{ex : exception FileError <: e}}
+--        -> Path
+--        -> String
+--        -> Co e Unit
+-- logged path line = do
+--   with f := File.open (access := Write { exists = Append }) path do
+--     File.writeString f (line ^ "\n")
+-- ```
+--
+-- An open file is the host's own thing, a `File` (std.filesystem's, as
+-- its effect's operations take it).  `open` opens one, and `close`
+-- closes it.  A file is closed once: an operation on it after is
+-- `EBADF`, never one on a file opened since, and a second `close` does
+-- nothing.  A file not closed is closed where the program drops its
+-- last reference to it: at once, in C, as it is counted.
+--
+-- `with f := File.open path do ...` is `open` and `close` around its
+-- body.  The standard streams are had the same way (`withStdin`,
+-- `withStdout`, `withStderr`), by the shared `held`, as they are always
+-- there, and left open when their body ends, so that a program reads
+-- its input a line at a time (`foldLines`), in as little memory as a
+-- chunk and a line take.
+--
+-- A file is opened, read and written by std.filesystem's effect,
+-- `filesystem`.  An operation that fails -- a file that does not open,
+-- a write the disk did not take, a read of a closed file -- throws why,
+-- a `FileError`, over the `exception` effect, as std.filesystem's
+-- operations on a path do.
+--
+-- A regular file is read and written there and then: the system has it
+-- ready at once, as far as poll can tell, so even where green threads are
+-- scheduled by std.reactor, a read of a file waits for the disk, the other
+-- threads with it.  A pipe, a terminal or a socket -- the standard
+-- streams, most often -- waits in std.reactor's reactor, as std.net's
+-- sockets do: the other threads go on while it waits.
+
+module std.file
+  ( Access(..)
+  , Exists(..)
+  , WriteOpts
+  , From(..)
+  , open
+  , close
+  , withStdin
+  , withStdout
+  , withStderr
+  , readChunk
+  , readLine
+  , writeBytes
+  , writeString
+  , seek
+  , tell
+  , stat
+  , foldLines
+  , foldLinesBy
+  , foldStdinLines
+  , copyOpen
+  , instanceBinderOpen
+  , instanceHolderOpen
+  )
+
+import bytes as Bytes
+import co
+import exception
+import resource
+import std.filesystem
+import std.path
+
+-- | What opening a file to write does, as Racket's `#:exists` says,
+-- | with a file there, and where there is none:
+-- |
+-- | - `Error`: one there is `EEXIST`; else it is made.
+-- | - `Truncate`: one there is emptied; else it is made.
+-- | - `MustTruncate`: one there is emptied; else `ENOENT`.
+-- | - `Replace`: one there is removed, and a new one made in its place
+-- |   (not a directory: there, `EEXIST`); else it is made.
+-- | - `TruncateOrReplace`: one there is emptied, or, where it cannot be
+-- |   (its permissions), replaced; else it is made.
+-- | - `Update`: one there is kept as it is; else `ENOENT`.
+-- | - `CanUpdate`: one there is kept as it is; else it is made.
+-- | - `Append`: one there is kept, each write at its end; else it is
+-- |   made.
+data Exists
+  = Error
+  | Truncate
+  | MustTruncate
+  | Replace
+  | TruncateOrReplace
+  | Update
+  | CanUpdate
+  | Append
+
+-- | How a file is opened to write: what is done with one there
+-- | (`exists`, unless said `Error`: it must be new), and the
+-- | permissions of one it makes (`0o666`, `rw-rw-rw-`, unless said,
+-- | less the umask).
+type WriteOpts = { exists : Exists = Error, permissions : Int = 0o666 }
+
+-- | What a file is opened for: reading (it must be there, and is had as
+-- | it is), writing, or both, as the `WriteOpts` says (`Write {}`, a new
+-- | file; `Write { exists = Truncate }`, emptied, as C's `fopen` does).
+data Access = Read | Write WriteOpts | ReadWrite WriteOpts
+
+-- | Where a seek counts from.
+data From = FromStart | FromCurrent | FromEnd
+
+-- (an access as the provider has it, to write and to read too or not,
+-- each write at the file's end or not)
+accessCode : Bool -> Bool -> Int
+accessCode False False = 1
+accessCode False True = 2
+accessCode True False = 3
+accessCode True True = 4
+
+-- (whether a file opened so is made where there is none)
+creates : Exists -> Bool
+creates MustTruncate = False
+creates Update = False
+creates _ = True
+
+-- (whether a file opened so is emptied first)
+truncates : Exists -> Bool
+truncates Truncate = True
+truncates MustTruncate = True
+truncates _ = False
+
+-- (whether a file opened so must be new)
+new : Exists -> Bool
+new Error = True
+new _ = False
+
+-- (whether each write to a file opened so is at its end)
+appends : Exists -> Bool
+appends Append = True
+appends _ = False
+
+-- (the provider's open of `path`: for what, whether the file is made
+-- where there is none, emptied first, new, and its permissions)
+openedAs : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> Path
+         -> Int
+         -> Bool
+         -> Bool
+         -> Bool
+         -> Int
+         -> Co e (Either FileError File)
+openedAs path code create truncate exclusive permissions =
+  op
+    (ev
+       (OpenPath
+          (render path)
+          code
+          create
+          truncate
+          exclusive
+          permissions
+          (\r -> r)))
+    val
+
+-- (`path` opened for `access`, or why it did not open)
+opened : {e : HFunctor}
+       -> {{ev : filesystem <: e}}
+       -> Access
+       -> Path
+       -> Co e (Either FileError File)
+opened access path = case access of
+  Read -> openedAs path 0 False False False 0
+  Write w -> written False w
+  ReadWrite w -> written True w
+  where
+  -- (the file opened to write, and to read too or not, as `w` says)
+  written : Bool -> WriteOpts -> Co e (Either FileError File)
+  written reads w = case w.exists of
+    Replace -> replaced
+    TruncateOrReplace -> bind (openedSo Truncate) orReplaced
+    so -> openedSo so
+    where
+    -- (the file opened as `so` says)
+    openedSo : Exists -> Co e (Either FileError File)
+    openedSo so =
+      openedAs
+        path
+        (accessCode reads (appends so))
+        (creates so)
+        (truncates so)
+        (new so)
+        w.permissions
+
+    -- (a new file made where what was there is removed; or why it was
+    -- not)
+    madeAfter : Either FileError Unit -> Co e (Either FileError File)
+    madeAfter (Right u) = openedSo Error
+    madeAfter (Left err) = pure (Left err)
+
+    -- (what is there removed, as its status says, but a directory, and
+    -- a new file made)
+    removedFor : Either FileError Status -> Co e (Either FileError File)
+    removedFor (Right st) = case st.kind of
+      Directory -> openedSo Error
+      _ -> bind (op (ev (Remove (render path) (\r -> r))) val) madeAfter
+    removedFor (Left err) = openedSo Error
+
+    -- (the file there removed, but a directory, and a new one made)
+    replaced : Co e (Either FileError File)
+    replaced =
+      bind (op (ev (PathStatus (render path) False (\r -> r))) val) removedFor
+
+    -- (a file not emptied, replaced)
+    orReplaced : Either FileError File -> Co e (Either FileError File)
+    orReplaced (Right f) = pure (Right f)
+    orReplaced (Left err) = replaced
+
+-- (what an operation answered, or what it failed with thrown)
+answered : {e : HFunctor}
+         -> {a : Type}
+         -> {{ex : exception FileError <: e}}
+         -> Either FileError a
+         -> Co e a
+answered (Left err) = throw err
+answered (Right x) = pure x
+
+-- | `path` opened for `access`, reading unless said (`open (access :=
+-- | Write {}) p`): the file, the host's own; where it does not open, why
+-- | is thrown.
+open : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> {access : Access := Read}
+     -> Path
+     -> Co e File
+open path = bind (opened access path) answered
+
+-- | The file closed; where it does not close -- a write the disk did not
+-- | take -- why is thrown.  A standard stream is left open.
+close : {e : HFunctor}
+      -> {{ev : filesystem <: e}}
+      -> {{ex : exception FileError <: e}}
+      -> File
+      -> Co e Unit
+close f = bind (op (ev (CloseFile f (\r -> r))) val) answered
+
+-- (a standard stream, as an open file: the same one each time, what it
+-- read ahead kept)
+standard : {e : HFunctor} -> {{ev : filesystem <: e}} -> Int -> Co e File
+standard i = op (ev (Standard i (\h -> h))) val
+
+-- (a standard stream is left open as its `with` ends)
+leftOpen : {e : HFunctor} -> File -> Co e Unit
+leftOpen f = pure MkUnit
+
+-- | The standard input, as an open file held by `body`: read it so, a
+-- | line at a time, or by std.io's `readStdin`, not both (what one has
+-- | read ahead the other does not see).  The stream is left open when
+-- | `body` ends, what was read ahead kept for the next `withStdin`.
+withStdin : {e : HFunctor}
+          -> {a : Type}
+          -> {{ev : filesystem <: e}}
+          -> (File -> Co e a)
+          -> Co e a
+withStdin body = held (standard 0) leftOpen (\f -> body (inside f))
+
+-- | The standard output, as an open file held by `body` (what std.io
+-- | wrote before is written out first), left open when `body` ends.
+withStdout : {e : HFunctor}
+           -> {a : Type}
+           -> {{ev : filesystem <: e}}
+           -> (File -> Co e a)
+           -> Co e a
+withStdout body = held (standard 1) leftOpen (\f -> body (inside f))
+
+-- | The standard error, as an open file held by `body`, left open when
+-- | `body` ends.
+withStderr : {e : HFunctor}
+           -> {a : Type}
+           -> {{ev : filesystem <: e}}
+           -> (File -> Co e a)
+           -> Co e a
+withStderr body = held (standard 2) leftOpen (\f -> body (inside f))
+
+-- | Up to `n` bytes of the file, from where it is: as many as there are,
+-- | waiting for one at least (from a pipe or a terminal, as many as have
+-- | come); none at its end.  At most 16 mebibytes at a time.  After the
+-- | file is closed, `EBADF` is thrown, as by each operation below.
+readChunk : {e : HFunctor}
+          -> {{ev : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> File
+          -> Int
+          -> Co e Bytes
+readChunk f n = bind (op (ev (ReadChunk f n (\r -> r))) val) answered
+
+-- | The next line of the file, without its `\n` (or `\r\n`); the last
+-- | one too where no `\n` ends it; `Nothing` at its end.  Its bytes as
+-- | they are, UTF-8 or not.
+readLine : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
+         -> File
+         -> Co e (Maybe String)
+readLine f = bind (op (ev (ReadLine f (\r -> r))) val) answered
+
+-- | All the bytes written, where the file is (at its end, appending),
+-- | waiting until the system has taken them.
+writeBytes : {e : HFunctor}
+           -> {{ev : filesystem <: e}}
+           -> {{ex : exception FileError <: e}}
+           -> File
+           -> Bytes
+           -> Co e Unit
+writeBytes f b = bind (op (ev (WriteBytes f b (\r -> r))) val) answered
+
+-- | A string's bytes written, as they are.
+writeString : {e : HFunctor}
+            -> {{ev : filesystem <: e}}
+            -> {{ex : exception FileError <: e}}
+            -> File
+            -> String
+            -> Co e Unit
+writeString f str = bind (op (ev (WriteString f str (\r -> r))) val) answered
+
+-- (where a seek counts from, as the provider has it)
+fromCode : From -> Int
+fromCode FromStart = 0
+fromCode FromCurrent = 1
+fromCode FromEnd = 2
+
+-- | Where the file is read and written next, moved by `n` bytes from its
+-- | start, from where it is, or from its end: where it is now, from its
+-- | start.  (A pipe or a terminal cannot be sought in: `ESPIPE`.)
+seek : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> File
+     -> From
+     -> Int
+     -> Co e Int
+seek f from n = bind (op (ev (Seek f (fromCode from) n (\r -> r))) val) answered
+
+-- | Where the file is read and written next, from its start.
+tell : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> File
+     -> Co e Int
+tell f = seek f FromCurrent 0
+
+-- | What the system says of the file.
+stat : {e : HFunctor}
+     -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
+     -> File
+     -> Co e Status
+stat f = bind (op (ev (FileStatus f (\r -> r))) val) answered
+
+-- Streams
+--------------------------------------------------------------------------------
+
+-- (how much a copy, or a fold of lines, reads at a time)
+chunkSize : Int
+chunkSize = 65536
+
+-- (where the line of `s` from `i` to its newline at `j` ends: before
+-- the `\r` before the newline, where there is one)
+lineEnd : String -> Int -> Int -> Int
+lineEnd s i j = if j > i && byteAt s (j - 1) == 13 then j - 1 else j
+
+-- (`rest`, the start of a line, gone on with by `s`)
+goneOn : String -> String -> String
+goneOn "" s = s
+goneOn rest s = rest ^ s
+
+-- (the lines of `s`, its last `n` bytes a chunk just read, each given to
+-- `step`: what is before them has no newline, so is not looked through
+-- again; `rest` is not had past `goneOn`, so that it grows in place)
+gathered : {e : HFunctor}
+         -> {a : Type}
+         -> (String -> a -> Co e a)
+         -> (a -> String -> Co e a)
+         -> String
+         -> Int
+         -> a
+         -> Co e a
+gathered again step s n acc = linesFrom 0 (strLength s - n) acc
+  where
+  -- (the lines of `s` from `i`, each given to `step`, the next newline
+  -- looked for from `k`; then `again` with what is left after the last
+  -- newline, the start of a line the next chunk goes on with)
+  linesFrom : Int -> Int -> a -> Co e a
+  linesFrom i k acc =
+    let j = strFind "\n" s k
+    in if j < 0 then again (leftFrom i) acc
+    else bind
+        (step acc (strSlice s i (lineEnd s i j)))
+        (\next -> linesFrom (j + 1) (j + 1) next)
+    where
+    -- (what is left of `s` from `i`: `s` itself from its start, so that
+    -- what a long line has gathered grows in place)
+    leftFrom : Int -> String
+    leftFrom 0 = s
+    leftFrom i = strSlice s i (strLength s)
+
+-- (the last line, where no newline ends it, given to `step`)
+lastLine : {e : HFunctor}
+         -> {a : Type}
+         -> (a -> String -> Co e a)
+         -> String
+         -> a
+         -> Co e a
+lastLine step "" acc = pure acc
+lastLine step rest acc = step acc rest
+
+-- (a chunk read: its lines given to `step`, the first going on from
+-- `rest`, then `again`; at the file's end, the last line)
+chunkRead : {e : HFunctor}
+          -> {a : Type}
+          -> (String -> a -> Co e a)
+          -> (a -> String -> Co e a)
+          -> String
+          -> a
+          -> Bytes
+          -> Co e a
+chunkRead again step rest acc b =
+  if bytesLength b == 0 then lastLine step rest acc
+  else gathered again step (goneOn rest (Bytes.asString b)) (bytesLength b) acc
+
+-- (the lines of the file after `rest`, read `n` bytes at a time)
+linesAfter : {e : HFunctor}
+           -> {{ev : filesystem <: e}}
+           -> {{ex : exception FileError <: e}}
+           -> {a : Type}
+           -> Int
+           -> File
+           -> (a -> String -> Co e a)
+           -> String
+           -> a
+           -> Co e a
+linesAfter n f step rest acc =
+  bind
+    (readChunk f n)
+    (chunkRead (\left next -> linesAfter n f step left next) step rest acc)
+
+-- | `foldLines`, the file read `n` bytes at a time (as `readChunk`
+-- | reads them): however few, each line is given whole.
+foldLinesBy : {e : HFunctor}
+            -> {{ev : filesystem <: e}}
+            -> {{ex : exception FileError <: e}}
+            -> {a : Type}
+            -> Int
+            -> File
+            -> a
+            -> (a -> String -> Co e a)
+            -> Co e a
+foldLinesBy n f acc step = linesAfter n f step "" acc
+
+-- | Each line of the file, from where it is to its end, given to
+-- | `step` with what the lines before it came to: what they all come
+-- | to.  A line is as `readLine` gives it: without its `\n` (or
+-- | `\r\n`), the last one too where no `\n` ends it.  The file is read
+-- | 64 kibibytes at a time (from a pipe or a terminal, as much as has
+-- | come), so that a chunk and a line are held, however long the file;
+-- | should the fold be left before its end, what it read past the line
+-- | it was at is not read again.
+foldLines : {e : HFunctor}
+          -> {{ev : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> {a : Type}
+          -> File
+          -> a
+          -> (a -> String -> Co e a)
+          -> Co e a
+foldLines f acc step = foldLinesBy chunkSize f acc step
+
+-- | Each line of the standard input given to `step`, as `foldLines`
+-- | gives them: what they all come to.
+foldStdinLines : {e : HFunctor}
+               -> {{ev : filesystem <: e}}
+               -> {{ex : exception FileError <: e}}
+               -> {a : Type}
+               -> a
+               -> (a -> String -> Co e a)
+               -> Co e a
+foldStdinLines acc step = withStdin (\i -> foldLines i acc step)
+
+-- (a chunk read written, then `again` with how many bytes were; at the
+-- end, how many were in all)
+copyNext : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
+         -> (Int -> Co e Int)
+         -> File
+         -> Int
+         -> Bytes
+         -> Co e Int
+copyNext again to n b =
+  if bytesLength b == 0 then pure n
+  else bind (writeBytes to b) (\u -> again (n + bytesLength b))
+
+-- | What is left of one open file written to another, a chunk at a time:
+-- | how many bytes.
+copyOpen : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
+         -> File
+         -> File
+         -> Co e Int
+copyOpen from to = copyFrom 0
+  where
+  -- (what is left of `from` written to `to`, after `n` bytes)
+  copyFrom : Int -> Co e Int
+  copyFrom n =
+    bind (readChunk from chunkSize) (copyNext (\m -> copyFrom m) to n)
+
+-- A `with` of bindings
+--------------------------------------------------------------------------------
+
+-- | A `with` of a file `open` opens, `with f := File.open path do ...`:
+-- | its name the file open, and the `with` comes to what its body came
+-- | to.
+instance instanceBinderOpen : {e : HFunctor} -> Binder (Co e File)
+instanceBinderOpen = { Contents = \s -> File, Result = \r -> r }
+
+-- | A file `open` opens, held by a `with`: opened, the body run with it,
+-- | and closed when the body ends.  A file that does not open is thrown
+-- | (a `FileError`), the body not run; one that does not close -- a
+-- | write the disk did not take -- is thrown once the body has ended.
+-- | Should the body be left otherwise -- a throw heard outside it, a
+-- | handler between that drops the continuation -- the file is closed
+-- | where the program drops its last reference to it.
+instance instanceHolderOpen : {e : HFunctor}
+                            -> {{ev : filesystem <: e}}
+                            -> {{ex : exception FileError <: e}}
+                            -> Holder e (Co e File) (\s -> File) (\r -> r)
+instanceHolderOpen =
+  { held = \opening written body ->
+        held
+          opening
+          close
+          (\f -> bind (body (s := Unit) (inside f)) (\p -> pure (fst p)))
+  }

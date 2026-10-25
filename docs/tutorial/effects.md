@@ -133,7 +133,7 @@ what it printed written now. The standard error keeps nothing.
 `readFile` gives a file's text; [`readBytes`](../api/std/filesystem.md#readBytes)
 gives its `Bytes`, as they are. A string is written as its bytes are, so
 `write (Bytes.asString b)` writes the bytes `b` to the output unchanged,
-and so does std.filesystem's `withStdout` with `writeBytes`.
+and so does std.file's `withStdout` with `writeBytes`.
 `Bytes.toString` is for text: it reads the bytes as UTF-8, and what is
 not UTF-8 becomes U+FFFD, which is not what a PNG wants.
 

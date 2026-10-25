@@ -155,7 +155,7 @@ static V heff_provider_threads(V p, V k) {
 
 A thing of the host the program holds, such as an open file, a socket
 or a page's element, has a host type: a `data` with no tags,
-`data OpenFile`. No program can make one or take one apart; only
+`data File`. No program can make one or take one apart; only
 providers can.
 
 - In C, `heff_foreign(p, let_go)` wraps a pointer, and
@@ -168,15 +168,21 @@ providers can.
 
 ## Scoped operations
 
-A thing that must be let go of, such as an open file, is handed out by a
-`with` of the effect's own, such as `std.filesystem`'s `withFile`:
+A thing that must be let go of, such as an open file, is acquired and
+let go of by operations of the effect's own, such as `std.file`'s `open`
+and `close`, and held by a `with` that does both around its body, such
+as `with f := File.open path do`. See [a thing held by a
+`with`](../api/resource.md).
 
-- The body gets the thing as a `With s a`, with a region `s` that keeps
-  it from escaping. See [a thing held by a `with`](../api/resource.md).
-- The effect's operations on it take the `With s a`, and give the thing
-  to the provider by `inside`.
-- The module exports its `with` and those operations, never the bare
-  acquire.
+- The provider lets go of the thing once: an operation on it after is
+  an error of the effect's (a file's, `EBADF`), never one on a thing
+  acquired since, and letting go of it again does nothing.
+- A thing the program drops without letting go of it is let go of by
+  its finalizer.
+- A module whose things must not outlive a body exports its `with`
+  alone: the body gets a `With s a`, whose region `s` keeps it from
+  escaping, and its operations take the `With s a`, giving the thing to
+  the provider by `inside`.
 
 The provider makes sure the thing is let go of:
 
