@@ -18,8 +18,10 @@
 -- commands' names (`/` first to type a `j`, `k` or `q`); Enter or Tab
 -- opens the command; Esc clears the filter, or ends, as `q` does.  On a
 -- form, Tab and down to the next field, Shift-Tab and up to the one
--- before; a field of words is typed in as a shell's line is, a choice
--- turned by left and right (or space); Enter ends, with the command
+-- before; a field of words is typed in as a shell's line is -- in a
+-- field of paths, the names its last word completes to shown under it,
+-- and Tab completing it as far as they all go (`listed` lists them) --
+-- a choice turned by left and right (or space); Enter ends, with the command
 -- line, once nothing is wrong with it; Esc goes back to the list (and
 -- `q`, on a choice), or, on a form alone, ends.
 
@@ -36,6 +38,8 @@ module std.cli.interactive
   , lacking
   , quoted
   , commandLine
+  , Listing
+  , pathsFor
   , Model
   , start
   , matching
@@ -45,9 +49,14 @@ module std.cli.interactive
   , view
   , app
   , prompt
+  , listed
   )
+import co
+import exception
 import rune as Rune
 import std.cli as CLI
+import std.filesystem
+import std.path as Path
 import std.terminal.widget as Widget
 
 -- The commands
@@ -328,14 +337,101 @@ quoted w =
 commandLine : String -> String -> List String -> String
 commandLine prog name ws = unwords (prog :: name :: List.map quoted ws)
 
+-- Paths completed
+--------------------------------------------------------------------------------
+
+-- | A directory, as a path typed in a field is completed in it: the
+-- | directory as typed (`""`, the working one), and each name in it, a
+-- | directory's with a `/` after it.
+type Listing = { dir : String, names : List String }
+
+-- (where the last `/` of the word is, from `i` down; -1 where there is
+-- none)
+slashFrom : String -> Int -> Int
+slashFrom w i =
+  if i < 0 then i else if byteAt w i == 47 then i else slashFrom w (i - 1)
+
+-- (the word's directory, as typed: up to its last `/`)
+dirOf : String -> String
+dirOf w = strSlice w 0 (slashFrom w (strLength w - 1) + 1)
+
+-- (the last word of a field's text: the one completed)
+lastWord : String -> String
+lastWord t = fromMaybe "" (List.last (split " " t))
+
+-- (what a field's words complete to)
+partComplete : Part -> CLI.Complete
+partComplete (Positional p) = p.complete
+partComplete (Flagged f) = f.complete
+
+-- (a field's words are paths: files, or directories)
+completesPaths : CLI.Complete -> Bool
+completesPaths (Files _) = True
+completesPaths Dirs = True
+completesPaths c = False
+
+-- (a name a path of the kind may be: a directory, or a file with the
+-- suffix)
+nameTaken : CLI.Complete -> String -> Bool
+nameTaken (Files sfx) n = endsWith "/" n || endsWith sfx n
+nameTaken Dirs n = endsWith "/" n
+nameTaken c n = False
+
+-- | What a path being typed completes to, of the kind: the names listed
+-- | in its directory that start as the rest of it does and that the kind
+-- | takes -- one that starts with `.` only where the rest does.
+-- | >>> pathsFor (Files ".hf") { dir = "src/", names = ["a.hf", "ab/", "b.hf", "c.txt", ".x/"] } "src/a"
+-- | ["src/a.hf", "src/ab/"]
+-- | >>> pathsFor Dirs { dir = "", names = ["a.hf", "ab/", ".x/"] } ""
+-- | ["ab/"]
+-- | >>> pathsFor Dirs { dir = "", names = ["ab/", ".x/"] } "."
+-- | [".x/"]
+-- | >>> pathsFor (Files ".hf") { dir = "", names = ["a.hf"] } "src/"
+-- | []
+pathsFor : CLI.Complete -> Listing -> String -> List String
+pathsFor c l w =
+  if strEq l.dir (dirOf w)
+  then List.map (\n -> dirOf w ^ n) (List.keepIf taken l.names)
+  else Nil
+  where
+  rest : String
+  rest = strSlice w (strLength (dirOf w)) (strLength w)
+  taken : String -> Bool
+  taken n =
+    nameTaken c n
+    && startsWith (prefix := rest) n
+    && (startsWith (prefix := ".") rest || not (startsWith (prefix := ".") n))
+
+-- (back to where a rune starts)
+runeStart : String -> Int -> Int
+runeStart a i =
+  if i > 0 && i < strLength a && byteAt a i >= 128 && byteAt a i < 192
+  then runeStart a (i - 1)
+  else i
+
+-- (how far two strings are the same, from `i`: not into a rune's
+-- continuation bytes)
+sameUpTo : String -> String -> Int -> Int
+sameUpTo a b i =
+  if i < strLength a && i < strLength b && byteAt a i == byteAt b i
+  then sameUpTo a b (i + 1)
+  else runeStart a i
+
+-- (what the words all start with)
+commonStart : List String -> String
+commonStart Nil = ""
+commonStart (x :: xs) =
+  List.foldl (\(a : String) (b : String) -> strSlice a 0 (sameUpTo a b 0)) x xs
+
 -- The app
 --------------------------------------------------------------------------------
 
 -- | Where the app is: the program's name, its commands, the filter
 -- | typed and whether it is being typed (`j`, `k` and `q` are then
 -- | letters of it), which of the commands it lets through is picked,
--- | the form open, if one is, and whether the form is all there is (no
--- | list to go back to: `prompt`).
+-- | the form open, if one is, whether the form is all there is (no
+-- | list to go back to: `prompt`), and the directory listed for the
+-- | path being typed in it, if one is (`listed`).
 type Model =
   { prog : String
   , entries : List Entry
@@ -344,6 +440,7 @@ type Model =
   , menu : Widget.Menu
   , form : Maybe Form
   , alone : Bool
+  , listing : Maybe Listing
   }
 
 -- | The list of the commands, nothing typed.
@@ -356,6 +453,7 @@ start prog es =
   , menu = Widget.menu
   , form = Nothing
   , alone = False
+  , listing = Nothing
   }
 
 -- | The commands the filter lets through: those whose names have it.
@@ -496,11 +594,50 @@ slotStep (Control c) m fm =
 slotStep k m fm =
   withForm m { fm | slots = updateAt fm.at (slotKey k) fm.slots }
 
+-- (the paths the field being filled in completes to, as listed)
+offered : Maybe Listing -> Form -> List String
+offered (Just l) fm = case focused fm of
+  Just { part = p, input = Typed t } ->
+    if completesPaths (partComplete p)
+    then pathsFor (partComplete p) l (lastWord (Widget.fieldText t))
+    else Nil
+  s -> Nil
+offered Nothing fm = Nil
+
+-- (the text, its last word completed as far as the paths it completes
+-- to all go, if they go further)
+completedText : String -> List String -> Maybe String
+completedText t ps =
+  if strLength (commonStart ps) > strLength (lastWord t)
+  then Just
+      (strSlice t 0 (strLength t - strLength (lastWord t)) ^ commonStart ps)
+  else Nothing
+
+-- (the field being filled in, its path completed, if it goes further)
+completedForm : Maybe Listing -> Form -> Maybe Form
+completedForm l fm = case focused fm of
+  Just { input = Typed t } -> case completedText
+      (Widget.fieldText t)
+      (offered l fm) of
+    Just text ->
+      Just
+        { fm
+        | slots =
+            updateAt
+              fm.at
+              (\(s : Slot) -> { s | input = Typed (Widget.field text) })
+              fm.slots
+        }
+    Nothing -> Nothing
+  s -> Nothing
+
 -- (a key on a form)
 formStep : Widget.Key -> Model -> Form -> Widget.Step Model Result
 formStep Escape m fm = leftForm m
 formStep Enter m fm = entered m fm (formProblem fm)
-formStep Tab m fm = withForm m (nextSlot 1 fm)
+formStep Tab m fm = case completedForm m.listing fm of
+  Just done -> withForm m done
+  Nothing -> withForm m (nextSlot 1 fm)
 formStep ArrowDown m fm = withForm m (nextSlot 1 fm)
 formStep BackTab m fm = withForm m (nextSlot (0 - 1) fm)
 formStep ArrowUp m fm = withForm m (nextSlot (0 - 1) fm)
@@ -644,6 +781,27 @@ helpRows w (Just s) =
   List.map (\l -> [Widget.dim l]) (Widget.wrap w (partSaid s.part))
 helpRows w Nothing = Nil
 
+-- (the paths the field completes to, by their names, side by side on
+-- lines of the width -- at most three -- and how many there are)
+offeredRows : Int -> List String -> List Widget.Row
+offeredRows w Nil = Nil
+offeredRows w ps =
+  List.map
+    (\l -> [Widget.plain l])
+    (List.take
+       3
+       (Widget.wrap
+          w
+          (joinWith "  " (List.map nameOf ps)
+           ^ "  (Tab: "
+           ^ debug (List.length ps)
+           ^ (if List.length ps == 1 then " path)" else " paths)"))))
+  where
+  nameOf : String -> String
+  nameOf q =
+    if endsWith "/" q then nameOf (strSlice q 0 (strLength q - 1)) ^ "/"
+    else strSlice q (strLength (dirOf q)) (strLength q)
+
 -- (what Esc does on a form: goes back, or leaves where the form is all
 -- there is)
 escSaid : Bool -> String
@@ -689,12 +847,14 @@ formView size m fm =
                  (Nil
                   :: List.append
                     (helpRows size.columns (focused fm))
-                    [ Nil
-                    , [ Widget.plain "$ "
-                      , Widget.bold
-                        (commandLine m.prog fm.entry.name (formWords fm))
-                      ]
-                    ]))))
+                    (List.append
+                       (offeredRows size.columns (offered m.listing fm))
+                       [ Nil
+                       , [ Widget.plain "$ "
+                         , Widget.bold
+                           (commandLine m.prog fm.entry.name (formWords fm))
+                         ]
+                       ])))))
         [Widget.status size.columns (formStatus m.alone (formProblem fm))]
   , cursor =
       formCursor
@@ -725,3 +885,57 @@ prompt prog es fm =
   , step = step
   , view = view
   }
+
+-- (the directory the path being typed in the form's field is in, where
+-- the field is one of paths)
+wantedDir : Model -> Maybe String
+wantedDir { form = Just fm } = case focused fm of
+  Just { part = p, input = Typed t } ->
+    if completesPaths (partComplete p)
+    then Just (dirOf (lastWord (Widget.fieldText t)))
+    else Nothing
+  s -> Nothing
+wantedDir m = Nothing
+
+-- (a directory's names, a directory's with a `/` after it; none where
+-- it cannot be read)
+namesIn : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> Co e (List String)
+namesIn d = do
+  read <-
+    attempt
+      FileError
+      (readDirectory
+         (ev := _)
+         (ex := _)
+         (Path.parse (if strEq d "" then "." else d)))
+  case read of
+    Left err -> pure Nil
+    Right ps -> named ps
+  where
+  named : List Path.Path -> Co e (List String)
+  named Nil = pure Nil
+  named (q :: qs) = do
+    dir <- isDirectory q
+    rest <- named qs
+    pure ((Path.basename q ^ (if dir then "/" else "")) :: rest)
+
+-- (it is listed already)
+listedAs : String -> Maybe Listing -> Bool
+listedAs d (Just l) = strEq l.dir d
+listedAs d Nothing = False
+
+-- | The app's state with the directory listed that the path being typed
+-- | in the form's field is in (what Tab completes it to, and what is
+-- | shown under it), where it is not yet: for `Terminal.interactWith`
+-- | to give each state the app comes to.
+listed : {e : HFunctor} -> {{disk : filesystem <: e}} -> Model -> Co e Model
+listed m = case wantedDir m of
+  Just d ->
+    if listedAs d m.listing then pure m
+    else do
+      names <- namesIn d
+      pure { m | listing = Just { dir = d, names = names } }
+  Nothing -> pure m
