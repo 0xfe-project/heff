@@ -306,21 +306,32 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint64_t d[]; } Big;
 // (a word's integers: from -INT_LIM up to, not with, INT_LIM)
 #define INT_LIM ((int64_t)1 << 62)
 #define IS_OBJ(v) (((v) & 3) == 0)
+// (an object's marks, the high bits of its count: the highest,
+// `IMMORTAL`, set where the object is not this thread's alone -- alone,
+// it is immortal, counted by none -- so that a count's fast path tests
+// one bit, `heff_mine`)
 #define IMMORTAL 0x80000000u
+#define heff_mine(rc) (!((rc) & IMMORTAL))
 
 // (an object shared between threads (#66, `heff_share`): counted by
-// them all, atomically, and freed by the one that lets it go last.
-// What a shared object holds is shared or immortal; a thread's own
-// object may hold a shared one, not the other way.  Without
-// `HEFF_THREADS`, no object is: `SHARED` is 0, and a count is read and
-// changed as it always was.  Threads: a count is read atomically too,
-// relaxed -- a plain load, to the processor -- since another thread may
-// change a shared one meanwhile)
+// them all, atomically, and freed by the one that lets it go last --
+// marked `SHARED`, both high bits, the one below the highest telling it
+// from an immortal one.  What a shared object holds is shared or
+// immortal; a thread's own object may hold a shared one, not the other
+// way.  Without `HEFF_THREADS`, no object is: `SHARED` is 0, and a
+// count is read and changed as it always was.  Threads: a count is read
+// atomically too, relaxed -- a plain load, to the processor -- since
+// another thread may change a shared one meanwhile)
 #ifdef HEFF_THREADS
-#define SHARED 0x40000000u
+#define HEFF_SHARED_BIT 0x40000000u
+#define SHARED (IMMORTAL | HEFF_SHARED_BIT)
+#define heff_shared(rc) ((rc) & HEFF_SHARED_BIT)
+#define heff_immortal(rc) (((rc) & SHARED) == IMMORTAL)
 #define heff_rc(o) __atomic_load_n(&(o)->rc, __ATOMIC_RELAXED)
 #else
 #define SHARED 0u
+#define heff_shared(rc) 0
+#define heff_immortal(rc) ((rc) & IMMORTAL)
 #define heff_rc(o) ((o)->rc)
 #endif
 // (an object's count but its marks)
@@ -329,27 +340,31 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint64_t d[]; } Big;
 HEFF_FN void heff_free(V v);
 
 #ifdef HEFF_THREADS
-// (a shared object counted, out of line: the fast paths below test both
-// marks at once, where one thread tests `IMMORTAL` alone)
-HEFF_FN __attribute__((noinline)) void heff_dup_shared(Obj *o) {
-  if (!(heff_rc(o) & IMMORTAL)) __atomic_fetch_add(&o->rc, 1, __ATOMIC_RELAXED);
-}
-
-// (... counted down: whether that was its last reference, which this
-// thread then frees -- acquiring what every other thread did with it
-// before it let it go.  One made immortal meanwhile (`heff_freeze`, of
-// a static thunk's value) is never its last: what made it so holds it)
+// (the fast paths below test the highest mark, as one thread does, and
+// leave an immortal object as it is where they are; a shared one is
+// counted where it is tested, up -- an instruction, where the processor
+// has one, as arm64's and x86's have, where a call, even one never
+// made, costs the function it is in a frame and a way out through it --
+// and down, out of line, the test of its last reference a constant the
+// compiler would keep in a register of its own all through the
+// function.  As those of one thread, they are copied into each place
+// they are used)
+//
+// (a shared object counted down: whether that was its last reference,
+// which this thread then frees -- acquiring what every other thread did
+// with it before it let it go.  One made immortal meanwhile
+// (`heff_freeze`, of a static thunk's value) is never its last: what
+// made it so holds it)
 HEFF_FN __attribute__((noinline)) int heff_down_shared(Obj *o) {
-  if (heff_rc(o) & IMMORTAL) return 0;
   uint32_t was = __atomic_fetch_sub(&o->rc, 1, __ATOMIC_ACQ_REL);
-  return !(was & IMMORTAL) && HEFF_COUNT(was) == 1;
+  return heff_shared(was) && HEFF_COUNT(was) == 1;
 }
 
-static inline V heff_dup(V v) {
+HEFF_FAST V heff_dup(V v) {
   if (IS_OBJ(v)) {
     uint32_t rc = heff_rc(OBJ(v));
-    if (HEFF_LIKELY(!(rc & (IMMORTAL | SHARED)))) OBJ(v)->rc = rc + 1;
-    else heff_dup_shared(OBJ(v));
+    if (HEFF_LIKELY(heff_mine(rc))) OBJ(v)->rc = rc + 1;
+    else if (heff_shared(rc)) __atomic_fetch_add(&OBJ(v)->rc, 1, __ATOMIC_RELAXED);
   }
   return v;
 }
@@ -358,15 +373,17 @@ static inline V heff_dup(V v) {
 // an immortal object)
 static inline int heff_down(Obj *o) {
   uint32_t rc = heff_rc(o);
-  if (HEFF_LIKELY(!(rc & (IMMORTAL | SHARED)))) return (o->rc = rc - 1) == 0;
-  return heff_down_shared(o);
+  if (HEFF_LIKELY(heff_mine(rc))) return (o->rc = rc - 1) == 0;
+  return heff_shared(rc) && heff_down_shared(o);
 }
 
 // (a count taken down where it is not the last unless the object is
 // shared -- the caller knows it held more than once, or immortal: the
 // last of a shared one frees it)
-static inline void heff_unref(V v) {
-  if (heff_down(OBJ(v))) heff_free(v);
+HEFF_FAST void heff_unref(V v) {
+  uint32_t rc = heff_rc(OBJ(v));
+  if (HEFF_LIKELY(heff_mine(rc))) OBJ(v)->rc = rc - 1;
+  else if (heff_shared(rc) && heff_down_shared(OBJ(v))) heff_free(v);
 }
 #else
 static inline V heff_dup(V v) {
@@ -402,9 +419,12 @@ HEFF_FN __attribute__((noinline)) int heff_unshare(Obj *o) {
   return 1;
 }
 
+// (a shared one's count compared out of line, as `heff_down_shared`
+// compares it)
 static inline int heff_alone(Obj *o) {
   uint32_t rc = heff_rc(o);
-  return HEFF_LIKELY(rc == 1) || (rc == (SHARED | 1) && heff_unshare(o));
+  if (HEFF_LIKELY(rc == 1)) return 1;
+  return heff_shared(rc) && heff_unshare(o);
 }
 #else
 static inline int heff_alone(Obj *o) { return o->rc == 1; }
@@ -1459,11 +1479,12 @@ HEFF_FN void heff_freeze_one(HeffStack *s, V *at) {
 #endif
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
-  if (rc & IMMORTAL) return;
+  if (heff_immortal(rc)) return;
 #ifdef HEFF_THREADS
-  // (a shared object, other threads counting it meanwhile: the mark set
-  // over its count, which they leave as it is from then on)
-  if (rc & SHARED) __atomic_fetch_or(&OBJ(v)->rc, IMMORTAL, __ATOMIC_RELAXED);
+  // (a shared object, other threads counting it meanwhile: its mark
+  // that tells it from an immortal one taken off, over its count, which
+  // they leave as it is from then on)
+  if (heff_shared(rc)) __atomic_fetch_and(&OBJ(v)->rc, ~HEFF_SHARED_BIT, __ATOMIC_RELAXED);
   else
 #endif
     OBJ(v)->rc = IMMORTAL;
@@ -1489,7 +1510,7 @@ HEFF_FN void heff_share_one(HeffStack *s, V *at) {
   V v = *at;
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
-  if (rc & (IMMORTAL | SHARED)) return;
+  if (!heff_mine(rc)) return;
   OBJ(v)->rc = rc | SHARED;
   heff_stack_push(s, v);
 }
@@ -1503,7 +1524,7 @@ HEFF_FN void heff_share_one(HeffStack *s, V *at) {
 // by one more count (`heff_dup`).  What of `v` is mortal is this
 // thread's: no other changes it meanwhile)
 HEFF_FN V heff_share(V v) {
-  if (!IS_OBJ(v) || !v || (heff_rc(OBJ(v)) & (IMMORTAL | SHARED))) return v;
+  if (!IS_OBJ(v) || !v || !heff_mine(heff_rc(OBJ(v)))) return v;
   HeffStack s = {0};
   heff_share_one(&s, &v);
   while (s.n) {
@@ -1521,7 +1542,7 @@ HEFF_FN void heff_move_one(HeffStack *s, V *at) {
   V v = *at;
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
-  if (rc & (IMMORTAL | SHARED)) return;
+  if (!heff_mine(rc)) return;
   if (rc == 1) heff_stack_push(s, v);
   else heff_share(v);
 }
@@ -1542,7 +1563,7 @@ HEFF_FN void heff_move_one(HeffStack *s, V *at) {
 HEFF_FN V heff_move(V v) {
   if (!IS_OBJ(v) || !v) return v;
   uint32_t rc = heff_rc(OBJ(v));
-  if (rc & (IMMORTAL | SHARED)) return v;
+  if (!heff_mine(rc)) return v;
   if (rc != 1) return heff_share(v);
   HeffStack s = {0};
   heff_stack_push(&s, v);
@@ -1647,7 +1668,7 @@ HEFF_FN __attribute__((noinline)) V heff_force_shared(V f, V *a) {
     V r = heff_share(heff_tr(c->fn(f, a)));
     heff_dup(r);
     if (__atomic_compare_exchange_n(&c->memo, &m, r, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-      if (heff_rc(&c->h) & IMMORTAL) heff_freeze(r);
+      if (heff_immortal(heff_rc(&c->h))) heff_freeze(r);
       heff_drop(f);
       return r;
     }
@@ -1690,7 +1711,7 @@ HEFF_FN V heff_apply(V f, int n, V *a) {
     // value every time -- as the JavaScript backend's `$force` keeps it)
     if (n == 1 && c->arity == 1 && a[0] == NTAG(TAG_MkUnit)) {
 #ifdef HEFF_THREADS
-      if (heff_rc(&c->h) & (IMMORTAL | SHARED)) return heff_force_shared(f, a);
+      if (!heff_mine(heff_rc(&c->h))) return heff_force_shared(f, a);
 #endif
       if (c->memo) {
         V r = heff_dup(c->memo);
@@ -3728,9 +3749,9 @@ HEFF_FN V heff_arrayReplicate(V n, V x) {
   for (int64_t k = 0; k < m; k++) r->a[k] = x;
   if (IS_OBJ(x)) {
     uint32_t rc = heff_rc(OBJ(x));
-    if (!(rc & (IMMORTAL | SHARED))) OBJ(x)->rc = rc + (uint32_t)(m - 1);
+    if (heff_mine(rc)) OBJ(x)->rc = rc + (uint32_t)(m - 1);
 #ifdef HEFF_THREADS
-    else if (!(rc & IMMORTAL)) __atomic_fetch_add(&OBJ(x)->rc, (uint32_t)(m - 1), __ATOMIC_RELAXED);
+    else if (heff_shared(rc)) __atomic_fetch_add(&OBJ(x)->rc, (uint32_t)(m - 1), __ATOMIC_RELAXED);
 #endif
   }
   return (V)r;
