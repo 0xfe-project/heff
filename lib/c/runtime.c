@@ -5050,9 +5050,11 @@ struct HeffSource {
 #endif
 
 // (a group: its number, unique among every thread's; how many waits are
-// pending in it -- in a root, those of the groups within it too -- and
-// the root it is within, or 0 where it is one)
-typedef struct { int64_t id, pending, root; } HeffGroup;
+// pending in it -- in a root, those of the groups within it too -- the
+// root it is within, or 0 where it is one; and, in a root, what a step
+// of a computation started in it that fails is finished as, given why,
+// or 0: the failure is the program's)
+typedef struct { int64_t id, pending, root; V failed; } HeffGroup;
 typedef struct { int64_t group; V v; } HeffFinished;
 
 HEFF_VAR(HEFF_TLS int64_t heff_group);
@@ -5291,13 +5293,41 @@ HEFF_FN V heff_kept(V self, V *a) {
   return a[0];
 }
 
-// (what group `g` started, the rest of it run in the group, from `k`
-// given `x`: to its end, its value finished, or to a wait, pending)
-HEFF_FN void heff_reactor_run(int64_t g, V k, V x) {
+// (what a failure of a step of what group `g` started is finished as:
+// its root's function, or 0)
+HEFF_FN V heff_group_failed(int64_t g) {
+  HeffGroup *gr = heff_group_of(g);
+  if (gr && gr->root) gr = heff_group_of(gr->root);
+  return gr ? gr->failed : 0;
+}
+
+// (`k` given `x`, a step of what group `g` started, run with the group
+// as `heff_group`: what it comes to, at `*r`.  Where the group has a
+// function for failures, under `heff_try`: one that fails is finished
+// as that function's value, given why, and 1 is the answer; else 0.
+// `k` and `x` consumed)
+HEFF_FN int heff_group_step(int64_t g, V k, V x, V *r) {
   int64_t up = heff_group;
   heff_group = g;
-  V r = heff_tr(heff_app1(k, x));
+  V failed = heff_group_failed(g);
+  if (!failed) {
+    *r = heff_tr(heff_app1(k, x));
+    heff_group = up;
+    return 0;
+  }
+  const char *why = heff_try(k, x, r);
   heff_group = up;
+  if (!why) return 0;
+  heff_finished_put(g, heff_tr(heff_app1(heff_dup(failed), heff_str_text(why))));
+  return 1;
+}
+
+// (what group `g` started, the rest of it run in the group, from `k`
+// given `x`: to its end, its value finished, or to a wait, pending; or,
+// where the group says what a failure is, failed, that finished)
+HEFF_FN void heff_reactor_run(int64_t g, V k, V x) {
+  V r;
+  if (heff_group_step(g, k, x, &r)) return;
   if (r != HEFF_PENDING) heff_finished_put(g, r);
 }
 
@@ -5386,13 +5416,22 @@ HEFF_FN int64_t heff_group_made(int64_t root) {
   heff_groups_open[heff_ngroups].id = g;
   heff_groups_open[heff_ngroups].pending = 0;
   heff_groups_open[heff_ngroups].root = root;
+  heff_groups_open[heff_ngroups].failed = 0;
   heff_ngroups++;
   heff_waker_add(g);
   return g;
 }
 
-// | A group of its own, for a scheduler: its number.
-HEFF_FN int64_t heff_reactor_open(void) { return heff_group_made(0); }
+// | A group of its own, for a scheduler: its number.  `failed`, where it
+// | is not 0, is what a step of a computation started in it that fails
+// | is finished as, given why, the others going on (kept by the group,
+// | and let go of when it is closed); where it is 0, the failure is the
+// | program's.
+HEFF_FN int64_t heff_reactor_open(V failed) {
+  int64_t g = heff_group_made(0);
+  heff_group_of(g)->failed = failed;
+  return g;
+}
 
 // | A group within group `g`: what is started in it finishes among the
 // | finished of `g`'s root, and is pending among its pending.
@@ -5609,6 +5648,7 @@ HEFF_FN void heff_reactor_close(int64_t g) {
   for (size_t i = 0; i < heff_ngroups;) {
     int64_t id = heff_groups_open[i].id;
     if (id == g || heff_groups_open[i].root == g) {
+      if (heff_groups_open[i].failed) heff_drop(heff_groups_open[i].failed);
       heff_groups_open[i] = heff_groups_open[--heff_ngroups];
       heff_waker_remove(id);
     } else i++;

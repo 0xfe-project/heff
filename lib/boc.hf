@@ -144,8 +144,11 @@
 -- closed ends once its connections are done.  An act awaited by main
 -- is started by a behaviour on no cown, on whichever domain takes it.
 -- An act that itself fails -- abandons, or fails in the runtime, not
--- an error it comes to -- fails the run: `failed` is given why, the
--- domains are stopped, and `scheduledWithReactor` abandons.  Under
+-- an error it comes to -- is as a body that fails: `failed` is given
+-- why, on the domain it ran on, the `with`'s body is never run, and
+-- every other act and behaviour goes on (it held no cown, so none is
+-- let go of).  Each step of an act runs under a catch for that, as a
+-- body does.  Under
 -- `scheduled`, an act is run where it is awaited, there and then, the
 -- behaviour holding its domain and its cowns until it is done:
 -- `scheduled` is for programs that await nothing.
@@ -660,7 +663,7 @@ instanceHolderCownsAwait =
 -- (the reactor's operations, its evidence given: where the scheduler
 -- waits on the world through it)
 type Outside (w : HFunctor) =
-  { open : Co w (Group w)
+  { open : (String -> Co w Unit) -> Co w (Group w)
   , start : Group w -> Co w (Co w Unit) -> Co w (Maybe (Co w Unit))
   , finished : Group w -> Bool -> Co w (List (Co w Unit))
   , pending : Group w -> Co w Int
@@ -1263,8 +1266,25 @@ serving st o worker g = do
       serving st o worker g
     Nothing -> pure ()
 
--- (a worker's group opened, on its domain, it serving, and its group
--- closed once it stops)
+-- (an act that failed, as what it comes to among its group's finished:
+-- `failed` given why, as for a body that fails, and counted where that
+-- fails too)
+actFailed : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
+          -> String
+          -> Co w Unit
+actFailed st why = do
+  reported <- Domain.tried (bind (later (\u -> st.failed why)) (\c -> c))
+  case reported of
+    Right u -> pure ()
+    Left again -> do
+      _ <- Domain.fetchAdd st.unreported 1
+      pure ()
+
+-- (a worker's group opened, on its domain, an act of it that fails
+-- coming to `actFailed`; it serving, and its group closed once it
+-- stops)
 servingIn : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
@@ -1272,7 +1292,7 @@ servingIn : {w : HFunctor}
           -> Worker w (Behaviour w)
           -> Co w Unit
 servingIn st o worker = do
-  g <- o.open
+  g <- o.open (\why -> actFailed st why)
   Domain.lock st.mutex
   Domain.set worker.group (Just g)
   Domain.unlock st.mutex
@@ -1283,9 +1303,11 @@ servingIn st o worker = do
   o.close g
 
 -- (a worker, on its domain.  Where the scheduler waits on the world
--- through the reactor, an act that fails there fails the run: `failed`
--- given why, counted as a `failed` that failed, and `scheduled` told at
--- once that it is over, the acts pending of the worker gone with it)
+-- through the reactor, a failure of the worker's own -- not of a body,
+-- nor of an act, which its group finishes as `actFailed` -- fails the
+-- run: `failed` given why, counted as a `failed` that failed, and
+-- `scheduled` told at once that it is over, the acts pending of the
+-- worker gone with it)
 workerOn : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
@@ -1443,8 +1465,8 @@ scheduled failed c = scheduledBy Nothing failed c
 -- | pending waits in its reactor, until one has come to its value, or a
 -- | behaviour is ready.  Every behaviour, and every act awaited, is
 -- | waited for.  An act that fails -- abandons, or fails in the runtime
--- | -- fails the run: `failed` given why, the domains stopped, and this
--- | abandons.
+-- | -- is as a body that fails: `failed` given why, its `with`'s body
+-- | not run, the others going on.
 scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
                      -> {{dm : Domain.domain <: w}}
@@ -1455,7 +1477,7 @@ scheduledWithReactor : {w : HFunctor}
 scheduledWithReactor failed c =
   scheduledBy
     (Just
-       { open = Reactor.open
+       { open = \f -> Reactor.open (failed := Just f)
        , start = \g m -> Reactor.start g m
        , finished = \g wait -> Reactor.finished g wait
        , pending = \g -> Reactor.pending g

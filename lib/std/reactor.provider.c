@@ -12,7 +12,9 @@
 // back, and `Begin` goes on from itself again, told `False`; once the
 // wait is done, the rest is run by the reactor, and its `End`, not of a
 // run of a `Begin`'s, gives back the value alone, one of the group's
-// finished.
+// finished.  Where the group was opened with what a failure is
+// finished as, each of these runs is under `heff_try`, and one that
+// fails is finished so, its start told it waits.
 //
 // An `End` and a `Finished` are each a function given what to do with
 // what they hold, their types erased: `rx_open` takes it -- an end's
@@ -45,10 +47,18 @@ static void rx_open(V b, int n) {
 
 static V heff_provider_reactor(V p, V k) {
   switch (heff_tag_of(p)) {
+  // (a group opened, with what a failure of a step in it is finished
+  // as, where `Just` that is given)
   case TAG_Open: {
-    V f = heff_dup(heff_field(p, 0));
+    V failing = heff_field(p, 0);
+    V failed = 0;
+    if (heff_tag_of(failing) == TAG_Just) {
+      rx_open(heff_dup(heff_field(failing, 0)), 1);
+      failed = rx_held[0];
+    }
+    V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V x = heff_answer(f, heff_int(heff_reactor_open()));
+    V x = heff_answer(f, heff_int(heff_reactor_open(failed)));
     return heff_tail(k, 1, &x);
   }
   case TAG_Begin: {
@@ -59,9 +69,16 @@ static V heff_provider_reactor(V p, V k) {
     heff_group = g;
     rx_trying = g;
     V x = heff_answer(heff_dup(f), NTAG(TAG_True));
-    V r = heff_tr(heff_app1(heff_dup(k), x));
+    V r;
+    int failed = heff_group_step(g, heff_dup(k), x, &r);
     heff_group = up;
     rx_trying = upTrying;
+    // (failed, where the group says what that is: finished so, and the
+    // start told it waits)
+    if (failed) {
+      V y = heff_answer(f, NTAG(TAG_False));
+      return heff_tail(k, 1, &y);
+    }
     if (r == RX_ENDED) {
       heff_drop(f);
       heff_drop(k);
