@@ -57,9 +57,12 @@
 --   pure ()
 -- ```
 --
--- A connection is had by `Net.accept`'s body in its thread, and closed
--- as that thread ends; the body first spawns the thread that accepts
--- the next, so one is always waiting to accept.  A connection whose
+-- One thread accepts, in a loop: each connection accepted is given a
+-- thread of its own, which serves it and closes it as it ends, and the
+-- loop goes on to accept the next.  (A thread that spawns the next from
+-- inside its `with` or `recover` would put each generation's operations
+-- through every earlier generation's handlers, each connection slower
+-- than the one before.)  A connection whose
 -- client sends nothing for `idle` milliseconds -- 30 seconds unless
 -- another is given, by name, `CmlServer.serve (idle := 5000) l
 -- handle`; 0 for no limit -- is closed, its thread done.  Where a
@@ -82,10 +85,11 @@ import std.net as Net
 import resource
 
 -- (a thread spawned from where `Net.NetError` is thrown: spawned in
--- `e`, with a handler of its own for what it throws, which lets it go
--- -- not under a handler of the spawning thread's, which the thread
--- after it would be under too, and so on, each connection's thread
--- under one more)
+-- `e`, with a handler of its own for what it throws, which lets it go.
+-- A spawn holds its thread, so each handler it passes on its way to
+-- cml's runs that thread too: spawned always from the same place, the
+-- accepting loop, each connection's thread is under as many as the
+-- first's)
 spawnedApart : {e w : HFunctor}
              -> {{cm : CML.cml w <: e}}
              -> Co (exception Net.NetError <+> e) Unit
@@ -96,12 +100,29 @@ spawnedApart c =
     (inj := _)
     (CML.spawn (bind (attempt Net.NetError c) (\r -> pure ())))
 
--- (a thread accepting the listener's next connection: a thread spawned
--- by `apart` to accept the one after it, then the connection served,
--- and closed as the thread ends; where accepting failed, `stop`.  The
--- throw is heard in this thread, by a `recover` of its own -- not by a
--- `try` of the scheduler's caller, which would run the body alone, its
--- spawn dropped)
+-- (a connection accepted, served by a thread `apart`, closed once
+-- served, and `again` the next accepted; where accepting failed,
+-- `stop`)
+servedApart : {e : HFunctor}
+            -> {s : Type}
+            -> {{nt : Net.net <: e}}
+            -> (Co e Unit -> Co e Unit)
+            -> Co e Unit
+            -> Int
+            -> (Server.Request -> Co e HTTP.Response)
+            -> (Unit -> Co e Unit)
+            -> Either Net.NetError (With s Net.TcpStream)
+            -> Co e Unit
+servedApart apart stop idle handle again (Left err) = stop
+servedApart apart stop idle handle again (Right c) = do
+  apart (do
+    _ <- Server.serveConnection (idle := idle) (\r -> False) handle c
+    _ <- Net.close c
+    pure ())
+  again MkUnit
+
+-- (the listener's connections accepted, one after another, each served
+-- by a thread of its own (`servedApart`); where accepting failed, `stop`)
 acceptor : {e : HFunctor}
          -> {s : Type}
          -> {{nt : Net.net <: e}}
@@ -113,18 +134,19 @@ acceptor : {e : HFunctor}
          -> (Server.Request -> Co e HTTP.Response)
          -> Co e Unit
 acceptor apart stop idle l handle =
-  recover
-    (Net.accept l (\c -> do
-     apart (acceptor apart stop idle l handle)
-     _ <- Server.serveConnection (idle := idle) (\r -> False) handle c
-     pure ()))
-    (\(err : Net.NetError) -> stop)
+  bind
+    (Net.accepted l)
+    (servedApart
+       apart
+       stop
+       idle
+       handle
+       (\u -> acceptor apart stop idle l handle))
 
 -- | The listener's connections served at once, each by a cml thread of
--- | its own (`Server.serveConnection`): the connection is had by
--- | `Net.accept`'s body in that thread, closed as it ends, and the body
--- | spawns the thread accepting the next, so that one is always waiting
--- | to accept.  Until one fails to be accepted: the listener left as it
+-- | its own (`Server.serveConnection`), spawned by one thread accepting
+-- | them in a loop, and closed as it is served.  Until one fails to be
+-- | accepted: the listener left as it
 -- | is, the connections being served going on.  A connection whose
 -- | client sends nothing for `idle` milliseconds is closed, its thread
 -- | done.
