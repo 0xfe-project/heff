@@ -296,6 +296,16 @@ if (mode === "boc") {
   const sb = await slow.ask("/slow");
   const ms = Date.now() - t0;
   console.log(`slow, its handler awaiting a sleep: ${sb === "slow" && ms >= 280 && ms < 2000 ? "answered, in time" : `${sb} in ${ms} ms`}`);
+  // (a handler that throws: its connection closed at once, unanswered,
+  // and the next client answered)
+  const thrower = await opened();
+  const t2 = Date.now();
+  const tb = await thrower.ask("/throw");
+  const thrownMs = Date.now() - t2;
+  const next = await opened();
+  const nb = next ? await next.ask("/after") : null;
+  if (next) { next.end(); await next.ended; }
+  console.log(`a handler that throws: ${tb === null && thrownMs < idle ? "closed at once, unanswered" : `${tb} in ${thrownMs} ms`}; the next: ${nb === "/after" ? "answered" : nb}`);
   // (a client that sends nothing: closed by the server in `idle`)
   const silent = await opened();
   const t1 = Date.now();

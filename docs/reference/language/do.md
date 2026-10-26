@@ -204,10 +204,19 @@ done once they are, no thread of it left running after it.
 - The body is a block of its own: it sets no variable of the block
   around, nor leaves it by `break`, `continue` or `return`; a `return`
   in it ends the body.
+- The world the body runs in is the binder's to say. A file's body is
+  in the block's world. A cown's body, or an await's, is a behaviour,
+  run later on another domain: it is in the scheduler's world,
+  `BOC.boc w <+> w`, and none of the handlers around the `with` (a
+  `try`, another `with`'s resource) is around it. What it needs, it
+  opens itself or is given as a value. cml's threads are the same: a
+  `CML.spawn` takes a computation of `CML.cml w <+> w`.
 - Its value is what the handler says: a file's `with` comes to what its
   body came to, a cown's to `()` (the behaviour runs later), cml's
   threads' to `Just` main's answer (`Nothing` where every thread
-  waits). `x <- with ... do` binds it.
+  waits). `x <- with ... do` binds it. A thread or behaviour that
+  failed does not stop the others: cml's `with` fails at its end as
+  the first thread that failed did.
 - A handler is a pair of instances, co's `Binder` (of what the names are
   bound to: what they are in the body, the world it runs in, and what
   the `with` comes to) and `Holder` (how it runs in the world), and the

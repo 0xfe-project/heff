@@ -431,6 +431,13 @@ static V heff_provider_domain(V p, V k) {
     x = heff_answer(g, dm_tried(c));
     break;
   }
+  // (this domain failed as the string says: a `tried`'s `Left` handed
+  // on, as a join hands on a domain's failure)
+  case TAG_Fail: {
+    char *why = heff_cstr_text(heff_field(p, 0));
+    heff_fail_again(why ? why : "domain: a failure whose words hold a NUL");
+    return 0;
+  }
   case TAG_Cores: {
     V g = heff_dup(heff_field(p, 0));
     heff_drop(p);

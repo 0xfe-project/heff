@@ -31,6 +31,7 @@
 -- helloAt : {e w : HFunctor}
 --         -> {{cm : CML.cml w <: e}}
 --         -> {{nt : Net.net <: e}}
+--         -> {{ntw : Net.net <: w}}
 --         -> {{sg : Signal.signals <: e}}
 --         -> {{ex : exception Net.NetError <: e}}
 --         -> Int
@@ -40,7 +41,7 @@
 --       { host = "127.0.0.1", port = port }
 --       128
 --       (\l -> CML.choose
---          [ CmlServer.serve l hello
+--          [ CmlServer.serve Empty l hello
 --          , bind (Signal.wait [Terminate, Interrupt]) (\s -> pure ())
 --          ])
 --
@@ -59,10 +60,12 @@
 --
 -- One thread accepts, in a loop: each connection accepted is given a
 -- thread of its own, which serves it and closes it as it ends, and the
--- loop goes on to accept the next.  (A thread that spawns the next from
--- inside its `with` or `recover` would put each generation's operations
--- through every earlier generation's handlers, each connection slower
--- than the one before.)  A connection whose
+-- loop goes on to accept the next.  A connection's thread is of cml's
+-- world, `cml w <+> w`, as every thread is, so the handler is too, with
+-- what it may throw, an `err` (`Empty` where it throws nothing): a throw
+-- no `recover` of the handler's hears closes that connection at once,
+-- unanswered, what was thrown let go of -- a handler that is to say why
+-- catches it itself -- and the others are served on.  A connection whose
 -- client sends nothing for `idle` milliseconds -- 30 seconds unless
 -- another is given, by name, `CmlServer.serve (idle := 5000) l
 -- handle`; 0 for no limit -- is closed, its thread done.  Where a
@@ -84,94 +87,71 @@ import std.http.server as Server
 import std.net as Net
 import resource
 
--- (a thread spawned from where `Net.NetError` is thrown: spawned in
--- `e`, with a handler of its own for what it throws, which lets it go.
--- A spawn holds its thread, so each handler it passes on its way to
--- cml's runs that thread too: spawned always from the same place, the
--- accepting loop, each connection's thread is under as many as the
--- first's)
-spawnedApart : {e w : HFunctor}
-             -> {{cm : CML.cml w <: e}}
-             -> Co (exception Net.NetError <+> e) Unit
-             -> Co (exception Net.NetError <+> e) Unit
-spawnedApart c =
-  lift
-    (h := e)
-    (inj := _)
-    (CML.spawn (bind (attempt Net.NetError c) (\r -> pure ())))
-
--- (a connection accepted, served by a thread `apart`, closed once
--- served, and `again` the next accepted; where accepting failed,
--- `stop`)
-servedApart : {e : HFunctor}
-            -> {s : Type}
-            -> {{nt : Net.net <: e}}
-            -> (Co e Unit -> Co e Unit)
-            -> Co e Unit
-            -> Int
-            -> (Server.Request -> Co e HTTP.Response)
-            -> (Unit -> Co e Unit)
-            -> Either Net.NetError (With s Net.TcpStream)
-            -> Co e Unit
-servedApart apart stop idle handle again (Left err) = stop
-servedApart apart stop idle handle again (Right c) = do
-  apart (do
-    _ <- Server.serveConnection (idle := idle) (\r -> False) handle c
-    _ <- Net.close c
-    pure ())
-  again MkUnit
+-- (a connection served, then closed: the handler's throws heard here,
+-- each a thread's own -- where it throws, the connection is closed at
+-- once, what it threw let go of)
+servedOn : {w : HFunctor}
+         -> {s : Type}
+         -> {err : Type}
+         -> {{nt : Net.net <: w}}
+         -> Int
+         -> (Server.Request
+             -> Co (exception err <+> (CML.cml w <+> w)) HTTP.Response)
+         -> With s Net.TcpStream
+         -> Co (CML.cml w <+> w) Unit
+servedOn idle handle c = do
+  _ <-
+    attempt
+      err
+      (Server.serveConnection
+         (idle := idle)
+         (\r -> False)
+         handle
+         c)
+  _ <- Net.close c
+  pure ()
 
 -- (the listener's connections accepted, one after another, each served
--- by a thread of its own (`servedApart`); where accepting failed, `stop`)
-acceptor : {e : HFunctor}
+-- by a thread of its own; where accepting failed, `stop`)
+acceptor : {w : HFunctor}
          -> {s : Type}
-         -> {{nt : Net.net <: e}}
-         -> {{ex : exception Net.NetError <: e}}
-         -> (Co e Unit -> Co e Unit)
-         -> Co e Unit
+         -> {err : Type}
+         -> {{nt : Net.net <: w}}
+         -> Co (CML.cml w <+> w) Unit
          -> Int
          -> With s Net.TcpListener
-         -> (Server.Request -> Co e HTTP.Response)
-         -> Co e Unit
-acceptor apart stop idle l handle =
-  bind
-    (Net.accepted l)
-    (servedApart
-       apart
-       stop
-       idle
-       handle
-       (\u -> acceptor apart stop idle l handle))
+         -> (Server.Request
+             -> Co (exception err <+> (CML.cml w <+> w)) HTTP.Response)
+         -> Co (CML.cml w <+> w) Unit
+acceptor stop idle l handle = do
+  r <- Net.accepted l
+  case r of
+    Left why -> stop
+    Right c -> do
+      CML.spawn (servedOn idle handle c)
+      acceptor stop idle l handle
 
 -- | The listener's connections served at once, each by a cml thread of
 -- | its own (`Server.serveConnection`), spawned by one thread accepting
 -- | them in a loop, and closed as it is served.  Until one fails to be
--- | accepted: the listener left as it
--- | is, the connections being served going on.  A connection whose
--- | client sends nothing for `idle` milliseconds is closed, its thread
--- | done.
+-- | accepted: the listener left as it is, the connections being served
+-- | going on.  A connection whose client sends nothing for `idle`
+-- | milliseconds is closed, its thread done.  The handler runs in its
+-- | connection's thread, in the scheduler's world, and may throw an
+-- | `err` (`Empty` for one that throws nothing): that connection is
+-- | closed at once, unanswered, and what was thrown let go of; the
+-- | others go on.
 serve : {e w : HFunctor}
       -> {s : Type}
       -> {idle : Int := 30000}
+      -> (err : Type)
       -> {{cm : CML.cml w <: e}}
-      -> {{nt : Net.net <: e}}
+      -> {{nt : Net.net <: w}}
       -> With s Net.TcpListener
-      -> (Server.Request -> Co e HTTP.Response)
+      -> (Server.Request
+          -> Co (exception err <+> (CML.cml w <+> w)) HTTP.Response)
       -> Co e Unit
-serve l handle = do
+serve err l handle = do
   stopped <- CML.newIVar
-  CML.spawn
-      (bind
-         (attempt
-            Net.NetError
-            (acceptor
-               (e := exception Net.NetError <+> e)
-               (nt := _)
-               (ex := _)
-               (spawnedApart (e := e) (cm := cm))
-               (lift (h := e) (inj := _) (CML.putIVar stopped ()))
-               idle
-               l
-               (\r -> lift (inj := _) (handle r))))
-         (\r -> pure ()))
+  CML.spawn (acceptor (CML.putIVar stopped ()) idle l handle)
   CML.readIVar stopped

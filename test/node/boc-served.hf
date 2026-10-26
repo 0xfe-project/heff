@@ -32,31 +32,34 @@ import resource
 here : Int -> Net.Address
 here port = { host = "127.0.0.1", port = port }
 
+-- | What a handler throws.
+data Thrown = MkThrown
+
 -- (a request answered, and counted, but `/stop`: `/slow` after 300
 -- ms, slept by an act the handler awaits; `/stop` answered, then the
--- listener closed; any other, its target)
-answering : {e w : HFunctor}
+-- listener closed; `/throw` thrown; any other, its target)
+answering : {w : HFunctor}
           -> {rg : Type}
-          -> {{bc : BOC.boc w <: e}}
-          -> {{dm : Domain.domain <: e}}
+          -> {{dm : Domain.domain <: w}}
           -> {{clock : time <: w}}
           -> {{nt : Net.net <: w}}
           -> Domain.Atomic Int
           -> With rg Net.TcpListener
           -> Server.Request
-          -> (HTTP.Response -> Co e Unit)
-          -> Co e Unit
+          -> BocServer.Responder w
+          -> Co (exception Thrown <+> (BOC.boc w <+> w)) Unit
 answering count l r respond = do
   _ <- (if r.target == "/stop" then pure 0 else Domain.fetchAdd count 1)
   if r.target == "/slow"
   then do
-    with _ := BOC.await (sleep (Duration.milliseconds 300)) do
+    with _ := BOC.await (w := w) (sleep (Duration.milliseconds 300)) do
       respond (Server.plain 200 "slow")
   else if r.target == "/stop"
   then do
     respond (Server.plain 200 "stopping")
-    with _ := BOC.await (Net.closeListener l) do
+    with _ := BOC.await (w := w) (Net.closeListener l) do
       pure ()
+  else if r.target == "/throw" then throw (MkThrown : Thrown)
   else respond (Server.plain 200 r.target)
 
 -- (the listener served; where `bySignal`, until SIGTERM or SIGINT,
@@ -65,7 +68,9 @@ served : {e w : HFunctor}
        -> {rg : Type}
        -> {{bc : BOC.boc w <: e}}
        -> {{io : stdio <: e}}
+       -> {{iow : stdio <: w}}
        -> {{dm : Domain.domain <: e}}
+       -> {{dmw : Domain.domain <: w}}
        -> {{clock : time <: w}}
        -> {{nt : Net.net <: w}}
        -> {{sg : Signal.signals <: w}}
@@ -75,7 +80,7 @@ served : {e w : HFunctor}
        -> With rg Net.TcpListener
        -> Co e Unit
 served bySignal idle count l = do
-  BocServer.serve (idle := idle) l (answering count l)
+  BocServer.serve (idle := idle) Thrown l (answering count l)
   if bySignal
   then do
     with s :=

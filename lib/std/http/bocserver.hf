@@ -27,9 +27,10 @@
 -- import resource
 --
 -- -- | each request answered at once
--- hello : {e : HFunctor}
+-- hello : {e w : HFunctor}
+--       -> {{bc : BOC.boc w <: e}}
 --       -> Server.Request
---       -> (HTTP.Response -> Co e Unit)
+--       -> BocServer.Responder w
 --       -> Co e Unit
 -- hello r respond = respond (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 --
@@ -43,9 +44,9 @@
 --        -> With s Net.TcpListener
 --        -> Co e Unit
 -- served l = do
---   BocServer.serve l hello
+--   BocServer.serve Empty l hello
 --   with _ := BOC.await (Signal.wait [Terminate, Interrupt]) do
---     with _ := BOC.await (Net.closeListener l) do
+--     with _ := BOC.await (w := w) (Net.closeListener l) do
 --       pure ()
 --
 -- -- | served on port 8080, its behaviours run on domains, each waiting
@@ -75,7 +76,7 @@
 --   pure ()
 -- ```
 --
--- `serve l handle` comes back at once, the server running in its
+-- `serve err l handle` comes back at once, the server running in its
 -- behaviours: the listener is held by a `with` around the scheduler,
 -- which ends once the server is done.  A connection is had by
 -- std.net's `accepted`, in the listener's region, and closed by the
@@ -107,15 +108,21 @@
 -- out of descriptors (`EMFILE`).  Then the connections waiting for a
 -- request are closed at once, and the others once the request in hand
 -- is answered: once the last is closed, nothing of the server is
--- pending, and `scheduledWithReactor` ends, if nothing else is.  A
--- handler that fails fails its behaviour, which boc's `failed` hears:
+-- pending, and `scheduledWithReactor` ends, if nothing else is.  The
+-- handler runs in a behaviour, of the scheduler's world, and may throw
+-- an `err` (`Empty` where it throws nothing): a throw no `recover` of
+-- the handler's hears closes that connection at once, unanswered, what
+-- was thrown let go of -- a handler that is to say why catches it
+-- itself -- and the others are served on.  A handler that fails
+-- otherwise (abandons) fails its behaviour, which boc's `failed` hears:
 -- its request is not answered, and its connection, read no further, is
 -- closed where the program lets go of it, at the run's end.
 
-module std.http.bocserver (serve)
+module std.http.bocserver (serve, Responder)
 import boc as BOC
 import bytes as Bytes
 import co
+import exception
 import std.http as HTTP
 import std.http.server as Server
 import std.net as Net
@@ -170,12 +177,21 @@ type Served (w : HFunctor) (rg : Type) =
   , stopped : Bool
   }
 
+-- | How a handler answers its request: in whichever world has boc's
+-- | behaviours, its own or a later behaviour's.
+type Responder (w : HFunctor) =
+  {e : HFunctor} -> {{bc : BOC.boc w <: e}} -> HTTP.Response -> Co e Unit
+
 -- (what every behaviour of the server knows: the time limit, the
--- server's cown, and the handler)
-type Serving (e : HFunctor) (w : HFunctor) (rg : Type) =
+-- server's cown, and the handler, of the scheduler's world, which may
+-- throw an `err`)
+type Serving (w : HFunctor) (rg : Type) (err : Type) =
   { idle : Int
   , served : BOC.Cown w (Served w rg)
-  , handler : Server.Request -> (HTTP.Response -> Co e Unit) -> Co e Unit
+  , handler :
+        Server.Request
+        -> Responder w
+        -> Co (exception err <+> (BOC.boc w <+> w)) Unit
   }
 
 -- (the server's state, the connection made by `made`, given the next
@@ -325,9 +341,10 @@ expects (Just r) =
 -- after does nothing)
 closing : {e w : HFunctor}
         -> {rg : Type}
+        -> {err : Type}
         -> {{bc : BOC.boc w <: e}}
         -> {{nt : Net.net <: w}}
-        -> Serving e w rg
+        -> Serving w rg err
         -> Connection w rg
         -> Co e Unit
 closing sg cn = do
@@ -339,9 +356,10 @@ closing sg cn = do
 -- connection closed)
 refusing : {e w : HFunctor}
          -> {rg : Type}
+         -> {err : Type}
          -> {{bc : BOC.boc w <: e}}
          -> {{nt : Net.net <: w}}
-         -> Serving e w rg
+         -> Serving w rg err
          -> Connection w rg
          -> Int
          -> Co e Unit
@@ -354,9 +372,10 @@ mutual
   -- milliseconds: what it comes to added to what was read)
   reading : {e w : HFunctor}
           -> {rg : Type}
+          -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
-          -> Serving e w rg
+          -> Serving w rg err
           -> Connection w rg
           -> Int
           -> Co e Unit
@@ -386,9 +405,10 @@ mutual
   -- (a `100 Continue` written, then the body read)
   continuing : {e w : HFunctor}
              -> {rg : Type}
+             -> {err : Type}
              -> {{bc : BOC.boc w <: e}}
              -> {{nt : Net.net <: w}}
-             -> Serving e w rg
+             -> Serving w rg err
              -> Connection w rg
              -> Co e Unit
   continuing sg cn = do
@@ -412,9 +432,10 @@ mutual
   -- last, where that holds one)
   writing : {e w : HFunctor}
           -> {rg : Type}
+          -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
-          -> Serving e w rg
+          -> Serving w rg err
           -> Connection w rg
           -> Bool
           -> Bytes
@@ -446,14 +467,14 @@ mutual
   -- read, where too little is; a `100 Continue` written, where the
   -- client waits for one; a request handed to the handler; or refused:
   -- the connection's state after)
-  advanced : {e w : HFunctor}
+  advanced : {w : HFunctor}
            -> {rg : Type}
-           -> {{bc : BOC.boc w <: e}}
+           -> {err : Type}
            -> {{nt : Net.net <: w}}
-           -> Serving e w rg
+           -> Serving w rg err
            -> Connection w rg
            -> Conn
-           -> Co e Conn
+           -> Co (BOC.boc w <+> w) Conn
   advanced sg cn st =
     if st.got < st.want
     then do
@@ -472,15 +493,20 @@ mutual
             reading sg cn (sizeFor more)
             pure more
         Right (Asked r rest) -> do
-          sg.handler r (responder sg cn r)
-          pure
-              { st
-              | phase = Answering
-              , parts = [rest]
-              , got = Bytes.length rest
-              , want = 0
-              , continued = False
-              }
+          outcome <- attempt err (sg.handler r (\res -> responder sg cn r res))
+          case outcome of
+            Right u ->
+              pure
+                { st
+                | phase = Answering
+                , parts = [rest]
+                , got = Bytes.length rest
+                , want = 0
+                , continued = False
+                }
+            Left thrown -> do
+              closing sg cn
+              pure { st | phase = Closing }
         Right (Refused status) -> do
           refusing sg cn status
           pure { st | phase = Closing }
@@ -493,9 +519,10 @@ mutual
   -- response asks, or the server has stopped)
   responder : {e w : HFunctor}
             -> {rg : Type}
+            -> {err : Type}
             -> {{bc : BOC.boc w <: e}}
             -> {{nt : Net.net <: w}}
-            -> Serving e w rg
+            -> Serving w rg err
             -> Connection w rg
             -> Server.Request
             -> HTTP.Response
@@ -523,9 +550,10 @@ mutual
 -- for a request; else once the one in hand is answered)
 stoppedFor : {e w : HFunctor}
            -> {rg : Type}
+           -> {err : Type}
            -> {{bc : BOC.boc w <: e}}
            -> {{nt : Net.net <: w}}
-           -> Serving e w rg
+           -> Serving w rg err
            -> Connection w rg
            -> Co e Unit
 stoppedFor sg cn = do
@@ -542,9 +570,10 @@ stoppedFor sg cn = do
 
 stoppedAll : {e w : HFunctor}
            -> {rg : Type}
+           -> {err : Type}
            -> {{bc : BOC.boc w <: e}}
            -> {{nt : Net.net <: w}}
-           -> Serving e w rg
+           -> Serving w rg err
            -> List (Pair Int (Connection w rg))
            -> Co e Unit
 stoppedAll sg Nil = pure ()
@@ -557,9 +586,10 @@ stoppedAll sg (MkPair n cn :: rest) = do
 -- server stopped)
 accepting : {e w : HFunctor}
           -> {rg : Type}
+          -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
-          -> Serving e w rg
+          -> Serving w rg err
           -> With rg Net.TcpListener
           -> Co e Unit
 accepting sg l = do
@@ -589,17 +619,22 @@ accepting sg l = do
 -- | `EMFILE`): then the connections waiting for a request are closed,
 -- | and the others once the request in hand is answered.  A client that
 -- | sends nothing for `idle` milliseconds, or takes no response in that
--- | time, is closed.  For `scheduledWithReactor`: under `scheduled`,
--- | each act holds a domain until it is done.
+-- | time, is closed.  The handler, of the scheduler's world, may throw
+-- | an `err`: that connection is closed at once, unanswered, and what
+-- | was thrown let go of.  For `scheduledWithReactor`: under
+-- | `scheduled`, each act holds a domain until it is done.
 serve : {e w : HFunctor}
       -> {rg : Type}
       -> {idle : Int := 30000}
+      -> (err : Type)
       -> {{bc : BOC.boc w <: e}}
       -> {{nt : Net.net <: w}}
       -> With rg Net.TcpListener
-      -> (Server.Request -> (HTTP.Response -> Co e Unit) -> Co e Unit)
+      -> (Server.Request
+          -> Responder w
+          -> Co (exception err <+> (BOC.boc w <+> w)) Unit)
       -> Co e Unit
-serve l handle = do
+serve err l handle = do
   served <-
     BOC.newCown
       ({ open = OrdMap.empty, next = 0, stopped = False } : Served w rg)

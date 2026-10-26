@@ -37,6 +37,12 @@ must (Left err) = abandon
 here : Int -> Net.Address
 here port = { host = "127.0.0.1", port = port }
 
+-- (a thread of its own, its throws heard there and let go of)
+apart : {w : HFunctor}
+      -> Co (exception Net.NetError <+> (CML.cml w <+> w)) Unit
+      -> Co (CML.cml w <+> w) Unit
+apart c = bind (attempt Net.NetError c) (\r -> pure ())
+
 repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
 repeatG 0 c = pure MkUnit
 repeatG n c = bind c (\u -> repeatG (n - 1) c)
@@ -67,9 +73,17 @@ readN c n acc =
       (Net.read c (n - Bytes.length acc))
       (\r -> readN c n (Bytes.append acc (must r)))
 
--- (each request answered with its target)
-answer : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
-answer r = pure (Server.plain 200 r.target)
+-- | What a handler throws.
+data Thrown = MkThrown
+
+-- (each request answered with its target; `/throw` thrown instead)
+answer : {e : HFunctor}
+       -> {{ex : exception Thrown <: e}}
+       -> Server.Request
+       -> Co e HTTP.Response
+answer r =
+  if r.target == "/throw" then throw MkThrown
+  else pure (Server.plain 200 r.target)
 
 -- (a request for `target` sent on the connection, and its response read:
 -- 1 where it is the one wanted)
@@ -88,6 +102,23 @@ asked c target = do
   got <- readN c (Bytes.length want) Bytes.empty
   pure (if got == want then 1 else 0)
 
+-- (a request whose handler throws, sent on the connection: whether the
+-- server closed it at once, unanswered -- the read ending, nothing
+-- read, well before the 30 seconds a connection may stay idle)
+thrownOn : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> With s Net.TcpStream
+         -> Co e String
+thrownOn c = do
+  _ <- Net.write c (Bytes.fromString "GET /throw HTTP/1.1\r\nHost: x\r\n\r\n")
+  r <- Net.read (timeout := 5000) c 100
+  pure (case r of
+    Right b ->
+      if Bytes.length b == 0 then "thrown: closed at once, unanswered"
+      else "thrown: answered"
+    Left err -> "thrown: left open, " ^ show err)
+
 -- (a client's connection: a first request, its answer said on `back`;
 -- then, once main says so on `go`, a second on the same connection:
 -- its answer)
@@ -95,6 +126,7 @@ clientOn : {e w : HFunctor}
          -> {s : Type}
          -> {{cm : CML.cml w <: e}}
          -> {{nt : Net.net <: e}}
+         -> {{ntw : Net.net <: w}}
          -> CML.Chan w Int
          -> CML.Chan w Int
          -> Int
@@ -112,6 +144,7 @@ clientOn back go i c = do
 client : {e w : HFunctor}
        -> {{cm : CML.cml w <: e}}
        -> {{nt : Net.net <: e}}
+       -> {{ntw : Net.net <: w}}
        -> {{ex : exception Net.NetError <: e}}
        -> Int
        -> CML.Chan w Int
@@ -126,6 +159,7 @@ client port back go i = do
 clients : {e w : HFunctor}
         -> {{cm : CML.cml w <: e}}
         -> {{nt : Net.net <: e}}
+        -> {{ntw : Net.net <: w}}
         -> {{ex : exception Net.NetError <: e}}
         -> Int
         -> CML.Chan w Int
@@ -134,7 +168,7 @@ clients : {e w : HFunctor}
         -> Co e Unit
 clients port back go 0 = pure MkUnit
 clients port back go i = do
-  CML.spawn (client port back go i)
+  CML.spawn (apart (client (w := w) port back go i))
   clients port back go (i - 1)
 
 -- (the server, a thread of its own, and n clients, each one too)
@@ -142,14 +176,16 @@ served : {e w : HFunctor}
        -> {s : Type}
        -> {{cm : CML.cml w <: e}}
        -> {{io : stdio <: e}}
+       -> {{iow : stdio <: w}}
        -> {{nt : Net.net <: e}}
+       -> {{ntw : Net.net <: w}}
        -> {{ex : exception Net.NetError <: e}}
        -> Int
        -> With s Net.TcpListener
        -> Co e Unit
 served n l = do
   at <- Net.local l
-  CML.spawn (CmlServer.serve l answer)
+  CML.spawn (CmlServer.serve (w := w) Thrown l answer)
   back <- CML.newChan
   go <- CML.newChan
   clients (must at).port back go n
@@ -158,11 +194,17 @@ served n l = do
   repeatG n (CML.send go 1)
   second <- recvSum back n 0
   print ("second requests answered, on the same connections: " ^ debug second)
+  thrown <- Net.withConnection (here (must at).port) (\c -> thrownOn c)
+  print thrown
+  after <- Net.withConnection (here (must at).port) (\c -> asked c "/after")
+  print ("asked after: " ^ debug after)
 
 program : {e w : HFunctor}
         -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
+        -> {{iow : stdio <: w}}
         -> {{nt : Net.net <: e}}
+        -> {{ntw : Net.net <: w}}
         -> {{ex : exception Net.NetError <: e}}
         -> Int
         -> Co e Unit
@@ -219,19 +261,23 @@ burstAt : {e w : HFunctor}
         -> {s : Type}
         -> {{cm : CML.cml w <: e}}
         -> {{io : stdio <: e}}
+        -> {{iow : stdio <: w}}
         -> {{nt : Net.net <: e}}
+        -> {{ntw : Net.net <: w}}
         -> With s Net.TcpListener
         -> Co e Unit
 burstAt l = do
   events <- CML.newChan
-  CML.spawn (CmlServer.serve l (counting events))
+  CML.spawn (CmlServer.serve (w := w) Empty l (counting events))
   n <- answeredOn events 0
   print ("answered " ^ debug n)
 
 burstProgram : {e w : HFunctor}
              -> {{cm : CML.cml w <: e}}
              -> {{io : stdio <: e}}
+             -> {{iow : stdio <: w}}
              -> {{nt : Net.net <: e}}
+             -> {{ntw : Net.net <: w}}
              -> {{sys : process <: e}}
              -> {{ex : exception Net.NetError <: e}}
              -> Co e Unit

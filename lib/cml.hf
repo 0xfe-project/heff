@@ -48,7 +48,7 @@
 --
 -- Operation | What it does
 -- --- | ---
--- `spawn c` | `c` is a thread of its own; this one goes on
+-- `spawn c` | `c`, of the scheduler's world `cml w <+> w`, is a thread of its own; this one goes on
 -- `yield` | the next thread's turn; this one's again after those ready
 -- `newChan` | a channel, of what its type says
 -- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver; a base event
@@ -58,8 +58,8 @@
 -- `readIVar iv` | what `iv` holds, waiting until it does; a base event
 -- `never` | a base event never ready
 -- `choose cs` | one of the branches: each run to its first base event, one of those committed, at random where several can be
--- `withNack f` | `f nack`, `nack` ready once a `choose` is left without this branch
--- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits
+-- `withNack f` | `f nack`, the ivar `nack` written once a `choose` is left without this branch
+-- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits; failing as the first thread that failed
 -- `scheduledWithReactor c` | the same, a thread's operation of the world that would wait pending in its domain's reactor, the others going on
 -- `with _ := threads do ss` | `scheduled`'s, `ss` main, a `with`: the block's world with cml, the `with` done once its threads are
 -- `with _ := threadsWithReactor do ss` | `scheduledWithReactor`'s, as a `with`
@@ -94,7 +94,7 @@
 -- branch of `Time.sleep d` is a time limit.  However a `choose` is
 -- left, the branches not taken are told: a thread whose guard work in
 -- a `choose` fails, after a `withNack` there, has each nack made so far
--- ready before it fails its worker, and is counted no more; and a
+-- ready before it fails, and is counted no more; and a
 -- thread the run drops before it goes on from a `choose` -- waiting
 -- there, or met and not yet run again, where main is done or every
 -- thread waits -- has its offer withdrawn and every nack of that
@@ -175,8 +175,28 @@
 -- (`Domain.spawn c` holds `c`) is run alone, as the operation does
 -- it: its `spawn`s, channels and ivars are the scheduler's, but a
 -- base event in it has no thread to meet, and is abandoned -- unless
--- it is in a `choose` with a branch that ends before its own.  A thread that fails fails its
--- worker, which `scheduled` says once main is done.
+-- it is in a `choose` with a branch that ends before its own.
+--
+-- A thread is a closed computation of the scheduler's world, `cml w <+>
+-- w`: `spawn c` takes `c` as it is, and none of the handlers around the
+-- spawn -- a `recover`, a state, a `with`'s resource -- is around the
+-- thread, which runs on, on another domain, after they are done.  What
+-- a thread needs it opens itself (its own `attempt`, its own `with`), or
+-- is given as a value (a channel, a socket, a nack).  So each thread is
+-- under its own handlers alone, however many generations spawned it.  A
+-- `choose`'s branches are not threads: they run in the choosing thread,
+-- in what is around the `choose`, and so in its world.
+--
+-- A thread that fails -- abandons, fails in the runtime, or a throw no
+-- handler of its own hears comes to the scheduler's world as a failure
+-- -- is done with that, caught in its turn by the worker running it,
+-- which goes on: the other threads are not stopped.  The scope collects
+-- it: once the run is over -- main done, or every thread waiting -- and
+-- the domains stopped, the first failure of a thread is the scope's,
+-- `scheduled` (or the `with`) failing as that thread did, its words kept
+-- (`Domain.fail`), caught by a `Domain.tried` around it as a `Left`.  A
+-- failure of main's own ends the run there, as main's answer would, the
+-- other threads dropped, and is the scope's the same way.
 --
 -- Under `scheduledWithReactor`, each worker opens a group of the reactor
 -- on its domain, its threads' operations of the world started there:
@@ -482,11 +502,23 @@ choosingMapped : {m n : Type -> Type}
                -> Choosing n x a
 choosingMapped nt (MkChoosing bs k) = MkChoosing (List.map (\b -> nt b) bs) k
 
+-- (a thread as `spawn` hands it to the scheduler: a computation of
+-- cml's world, closed -- no handler of where it was spawned is around
+-- it -- written for whichever world it is put in, given where the
+-- operations of `f`, cml's, and of `w`, the scheduler's world, go
+-- there.  So it names cml's operations by their functor, `f`, not by
+-- `cml w`, which is made of them)
+type Thread (f : (Type -> Type) -> Type -> Type) (w : HFunctor) =
+  (e : HFunctor)
+  -> ({m : Type -> Type} -> {x : Type} -> f m x -> e.f m x)
+  -> (w <: e)
+  -> Co e Unit
+
 -- (an operation of `cml`; `Settled` is the scheduler's own, no
 -- program's: a thread gone on from a choice it waited at with nacks,
 -- the choice's number)
 data CmlF (w : HFunctor) (m : Type -> Type) x
-  = Spawn (m Unit) (Unit -> x)
+  = Spawn (Thread (CmlF w) w) (Unit -> x)
   | Yield (Unit -> x)
   | NewChan (Some (MakingChan w x))
   | NewIVar (Some (MakingIVar w x))
@@ -520,7 +552,7 @@ cml w =
   { f = CmlF w
   , hfmap = \m g p -> stepThen g p
   , hmap = \m n nt p -> case p of
-      Spawn c k -> Spawn (nt c) k
+      Spawn c k -> Spawn c k
       Yield k -> Yield k
       NewChan s -> NewChan s
       NewIVar s -> NewIVar s
@@ -534,9 +566,29 @@ cml w =
 -- Threads
 --------------------------------------------------------------------------------
 
--- | `c`, a thread of its own; this one goes on.
-spawn : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit -> Co e Unit
-spawn c = op (cm (Spawn c (\u -> u))) val
+-- (an operation of a sum put where its side's goes)
+summedInto : {h k e : HFunctor} -> (h <: e) -> (k <: e) -> (h <+> k <: e)
+summedInto l r (InL p) = l p
+summedInto l r (InR q) = r q
+
+-- | `c`, a thread of its own; this one goes on.  `c` is a computation
+-- | of the scheduler's world, `cml w <+> w`: no handler around the
+-- | spawn is around it, so what it needs -- a `recover`, a state, a
+-- | resource -- it opens itself, or is given as a value.
+spawn : {e w : HFunctor}
+      -> {{cm : cml w <: e}}
+      -> Co (cml w <+> w) Unit
+      -> Co e Unit
+spawn c =
+  op
+    (cm
+       (Spawn
+          (\t inCml inWorld ->
+             lift
+               (inj := summedInto (h := cml w) (k := w) (e := t) inCml inWorld)
+               c)
+          (\u -> u)))
+    val
 
 -- | The next thread's turn; this one's again after those ready.
 yield : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit
@@ -625,45 +677,57 @@ choose : {e w : HFunctor}
 choose bs = op (cm (Choose (\r use -> use a (MkChoosing bs (\v -> v))))) val
 
 -- | `f` given its nack, the computation run: `f nack`, run as the rest
--- | of its branch, and `nack` a base event ready once the `choose` it
--- | is in is left without this branch -- another committed, its guard
--- | work failed, or its thread dropped before going on from it -- so a
--- | thread waiting on `nack` knows it was not chosen.  Outside a
--- | `choose`, or where its branch is the one committed and its thread
--- | goes on, `nack` is never ready.
+-- | of its branch, and `nack` an ivar written once the `choose` it is
+-- | in is left without this branch -- another committed, its guard work
+-- | failed, or its thread dropped before going on from it -- so a
+-- | thread reading it (`readIVar nack`, a base event) knows it was not
+-- | chosen.  A value, not a computation of this thread's world, so
+-- | that a thread spawned in the guard, of the scheduler's world, can
+-- | be given it.  Outside a `choose`, or where its branch is the one
+-- | committed and its thread goes on, `nack` is never written.
 withNack : {e w : HFunctor}
          -> {a : Type}
          -> {{cm : cml w <: e}}
-         -> (Co e Unit -> Co e a)
+         -> (IVar w Unit -> Co e a)
          -> Co e a
 withNack f = do
   nack <- (newIVar : Co e (IVar w Unit))
   op (cm (Nack nack (\u -> u))) val
-  f (readIVar nack)
+  f nack
 
 -- The handler: a thread as a resumption
 --------------------------------------------------------------------------------
 
 -- | A thread, stopped where the scheduler has a say: done; at an
--- | operation of `cml`, what comes after it a thread again; or at one
--- | of the world's, to be done in `Co w`.
+-- | operation of `cml`, what comes after it a thread again; at one of
+-- | the world's, to be done in `Co w`; or after one, what comes next
+-- | left to the worker that takes the thread on, so that what the
+-- | thread computes is computed in its turn, where a failure of it is
+-- | caught as the thread's, never where the world's operation ended (a
+-- | reactor's step).
 data Res (w : HFunctor) a
   = RDone a
   | RStep (CmlF w (Res w) (Res w a))
   | RAct (Co w (Res w a))
+  | RNext (Unit -> Res w a)
 
 thenRes : {w : HFunctor} -> {a b : Type} -> Res w a -> (a -> Res w b) -> Res w b
 thenRes (RDone x) f = f x
 thenRes (RStep p) f = RStep (stepThen (\r -> thenRes r f) p)
-thenRes (RAct m) f = RAct (bind m (\r -> pure (thenRes r f)))
+thenRes (RAct m) f = RAct (bind m (\r -> pure (RNext (\u -> thenRes r f))))
+thenRes (RNext g) f = RNext (\u -> thenRes (g u) f)
 
 resFunctor : (w : HFunctor) -> RawFunctor
 resFunctor w = { f = Res w, fmap = \g r -> thenRes r (\x -> RDone (g x)) }
 
 -- (what a thread's step came to: it goes on from here; or it stopped
 -- -- ended, waiting, or its turn given up -- and the domain takes
--- another)
-data Stepped (w : HFunctor) = GoesOn (Res w Unit) | Stopped
+-- another; or, after an operation of the world that waited in the
+-- reactor, it goes on, by the turns its thread's `turnOf` makes)
+data Stepped (w : HFunctor)
+  = GoesOn (Res w Unit)
+  | Stopped
+  | Resumed (Res w Unit) ((Unit -> Res w Unit) -> Turn w)
 
 -- The world's operations, waited on through the reactor
 --------------------------------------------------------------------------------
@@ -732,8 +796,10 @@ data Waiting (w : HFunctor) = MkWaiting Int Offer (List (IVar w Unit))
 -- is done or every thread waits; whether that has come; and whether the
 -- domains are to stop; where it waits on the world through the reactor,
 -- its operations, each worker's waits, and how many workers wait in the
--- reactor; and the choices with nacks whose threads have not gone on
--- from them, for the nacks to be told should the run drop them)
+-- reactor; the choices with nacks whose threads have not gone on
+-- from them, for the nacks to be told should the run drop them; a
+-- spawned thread's first turn; and the first failure of a thread, for
+-- the run to fail with at its end)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
   , draws : Domain.Atomic Int
@@ -750,6 +816,8 @@ type Sched (w : HFunctor) =
   , waits : List (Waits w)
   , polling : Domain.Atomic Int
   , waiting : Domain.Atomic (List (Waiting w))
+  , thread : Thread (CmlF w) w -> Turn w
+  , failure : Domain.Atomic (Maybe String)
   }
 
 -- (the `i`th of them, if there is one)
@@ -1555,43 +1623,35 @@ deliveredBranch : {w : HFunctor}
                 -> {a : Type}
                 -> {{dm : Domain.domain <: w}}
                 -> Outside w
+                -> ((Unit -> Res w Unit) -> Turn w)
                 -> Choice w
                 -> List Int
                 -> (Res w a -> Res w Unit)
                 -> Res w a
                 -> Co w (Stepped w)
-deliveredBranch o c around up next = do
+deliveredBranch o turnOf c around up next = do
   ok <- claimedOffer c.offer
   if ok
   then do
     o.close c.group
     nacks <- Domain.get c.nacks
     pure
-        (GoesOn
-           (nacking (abandonedNacks around nacks) (settling nacks (up next))))
+        (Resumed
+           (nacking (abandonedNacks around nacks) (settling nacks (up next)))
+           turnOf)
   else pure Stopped
 
 -- (a choice's guard work failed, after the nack was made: the nack
--- told, from no worker -- its readers put among those ready, not in the
--- slot of this worker, which the failure ends -- and the failure going
--- on.  Where it is the choice's first nack, the last caught, the turn in
--- the slot is put among those ready too, and the thread, failed, is
--- counted no more)
+-- told, from no worker -- its readers put among those ready -- and the
+-- failure going on, as it came, for the thread's turn to fail with)
 failedAfter : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
-            -> Sched w
-            -> Runner w
-            -> Bool
             -> IVar w Unit
+            -> String
             -> Co w (Branches w)
-failedAfter st runner first nack = do
+failedAfter nack why = do
   toldNack Nothing nack
-  if first
-  then do
-    unkept st runner
-    uncounted st
-  else pure ()
-  abandon
+  Domain.fail why
 
 -- (the branches, each run on `runner` up to its first base event, in
 -- order: its base events, or one ready at once where it ends first,
@@ -1635,7 +1695,7 @@ branched st turnOf runner (sb :: rest) acc =
                 (bind m (\(next : Res w a) -> do
                  pended <- (Domain.get waited : Co w Bool)
                  if pended then pure () else Domain.set now (Just next)
-                 pure (deliveredBranch o c around up next)))
+                 pure (deliveredBranch o turnOf c around up next)))
             case r of
               Just act -> do
                 next <- Domain.get now
@@ -1664,9 +1724,16 @@ branched st turnOf runner (sb :: rest) acc =
                 runner
                 ((\t use -> use a (MkBranch next up around)) :: rest)
                 acc
+      RNext g ->
+        branched
+          st
+          turnOf
+          runner
+          ((\t use -> use a (MkBranch (g MkUnit) up around)) :: rest)
+          acc
       RStep p -> case p of
         Spawn c k -> do
-          readyAgain st runner (turnOf (\u -> c))
+          readyAgain st runner (st.thread c)
           branched
               st
               turnOf
@@ -1724,7 +1791,7 @@ branched st turnOf runner (sb :: rest) acc =
                  { acc | nacks = nack :: acc.nacks })
           case r of
             Right got -> pure got
-            Left why -> failedAfter st runner (List.null acc.nacks) nack
+            Left why -> failedAfter nack why
         Settled n k ->
           branched
             st
@@ -1882,13 +1949,14 @@ stepped st turnOf runner (RAct m) = do
   on <- groupOn st runner
   case on of
     Just (MkPair o g) -> do
-      r <- o.start g (bind m (\next -> pure (pure (GoesOn next))))
+      r <- o.start g (bind m (\next -> pure (pure (Resumed next turnOf))))
       case r of
         Just act -> act
         Nothing -> pure Stopped
     Nothing -> bind m (\r -> pure (GoesOn r))
+stepped st turnOf runner (RNext g) = pure (GoesOn (g MkUnit))
 stepped st turnOf runner (RStep (Spawn c k)) = do
-  readyAgain st runner (turnOf (\u -> c))
+  readyAgain st runner (st.thread c)
   next <- later k
   pure (GoesOn next)
 stepped st turnOf runner (RStep (Yield k)) = do
@@ -1978,18 +2046,50 @@ ranOn st turnOf runner fuel r = do
         others <- othersReady st runner
         if others then yielded st runner (turnOf (\u -> next))
         else ranOn st turnOf runner fuelPerRun next
+    Resumed next mk -> ranOn st turnOf runner fuel next
     Stopped -> pure ()
+
+-- (a thread failed, in its turn: the first failure of the run kept, the
+-- others let go of; the thread counted no more; and where it is main,
+-- the run over, as where main is done)
+threadFailed : {w : HFunctor}
+             -> {{dm : Domain.domain <: w}}
+             -> Sched w
+             -> Bool
+             -> String
+             -> Co w Unit
+threadFailed st main why = do
+  _ <- Domain.cas st.failure (Nothing : Maybe String) (Just why)
+  uncounted st
+  if main then finishedWith st else pure ()
 
 -- (a thread run, on `runner`, from where it stopped until it ends,
 -- waits, or gives up its turn, its fuel full; the turns of the threads
--- it readies run them so, on the worker that takes each)
+-- it readies run them so, on the worker that takes each.  A failure in
+-- the turn is the thread's, caught there: the worker goes on)
 run : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
+    -> Bool
     -> Runner w
     -> Res w Unit
     -> Co w Unit
-run st runner r = ranOn st (\k on -> run st on (k MkUnit)) runner fuelPerRun r
+run st main runner r = do
+  out <-
+    Domain.tried
+      (bind
+         (later
+            (\u ->
+               ranOn
+                 st
+                 (\k on -> run st main on (k MkUnit))
+                 runner
+                 fuelPerRun
+                 r))
+         (\c -> c))
+  case out of
+    Right u -> pure ()
+    Left why -> threadFailed st main why
 
 -- (a branch of a choice run alone, of whatever type: what is left of
 -- it to run up to its commit point, and `up` making what follows that)
@@ -2013,9 +2113,11 @@ readyAlone st (sb :: rest) =
       RAct m -> do
         next <- m
         readyAlone st ((\t use -> use a (MkAloneBranch next up)) :: rest)
+      RNext g ->
+        readyAlone st ((\t use -> use a (MkAloneBranch (g MkUnit) up)) :: rest)
       RStep p -> case p of
         Spawn c k -> do
-          readyAgain st Nothing (\on -> run st on c)
+          readyAgain st Nothing (st.thread c)
           readyAlone
               st
               ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
@@ -2074,8 +2176,9 @@ alone : {w : HFunctor}
       -> Co w a
 alone st (RDone x) = pure x
 alone st (RAct m) = bind m (\r -> alone st r)
+alone st (RNext g) = alone st (g MkUnit)
 alone st (RStep (Spawn c k)) = do
-  readyAgain st Nothing (\on -> run st on c)
+  readyAgain st Nothing (st.thread c)
   alone st (k MkUnit)
 alone st (RStep (Yield k)) = alone st (k MkUnit)
 alone st (RStep (NewChan s)) =
@@ -2124,6 +2227,28 @@ cmlHandler st =
   , ret = \x -> RDone x
   , bind = \m f -> thenRes m f
   , malg = \p -> cmlAlg st p
+  }
+
+-- (the scheduler's state, its spawned threads' first turns made: the
+-- thread put in the scheduler's world, `cml w <+> w`, and handled, in
+-- its own turn)
+threaded : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> Sched w
+threaded st =
+  { st
+  | thread = \c on ->
+        let s : Sched w = threaded st
+        in run
+          s
+          False
+          on
+          (RNext
+             (\u ->
+                handle
+                  (cmlHandler s)
+                  (c (cml w <+> w) (inl (cml w) w) (inr (cml w) w))))
   }
 
 -- (how many turns in a row a worker takes from its slot, before it puts
@@ -2229,7 +2354,8 @@ deliveredAll st slot Nil = pure ()
 deliveredAll st slot (act :: acts) = do
   s <- act
   case s of
-    GoesOn next -> readiedOn st (Just slot) (\on -> run st on next)
+    GoesOn next -> readiedOn st (Just slot) (\on -> run st False on next)
+    Resumed next turnOf -> readiedOn st (Just slot) (turnOf (\u -> next))
     Stopped -> pure ()
   deliveredAll st slot acts
 
@@ -2469,7 +2595,8 @@ scheduledBy outside c = do
   stopping <- Domain.newAtomic False
   polling <- Domain.newAtomic 0
   waiting <- Domain.newAtomic (Nil : List (Waiting w))
-  let st : Sched w =
+  failure <- Domain.newAtomic (Nothing : Maybe String)
+  let st0 : Sched w =
     { numbers = numbers
     , draws = draws
     , live = live
@@ -2485,17 +2612,22 @@ scheduledBy outside c = do
     , waits = waits
     , polling = polling
     , waiting = waiting
+    , thread = \t on -> pure ()
+    , failure = failure
     }
+  let st = threaded st0
   answer <- Domain.newAtomic (Nothing : Maybe a)
   let main : Res w Unit =
-    thenRes
-      (handle (cmlHandler st) c)
-      (\x ->
-         RAct (do
-           Domain.set answer (Just x)
-           finishedWith st
-           pure (RDone MkUnit)))
-  readyAgain st Nothing (\on -> run st on main)
+    RNext
+      (\u ->
+         thenRes
+           (handle (cmlHandler st) c)
+           (\x ->
+              RAct (do
+                Domain.set answer (Just x)
+                finishedWith st
+                pure (RDone MkUnit))))
+  readyAgain st Nothing (\on -> run st True on main)
   ds <- workers st slots
   Domain.lock mutex
   idleUntilDone st
@@ -2508,15 +2640,19 @@ scheduledBy outside c = do
   joinedAll ds
   dropped <- Domain.get waiting
   toldDropped dropped
-  Domain.get answer
+  failed <- Domain.get failure
+  case failed of
+    Just why -> Domain.fail why
+    Nothing -> Domain.get answer
 
 -- | `c` and the threads it spawns, run on as many domains as the
 -- | machine has cores (`Domain.cores`): `Just` main's answer, the other
 -- | threads dropped where they stopped; or `Nothing` where main is not
 -- | done and every thread waits at a base event, a deadlock.  A
 -- | thread's operation of the world is done where it is, holding its
--- | domain until it is.  A thread that fails fails the domain running
--- | it, which fails this once main is done.
+-- | domain until it is.  A thread that fails is done with that, the
+-- | others going on; once the run is over, this fails as the first one
+-- | that failed did (main's failure ends the run).
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
