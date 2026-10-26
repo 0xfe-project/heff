@@ -56,7 +56,7 @@
 -- `readIVar iv` | what `iv` holds, waiting until it does; a base event
 -- `never` | a base event never ready
 -- `choose cs` | one of the branches: each run to its first base event, one of those committed, at random where several can be
--- `withNack f` | `f nack`, `nack` ready once a `choose` abandoned this branch for another
+-- `withNack f` | `f nack`, `nack` ready once a `choose` is left without this branch
 -- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits
 -- `scheduledWithReactor c` | the same, a thread's operation of the world that would wait pending in its domain's reactor, the others going on
 --
@@ -87,9 +87,19 @@
 -- socket read, a request, a sleep, pending in the reactor of the domain
 -- that started it; in a `choose`, committed once it is done, where no
 -- other base event was first, and else let go of, undone -- so a
--- branch of `Time.sleep d` is a time limit.  A thread dropped while it
--- waits (main done), or a `choose` left by a throw before it commits,
--- tells no nack.
+-- branch of `Time.sleep d` is a time limit.  However a `choose` is
+-- left, the branches not taken are told: a thread whose guard work in
+-- a `choose` fails, after a `withNack` there, has each nack made so far
+-- ready before it fails its worker, and is counted no more; and a
+-- thread the run drops before it goes on from a `choose` -- waiting
+-- there, or met and not yet run again, where main is done or every
+-- thread waits -- has its offer withdrawn and every nack of that
+-- `choose` ready, once the domains have stopped, none failed.  No
+-- thread of the run takes a turn after that, so such a nack readies
+-- none of them: it is for those reading it from elsewhere, a run of
+-- the scheduler inside one of the threads, or one after it.  A
+-- `choose` run alone, in a computation an operation of `w` holds
+-- (below), tells no nack.
 --
 -- The threads are the scheduler's, a handler in the language, and the
 -- domains are their workers: a thread is a resumption, run by a
@@ -460,6 +470,9 @@ choosingMapped : {m n : Type -> Type}
                -> Choosing n x a
 choosingMapped nt (MkChoosing bs k) = MkChoosing (List.map (\b -> nt b) bs) k
 
+-- (an operation of `cml`; `Settled` is the scheduler's own, no
+-- program's: a thread gone on from a choice it waited at with nacks,
+-- the choice's number)
 data CmlF (w : HFunctor) (m : Type -> Type) x
   = Spawn (m Unit) (Unit -> x)
   | Yield (Unit -> x)
@@ -469,6 +482,7 @@ data CmlF (w : HFunctor) (m : Type -> Type) x
   | Sync (List (Base w x))
   | Choose (Some (Choosing m x))
   | Nack (IVar w Unit) (Unit -> x)
+  | Settled Int (Unit -> x)
 
 -- (what comes after an operation, changed)
 stepThen : {w : HFunctor}
@@ -485,6 +499,7 @@ stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
 stepThen g (Sync bs) = Sync (List.map (baseThen g) bs)
 stepThen g (Choose s) = Choose (someThen (choosingThen g) s)
 stepThen g (Nack iv k) = Nack iv (\u -> g (k u))
+stepThen g (Settled n k) = Settled n (\u -> g (k u))
 
 -- | For CML threads run in the world `w`: spawned and yielding,
 -- | channels and ivars made, and events synced on.
@@ -501,6 +516,7 @@ cml w =
       Sync bs -> Sync bs
       Choose s -> Choose (someThen (choosingMapped nt) s)
       Nack iv k -> Nack iv k
+      Settled n k -> Settled n k
   }
 
 -- Threads
@@ -598,10 +614,11 @@ choose bs = op (cm (Choose (\r use -> use a (MkChoosing bs (\v -> v))))) val
 
 -- | `f` given its nack, the computation run: `f nack`, run as the rest
 -- | of its branch, and `nack` a base event ready once the `choose` it
--- | is in has committed another branch -- this one abandoned, so a
+-- | is in is left without this branch -- another committed, its guard
+-- | work failed, or its thread dropped before going on from it -- so a
 -- | thread waiting on `nack` knows it was not chosen.  Outside a
--- | `choose`, or where its branch is the one committed, `nack` is never
--- | ready.
+-- | `choose`, or where its branch is the one committed and its thread
+-- | goes on, `nack` is never ready.
 withNack : {e w : HFunctor}
          -> {a : Type}
          -> {{cm : cml w <: e}}
@@ -689,6 +706,10 @@ choiceOffer c = c.offer
 -- The scheduler
 --------------------------------------------------------------------------------
 
+-- (a choice with nacks, its thread waiting at it: its number, the
+-- number of its last nack made; its offer; and its nacks)
+data Waiting (w : HFunctor) = MkWaiting Int Offer (List (IVar w Unit))
+
 -- (what the domains running threads share: the next channel's or
 -- ivar's number; the last draw, which the next is made from; how many
 -- threads are running or ready, which is 0 only at a deadlock; the
@@ -699,7 +720,8 @@ choiceOffer c = c.offer
 -- is done or every thread waits; whether that has come; and whether the
 -- domains are to stop; where it waits on the world through the reactor,
 -- its operations, each worker's waits, and how many workers wait in the
--- reactor)
+-- reactor; and the choices with nacks whose threads have not gone on
+-- from them, for the nacks to be told should the run drop them)
 type Sched (w : HFunctor) =
   { numbers : Domain.Atomic Int
   , draws : Domain.Atomic Int
@@ -715,6 +737,7 @@ type Sched (w : HFunctor) =
   , outside : Maybe (Outside w)
   , waits : List (Waits w)
   , polling : Domain.Atomic Int
+  , waiting : Domain.Atomic (List (Waiting w))
   }
 
 -- (the `i`th of them, if there is one)
@@ -996,6 +1019,77 @@ written runner (MkPutting (MkIVar n mu value readers) v k) = do
       Domain.unlock mu
       wokenAll runner (Deque.toList rs) v
       later k
+
+-- (the choice put among those whose threads have not gone on from them)
+registered : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Waiting w
+           -> Co w Unit
+registered st x = do
+  xs <- Domain.get st.waiting
+  ok <- Domain.cas st.waiting xs (x :: xs)
+  if ok then pure () else registered st x
+
+waitingNumber : {w : HFunctor} -> Waiting w -> Int
+waitingNumber (MkWaiting n off nacks) = n
+
+-- (the choice numbered `n` taken out of those, its thread gone on)
+settled : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Int
+        -> Co w Unit
+settled st n = do
+  xs <- Domain.get st.waiting
+  if List.any (\x -> waitingNumber x == n) xs
+  then do
+    ok <- Domain.cas st.waiting xs (List.keepIf (\x -> waitingNumber x /= n) xs)
+    if ok then pure () else settled st n
+  else pure ()
+
+-- (the nack written, where it is not yet, its readers woken from
+-- `runner`: told once, a second telling no write)
+toldNack : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Runner w
+         -> IVar w Unit
+         -> Co w Unit
+toldNack runner (MkIVar n mu value readers) = do
+  Domain.lock mu
+  held <- Domain.get value
+  case held of
+    Just old -> Domain.unlock mu
+    Nothing -> do
+      Domain.set value (Just MkUnit)
+      rs <- Domain.get readers
+      Domain.set readers Deque.empty
+      Domain.unlock mu
+      wokenAll runner (Deque.toList rs) MkUnit
+
+toldAll : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Runner w
+        -> List (IVar w Unit)
+        -> Co w Unit
+toldAll runner Nil = pure ()
+toldAll runner (nack :: rest) = do
+  toldNack runner nack
+  toldAll runner rest
+
+-- (the choices whose threads the run dropped, at its end, before they
+-- went on from them -- waiting there, or met and not yet run again:
+-- each one's offer claimed, so that no partner meets it after, and its
+-- nacks told, none of its branches going on)
+toldDropped : {w : HFunctor}
+            -> {{dm : Domain.domain <: w}}
+            -> List (Waiting w)
+            -> Co w Unit
+toldDropped Nil = pure ()
+toldDropped (MkWaiting n off nacks :: rest) = do
+  _ <- claimedOffer off
+  toldAll Nothing nacks
+  toldDropped rest
 
 -- (the offers at the front of those waiting that are stale -- claimed
 -- already, through this channel or another -- dropped, up to the first
@@ -1396,6 +1490,28 @@ abandonedNacks around (nack :: rest) =
   if List.elem (ivarNumber nack) around then abandonedNacks around rest
   else nack :: abandonedNacks around rest
 
+-- (a choice with these nacks, its thread to wait at `off`: put among
+-- those whose threads have not gone on, numbered by its last nack made)
+waitedWith : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Offer
+           -> List (IVar w Unit)
+           -> Co w Unit
+waitedWith st off Nil = pure ()
+waitedWith st off (nack :: rest) =
+  registered st (MkWaiting (ivarNumber nack) off (nack :: rest))
+
+-- (the thread going on as `r` says, once it has gone on from the choice
+-- with these nacks: the choice taken out of those waiting first)
+settling : {w : HFunctor}
+         -> {a : Type}
+         -> List (IVar w Unit)
+         -> Res w a
+         -> Res w a
+settling Nil r = r
+settling (nack :: rest) r = RStep (Settled (ivarNumber nack) (\u -> r))
+
 -- (a branch of a choice, of whatever type: what is left of it to run
 -- up to its commit point, `up` making the thread's continuation of what
 -- follows that, and the numbers of the nacks enclosing it)
@@ -1438,8 +1554,32 @@ deliveredBranch o c around up next = do
   then do
     o.close c.group
     nacks <- Domain.get c.nacks
-    pure (GoesOn (nacking (abandonedNacks around nacks) (up next)))
+    pure
+        (GoesOn
+           (nacking (abandonedNacks around nacks) (settling nacks (up next))))
   else pure Stopped
+
+-- (a choice's guard work failed, after the nack was made: the nack
+-- told, from no worker -- its readers put among those ready, not in the
+-- slot of this worker, which the failure ends -- and the failure going
+-- on.  Where it is the choice's first nack, the last caught, the turn in
+-- the slot is put among those ready too, and the thread, failed, is
+-- counted no more)
+failedAfter : {w : HFunctor}
+            -> {{dm : Domain.domain <: w}}
+            -> Sched w
+            -> Runner w
+            -> Bool
+            -> IVar w Unit
+            -> Co w (Branches w)
+failedAfter st runner first nack = do
+  toldNack Nothing nack
+  if first
+  then do
+    unkept st runner
+    uncounted st
+  else pure ()
+  abandon
 
 -- (the branches, each run on `runner` up to its first base event, in
 -- order: its base events, or one ready at once where it ends first,
@@ -1557,17 +1697,29 @@ branched st turnOf runner (sb :: rest) acc =
                 runner
                 ((\t use -> use a (MkBranch k up around)) :: rest)
                 acc)
-        Nack nack k ->
+        Nack nack k -> do
+          r <-
+            Domain.tried
+              (branched
+                 st
+                 turnOf
+                 runner
+                 ((\t use ->
+                     use
+                       a
+                       (MkBranch (k MkUnit) up (ivarNumber nack :: around)))
+                  :: rest)
+                 { acc | nacks = nack :: acc.nacks })
+          case r of
+            Right got -> pure got
+            Left why -> failedAfter st runner (List.null acc.nacks) nack
+        Settled n k ->
           branched
             st
             turnOf
             runner
-            ((\t use ->
-                use
-                  a
-                  (MkBranch (k MkUnit) up (ivarNumber nack :: around)))
-             :: rest)
-            { acc | nacks = nack :: acc.nacks }
+            ((\t use -> use a (MkBranch (k MkUnit) up around)) :: rest)
+            acc
         Sync bs ->
           branched
             st
@@ -1592,12 +1744,19 @@ branched st turnOf runner (sb :: rest) acc =
                  ++ rest)
                 acc))
 
+-- (a choice's nacks, every one made)
+branchesNacks : {w : HFunctor} -> Branches w -> List (IVar w Unit)
+branchesNacks br = br.nacks
+
 -- (a choice's base events, each going on, once committed, with the
 -- nacks of the branches abandoned written)
 committable : {w : HFunctor} -> Branches w -> List (Base w (Res w Unit))
 committable br =
   List.map
-    (\p -> baseThen (\r -> nacking (abandonedNacks (fst p) br.nacks) r) (snd p))
+    (\p ->
+       baseThen
+         (\r -> nacking (abandonedNacks (fst p) br.nacks) (settling br.nacks r))
+         (snd p))
     br.bases
 
 -- (a sync, on `runner`: the mutexes of its base events held, one of
@@ -1618,9 +1777,10 @@ synced : {w : HFunctor}
        -> ((Unit -> Res w Unit) -> Turn w)
        -> Runner w
        -> Maybe (Choice w)
+       -> List (IVar w Unit)
        -> List (Base w (Res w Unit))
        -> Co w (Stepped w)
-synced st turnOf runner chosen bs = do
+synced st turnOf runner chosen nacks bs = do
   let locks = locksOf bs
   lockedAll locks
   r <- committedOne st runner bs
@@ -1636,6 +1796,7 @@ synced st turnOf runner chosen bs = do
       pure (GoesOn next)
     Nothing -> case (chosen, st.outside) of
       (Just c, Just o) -> do
+        waitedWith st c.offer nacks
         offeredAll
             (\on t -> do
              postedTo st c.slot (o.close c.group)
@@ -1647,7 +1808,9 @@ synced st turnOf runner chosen bs = do
         pure Stopped
       _ -> do
         claimed <- Domain.newAtomic False
-        offeredAll (\on t -> readyAgain st on t) turnOf (MkOffer claimed) bs
+        let off : Offer = MkOffer claimed
+        waitedWith st off nacks
+        offeredAll (\on t -> readyAgain st on t) turnOf off bs
         unlockedAll locks
         uncounted st
         pure Stopped
@@ -1727,7 +1890,8 @@ stepped st turnOf runner (RStep (NewIVar s)) =
     MkMakingIVar k -> bind (madeIVar st) (\iv -> pure (GoesOn (k iv))))
 stepped st turnOf runner (RStep (PutIVar s)) =
   s (Co w (Stepped w)) (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
-stepped st turnOf runner (RStep (Sync bs)) = synced st turnOf runner Nothing bs
+stepped st turnOf runner (RStep (Sync bs)) =
+  synced st turnOf runner Nothing Nil bs
 stepped st turnOf runner (RStep (Choose s)) =
   s (Co w (Stepped w)) (\a ch -> case ch of
     MkChoosing bs k -> do
@@ -1743,8 +1907,12 @@ stepped st turnOf runner (RStep (Choose s)) =
               Branches w) :
            Co w (Branches w))
       chosen <- pendingChoice st br
-      synced st turnOf runner chosen (committable br))
+      synced st turnOf runner chosen (branchesNacks br) (committable br))
 stepped st turnOf runner (RStep (Nack nack k)) = do
+  next <- later k
+  pure (GoesOn next)
+stepped st turnOf runner (RStep (Settled n k)) = do
+  settled st n
   next <- later k
   pure (GoesOn next)
 
@@ -1865,6 +2033,10 @@ readyAlone st (sb :: rest) =
           readyAlone
             st
             ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
+        Settled n k ->
+          readyAlone
+            st
+            ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
         Sync bs -> readyAlone st rest
         Choose s ->
           s (Co w (Maybe x)) (\c ch -> case ch of
@@ -1904,6 +2076,7 @@ alone st (RStep (PutIVar s)) =
   s (Co w a) (\t p -> bind (written Nothing p) (\k -> alone st k))
 alone st (RStep (Sync bs)) = abandon
 alone st (RStep (Nack nack k)) = alone st (k MkUnit)
+alone st (RStep (Settled n k)) = alone st (k MkUnit)
 alone st (RStep (Choose s)) =
   s (Co w a) (\t ch -> case ch of
     MkChoosing bs k -> do
@@ -2283,6 +2456,7 @@ scheduledBy outside c = do
   done <- Domain.newAtomic False
   stopping <- Domain.newAtomic False
   polling <- Domain.newAtomic 0
+  waiting <- Domain.newAtomic (Nil : List (Waiting w))
   let st : Sched w =
     { numbers = numbers
     , draws = draws
@@ -2298,6 +2472,7 @@ scheduledBy outside c = do
     , outside = outside
     , waits = waits
     , polling = polling
+    , waiting = waiting
     }
   answer <- Domain.newAtomic (Nothing : Maybe a)
   let main : Res w Unit =
@@ -2319,6 +2494,8 @@ scheduledBy outside c = do
     Nothing -> pure ()
   Domain.unlock mutex
   joinedAll ds
+  dropped <- Domain.get waiting
+  toldDropped dropped
   Domain.get answer
 
 -- | `c` and the threads it spawns, run on as many domains as the
