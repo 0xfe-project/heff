@@ -484,11 +484,139 @@ HEFF_FN void *heff_alloc(size_t n) {
 // (`-DHEFF_COUNT_ALLOCS`, as `heff bench` builds one): what its allocs/op
 // and B/op are of.  Elsewhere nothing, not a counter kept)
 #ifdef HEFF_COUNT_ALLOCS
-HEFF_VAR(HEFF_TLS uint64_t heff_allocs);
-HEFF_VAR(HEFF_TLS uint64_t heff_alloc_bytes);
+#ifndef HEFF_THREADS
+HEFF_VAR(uint64_t heff_allocs);
+HEFF_VAR(uint64_t heff_alloc_bytes);
+#endif
 #define HEFF_COUNTED(c) (heff_allocs++, heff_alloc_bytes += (uint64_t)(c) * 8)
 #else
 #define HEFF_COUNTED(c) ((void)0)
+#endif
+
+// (a page of objects of one size, and a thread's pages, its heap -- below)
+#define HEFF_PAGE ((size_t)1 << 16)
+typedef struct HeffPage {
+  void *free;               // what was given back here
+  char *bump, *end;         // what was never used yet
+  struct HeffPage *next;    // the next of its size with room
+  uint32_t c, listed;       // its size, in words; on that list
+#ifdef HEFF_THREADS
+  struct HeffHeap *owner;   // the thread's whose page it is, else none
+  void *remote;             // what other threads gave back here
+  struct HeffPage *all;     // the owner's next page of its size
+#endif
+} HeffPage;
+#define HEFF_PAGE_OF(p) ((HeffPage *)((uintptr_t)(p) & ~(uintptr_t)(HEFF_PAGE - 1)))
+#define HEFF_PAGE_FIRST(pg) ((char *)(pg) + (sizeof(HeffPage) + 15) / 16 * 16)
+
+#ifdef HEFF_THREADS
+typedef struct HeffHeap {
+  HeffPage *at[SMALL_MAX / 8 + 1];       // the page made in last, each size
+  HeffPage *room[SMALL_MAX / 8 + 1];     // pages with room, each size
+  HeffPage *all[SMALL_MAX / 8 + 1];      // all its pages, each size
+  unsigned long news[SMALL_MAX / 8 + 1]; // `heff_remote_news`, as last looked
+} HeffHeap;
+#endif
+
+// (where a lambda's call last of more arguments than it took is put, up
+// to `HEFF_ROOM` of them -- "Calls of what is not known", below)
+#define HEFF_ROOM 4
+
+// (with threads: what each thread keeps of the runtime and uses all the
+// time -- its heap, its count of calls last, its room, its stack of what
+// is given back, its count of what it made -- in one block of its own,
+// `heff_tls()`, found once in a function for all of them.  Where a
+// thread's own variable costs a call, macOS on arm64 (`_tlv_get_addr`,
+// one for each variable a function uses, and a frame for the call even
+// in a leaf), the block is found as the system's own thread-specific
+// data is, by the register that points to it (`tpidrro_el0`) and a key
+// of heff's (`heff_tls_key`), the block put in its slot on each thread
+// heff starts before it runs anything of the program's
+// (`heff_tls_enter`) -- the slot read with nothing checked.  Elsewhere
+// C's `_Thread_local`, an offset from the thread's register already.
+// Without threads, each a variable of its own, as ever)
+#ifdef HEFF_THREADS
+typedef struct {
+#if SMALL_MAX != 0
+  HeffHeap heap;
+#endif
+  long dep;
+  V room[HEFF_ROOM];
+  V *dead;
+  size_t ndead, cdead;
+#ifdef HEFF_COUNT_ALLOCS
+  uint64_t allocs, alloc_bytes;
+#endif
+} HeffTls;
+HEFF_VAR(_Thread_local HeffTls heff_tls_own);
+#if defined(__APPLE__) && defined(__aarch64__)
+HEFF_VAR(pthread_key_t heff_tls_key);
+// (the block: the key read in the same instructions, out of sight of
+// the compiler, which may then find the block once for a whole
+// function -- the thread, its key and its slot the same all through
+// it.  `tpidrro_el0`'s low bits are not the address's)
+static inline HeffTls *heff_tls(void) {
+  HeffTls *t;
+  __asm__("adrp %0, _heff_tls_key@PAGE\n\t"
+          "ldr %0, [%0, _heff_tls_key@PAGEOFF]\n\t"
+          "mrs x16, tpidrro_el0\n\t"
+          "and x16, x16, #~7\n\t"
+          "ldr %0, [x16, %0, lsl #3]"
+          : "=r"(t) : : "x16");
+  return t;
+}
+#define HEFF_TLS_SLOT 1
+#else
+#define heff_tls() (&heff_tls_own)
+#endif
+#if SMALL_MAX != 0
+#define heff_heap (heff_tls()->heap)
+#endif
+#define heff_dep (heff_tls()->dep)
+#define heff_room (heff_tls()->room)
+#define heff_dead (heff_tls()->dead)
+#define heff_ndead (heff_tls()->ndead)
+#define heff_cdead (heff_tls()->cdead)
+#define heff_allocs (heff_tls()->allocs)
+#define heff_alloc_bytes (heff_tls()->alloc_bytes)
+
+// (the block set as this thread's, before it runs anything of the
+// program's: in a function of its own, none that uses the block, so
+// that no reading of it is moved before it)
+HEFF_FN __attribute__((noinline)) void heff_tls_enter(void) {
+#ifdef HEFF_TLS_SLOT
+  if (pthread_setspecific(heff_tls_key, &heff_tls_own) != 0) {
+    fputs("heff: no room for a thread's own\n", stderr);
+    exit(1);
+  }
+#endif
+}
+
+// (the key made, as the program starts, before any thread of it: and
+// the block of the thread that made it found by it, as `heff_tls`
+// finds it -- else the system keeps its own otherwise than heff knows)
+HEFF_FN __attribute__((noinline)) void heff_tls_found(void) {
+#ifdef HEFF_TLS_SLOT
+  if (heff_tls() != &heff_tls_own) {
+    fputs("heff: a thread's own not found where it was put\n", stderr);
+    exit(1);
+  }
+#endif
+}
+
+HEFF_FN void heff_tls_begin(void) {
+#ifdef HEFF_TLS_SLOT
+  if (pthread_key_create(&heff_tls_key, NULL) != 0) {
+    fputs("heff: no room for a thread's own\n", stderr);
+    exit(1);
+  }
+#endif
+  heff_tls_enter();
+  heff_tls_found();
+}
+#else
+HEFF_FN void heff_tls_enter(void) {}
+HEFF_FN void heff_tls_begin(void) {}
 #endif
 
 #if SMALL_MAX == 0
@@ -535,29 +663,7 @@ static inline void heff_obj_free(void *p, size_t n) {
 // slow path, `heff_page_alloc`).  A thread that ends gives back its pages
 // that hold nothing, and leaves the others, abandoned, to whichever
 // thread next finds no room in a page of their size: it adopts them)
-#define HEFF_PAGE ((size_t)1 << 16)
-typedef struct HeffPage {
-  void *free;               // what was given back here
-  char *bump, *end;         // what was never used yet
-  struct HeffPage *next;    // the next of its size with room
-  uint32_t c, listed;       // its size, in words; on that list
 #ifdef HEFF_THREADS
-  struct HeffHeap *owner;   // the thread's whose page it is, else none
-  void *remote;             // what other threads gave back here
-  struct HeffPage *all;     // the owner's next page of its size
-#endif
-} HeffPage;
-#define HEFF_PAGE_OF(p) ((HeffPage *)((uintptr_t)(p) & ~(uintptr_t)(HEFF_PAGE - 1)))
-#define HEFF_PAGE_FIRST(pg) ((char *)(pg) + (sizeof(HeffPage) + 15) / 16 * 16)
-
-#ifdef HEFF_THREADS
-typedef struct HeffHeap {
-  HeffPage *at[SMALL_MAX / 8 + 1];       // the page made in last, each size
-  HeffPage *room[SMALL_MAX / 8 + 1];     // pages with room, each size
-  HeffPage *all[SMALL_MAX / 8 + 1];      // all its pages, each size
-  unsigned long news[SMALL_MAX / 8 + 1]; // `heff_remote_news`, as last looked
-} HeffHeap;
-HEFF_VAR(HEFF_TLS HeffHeap heff_heap);
 HEFF_FN void heff_page_remote(HeffPage *pg, void *p);
 #define HEFF_HEAP HeffHeap *h = &heff_heap
 #define HEFF_AT h->at
@@ -1306,10 +1412,12 @@ HEFF_FN __attribute__((noinline)) void heff_flat_clear(V *f, int64_t n, uint32_t
 
 // (what is given back, a stack of it, not a recursion: a long list's
 // cells given back one after another, the stack as deep as the list
-// never)
-HEFF_VAR(HEFF_TLS V *heff_dead);
-HEFF_VAR(HEFF_TLS size_t heff_ndead);
-HEFF_VAR(HEFF_TLS size_t heff_cdead);
+// never -- with threads, each thread's, in its block)
+#ifndef HEFF_THREADS
+HEFF_VAR(V *heff_dead);
+HEFF_VAR(size_t heff_ndead);
+HEFF_VAR(size_t heff_cdead);
+#endif
 
 // (a value whose last reference this was, put on the stack)
 static inline void heff_dead_put(V v) {
@@ -1583,15 +1691,16 @@ static inline V heff_move(V v) { return v; }
 // Calls of what is not known
 // ---------------------------------------------------------------------
 
-HEFF_VAR(HEFF_TLS long heff_dep);
-
-// (where a lambda's call last of more arguments than it took is put, up
-// to `HEFF_ROOM` of them, to be made a jump: its own are where its
-// caller put them, room for only as many as it takes -- and what is
-// called reads them at once, before it calls anything -- see the C
-// emitter's `roomed`)
-#define HEFF_ROOM 4
-HEFF_VAR(HEFF_TLS V heff_room[HEFF_ROOM]);
+// (the calls last counted, `heff_dep`; and where a lambda's call last of
+// more arguments than it took is put, up to `HEFF_ROOM` of them, to be
+// made a jump, `heff_room`: its own are where its caller put them, room
+// for only as many as it takes -- and what is called reads them at
+// once, before it calls anything -- see the C emitter's `roomed`.  With
+// threads, each thread's, in its block)
+#ifndef HEFF_THREADS
+HEFF_VAR(long heff_dep);
+HEFF_VAR(V heff_room[HEFF_ROOM]);
+#endif
 
 HEFF_FN V heff_apply(V f, int n, V *a);
 
@@ -4944,6 +5053,7 @@ typedef struct { void *(*run)(void *); void *u; } HeffStart;
 HEFF_FN void *heff_started(void *u) {
   HeffStart s = *(HeffStart *)u;
   free(u);
+  heff_tls_enter();
   heff_watch_stack();
   void *r = s.run(s.u);
   heff_unwatch_stack();
@@ -6117,6 +6227,7 @@ static void heff_check_init(void);
 
 static void *heff_thread(void *u) {
   (void)u;
+  heff_tls_enter();
   heff_watch_stack();
   heff_check_init();
   Buf out = {0};
@@ -6157,6 +6268,7 @@ static void heff_layout_held(void) {}
 
 static void *heff_thread(void *u) {
   (void)u;
+  heff_tls_enter();
   heff_layout_held();
   heff_watch_stack();
   heff_tr(heff_entry());
@@ -6174,6 +6286,7 @@ static DWORD WINAPI heff_win_thread(LPVOID u) {
 
 int main(int argc, char **argv) {
   heff_argc = argc; heff_argv = argv;
+  heff_tls_begin();
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stderr), _O_BINARY);
@@ -6187,6 +6300,7 @@ int main(int argc, char **argv) {
 #else
 int main(int argc, char **argv) {
   heff_argc = argc; heff_argv = argv;
+  heff_tls_begin();
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, HEFF_MAIN_STACK);
