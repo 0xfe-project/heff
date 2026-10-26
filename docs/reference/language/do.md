@@ -192,7 +192,10 @@ runs, and what happens at its end: here one behaviour on both cowns, `a`
 and `b` what they hold, written back when it ends; with
 `std.file`'s `open path`, a file opened, the body run with it,
 and closed; with boc's `r := BOC.await act` last, `act` run outside
-every behaviour, and the body a behaviour once it has come to `r`.
+every behaviour, and the body a behaviour once it has come to `r`; with
+cml's `_ := CML.threads`, the body cml's main thread, in a world with
+cml, it and the threads it spawns scheduled on domains, and the `with`
+done once they are, no thread of it left running after it.
 
 - The names are the body's variables: they can be set, `a := a - n`.
   The handler is told which ones the body sets, and is given what they
@@ -202,8 +205,9 @@ every behaviour, and the body a behaviour once it has come to `r`.
   around, nor leaves it by `break`, `continue` or `return`; a `return`
   in it ends the body.
 - Its value is what the handler says: a file's `with` comes to what its
-  body came to, a cown's to `()` (the behaviour runs later). `x <- with
-  ... do` binds it.
+  body came to, a cown's to `()` (the behaviour runs later), cml's
+  threads' to `Just` main's answer (`Nothing` where every thread
+  waits). `x <- with ... do` binds it.
 - A handler is a pair of instances, co's `Binder` (of what the names are
   bound to: what they are in the body, the world it runs in, and what
   the `with` comes to) and `Holder` (how it runs in the world), and the
