@@ -2,7 +2,7 @@
 
 Highlighting for `.hf` files, and a client for heff's language server
 (`heff lsp`): diagnostics as you type, hover, go to definition,
-completion, formatting, an outline, splitting a variable into cases (a
+completion, formatting (on save too, by default), an outline, splitting a variable into cases (a
 code action), the module claim (a quick fix; and a new, empty `.hf`
 file gets `module <name>` written in it), and references, renaming and
 symbols across the project.
