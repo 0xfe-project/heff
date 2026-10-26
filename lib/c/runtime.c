@@ -3370,13 +3370,24 @@ HEFF_FN __attribute__((noinline, cold)) void heff_arr_out(void) { heff_abandon()
 #define heff_arr_in(r, i) (IS_INT(i) && (uint64_t)INT_OF(i) < (uint64_t)(r)->n)
 
 // (whether the array is held only here and keeps its elements as `kind`
-// says: its header, one word, all of it looked at at once -- but in
-// threads, where its count is read atomically, `heff_rc`)
+// says: its header, one word, all of it looked at at once -- in
+// threads read atomically, relaxed, as `heff_rc` reads a count, a plain
+// load still; one shared, held only here, as `heff_alone` has it)
 static inline int heff_arr_mine(Arr *r, unsigned kind) {
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && !defined(HEFF_THREADS)
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#ifdef HEFF_THREADS
+  uint64_t h = __atomic_load_n((uint64_t *)&r->h, __ATOMIC_RELAXED);
+#else
   uint64_t h;
   memcpy(&h, &r->h, sizeof h);
-  return (h & ~((uint64_t)0xff00 << 48)) == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48);
+#endif
+  if (HEFF_LIKELY((h & ~((uint64_t)0xff00 << 48)) == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48)))
+    return 1;
+#ifdef HEFF_THREADS
+  return heff_shared((uint32_t)h) && HEFF_ARR_KIND(r) == kind && heff_unshare(&r->h);
+#else
+  return 0;
+#endif
 #else
   return HEFF_ARR_KIND(r) == kind && heff_alone(&r->h);
 #endif
