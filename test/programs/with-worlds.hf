@@ -1,0 +1,178 @@
+-- A `with` of bindings whose body runs in a world of its own, made from
+-- the block's by its binder, and handled by its holder: a body whose
+-- output (`stdio <+> e`) is written into a buffer, a state of the block
+-- around, and one with a count of its own (`state Int <+> e`).  The
+-- evidence the bodies ask for is found with nothing written: an effect
+-- the body's world adds is its own, and the others are the block's,
+-- through the evidence in scope there.
+
+module test.programs.with-worlds
+
+import co
+import state
+import std.io
+
+data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
+
+nothingElse : HFunctor
+nothingElse =
+  { f = NoneF
+  , hfmap = \m g p -> case p of
+      NoneOf q -> abandon
+  , hmap = \m n nt p -> case p of
+      NoneOf q -> abandon
+  }
+
+noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
+noneAlg (NoneOf q) = noneAlg q
+
+ranAlone : Handler nothingElse
+ranAlone =
+  { M = \x -> x
+  , ret = \x -> x
+  , bind = \m k -> k m
+  , malg = \p -> noneAlg p
+  }
+
+ran : {a : Type} -> Co nothingElse a -> a
+ran c = handle ranAlone c
+
+-- Output into a buffer
+--------------------------------------------------------------------------------
+
+-- (a `with _ := buffered do`: its body's output, a `stdio` of its own,
+-- appended to the buffer, a `state String` of the world around; what
+-- it reads, nothing)
+data Buffered = MkBuffered
+
+buffered : Buffered
+buffered = MkBuffered
+
+instance instanceBinderBuffered : Binder Buffered
+instanceBinderBuffered =
+  { Contents = \s -> Unit, World = \w -> stdio <+> w, Result = \r -> r }
+
+-- (a piece written, appended)
+appended : {e : HFunctor} -> {{buf : state String <: e}} -> String -> Co e Unit
+appended str = do
+  b <- get
+  put (b ^ str)
+
+instance instanceHolderBuffered : {e : HFunctor}
+                                -> {{buf : state String <: e}}
+                                -> Holder
+                                  e
+                                  Buffered
+                                  (\s -> Unit)
+                                  (\w -> stdio <+> w)
+                                  (\r -> r)
+instanceHolderBuffered =
+  { held = \c written body ->
+        bind
+          (handle
+             (through
+                stdio
+                e
+                (\t -> case t of
+                   Write str x -> bind (appended str) (\u -> pure x)
+                   WriteErr str x -> bind (appended str) (\u -> pure x)
+                   ReadStdin k -> pure (k "")
+                   Flush x -> pure x))
+             (body (s := Unit) MkUnit))
+          (\p -> pure (fst p))
+  }
+
+-- (lines printed into the buffer, a count of the world around put
+-- between them: `print` is the body's own `stdio`, `put` the block's
+-- `state Int`)
+report : {e : HFunctor}
+       -> {{buf : state String <: e}}
+       -> {{st : state Int <: e}}
+       -> Co e Int
+report = do
+  n <-
+    with _ := buffered do
+      print "one"
+      put 41
+      print "two"
+      pure 2
+  m <- get
+  pure (n + m)
+
+-- | the lines in the buffer, the count the body put, and what the `with`
+-- | came to
+-- | >>> reported
+-- | MkPair (MkPair 43 41) "one\ntwo\n"
+reported : ((Int, Int), String)
+reported =
+  ran (runState "" (runState 0 (report (buf := _) (st := _))))
+
+-- A count of its own
+--------------------------------------------------------------------------------
+
+-- (a `with n := counter k do`: its body has a count of its own, from `k`,
+-- `n` the count it starts from; the `with` comes to the body's value
+-- beside the count it leaves)
+data Counter = MkCounter Int
+
+counter : Int -> Counter
+counter k = MkCounter k
+
+instance instanceBinderCounter : Binder Counter
+instanceBinderCounter =
+  { Contents = \s -> Int
+  , World = \w -> state Int <+> w
+  , Result = \r -> (r, Int)
+  }
+
+instance instanceHolderCounter : {e : HFunctor}
+                               -> Holder
+                                 e
+                                 Counter
+                                 (\s -> Int)
+                                 (\w -> state Int <+> w)
+                                 (\r -> (r, Int))
+instanceHolderCounter =
+  { held = \c written body -> case c of
+      MkCounter k ->
+        bind
+          (runState k (body (s := Unit) k))
+          (\p -> pure (fst (fst p), snd p))
+  }
+
+-- (counted from 5: the body's `get` and `put` its own count's, the
+-- block's count of the same type left as it was)
+counted : {e : HFunctor} -> {{st : state Int <: e}} -> Co e ((String, Int), Int)
+counted = do
+  put 100
+  r <-
+    with n := counter 5 do
+      put (n + 1)
+      m <- get
+      put (m * 10)
+      pure "counted"
+  outer <- get
+  pure (r, outer)
+
+-- | the body's value, its count at the end, and the block's count
+-- | >>> countedAlone
+-- | MkPair (MkPair (MkPair "counted" 60) 100) 100
+countedAlone : (((String, Int), Int), Int)
+countedAlone = ran (runState 0 (counted (st := _)))
+
+-- (one inside the other: the inner body's `print` is the outer's
+-- `stdio`, its `get` its own count)
+nested : {e : HFunctor} -> {{buf : state String <: e}} -> Co e (Int, Int)
+nested = do
+  with _ := buffered do
+    with n := counter 3 do
+      m <- get
+      print ("from " ^ debug m)
+      put (m + n)
+      pure m
+
+-- | the inner body's value and count, and the buffer
+-- | >>> nestedAlone
+-- | MkPair (MkPair 3 6) "from 3\n"
+nestedAlone : ((Int, Int), String)
+nestedAlone = ran (runState "" (nested (buf := _)))

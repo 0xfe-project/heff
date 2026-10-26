@@ -141,7 +141,9 @@ Rules:
   definition is elaborated. Where it is still not known then, the one
   instance in scope that unifies with it is taken, and solves what was
   unknown, as Agda's instance search does: under `{{st : state Int <: e}}`,
-  `get` alone reads an `Int`. None, or more than one, is E0340.
+  `get` alone reads an `Int` -- unless its world has a state of its
+  own, as `runState`'s computation's, `state s <+> e`, whose `get` is
+  that one's. None, or more than one, is E0340.
 - Searches nest at most 32 deep (E0349).
 - An instance cannot take an explicit argument (E0348).
 - Each of its implicit arguments must appear in what it is for (E0350).

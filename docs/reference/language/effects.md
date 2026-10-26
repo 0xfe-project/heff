@@ -47,8 +47,11 @@ A part of the world that is a world of its own, `e`, is reached through
 the evidence in scope that says where `h` is in `e`: in `attempt
 FileError c`, whose world is `exception FileError <+> e`, `c`'s `fx :
 exception FileError <: exception FileError <+> e` is `\p -> InL p`, and
-its `io` is `\p -> InR (io p)`, through the `io` in scope. An effect in
-no place of the world is E0355; in more than one, E0356 (give the
+its `io` is `\p -> InR (io p)`, through the `io` in scope. A place of
+`h` in the world as it is comes before one through the evidence in
+scope: in a world `state Int <+> e`, as `runState`'s computation's,
+`get` is the first's, whatever `e` has. An effect in no place of the
+world is E0355; in more than one, E0356 (give the
 evidence there); an argument that is no `h <: e`, given `(x := _)`, or a
 world not known where the call is, E0357.
 

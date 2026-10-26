@@ -204,9 +204,65 @@ and closed.
   body came to, a cown's to `()` (the behaviour runs later). `x <- with
   ... do` binds it.
 - A handler is a pair of instances, co's `Binder` (of what the names are
-  bound to: what they are in the body, and what the `with` comes to)
-  and `Holder` (how it runs in the world), and the `with` is co's
-  `holding`.
+  bound to: what they are in the body, the world it runs in, and what
+  the `with` comes to) and `Holder` (how it runs in the world), and the
+  `with` is co's `holding`.
+
+The body runs in the world of the block around, `e`, unless the
+`Binder` says another, by its field `World`: a function from `e` to the
+body's world. A handler that gives its body a count of its own:
+
+```haskell
+import state
+
+data Counter = MkCounter Int
+
+counter : Int -> Counter
+counter k = MkCounter k
+
+instance instanceBinderCounter : Binder Counter
+instanceBinderCounter =
+  { Contents = \s -> Int
+  , World = \w -> state Int <+> w
+  , Result = \r -> (r, Int)
+  }
+
+instance instanceHolderCounter : {e : HFunctor}
+                               -> Holder
+                                 e
+                                 Counter
+                                 (\s -> Int)
+                                 (\w -> state Int <+> w)
+                                 (\r -> (r, Int))
+instanceHolderCounter =
+  { held = \c written body -> case c of
+      MkCounter k ->
+        bind
+          (runState k (body (s := Unit) k))
+          (\p -> pure (fst (fst p), snd p))
+  }
+
+tens : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
+tens = do
+  r <- with n := counter 5 do
+    put (n + 1)
+    m <- get
+    print ("counted " ^ debug m)
+    put (m * 10)
+    pure "done"
+  print (fst r ^ " at " ^ debug (snd r))
+```
+
+The body of `with n := counter 5 do` runs in `state Int <+> e`: `n` is
+the count it starts from, and `get` and `put` are its own count's. The
+holder's `held` is given the body as a computation of that world, and
+handles what it has beyond `e`, here by `runState`; the `with` comes to
+`("done", 60)`. The body's evidence is found in its world
+([giving the evidence](effects.md#giving-the-evidence)): an effect the
+world adds is the body's own, even where `e` has it too, and `print`
+is `e`'s `stdio`, through the `io` in scope, with nothing written. A
+world `\w -> stdio <+> w` makes a `with` whose holder sends what its
+body prints elsewhere, to a file or a buffer.
 
 `with` and `as` are [keywords](definitions.md#keywords): neither is a
 name.

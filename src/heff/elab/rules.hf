@@ -619,6 +619,15 @@ unsolvedWorld mc (VNeu (HGlobal k) (SpApp (SpApp SpId a) b) ty expansion desc) =
   strEq k "co.<+>" && (unsolvedWorld mc a || unsolvedWorld mc b)
 unsolvedWorld mc v = False
 
+-- | the metavariable a goal's world is, where it is evidence whose world
+-- | is one not solved yet, alone
+bareWorld : Value.MetaCtx -> Value.Ty -> Maybe Int
+bareWorld mc goal = case effectAndWorld mc goal of
+  Just (MkPair h w) -> case Value.forceEl mc w of
+    VNeu (HMeta m) sp ty expansion desc -> Just m
+    _ -> Nothing
+  Nothing -> Nothing
+
 -- | whether a goal is evidence whose world is not solved yet
 -- | (`unsolvedWorld`): nothing tried again finds it
 stillWaiting : Value.MetaCtx -> Value.Ty -> Bool
@@ -992,6 +1001,21 @@ effectFits e h w = do
         Left _ -> False)
     Nothing -> pure False
 
+-- | whether a part of a world, as far as it is known, is the effect `h`
+-- | itself, whatever its parameters: a definition of the same name
+effectInWorld : Value.MetaCtx -> Value.V -> Value.V -> Bool
+effectInWorld mc h w = case Value.forceEl mc w of
+  VNeu (HGlobal k) (SpApp (SpApp SpId a) b) ty expansion desc ->
+    if strEq k "co.<+>" then effectInWorld mc h a || effectInWorld mc h b
+    else sameEffect k
+  VNeu (HGlobal k) sp ty expansion desc -> sameEffect k
+  _ -> False
+  where
+  sameEffect : String -> Bool
+  sameEffect k = case Value.forceEl mc h of
+    VNeu (HGlobal kh) sp ty expansion desc -> strEq k kh
+    _ -> False
+
 -- | evidence wanted before its world is known (`worldWaits`): the
 -- | evidence in scope of its effect, where there is one, says what the
 -- | effect's parameters are (`boc ?w <: ?e` by `bc : boc w <: e`: `w`),
@@ -1000,13 +1024,18 @@ effectFits e h w = do
 -- | may be another's (in `attempt err c`, `c`'s world is `exception err
 -- | <+> e`, and its evidence of `stdio` goes through the `io` in scope,
 -- | not `io` itself).  An effect with no metavariable in it, or one that
--- | is a metavariable itself, says nothing so
+-- | is a metavariable itself, says nothing so; nor does one whose world
+-- | has a part known to be that effect itself (`state Int <+> ?e`, the
+-- | world of `runState`'s computation or of a `with`'s body, whose `get`
+-- | is its own state's, not the one in scope's)
 effectSaid : ElabEnv -> Value.Ty -> Elab Unit
 effectSaid e goal = do
   mc <- gets (\c -> c.metas)
   case effectAndWorld mc goal of
-    Just (MkPair h _) ->
-      if List.null (metasLeftEl e mc h) || bareMeta (Value.forceEl mc h)
+    Just (MkPair h w) ->
+      if List.null (metasLeftEl e mc h)
+         || bareMeta (Value.forceEl mc h)
+         || effectInWorld mc h w
       then pure MkUnit
       else do
         fitting <-
@@ -1463,14 +1492,38 @@ insertInstance e sp goal name = do
          ^ (if ready then "  [ready at the call]"
             else if evidence then "  [evidence: its one witness, or waits]"
             else "  [waits for implicits]"))
-  found <- if ready || evidence then searchedNow e sp hole goal else pure False
+  -- (evidence whose world is a metavariable alone, the head's own `e`
+  -- not unified yet with what the application is checked at, waits
+  -- until that metavariable is solved -- to the world it is checked
+  -- in, or another metavariable: until then, the evidence in scope
+  -- cannot tell its effect's parameters from those of the same effect
+  -- the world may have of its own, `runState`'s or a `with`'s)
+  let fresh = bareWorld mc0 goal
+  found <-
+    if (ready || evidence) && not (evidence && fresh /= Nothing)
+    then searchedNow e sp hole goal
+    else pure False
+  let waits : Bool -> Elab Bool = \final -> do
+    mc <- gets (\c -> c.metas)
+    if not final && stillWaiting mc goal then pure False
+    else resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal final
   if found then pure MkUnit
-  else if evidence
+  else if evidence && fresh /= Nothing
   then want
       sp (\final -> do
     mc <- gets (\c -> c.metas)
-    if not final && stillWaiting mc goal then pure False
-    else resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal final)
+    if final
+    then resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal final
+    else if bareWorld mc goal == fresh
+    then pure False
+    else do
+      done <- searchedNow e sp hole goal
+      if done then pure True
+      else do
+        want sp waits
+        pure True)
+  else if evidence
+  then want sp waits
   else want
       sp
       (\final ->
@@ -2771,6 +2824,85 @@ unifiedFirst e sp a t = do
       restoreWaiting waiting
       pure False
 
+-- | the world of a computation's type, `h` of `Co h a`
+computationWorld : Value.MetaCtx -> Value.Ty -> Maybe Value.V
+computationWorld mc t = case Value.forceTy mc t of
+  VFunction level dom cod implicit dflt folded -> case Value.forceTy mc dom of
+    VDecode (HGlobal k) (SpApp SpId h) u described el ->
+      if strEq k "co.Handler" then Just h else Nothing
+    _ -> Nothing
+  _ -> Nothing
+
+-- (whether the metavariable `m` is in the type of one of the `k`
+-- explicit arguments `t` takes)
+inArguments : ElabEnv -> Value.MetaCtx -> Int -> Value.Ty -> Int -> Elab Bool
+inArguments e mc m t k = do
+  ft <- Meta.forceT t
+  if k <= 0 then pure False
+  else case Value.behavior ft of
+    LikeFunction level dom cod Expl ->
+      if List.elem m (metasLeft e mc dom) then pure True
+      else inArguments
+          e
+          mc
+          m
+          (Value.nom (Value.appClo cod (\u -> Value.errorHole dom)))
+          (k - 1)
+    _ -> pure False
+
+-- | an application checked at a computation's type not known whole, `Co
+-- | e ?a`, whose own type, `t`, is a computation's of a world that is a
+-- | metavariable of the head's, made since `since` and not solved yet,
+-- | and that one of its `n` arguments is a computation of, or holds one
+-- | (`bind`'s `h`, `runState`'s `e`): that world is `e`, said before the
+-- | arguments, as it decides nothing but the head's own -- so a `do`
+-- | block knows its world before its statements, though not what it
+-- | comes to, and evidence is found in it as it is wanted (where the two
+-- | do not unify so, nothing of it is kept).  `headTy` is the head's
+-- | type, its arguments to come
+worldFirst : ElabEnv
+           -> Params.Span
+           -> Int
+           -> Int
+           -> Value.Ty
+           -> Value.Ty
+           -> Value.Ty
+           -> Elab Unit
+worldFirst e sp since n headTy a t = do
+  mc <- gets (\c -> c.metas)
+  case computationWorld mc t of
+    Just hw -> case Value.forceEl mc hw of
+      VNeu (HMeta m) msp mty expansion desc -> do
+        used <- if m < since then pure False else inArguments e mc m headTy n
+        if not used then pure MkUnit
+        else case computationWorld mc a of
+          Just w -> do
+            before <- gets (\c -> c)
+            waiting <- saveDelayed
+            r <- Meta.unifyEl e.globals (shape e.scope) hw w
+            after <- gets (\c -> c)
+            case r of
+              Right _ ->
+                if List.length after.postponed == List.length before.postponed
+                then traceE
+                    sp
+                    "unify"
+                    (\u ->
+                       "world "
+                       ^ instShown e after.metas a
+                       ^ "  =?=  "
+                       ^ instShown e after.metas t
+                       ^ "   ok, before the arguments")
+                else do
+                  modify (Meta.undoTo before)
+                  restoreWaiting waiting
+              Left _ -> do
+                modify (Meta.undoTo before)
+                restoreWaiting waiting
+          Nothing -> pure MkUnit
+      _ -> pure MkUnit
+    Nothing -> pure MkUnit
+
 -- | an application of `head` to `n` explicit arguments (`elims`, each
 -- | one's elimination), checked at a function type `a` (a
 -- | computation's, `Co e a`), its type said first: the head's
@@ -2808,10 +2940,20 @@ applyResultFirst sp firstSp nominal head n elims =
       if not (isImplicitPi t0)
       then runChk (apply sp (markedIf (elims (MkSyn (\e2 -> pure pm))))) e a0
       else do
+        since <- gets (\c -> c.nextMeta)
         pi <- insertImplicits (headEnv e) firstSp (fst pm) t0
         r <- resultAfter (snd pi) n
         first <- case r of
-          Just t -> unifiedFirst e sp a t
+          -- (the whole type said first; where that does not hold, its
+          -- world alone, where that is the head's own)
+          Just t ->
+            bind
+              (unifiedFirst e sp a t)
+              (\(whole : Bool) ->
+                 if whole then (pure True : Elab Bool)
+                 else bind
+                     (worldFirst e sp since n (snd pi) a t)
+                     (\u -> pure False))
           Nothing -> pure False
         let applied = markedIf (elims (MkSyn (\e2 -> pure pi)))
         if first

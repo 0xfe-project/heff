@@ -1,0 +1,112 @@
+-- A `with` whose body's output goes to a file, by C: `with _ :=
+-- redirected f do`, its body run in a world of its own, `stdio <+> e`,
+-- whose `stdio` the holder handles -- what the body writes, written to
+-- `f`; what it writes to the error stream and reads, the program's own.
+-- The body's other effects are the block's, found with nothing written:
+-- its files', and a throw heard outside it.  Nested in a `with` of the
+-- file, and a `with` of the redirection around another.
+
+module test.node.redirected
+
+import co
+import exception
+import std.file
+import std.filesystem
+import std.io
+import std.path as Path
+
+-- (a `with _ := redirected f do`: the output of its body, `f`'s)
+data Redirect = Redirected File
+
+redirected : File -> Redirect
+redirected f = Redirected f
+
+instance instanceBinderRedirect : Binder Redirect
+instanceBinderRedirect =
+  { Contents = \s -> Unit, World = \w -> stdio <+> w, Result = \r -> r }
+
+instance instanceHolderRedirect : {e : HFunctor}
+                                -> {{io : stdio <: e}}
+                                -> {{disk : filesystem <: e}}
+                                -> {{fx : exception FileError <: e}}
+                                -> Holder
+                                  e
+                                  Redirect
+                                  (\s -> Unit)
+                                  (\w -> stdio <+> w)
+                                  (\r -> r)
+instanceHolderRedirect =
+  { held = \c written body -> case c of
+      Redirected f ->
+        bind
+          (handle
+             (through
+                stdio
+                e
+                (\t -> case t of
+                   Write str x -> bind (writeString f str) (\u -> pure x)
+                   WriteErr str x -> bind (writeErr str) (\u -> pure x)
+                   ReadStdin k -> bind readStdin (\str -> pure (k str))
+                   Flush x -> pure x))
+             (body (s := Unit) MkUnit))
+          (\p -> pure (fst p))
+  }
+
+-- (lines written to the file, its being there asked of the files
+-- between them, the redirection's value the body's)
+written : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> Path.Path
+        -> Co e Int
+written path = do
+  with f := open (access := Write { exists = Truncate }) path do
+    with _ := redirected f do
+      print "one"
+      there <- exists path
+      print ("the file is there: " ^ debug there)
+      pure 2
+
+-- (a throw out of a redirected body, heard by a `catch` outside it:
+-- what was written before it is in the file)
+thrown : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{ex : exception String <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> Path.Path
+       -> Co e Unit
+thrown path = do
+  try
+    with f := open (access := Write { exists = Append }) path do
+      with _ := redirected f do
+        print "before the throw"
+        (throw "boom" : Co (stdio <+> e) Unit)
+        print "never here"
+  catch (why : String) ->
+    print ("caught " ^ why)
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> Co e Unit
+program = do
+  dir <- temporaryDirectory "heff-redirected-"
+  let path = dir / "out.txt"
+  print "begun"
+  n <- written path
+  print ("the body came to " ^ debug n)
+  r <- attempt String (thrown path)
+  text <- readFile path
+  print ("the file holds:\n" ^ text)
+  remove dir
+  print "removed"
+
+main : Co (stdio <+> filesystem) Unit
+main = do
+  r <- attempt FileError program
+  case r of
+    Left err -> print ("not heard: " ^ show err)
+    Right _ -> pure ()
