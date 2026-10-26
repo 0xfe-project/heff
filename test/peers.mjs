@@ -44,6 +44,21 @@ const freePorts = async (n) => {
   return ports;
 };
 const sum = (b) => b.reduce((s, c) => s + c, 0);
+// (a connection to `port` once it is made, or the error it failed by;
+// one reset before it is made tried again, a little later: so macOS
+// answers a connection past the listener's queue -- at most
+// `kern.ipc.somaxconn` long, 128 by default -- where Linux drops it and
+// the client's system tries again by itself)
+const reached = (port, tries = 100) => new Promise((ok) => {
+  const s = connect({ host: "127.0.0.1", port });
+  const failed = (e) => {
+    s.destroy();
+    if (e.code === "ECONNRESET" && tries > 0) setTimeout(() => reached(port, tries - 1).then(ok), 50);
+    else ok(e);
+  };
+  s.once("error", failed);
+  s.once("connect", () => { s.off("error", failed); ok(s); });
+});
 // (until the input ends)
 const inputEnded = () => new Promise((ok) => { process.stdin.on("data", () => {}); process.stdin.on("end", ok); process.stdin.resume(); });
 
@@ -195,16 +210,19 @@ if (mode === "burst") {
   const port = Number(arg), before = Number(process.argv[4]), n = Number(process.argv[5]);
   // (a request on a connection of its own, closed after: what came back,
   // or the error)
-  const got = (target) => new Promise((ok) => {
-    const s = connect({ host: "127.0.0.1", port });
-    let back = "";
-    const timer = setTimeout(() => { s.destroy(); ok(`${back}(no end)`); }, 20000);
-    s.setEncoding("latin1");
-    s.on("connect", () => s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`));
-    s.on("data", (d) => { back += d; });
-    s.on("error", (e) => { back += `(${e.code})`; });
-    s.on("close", () => { clearTimeout(timer); ok(back); });
-  });
+  const got = async (target) => {
+    const s = await reached(port);
+    if (s instanceof Error) return `(${s.code})`;
+    return new Promise((ok) => {
+      let back = "";
+      const timer = setTimeout(() => { s.destroy(); ok(`${back}(no end)`); }, 20000);
+      s.setEncoding("latin1");
+      s.on("data", (d) => { back += d; });
+      s.on("error", (e) => { back += `(${e.code})`; });
+      s.on("close", () => { clearTimeout(timer); ok(back); });
+      s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+    });
+  };
   // (the server up: a connection made, closed at once)
   for (let i = 0; i < 600 && !(await new Promise((ok) => {
     const s = connect({ host: "127.0.0.1", port });
@@ -229,8 +247,9 @@ if (mode === "boc") {
   // (a connection kept: `ask(target)`, one request on it, its response's
   // body once it is all come, or null where the connection ended first;
   // `ended`, once the other side closed it)
-  const opened = () => new Promise((ok) => {
-    const s = connect({ host: "127.0.0.1", port });
+  const opened = async () => {
+    const s = await reached(port);
+    if (s instanceof Error) return null;
     s.setEncoding("latin1");
     let buf = "", waiting = null, closed = false;
     const ended = new Promise((done) => s.on("close", () => { closed = true; if (waiting) { waiting(null); waiting = null; } done(); }));
@@ -253,9 +272,8 @@ if (mode === "boc") {
       s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\n\r\n`);
       take();
     });
-    s.on("connect", () => ok({ ask, ended, end: () => s.end(), s }));
-    s.on("error", () => ok(null));
-  });
+    return { ask, ended, end: () => s.end(), s };
+  };
   let up = null;
   for (let i = 0; i < 600 && !up; i++) {
     up = await opened();
