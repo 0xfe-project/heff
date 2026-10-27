@@ -268,6 +268,257 @@ batched k xs n b = do
   t <- freshS "fuel"
   pure (ELet t (EPrimCall FuelTicks (Cons (EInt n) Nil)) e)
 
+-- Counted loops
+--------------------------------------------------------------------------------
+
+-- A loop whose body tests an index against a bound, `if i < n then ... f
+-- (i + d) ... else e` (`<` or `<=`, either arm going round, the index
+-- stepped by a constant), where the bound is what the loop keeps (a
+-- number, a parameter given itself again, the length of one), and whose
+-- round goes nowhere but round, is counted: at a batch's head whether all
+-- `k` rounds go round is tested once -- the test at the index and at the
+-- index of the batch's last round, the step `k - 1` times on -- and if
+-- so the batch is the `k` rounds' copies with no test between them, a
+-- read of the bound's array at the index in range there (`arrayIndexIn`,
+-- the index at least 0 tested too); if not, one round as it is, all but
+-- one of the batch's charge given back.  Its batch is of about
+-- `countedWork` nodes, the copies being straight on.
+--
+--   f a i s = if i < length a      f a i s = let t = fuelTicks 2
+--             then f a (i + 1)                in if i < length a && i + 1 < length a && 0 <= i
+--                    (s + a[i])                   then f a (i + 2) (s + a[i] + a[i + 1])  (unchecked)
+--             else s                           else let t2 = fuelTicks (-1) in (the body)
+
+-- (the comparison of a test whose order holds between its two ends)
+monotone : Prim -> Bool
+monotone IntLt = True
+monotone IntLe = True
+monotone _ = False
+
+-- (what a call of the loop `k` gives each of its parameters, by name)
+givenTo : List String -> IR.Expr -> OrdMap.OrdMap String IR.Expr
+givenTo xs (ECall _ args) = OrdMap.fromList (List.zip xs args)
+givenTo xs _ = OrdMap.empty
+
+-- (whether the parameter `x` is given itself again)
+keptBy : OrdMap.OrdMap String IR.Expr -> String -> Bool
+keptBy again x = case OrdMap.lookup again x of
+  Just (EVar y) -> strEq x y
+  _ -> False
+
+-- | whether an expression is the same every round: a number, a parameter
+-- | given itself again, or a length of one
+invariant : OrdMap.OrdMap String IR.Expr -> IR.Expr -> Bool
+invariant again (EInt _) = True
+invariant again (EVar x) = keptBy again x
+invariant again (EPrimCall ArrayLength (Cons a Nil)) = invariant again a
+invariant again (EPrimCall StrLength (Cons a Nil)) = invariant again a
+invariant again (EPrimCall BytesLength (Cons a Nil)) = invariant again a
+invariant again _ = False
+
+-- (the constant step of `x`, of what the next round gives it)
+stepOf : String -> Maybe IR.Expr -> Maybe Int
+stepOf x (Just (EPrimCall IntAdd (Cons (EVar y) (Cons (EInt d) Nil)))) =
+  if strEq x y then Just d else Nothing
+stepOf x (Just (EPrimCall IntAdd (Cons (EInt d) (Cons (EVar y) Nil)))) =
+  if strEq x y then Just d else Nothing
+stepOf x (Just (EPrimCall IntSub (Cons (EVar y) (Cons (EInt d) Nil)))) =
+  if strEq x y then Just (0 - d) else Nothing
+stepOf x _ = Nothing
+
+-- | a counted loop's: its index, the step, the test going round holds
+-- | of (a condition), the arm going round, and the array the index is
+-- | below the length of (its reads there in range), if it is
+type Counted =
+  { index : String
+  , step : Int
+  , goes : IR.Cond
+  , round : IR.Expr
+  , array : Maybe String
+  }
+
+-- (the index of a comparison, a parameter stepped by a constant, the
+-- other side the same every round)
+indexOf2 : List String
+         -> OrdMap.OrdMap String IR.Expr
+         -> IR.Expr
+         -> IR.Expr
+         -> Maybe (Pair String Int)
+indexOf2 xs again (EVar x) other =
+  if List.elem x xs && invariant again other
+  then maybe
+      Nothing
+      (\d -> Just (MkPair x d))
+      (stepOf x (OrdMap.lookup again x))
+  else Nothing
+indexOf2 xs again _ other = Nothing
+
+-- (the array whose length a test going round has the index below: where
+-- it is `i < length a`, going round where it holds, `i` stepping up)
+arrayBelow : Bool -> Prim -> String -> Int -> IR.Expr -> IR.Expr -> Maybe String
+arrayBelow True IntLt i d (EVar j) (EPrimCall ArrayLength (Cons (EVar a) Nil)) =
+  if strEq i j && d > 0 then Just a else Nothing
+arrayBelow _ _ _ _ _ _ = Nothing
+
+-- (whether the ways out are one, a call of `k`)
+onlyRoundW : String -> List IR.Expr -> Bool
+onlyRoundW k (Cons (ECall g _) Nil) = strEq g k
+onlyRoundW k _ = False
+
+-- (whether an arm's one way out is a call of the loop `k`)
+onlyRound : String -> IR.Expr -> Bool
+onlyRound k b = onlyRoundW k (IR.waysList b)
+
+-- (an arm's one way out)
+lastWay : IR.Expr -> IR.Expr
+lastWay b = fromMaybe b (List.head (IR.waysList b))
+
+-- (the condition going round: the test, or its negation)
+goesOf : Bool -> IR.Cond -> IR.Cond
+goesOf True c = c
+goesOf False c = CNot c
+
+-- (the test `p l r`, going round where it `holds` (or not) by `arm`,
+-- what the next round gives each parameter `again`: counted, where one
+-- side is the index)
+countedAt : List String
+          -> Prim
+          -> IR.Expr
+          -> IR.Expr
+          -> Bool
+          -> IR.Expr
+          -> OrdMap.OrdMap String IR.Expr
+          -> Maybe Counted
+countedAt xs p l r holds arm again = case indexOf2 xs again l r of
+  Just (MkPair i d) ->
+    Just
+      { index = i
+      , step = d
+      , goes = goesOf holds (CRel p l r)
+      , round = arm
+      , array = arrayBelow holds p i d l r
+      }
+  Nothing -> case indexOf2 xs again r l of
+    Just (MkPair i d) ->
+      Just
+        { index = i
+        , step = d
+        , goes = goesOf holds (CRel p l r)
+        , round = arm
+        , array = Nothing
+        }
+    Nothing -> Nothing
+
+-- (a test's arms: the one going round -- its one way out a call of the
+-- loop -- and whether it is where the test holds)
+roundArm : String -> List IR.Arm -> Maybe (Pair Bool IR.Expr)
+roundArm k (Cons (MkArm t1 _ b1) (Cons (MkArm t2 _ b2) Nil)) =
+  if strEq t1 "True" && onlyRound k b1 then Just (MkPair True b1)
+  else if strEq t1 "False" && onlyRound k b1 then Just (MkPair False b1)
+  else if strEq t2 "True" && onlyRound k b2 then Just (MkPair True b2)
+  else if strEq t2 "False" && onlyRound k b2 then Just (MkPair False b2)
+  else Nothing
+roundArm k _ = Nothing
+
+countedBy : List String
+          -> Prim
+          -> IR.Expr
+          -> IR.Expr
+          -> Pair Bool IR.Expr
+          -> Maybe Counted
+countedBy xs p l r (MkPair holds arm) =
+  countedAt xs p l r holds arm (givenTo xs (lastWay arm))
+
+-- | the loop `k`'s body, of parameters `xs`, as a counted loop, if it is
+counted : String -> List String -> IR.Expr -> Maybe Counted
+counted k xs (EMatch (EBool (CRel p l r)) arms) =
+  if monotone p then maybe Nothing (countedBy xs p l r) (roundArm k arms)
+  else Nothing
+counted k xs _ = Nothing
+
+-- (each read of the array `a` at the index `i` made one in range)
+inRange : String -> String -> IR.Expr -> IR.Expr
+inRange a i (EPrimCall ArrayIndex (Cons (EVar b) (Cons (EVar j) Nil))) =
+  if strEq a b && strEq i j
+  then EPrimCall ArrayIndexIn (Cons (EVar b) (Cons (EVar j) Nil))
+  else EPrimCall ArrayIndex (Cons (EVar b) (Cons (EVar j) Nil))
+inRange a i e = IR.mapParts (\_ p -> inRange a i p) e
+
+-- (the round, its reads of the array in range, where there is one)
+roundIn : Counted -> IR.Expr
+roundIn c = maybe c.round (\a -> inRange a c.index c.round) c.array
+
+-- (whether the index is at least 0, where an array is read at it)
+lowOf : Counted -> IR.Cond
+lowOf c = maybe CTrue (\a -> CRel IntLe (EInt 0) (EVar c.index)) c.array
+
+-- (all of a batch of `n` rounds going round: at its first and its last)
+allGo : Int -> Counted -> IR.Cond
+allGo n c =
+  CIf
+    c.goes
+    (CIf
+       (IR.condMap
+          (\e ->
+             IR.subst
+               (OrdMap.fromList
+                  [ MkPair
+                    c.index
+                    (EPrimCall
+                       IntAdd
+                       [EVar c.index, EInt ((n - 1) * c.step)])
+                  ])
+               e)
+          c.goes)
+       (lowOf c)
+       CFalse)
+    CFalse
+
+-- | the counted loop `k`'s body `b`, of parameters `xs`, in batches of `n`
+-- | rounds: where all of a batch go round, its rounds' copies with no test
+-- | between them, else each tested
+countedBatched : String
+               -> List String
+               -> Int
+               -> Counted
+               -> IR.Expr
+               -> S IR.Expr
+countedBatched k xs n c b = do
+  first <- copied (roundIn c)
+  fast <- unrolled k xs (roundIn c) (n - 1) first
+  r <- freshS "fuel"
+  let slow : IR.Expr = ELet r (EPrimCall FuelTicks (Cons (EInt (1 - n)) Nil)) b
+  t <- freshS "fuel"
+  pure
+      (ELet
+         t
+         (EPrimCall FuelTicks (Cons (EInt n) Nil))
+         (EMatch
+            (EBool (allGo n c))
+            [MkArm "True" Nil fast, MkArm "False" Nil slow]))
+
+-- | the IR's nodes a counted loop's batch is made of, about: more than
+-- | another's, its rounds' copies having no test between them
+countedWork : Int
+countedWork = 256
+
+-- (a loop in batches: counted, where it is, its batch of
+-- `countedWork`)
+batchedBy : String
+          -> List String
+          -> Int
+          -> IR.Expr
+          -> Maybe Counted
+          -> S IR.Expr
+batchedBy k xs n b (Just c) =
+  countedBatched
+    k
+    xs
+    (clamped 1 batchMost (countedWork / IR.size c.round))
+    c
+    b
+batchedBy k xs n b Nothing = batched k xs n b
+
 -- (a function's body: a loop's in batches, where they are of more than
 -- a round, else ticked as any)
 lamTicked : (String -> Bool)
@@ -277,7 +528,8 @@ lamTicked : (String -> Bool)
           -> S IR.Expr
 lamTicked inGroup k xs b = do
   b2 <- tickedIn inGroup b
-  if roundsOf k b2 > 1 then batched k xs (roundsOf k b2) b2
+  if roundsOf k b2 > 1
+  then batchedBy k xs (roundsOf k b2) b2 (counted k xs b2)
   else ticked inGroup b2
 
 bodyTicked : (String -> Bool) -> String -> IR.Expr -> S IR.Expr

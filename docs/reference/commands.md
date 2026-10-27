@@ -235,18 +235,21 @@ body copied as many times as make about sixty-four of the compiler's
 steps (at most `Fuel.batchMost`, 64), and charged the batch: `limited`
 stops such a loop up to a batch before its limit, and charges it up to a
 batch more each time it is entered. A loop calling anything, and a
-recursion not last or round other functions, ticks once a round.
+recursion not last or round other functions, ticks once a round. A
+counted loop -- one testing an index against a bound it keeps, the index
+stepped by a constant, as an array's walk does -- is tested once a batch
+for all its rounds going round, and then runs them with no test between
+them, its reads of the array in range unchecked; its last rounds, fewer
+than a batch, go one at a time.
 Measured (one machine, median of three):
 
 | | without fuel | a tick each round | batched |
 |---|---|---|---|
 | a loop counting to a thousand | 638 ns | 783 ns | 610 ns |
 | a thousand gets and puts of a state handler | 459 ns | 595 ns | 411 ns |
-| summing an array of floats, 10⁹ elements | 2.25 G instructions | 12.2 G | 9.5 G |
+| summing an array of floats, 10⁹ elements | 0.53 s, 2.24 G instructions | 0.73 s, 12.2 G | 0.53 s, 2.34 G (counted) |
 | the compiler's C, built with fuel | 30.95 MB | 31.45 MB | 33.57 MB |
 
-(The float sum stays far above: its copies are each checked in range,
-where without fuel the loop's index is checked once.)
 
 So only a program that must stop pure work it does not trust should be
 built with fuel.
