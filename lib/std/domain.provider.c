@@ -37,7 +37,10 @@
 // the taker holds alone, counted by it without atomics.
 //
 // An operation of a type of its own holds it as a function given what
-// to do with it (`Some`, its types erased): `dm_open` takes it.
+// to do with it (`Some`, its types erased): `dm_open` takes it.  A
+// computation a domain is spawned with, or one tried, is taken given
+// the custodian current where it was asked (`heff_carried`): the
+// domain's custodian is its spawner's.
 
 #include <stdatomic.h>
 #include <sched.h>
@@ -413,7 +416,7 @@ static V heff_provider_domain(V p, V k) {
   case TAG_Spawn: {
     V sp = dm_open(heff_dup(heff_field(p, 0)));
     heff_drop(p);
-    V c = heff_dup(heff_field(sp, 0)), g = heff_dup(heff_field(sp, 1));
+    V c = heff_carried(heff_dup(heff_field(sp, 0))), g = heff_dup(heff_field(sp, 1));
     heff_drop(sp);
     x = heff_answer(g, heff_foreign(dm_spawn(c), dm_domain_let_go));
     break;
@@ -430,7 +433,7 @@ static V heff_provider_domain(V p, V k) {
   case TAG_Tried: {
     V t = dm_open(heff_dup(heff_field(p, 0)));
     heff_drop(p);
-    V c = heff_dup(heff_field(t, 0)), g = heff_dup(heff_field(t, 1));
+    V c = heff_carried_fn(heff_dup(heff_field(t, 0))), g = heff_dup(heff_field(t, 1));
     heff_drop(t);
     x = heff_answer(g, dm_tried(c));
     break;

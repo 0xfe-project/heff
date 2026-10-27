@@ -236,67 +236,127 @@ lower g roots = erasedWith (lowerKept False) roots (Erase.eraseProgram g)
 -- runtime's): so it is known where the program is, a record, and the
 -- program's computations are simplified with it -- their handler's
 -- `bind` and `ret` inlined, a copy of each made for it.
+--
+-- Where the world has the custodian's effect, the monad reads the
+-- custodian current too, as Reader does (`Maybe Custodian -> (a -> ())
+-- -> ()`, `Nothing` the root's): `bind` hands it on, the custodian's
+-- `Under k body` runs `body` given `Just k`, and each operation tells
+-- the runtime the one it is performed in (`CustodyIn`) just before it,
+-- for the providers to read.  What an operation carries to run is given
+-- the custodian current there by the provider that runs it.  A world
+-- without custodians has no such argument.
 
 entryKey : String
 entryKey = "run$entry"
 
 -- (names of its own: `$`-numbered from where erasure's ended)
 -- | whether a program of the world whose effects are of these modules
--- | runs the releases due before each operation: where it has the
--- | custodian's effect
+-- | runs the releases due before each operation, and reads the
+-- | custodian current: where it has the custodian's effect
 dueWorld : List String -> Bool
 dueWorld ms = List.any (\m -> strEq m "custodian") ms
 
+-- (a name of the entry's own, the `i`th after `n`)
+entryName : String -> Int -> Int -> String
+entryName s n i = s ^ "$" ^ debug (n + i)
+
 -- (an operation performed: where releases are due, what is due on the
--- domain run first)
+-- domain run first, and the custodian current told the runtime)
 performed : Bool -> Int -> IR.Expr
 performed False n =
-  EPrimCall Perform [EVar ("p$" ^ debug (n + 6)), EVar ("k$" ^ debug (n + 7))]
+  EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]
 performed True n =
   ELet
-    ("due$" ^ debug (n + 6))
+    (entryName "due" n 6)
     (EPrimCall CustodianDue Nil)
-    (EPrimCall
-       Perform
-       [EVar ("p$" ^ debug (n + 6)), EVar ("k$" ^ debug (n + 7))])
+    (ELet
+       (entryName "in" n 11)
+       (EPrimCall CustodyIn [EVar (entryName "c" n 12)])
+       (EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]))
 
-entryBody : Bool -> String -> Int -> IR.Expr
-entryBody due key n =
+-- (the continuation monad's `ret`, `bind` and algebra, and the program's
+-- computation run: given its handler, what follows it, and its end)
+entryCps : String -> Int -> IR.Expr
+entryCps key n =
   EApp
     (EGlobal key)
     [ ERecord
       [ MkPair
         "ret"
         (ELam
-           ["x$" ^ debug n, "k$" ^ debug (n + 1)]
-           (EApp (EVar ("k$" ^ debug (n + 1))) [EVar ("x$" ^ debug n)]))
+           [entryName "x" n 0, entryName "k" n 1]
+           (EApp (EVar (entryName "k" n 1)) [EVar (entryName "x" n 0)]))
       , MkPair
         "bind"
         (ELam
-           [ "m$" ^ debug (n + 2)
-           , "f$" ^ debug (n + 3)
-           , "k$" ^ debug (n + 4)
+           [entryName "m" n 2, entryName "f" n 3, entryName "k" n 4]
+           (EApp
+              (EVar (entryName "m" n 2))
+              [ ELam
+                [entryName "x" n 5]
+                (EApp
+                   (EVar (entryName "f" n 3))
+                   [EVar (entryName "x" n 5), EVar (entryName "k" n 4)])
+              ]))
+      , MkPair
+        "malg"
+        (ELam [entryName "p" n 6, entryName "k" n 7] (performed False n))
+      ]
+      [FtOther, FtOther, FtOther]
+    , ELam
+      [entryName "x" n 8, entryName "k" n 9]
+      (EApp (EVar (entryName "k" n 9)) [EVar (entryName "x" n 8)])
+    , ELam [entryName "x" n 10] (ETag "MkUnit" Nil Nil)
+    ]
+
+-- (... the monad reading the custodian current, `c$`: `Nothing` at first)
+entryReading : String -> Int -> IR.Expr
+entryReading key n =
+  EApp
+    (EGlobal key)
+    [ ERecord
+      [ MkPair
+        "ret"
+        (ELam
+           [entryName "x" n 0, entryName "c" n 13, entryName "k" n 1]
+           (EApp (EVar (entryName "k" n 1)) [EVar (entryName "x" n 0)]))
+      , MkPair
+        "bind"
+        (ELam
+           [ entryName "m" n 2
+           , entryName "f" n 3
+           , entryName "c" n 14
+           , entryName "k" n 4
            ]
            (EApp
-              (EVar ("m$" ^ debug (n + 2)))
-              [ ELam
-                ["x$" ^ debug (n + 5)]
+              (EVar (entryName "m" n 2))
+              [ EVar (entryName "c" n 14)
+              , ELam
+                [entryName "x" n 5]
                 (EApp
-                   (EVar ("f$" ^ debug (n + 3)))
-                   [ EVar ("x$" ^ debug (n + 5))
-                   , EVar ("k$" ^ debug (n + 4))
+                   (EVar (entryName "f" n 3))
+                   [ EVar (entryName "x" n 5)
+                   , EVar (entryName "c" n 14)
+                   , EVar (entryName "k" n 4)
                    ])
               ]))
       , MkPair
         "malg"
-        (ELam ["p$" ^ debug (n + 6), "k$" ^ debug (n + 7)] (performed due n))
+        (ELam
+           [entryName "p" n 6, entryName "c" n 12, entryName "k" n 7]
+           (performed True n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
-      ["x$" ^ debug (n + 8), "k$" ^ debug (n + 9)]
-      (EApp (EVar ("k$" ^ debug (n + 9))) [EVar ("x$" ^ debug (n + 8))])
-    , ELam ["x$" ^ debug (n + 10)] (ETag "MkUnit" Nil Nil)
+      [entryName "x" n 8, entryName "c" n 15, entryName "k" n 9]
+      (EApp (EVar (entryName "k" n 9)) [EVar (entryName "x" n 8)])
+    , ETag "Nothing" Nil Nil
+    , ELam [entryName "x" n 10] (ETag "MkUnit" Nil Nil)
     ]
+
+entryBody : Bool -> String -> Int -> IR.Expr
+entryBody False key n = entryCps key n
+entryBody True key n = entryReading key n
 
 -- (... its workers, of what else is known)
 withWorkersOf : List IR.Def -> Facts.Facts -> Facts.Facts
@@ -615,7 +675,7 @@ entryKept due key u =
         (\m ->
            MkPair
              (Just (IR.mkDef entryKey entryKey (entryBody due key m)))
-             (m + 11))
+             (m + 16))
   , refs = u.refs
   }
 
@@ -781,7 +841,7 @@ piecesWith due vers ks key acc =
     (List.reverse acc.errors)
     vers
     ks
-    (acc.supply + 11)
+    (acc.supply + 16)
     (reachedPieces
        (List.reverse
           (revOnto (entryPieces due vers ks key acc.supply) acc.pieces)))

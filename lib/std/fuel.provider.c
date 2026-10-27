@@ -57,7 +57,7 @@ static V heff_provider_fuel(V p, V k) {
     // (a big number of fuel as good as endless, a negative one none)
     V nv = heff_field(t, 0);
     int64_t n = IS_INT(nv) ? INT_OF(nv) : heff_int_neg(nv) ? 0 : HEFF_FUEL_ENDLESS - 1;
-    V c = heff_dup(heff_field(t, 1)), g = heff_dup(heff_field(t, 2));
+    V c = heff_carried_fn(heff_dup(heff_field(t, 1))), g = heff_dup(heff_field(t, 2));
     heff_drop(t);
     x = heff_answer(g, fl_limited(n, c));
     break;

@@ -1101,6 +1101,20 @@ static void heff_spawn_release(void) {
 }
 #endif
 
+// (ended by its custodian, while a domain may hold it still: killed,
+// with its group, unless it has exited -- the domain that waits for it
+// reaps it, and the program's letting go of it frees it)
+static const char *heff_sub_ended(void *x) {
+  HeffSub *s = x;
+#ifdef _WIN32
+  heff_sub_end(s);
+#else
+  if (s->group) kill(-s->pid, SIGKILL);
+  heff_sub_signal(s, SIGKILL);
+#endif
+  return NULL;
+}
+
 // (let go of -- the program dropped its last reference to its value:
 // ended first, taken out of those started)
 static void heff_sub_let_go(void *x) {
@@ -1145,7 +1159,7 @@ static V heff_start(V inv) {
   heff_spawn_release();
 #endif
   if (!s) return heff_tag_n(TAG_Left, 1, &why);
-  V x = heff_foreign(s, heff_sub_let_go);
+  V x = heff_foreign_ending(s, heff_sub_let_go, heff_sub_ended);
   return heff_tag_n(TAG_Right, 1, &x);
 }
 

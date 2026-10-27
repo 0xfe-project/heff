@@ -15,6 +15,7 @@
 -- ```haskell
 -- import cml as CML
 -- import co
+-- import custodian
 -- import std.domain as Domain
 --
 -- -- | what comes on `a`, one more, sent on `b`, for ever
@@ -40,6 +41,7 @@
 -- -- | `Just 1`, the threads on domains
 -- pingedHere : {w : HFunctor}
 --            -> {{dm : Domain.domain <: w}}
+--            -> {{cu : custodian <: w}}
 --            -> Co w (Maybe Int)
 -- pingedHere = do
 --   with _ := CML.threads do
@@ -48,7 +50,7 @@
 --
 -- Operation | What it does
 -- --- | ---
--- `spawn c` | `c`, of the scheduler's world `cml w <+> w`, is a thread of its own; this one goes on
+-- `spawn c` | `c`, of the scheduler's world `cml w <+> w`, is a thread of its own, the custodian current here current in each of its turns; this one goes on
 -- `yield` | the next thread's turn; this one's again after those ready
 -- `newChan` | a channel, of what its type says
 -- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver; a base event
@@ -246,6 +248,7 @@ module cml
   )
 
 import co
+import custodian as Custodian
 import std.deque as Deque
 import std.domain as Domain
 import std.reactor as Reactor
@@ -833,7 +836,9 @@ type Sched (w : HFunctor) =
   , waits : List (Waits w)
   , polling : Domain.Atomic Int
   , waiting : Domain.Atomic (List (Waiting w))
-  , thread : Thread (CmlF w) w -> Turn w
+  , thread : Maybe Custodian.Custodian -> Thread (CmlF w) w -> Turn w
+  , current : Co w (Maybe Custodian.Custodian)
+  , inCustody : Maybe Custodian.Custodian -> Co w Unit -> Co w Unit
   , failure : Domain.Atomic (Maybe String)
   }
 
@@ -1750,7 +1755,8 @@ branched st turnOf runner (sb :: rest) acc =
           acc
       RStep p -> case p of
         Spawn c k -> do
-          readyAgain st runner (st.thread c)
+          cust <- st.current
+          readyAgain st runner (st.thread cust c)
           branched
               st
               turnOf
@@ -1973,7 +1979,8 @@ stepped st turnOf runner (RAct m) = do
     Nothing -> bind m (\r -> pure (GoesOn r))
 stepped st turnOf runner (RNext g) = pure (GoesOn (g MkUnit))
 stepped st turnOf runner (RStep (Spawn c k)) = do
-  readyAgain st runner (st.thread c)
+  cust <- st.current
+  readyAgain st runner (st.thread cust c)
   next <- later k
   pure (GoesOn next)
 stepped st turnOf runner (RStep (Yield k)) = do
@@ -2112,6 +2119,21 @@ run st True runner r = do
     Right u -> pure ()
     Left why -> threadFailed st True why
 
+-- (a thread's turns, each run with the custodian current that was so as
+-- it was spawned, as Racket's threads keep the one current at their
+-- making: no other thread's is current in them, nor theirs in another's)
+runIn : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Maybe Custodian.Custodian
+      -> Runner w
+      -> Res w Unit
+      -> Co w Unit
+runIn st cust runner r =
+  st.inCustody
+    cust
+    (ranOn st (\k on -> runIn st cust on (k MkUnit)) runner fuelPerRun r)
+
 -- (a branch of a choice run alone, of whatever type: what is left of
 -- it to run up to its commit point, and `up` making what follows that)
 data AloneBranch (w : HFunctor) x a = MkAloneBranch (Res w a) (Res w a -> x)
@@ -2138,7 +2160,8 @@ readyAlone st (sb :: rest) =
         readyAlone st ((\t use -> use a (MkAloneBranch (g MkUnit) up)) :: rest)
       RStep p -> case p of
         Spawn c k -> do
-          readyAgain st Nothing (st.thread c)
+          cust <- st.current
+          readyAgain st Nothing (st.thread cust c)
           readyAlone
               st
               ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
@@ -2199,7 +2222,8 @@ alone st (RDone x) = pure x
 alone st (RAct m) = bind m (\r -> alone st r)
 alone st (RNext g) = alone st (g MkUnit)
 alone st (RStep (Spawn c k)) = do
-  readyAgain st Nothing (st.thread c)
+  cust <- st.current
+  readyAgain st Nothing (st.thread cust c)
   alone st (k MkUnit)
 alone st (RStep (Yield k)) = alone st (k MkUnit)
 alone st (RStep (NewChan s)) =
@@ -2259,11 +2283,11 @@ threaded : {w : HFunctor}
          -> Sched w
 threaded st =
   { st
-  | thread = \c on ->
+  | thread = \cust c on ->
         let s : Sched w = threaded st
-        in run
+        in runIn
           s
-          False
+          cust
           on
           (RNext
              (\u ->
@@ -2614,9 +2638,20 @@ stopped st = do
 
 -- (`c` and its threads scheduled, waiting on the world through the
 -- reactor where `outside` gives its operations)
+-- (`m` run with the custodian current that a thread was spawned with:
+-- the root's, or the scheduler's, as it is)
+inCustodyOf : {w : HFunctor}
+            -> {{cu : Custodian.custodian <: w}}
+            -> Maybe Custodian.Custodian
+            -> Co w Unit
+            -> Co w Unit
+inCustodyOf Nothing m = m
+inCustodyOf (Just k) m = Custodian.custodied k m
+
 scheduledBy : {w : HFunctor}
             -> {a : Type}
             -> {{dm : Domain.domain <: w}}
+            -> {{cu : Custodian.custodian <: w}}
             -> Maybe (Outside w)
             -> Co (cml w <+> w) a
             -> Co w (Maybe a)
@@ -2656,7 +2691,9 @@ scheduledBy outside c = do
     , waits = waits
     , polling = polling
     , waiting = waiting
-    , thread = \t on -> pure ()
+    , thread = \cust t on -> pure ()
+    , current = Custodian.current
+    , inCustody = inCustodyOf
     , failure = failure
     }
   let st = threaded st0
@@ -2693,6 +2730,7 @@ scheduledBy outside c = do
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
+          -> {{cu : Custodian.custodian <: w}}
           -> Co (cml w <+> w) a
           -> Co w (Maybe a)
 scheduled c = scheduledBy Nothing c
@@ -2711,6 +2749,7 @@ scheduled c = scheduledBy Nothing c
 scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
                      -> {{dm : Domain.domain <: w}}
+                     -> {{cu : Custodian.custodian <: w}}
                      -> {{rx : Reactor.reactor <: w}}
                      -> Co (cml w <+> w) a
                      -> Co w (Maybe a)
@@ -2769,6 +2808,7 @@ instanceBinderThreadsWithReactor =
 -- | cml's threads held by a `with`: the body scheduled, its value main's.
 instance instanceHolderThreads : {e : HFunctor}
                                -> {{dm : Domain.domain <: e}}
+                               -> {{cu : Custodian.custodian <: e}}
                                -> Holder
                                  e
                                  Threads
@@ -2783,6 +2823,7 @@ instanceHolderThreads =
 -- | ... with a reactor.
 instance instanceHolderThreadsWithReactor : {e : HFunctor}
                                           -> {{dm : Domain.domain <: e}}
+                                          -> {{cu : Custodian.custodian <: e}}
                                           -> {{rx : Reactor.reactor <: e}}
                                           -> Holder
                                             e

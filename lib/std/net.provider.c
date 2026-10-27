@@ -63,20 +63,22 @@ static int net_close(NetSock *s) {
   return r;
 }
 
-// (a socket a `with` let go of not closed: a failure of the runtime's,
-// said, the program ended with it, as an uncaught one is -- whether the
-// `with` closed it or its last holder did, later)
-static void net_unclosed(NetSock *s) {
-  fflush(stdout);
-  fprintf(stderr, "heff: std.net: %s not closed: %s\n", s->address ? s->address : "a socket", strerror(errno));
-  exit(1);
+// (the socket ended: closed, unless it is already -- by the `with`, by
+// `close`, or by its custodian's shutdown, while a domain may hold it
+// still -- or why it was not, a failure of its custodian's)
+static HEFF_TLS char net_unclosed[256];
+
+static const char *net_end(void *x) {
+  NetSock *s = x;
+  if (net_close(s) == 0) return NULL;
+  snprintf(net_unclosed, sizeof net_unclosed, "std.net: %s not closed: %s",
+           s->address ? s->address : "a socket", strerror(errno));
+  return net_unclosed;
 }
 
-// (the program letting go of its last reference: closed, unless the
-// `with` closed it)
+// (the program letting go of its last reference, the socket ended)
 static void net_let_go(void *x) {
   NetSock *s = x;
-  if (net_close(s) < 0) net_unclosed(s);
   s->magic = 0;
   free(s->address);
   free(s);
@@ -186,7 +188,7 @@ static V net_value(int fd, char *address) {
   s->magic = NET_MAGIC;
   s->fd = fd;
   s->address = address;
-  return net_right(heff_foreign(s, net_let_go));
+  return net_right(heff_foreign_ending(s, net_let_go, net_end));
 }
 
 // (a host and a port as a failure names them, as a URL has them -- an
@@ -726,7 +728,6 @@ static V heff_provider_net(V p, V k) {
     }
     if (heff_tag_of(p) == TAG_Release || heff_tag_of(p) == TAG_LetGo) shutdown(s->fd, SHUT_WR);
     int closed = net_close(s);
-    if (closed < 0 && letting) net_unclosed(s);
     V r = closed < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
     V x = heff_answer(f, r);

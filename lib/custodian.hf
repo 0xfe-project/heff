@@ -1,73 +1,111 @@
--- Custodians, as Racket has them: a custodian manages resources -- what
--- ends a thing is given to it -- and the custodians made under it, and
--- `shutdown` ends all of it at once.  A custodian is the
--- runtime's object, as a thing a `with` holds is: the program holds it
--- as a value, and it lives as long as the program can reach it.
+-- Custodians, as Racket has them: a custodian has things in its custody
+-- -- what a `with` holds -- what ends a thing given to it, and the
+-- custodians made under it, and `shutdown` ends all of it at once.  A
+-- custodian is the runtime's object, as a thing a `with` holds is: the
+-- program holds it as a value, and it lives as long as the program can
+-- reach it, or a thing in its custody lives.
 --
--- What a `with` holds is already in the custody of the runtime: the
--- thing is the host's own, its lifetime the runtime's.  A `with` lets go
--- of its hold when its body ends; where nothing else holds the thing --
--- no thread it was given to -- it is ended there, else it is ended when
--- the last holder lets go of it (resource's `scoped`).  A `with` whose
--- thing is let go of by a computation (resource's `held`) is the special
--- case whose policy is to release as its block is left.  A custodian is
--- for the program that wants more: a group of things ended together, on
--- its say, whoever else holds them.  A custodian manages no thread: a
--- thread that took a thing from it finds the thing ended at its next
--- operation on it (a socket's `EBADF`), and is the one to deal with
--- that.
+-- A `with` lets go of its hold when its body ends; where nothing else
+-- holds the thing -- no thread it was given to -- it is ended there,
+-- else it is ended when the last holder lets go of it (resource's
+-- `scoped`).  A `with` whose thing is let go of by a computation
+-- (resource's `held`) is the special case whose policy is to release as
+-- its block is left.  Either way the thing is in the custody of the
+-- custodian current: the one whose `with` the `with` is in, as Racket's
+-- `parameterize` has it, or the root's, outside every one.  The
+-- custodian current is the runtime's to carry, as Reader carries its
+-- value: a `with` of a custodian adds no effect to its body's world,
+-- and what starts to run later -- a continuation, a domain, a cml
+-- thread -- keeps the one current where it was started.
 --
 -- ```haskell
+-- import bytes as Bytes
 -- import co
 -- import custodian as Custodian
+-- import exception
+-- import resource
+-- import std.net as Net
 --
--- -- | `stop` managed by a custodian of its own, then all of it ended:
--- -- | `stop` run once, by the shutdown
--- stopped : {e : HFunctor}
---         -> {{cu : Custodian.custodian <: e}}
---         -> Co e Unit
---         -> Co e (List String)
--- stopped stop = do
---   c <- Custodian.make
---   _ <- Custodian.manage c stop
---   Custodian.shutdown c
+-- -- | each connection in a custodian of its own, which contains its
+-- -- | failures: one that fails to close takes down its custodian alone
+-- served : {e : HFunctor}
+--        -> {s : Type}
+--        -> {{nt : Net.net <: e}}
+--        -> {{cu : Custodian.custodian <: e}}
+--        -> {{ex : exception Net.NetError <: e}}
+--        -> With s Net.TcpListener
+--        -> Co e Unit
+-- served l = do
+--   with k := Custodian.contained do
+--     with Net.accept l as c do
+--       _ <- Net.write c (Bytes.fromString "hello")
+--       pure ()
+--   served l
 -- ```
 --
 -- Operation | What it does
 -- --- | ---
--- `make` | a custodian, of its own
--- `under c` | a custodian managed by `c`: shut down with it
+-- `with k := custody do` | the body run with `k` a custodian under the one the `with` is in; the things its `with`s hold in `k`'s custody
+-- `with k := contained do` | the same, `k` containing its failures
+-- `make` | a custodian, under the one it is made in
+-- `under c` | a custodian under `c`: shut down with it
 -- `manage c stop` | `stop` given to `c`, to run at its shutdown; `False` where `c` is shut down already, `stop` not kept
--- `shutdown c` | every `stop` given to `c` run, once, in the order given, then those of the custodians under it; why each that failed did
+-- `shutdown c` | the things in `c`'s custody ended, every `stop` given to it run, once, in the order given, then those of the custodians under it; why each `stop` that failed did
+--
+-- A custodian manages no thread: a thread that took a thing in its
+-- custody finds the thing ended at its next operation on it (a
+-- socket's `EBADF`), and is the one to deal with that.
+--
+-- A thing that fails to end -- its `with` ending it, its last holder, or
+-- its custodian's shutdown -- is a failure of its custodian's, never
+-- thrown to the `with`'s caller.  The custodian is shut down, with
+-- those under it, and the failure goes to the one it is under; one
+-- made by `contained` says it and goes no further, the program going
+-- on; at the root, the failure is the program's: said, and the program
+-- ended.  A release run after its block was left (`held`'s) that fails
+-- is the same.
 --
 -- What a custodian is given is a computation, higher-order: it is of
 -- the world it was given in, the handlers between there and the
 -- program's top level handled where it was given, and it runs where the
--- shutdown is, after their scope may have ended.  A handler that cannot
--- let a computation out of its scope says so as it runs: `attempt`
--- turns a throw that leaves one into `abandon`, which the shutdown then
--- says, as it says any failure, in the list it comes to.  That list is
--- where a failure to end something is heard, for now: who else is to
--- hear it is not settled.
+-- shutdown is, after their scope may have ended -- or, where a failure
+-- shut it down, on the domain that made the custodian, at its next
+-- operation.  A handler that cannot let a computation out of its scope
+-- says so as it runs: `attempt` turns a throw that leaves one into
+-- `abandon`, which the shutdown then says in the list it comes to.
 --
--- A custodian the program no longer reaches is let go of by the
--- runtime: what it was given is dropped, not run, and what that kept
--- alive is let go of as the program's other values are -- at once on
--- the C backend, by the count of references, and whenever JavaScript's
--- collector comes to it in a page.  A custodian under another is held
--- by its parent: it lives as long as its parent does, unless the
--- program holds it longer.
+-- A custodian the program no longer reaches, and no thing in its
+-- custody holds, is let go of by the runtime: what it was given is
+-- dropped, not run, and what that kept alive is let go of as the
+-- program's other values are -- at once on the C backend, by the count
+-- of references, and whenever JavaScript's collector comes to it in a
+-- page.  A custodian under another is held by its parent: it lives as
+-- long as its parent does, unless the program holds it longer; where
+-- it outlives its parent, its failures go where its parent's would.
 --
 module custodian
   ( custodian
   , CustodianF(..)
+  , Asking(..)
+  , Giving(..)
   , Custodian
+  , Owned(..)
   , custodianThen
   , custodianBy
   , make
   , under
   , manage
   , shutdown
+  , owned
+  , failed
+  , current
+  , custodied
+  , Running(..)
+  , Custody
+  , custody
+  , contained
+  , instanceBinderCustody
+  , instanceHolderCustody
   , Ticket
   , kept
   , dropped
@@ -85,17 +123,97 @@ data Custodian
 -- | by none.)
 data Ticket = Unkept
 
--- | The custodians' operations: one made, under another or of its own;
--- | something given one, to run at its shutdown -- a function of `Unit`,
--- | computed only where it is run, so that a handler between maps it
--- | without computing it -- `False` where it is shut down already; and
--- | one shut down, why each that failed did.
-data CustodianF (m : Type -> Type) x
-  = Made (Maybe Custodian) (Custodian -> x)
-  | Managed Custodian (Unit -> m Unit) (Bool -> x)
+-- (what an operation holds of a type of its own, its type erased: given
+-- what to do with it)
+type Some (f : Type -> Type) = (r : Type) -> ((a : Type) -> f a -> r) -> r
+
+-- (what it holds, changed, of whatever type)
+someThen : {f g : Type -> Type}
+         -> ({a : Type} -> f a -> g a)
+         -> Some f
+         -> Some g
+someThen h s = \r use -> s r (\a v -> use a (h v))
+
+-- | A thing a `with` holds, of whatever type, given to a custodian.
+data Owned a = MkOwned a
+
+-- | A computation run with a custodian current, and what comes after.
+data Running (m : Type -> Type) x a = MkRunning (m a) (a -> x)
+
+runningThen : {m : Type -> Type}
+            -> {x y a : Type}
+            -> (x -> y)
+            -> Running m x a
+            -> Running m y a
+runningThen g (MkRunning c k) = MkRunning c (\v -> g (k v))
+
+runningBy : {m n : Type -> Type}
+          -> {x a : Type}
+          -> ({t : Type} -> m t -> n t)
+          -> Running m x a
+          -> Running n x a
+runningBy nt (MkRunning c k) = MkRunning (nt c) k
+
+-- | The custodians' operations that are given no computation: one
+-- | made, under another -- `Nothing`, the one current -- and whether a
+-- | failure stops at it; one shut down, why each `stop` that failed
+-- | did; a release kept dropped; a thing a `with` holds given the one
+-- | current; a failure of the one current's, why said; and which one
+-- | is current, `Nothing` the root's.
+data Asking x
+  = Made (Maybe Custodian) Bool (Custodian -> x)
   | ShutDown Custodian (List String -> x)
-  | Kept (Unit -> m Unit) (Ticket -> x)
   | Dropped Ticket x
+  | Own (Some Owned) x
+  | Failed String x
+  | Current (Maybe Custodian -> x)
+
+-- | The custodians' operations given a computation -- a function of
+-- | `Unit`, computed only where it is run, so that a handler between
+-- | maps it without computing it: something given one, to run at its
+-- | shutdown, `False` where it is shut down already; a release kept for
+-- | a `with`, by the one current; and a computation run with one
+-- | current, as Reader's `local` runs one.
+data Giving (m : Type -> Type) x
+  = Managed Custodian (Unit -> m Unit) (Bool -> x)
+  | Kept (Unit -> m Unit) (Ticket -> x)
+  | Under Custodian (Some (Running m x))
+
+-- | The custodians' operations: those given no computation, and those
+-- | given one.  (Two kinds, so that a handler maps an operation by
+-- | looking at two cases, its computations only where there are some.)
+data CustodianF (m : Type -> Type) x
+  = Asked (Asking x)
+  | Given (Giving m x)
+
+-- (what comes after an operation given no computation, changed)
+askingThen : {x y : Type} -> (x -> y) -> Asking x -> Asking y
+askingThen g (Made p b k) = Made p b (\c -> g (k c))
+askingThen g (ShutDown c k) = ShutDown c (\ws -> g (k ws))
+askingThen g (Dropped t x) = Dropped t (g x)
+askingThen g (Own s x) = Own s (g x)
+askingThen g (Failed why x) = Failed why (g x)
+askingThen g (Current k) = Current (\c -> g (k c))
+
+-- (... given one)
+givingThen : {m : Type -> Type}
+           -> {x y : Type}
+           -> (x -> y)
+           -> Giving m x
+           -> Giving m y
+givingThen g (Managed c s k) = Managed c s (\b -> g (k b))
+givingThen g (Kept r k) = Kept r (\t -> g (k t))
+givingThen g (Under c s) = Under c (someThen (runningThen g) s)
+
+-- (what an operation given a computation is given, put in another monad)
+givingBy : {m n : Type -> Type}
+         -> {x : Type}
+         -> ({t : Type} -> m t -> n t)
+         -> Giving m x
+         -> Giving n x
+givingBy nt (Managed c s k) = Managed c (\u -> nt (s u)) k
+givingBy nt (Kept r k) = Kept (\u -> nt (r u)) k
+givingBy nt (Under c s) = Under c (someThen (runningBy nt) s)
 
 -- | What comes after an operation, changed.
 custodianThen : {m : Type -> Type}
@@ -103,11 +221,8 @@ custodianThen : {m : Type -> Type}
               -> (x -> y)
               -> CustodianF m x
               -> CustodianF m y
-custodianThen g (Made p k) = Made p (\c -> g (k c))
-custodianThen g (Managed c s k) = Managed c s (\b -> g (k b))
-custodianThen g (ShutDown c k) = ShutDown c (\ws -> g (k ws))
-custodianThen g (Kept r k) = Kept r (\t -> g (k t))
-custodianThen g (Dropped t x) = Dropped t (g x)
+custodianThen g (Asked q) = Asked (askingThen g q)
+custodianThen g (Given q) = Given (givingThen g q)
 
 -- | What is given to run, put in another monad.
 custodianBy : {m n : Type -> Type}
@@ -115,11 +230,8 @@ custodianBy : {m n : Type -> Type}
             -> ({t : Type} -> m t -> n t)
             -> CustodianF m x
             -> CustodianF n x
-custodianBy nt (Made p k) = Made p k
-custodianBy nt (Managed c s k) = Managed c (\u -> nt (s u)) k
-custodianBy nt (ShutDown c k) = ShutDown c k
-custodianBy nt (Kept r k) = Kept (\u -> nt (r u)) k
-custodianBy nt (Dropped t x) = Dropped t x
+custodianBy nt (Asked q) = Asked q
+custodianBy nt (Given q) = Given (givingBy nt q)
 
 -- | Custodians, the runtime's: a provider at the program's top level.
 custodian : HFunctor
@@ -129,16 +241,17 @@ custodian =
   , hmap = \m n nt p -> custodianBy nt p
   }
 
--- | A custodian of its own.
+-- | A custodian, under the one current: the root's, outside every
+-- | `with` of a custodian.
 make : {e : HFunctor} -> {{cu : custodian <: e}} -> Co e Custodian
-make = op (cu (Made Nothing (\c -> c))) val
+make = op (cu (Asked (Made Nothing False (\c -> c)))) val
 
 -- | A custodian managed by `parent`: shut down with it.
 under : {e : HFunctor}
       -> {{cu : custodian <: e}}
       -> Custodian
       -> Co e Custodian
-under parent = op (cu (Made (Just parent) (\c -> c))) val
+under parent = op (cu (Asked (Made (Just parent) False (\c -> c)))) val
 
 -- | `stop` given to the custodian, to run at its shutdown, once: `True`;
 -- | `False` where it is shut down already, `stop` not kept (to run
@@ -148,17 +261,54 @@ manage : {e : HFunctor}
        -> Custodian
        -> Co e Unit
        -> Co e Bool
-manage c stop = op (cu (Managed c (\u -> stop) (\b -> b))) val
+manage c stop = op (cu (Given (Managed c (\u -> stop) (\b -> b)))) val
 
 -- | Everything given to the custodian run, once, in the order given,
--- | then the custodians under it shut down too: why each that failed
--- | did.  Shut down again, nothing is run; given more after, it is not
--- | kept.
+-- | the things in its custody ended, then the custodians under it shut
+-- | down too: why each `stop` that failed did.  A thing that fails to
+-- | end is a failure of the custodian's.  Shut down again, nothing is
+-- | run; given more after, it is not kept.
 shutdown : {e : HFunctor}
          -> {{cu : custodian <: e}}
          -> Custodian
          -> Co e (List String)
-shutdown c = op (cu (ShutDown c (\ws -> ws))) val
+shutdown c = op (cu (Asked (ShutDown c (\ws -> ws)))) val
+
+-- | `x`, a thing a `with` holds, in the custody of the custodian
+-- | current: it is ended as that one is shut down, and a failure to end
+-- | it is that one's.  (resource's `scoped` gives it.)
+owned : {e : HFunctor}
+      -> {{cu : custodian <: e}}
+      -> {a : Type}
+      -> a
+      -> Co e Unit
+owned x = op (cu (Asked (Own (\r use -> use a (MkOwned x)) MkUnit))) val
+
+-- | A thing in the custody of the custodian current failed to end, as
+-- | `why` says: the failure of that custodian's.  It is shut down, and
+-- | the failure passed to the one it is under; one made to contain its
+-- | failures says it there and goes no further, and the root says it,
+-- | the program ended.
+failed : {e : HFunctor} -> {{cu : custodian <: e}} -> String -> Co e Unit
+failed why = op (cu (Asked (Failed why MkUnit))) val
+
+-- | The custodian current: `Nothing`, the root's.
+current : {e : HFunctor} -> {{cu : custodian <: e}} -> Co e (Maybe Custodian)
+current = op (cu (Asked (Current (\c -> c)))) val
+
+-- | `c` run with `k` the custodian current, and after it the one current
+-- | before: Racket's `parameterize` of the current custodian, as
+-- | Reader's `local` is, by the handler of the one `custodian` -- the
+-- | runtime's -- not a variable.  What `c` leaves to run later (a
+-- | continuation kept, a thread or a domain started) keeps `k`.
+custodied : {e : HFunctor}
+          -> {a : Type}
+          -> {{cu : custodian <: e}}
+          -> Custodian
+          -> Co e a
+          -> Co e a
+custodied k c =
+  op (cu (Given (Under k (\r use -> use a (MkRunning c (\v -> v)))))) val
 
 -- | `release` kept by the program's top level, as a `with` enters its
 -- | block: a computation of the world it is given in, the handlers
@@ -170,33 +320,97 @@ shutdown c = op (cu (ShutDown c (\ws -> ws))) val
 -- | next operation of the domain that kept it, on the C backend as the
 -- | count of its references comes to none, in JavaScript as the
 -- | collector comes to it.  A release that fails there is a failure of
--- | the runtime's, said, and the program ended.
+-- | the custodian whose custody the `with` was in.
 kept : {e : HFunctor}
      -> {{cu : custodian <: e}}
      -> Co e Unit
      -> Co e Ticket
-kept release = op (cu (Kept (\u -> release) (\t -> t))) val
+kept release = op (cu (Given (Kept (\u -> release) (\t -> t)))) val
 
 -- | The release kept dropped, not run: the `with`'s block left as it
 -- | was to be.
 dropped : {e : HFunctor} -> {{cu : custodian <: e}} -> Ticket -> Co e Unit
-dropped t = op (cu (Dropped t MkUnit)) val
+dropped t = op (cu (Asked (Dropped t MkUnit))) val
 
--- (the releases kept by none, in the handler around; a custodian's
--- operations, which only the runtime has, abandoned)
+-- The `with` of a custodian
+--------------------------------------------------------------------------------
+
+-- | What a `with k := custody do` makes: a custodian, which the things
+-- | its body's `with`s hold are in the custody of; `True`, one whose
+-- | failures stop at it.
+data Custody = InCustody Bool
+
+-- | `with k := custody do ss`: `ss` run with `k` a custodian made under
+-- | the one the `with` is in the custody of (the root's, outside every
+-- | other), and the things the `with`s in `ss` hold in its custody, the
+-- | custodians made there under it.  A failure of `k`'s passes on to
+-- | the one it is under.
+custody : Custody
+custody = InCustody False
+
+-- | `with k := contained do ss`: as `custody`, but a failure of `k`'s
+-- | goes no further: `k` is shut down, the failure said, and the
+-- | program goes on.
+contained : Custody
+contained = InCustody True
+
+-- (a custodian made, the body run with it current)
+heldCustody : {e : HFunctor}
+            -> {r : Type}
+            -> {{cu : custodian <: e}}
+            -> Custody
+            -> (Custodian -> Co e (r, Custodian))
+            -> Co e r
+heldCustody (InCustody stops) body = do
+  k <- op (cu (Asked (Made Nothing stops (\c -> c)))) val
+  custodied k (bind (body k) (\p -> pure (fst p)))
+
+-- | A `with` of a custodian: its name the custodian, its body in the
+-- | world of the block around, and the `with` comes to what the body
+-- | came to.
+instance instanceBinderCustody : Binder Custody
+instanceBinderCustody = { Contents = \w s -> Custodian, Result = \r -> r }
+
+-- | A custodian held by a `with`: made, and the body run with it the
+-- | custodian current (`custodied`).  It is not shut down as the body
+-- | ends: the things in its custody are let go of by their own
+-- | `with`s; the body shuts it down where it will (`shutdown k`), and a
+-- | failure does.
+instance instanceHolderCustody : {e : HFunctor}
+                               -> {{cu : custodian <: e}}
+                               -> Holder
+                                 e
+                                 Custody
+                                 (\s -> Custodian)
+                                 (\w -> w)
+                                 (\r -> r)
+instanceHolderCustody =
+  { held = \c written body -> heldCustody c (\k -> body (s := Unit) k) }
+
+-- (the releases kept by none, in the handler around; a thing given no
+-- custodian, the root's current, a computation run as it is; a failure
+-- the program's, which a world with no runtime has as an abandon; a
+-- custodian's operations, which only the runtime has, abandoned)
 untendedAlg : {e : HFunctor}
             -> {a : Type}
             -> (hd : Handler e)
             -> CustodianF hd.M a
             -> hd.M a
-untendedAlg hd (Kept r k) = hd.ret (k Unkept)
-untendedAlg hd (Dropped t x) = hd.ret x
-untendedAlg hd (Made p k) = abandon
-untendedAlg hd (Managed c s k) = abandon
-untendedAlg hd (ShutDown c k) = abandon
+untendedAlg hd (Given (Kept r k)) = hd.ret (k Unkept)
+untendedAlg hd (Asked (Dropped t x)) = hd.ret x
+untendedAlg hd (Asked (Own s x)) = hd.ret x
+untendedAlg hd (Asked (Current k)) = hd.ret (k Nothing)
+untendedAlg hd (Given (Under c s)) =
+  s (hd.M a) (\b r -> case r of
+    MkRunning m k -> hd.bind m (\v -> hd.ret (k v)))
+untendedAlg hd (Asked (Failed why x)) = abandon
+untendedAlg hd (Asked (Made p b k)) = abandon
+untendedAlg hd (Given (Managed c s k)) = abandon
+untendedAlg hd (Asked (ShutDown c k)) = abandon
 
 -- | `c`, its `with`s' releases kept by none, for a world with no
 -- | runtime under it (an interpreter's, a handler's own): each run as
--- | its block is left, one whose block a throw leaves lost.
+-- | its block is left, one whose block a throw leaves lost; a release
+-- | that fails, the program's failure, an abandon.
 untended : {e : HFunctor} -> {a : Type} -> Co (custodian <+> e) a -> Co e a
 untended c = within custodian e (\hd p -> untendedAlg hd p) c
