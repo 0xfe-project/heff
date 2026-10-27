@@ -190,3 +190,42 @@ Other calls take stack:
 
 What must go deeper should use a tail call (`List.foldl`, not
 `List.foldr`), or run as a C program.
+
+## Fuel
+
+A compiled program counts its own steps: the compiler puts a tick, a
+decrement and a branch, at the entry of every function that may be
+entered again before it ends -- one that calls a function of its own
+recursive group, or a closure -- so every loop ticks, even one with no
+operation in it. With no limit set, the count never runs out. Under
+std.domain's `limited n c`, `c` runs on `n` ticks: `Just` its answer,
+or `Nothing` where it runs out first.
+
+```haskell
+import co
+import std.domain as Domain
+
+spin : Int -> Int
+spin n = spin (n + 1)
+
+stopped : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Maybe Int)
+stopped = Domain.limited 100000 (later (\u -> spin 0))  -- Nothing
+```
+
+- It is a watchdog, not a time slice: a computation that runs out is
+  stopped, not suspended, and never resumed. In C it is jumped out of,
+  as a failure is; in JavaScript, thrown out of.
+- A limit within a limit gets at most what is left of the outer one,
+  and what it uses is the outer's. Where the inner runs out of its own,
+  it is `Nothing` and the outer goes on; where it runs out of what was
+  left of the outer, the outer is `Nothing` too.
+- A failure inside is handed on as it came; a `Domain.tried` inside
+  does not catch running out.
+- The count is each domain's: a domain spawned inside runs with no limit.
+- What the stopped computation had not finished is left undone, as a
+  failure leaves it. A `with`'s release it skips is not run: the thing
+  is let go of by its finalizer, as where a continuation is dropped --
+  where its last reference is dropped. What only the stopped frames
+  held on C is leaked, as a failure's.
+- Every program pays for the ticks, limited or not (pure code carries no
+  effect, so the compiler cannot tell which code runs under a limit).

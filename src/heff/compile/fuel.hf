@@ -1,0 +1,137 @@
+-- Fuel, the compiler's part (#133): a tick -- the fuel counted down, and
+-- the computation stopped where it runs out -- at the entry of each
+-- function that may be entered again before it ends, so that any loop,
+-- even one doing no operation, runs out where a limit is set on it.
+--
+-- In heff a loop is a call: of itself (made a jump, heff.compile.trmc
+-- and heff.compile.cycles, whose next round enters the body again), of
+-- a function that calls it back, or of a closure.  So a function's body
+-- -- a definition's or a lambda's, not counting the lambdas in it -- is
+-- given a tick where it calls a definition of its own group (the
+-- strongly connected component of the definitions mentioning one
+-- another it is in: a call that may lead back to it), or calls what is
+-- not known (a closure, which may be anything, a type of data holding
+-- a function of itself among them).  Every round of a loop makes one
+-- such call, from a body entered each round: a body that calls only
+-- what cannot call it back, and no closure, has none, so a leaf -- and
+-- a function calling only leaves -- pays nothing.
+--
+--   count acc n = if n <= 0 then acc     count acc n = let t = fuelTick
+--                 else count (acc+1) (n-1)   in if n <= 0 then ...
+--
+-- The tick is a primitive that may fail, `fuelTick`, bound first in the
+-- body: no pass drops it nor moves it.  This runs on what both backends
+-- are given (heff.compile.lower's `shared`), last, so that the calls are
+-- those the backends make.
+
+module heff.compile.fuel
+
+import heff.compile.cycles as Cycles
+import heff.compile.ir as IR
+import heff.elab.primitive
+import heff.compile.supply
+import std.ordmap as OrdMap
+
+-- The groups
+--------------------------------------------------------------------------------
+
+-- (each definition by the globals it mentions)
+mentions : List IR.Def -> OrdMap.OrdMap String (List String)
+mentions defs =
+  List.foldl
+    (\m (d : IR.Def) -> OrdMap.insert m d.key (IR.globalsIn d.body))
+    OrdMap.empty
+    defs
+
+-- (each definition of a group by the group's number)
+numbered : OrdMap.OrdMap String Int
+         -> Int
+         -> List (List String)
+         -> OrdMap.OrdMap String Int
+numbered m i Nil = m
+numbered m i (Cons g gs) =
+  numbered (List.foldl (\acc k -> OrdMap.insert acc k i) m g) (i + 1) gs
+
+groupsBy : OrdMap.OrdMap String (List String)
+         -> List IR.Def
+         -> OrdMap.OrdMap String Int
+groupsBy refs defs =
+  numbered
+    OrdMap.empty
+    0
+    (Cycles.foundOf
+       (List.foldl
+          (\(w : Cycles.Walk) (d : IR.Def) ->
+             if OrdMap.member w.index d.key then w
+             else Cycles.strong refs w d.key)
+          Cycles.startWalk
+          defs))
+
+-- | each definition by the number of its group: those mentioning one
+-- | another, round a cycle, of one number
+groupsOf : List IR.Def -> OrdMap.OrdMap String Int
+groupsOf defs = groupsBy (mentions defs) defs
+
+-- The calls that may close a loop
+--------------------------------------------------------------------------------
+
+-- (the global an application calls, if it calls one by name)
+calleeOf : IR.Expr -> Maybe String
+calleeOf (EGlobal g) = Just g
+calleeOf _ = Nothing
+
+-- | whether a body, not the lambdas in it, calls a definition of its
+-- | group (`inGroup`) or what is not known (an application of anything
+-- | but a global): a worklist of its parts
+closes : (String -> Bool) -> List IR.Expr -> Bool
+closes inGroup Nil = False
+closes inGroup (Cons (ELam _ _) rest) = closes inGroup rest
+closes inGroup (Cons (ECall g args) rest) =
+  inGroup g || closes inGroup (IR.appendI args rest)
+closes inGroup (Cons (EApp f args) rest) =
+  maybe True inGroup (calleeOf f) || closes inGroup (IR.appendI args rest)
+closes inGroup (Cons e rest) = closes inGroup (IR.partsOnto e rest)
+
+-- The ticks
+--------------------------------------------------------------------------------
+
+-- (a body, its tick first where it may close a loop)
+ticked : (String -> Bool) -> IR.Expr -> S IR.Expr
+ticked inGroup b =
+  if closes inGroup (Cons b Nil)
+  then do
+    t <- freshS "fuel"
+    pure (ELet t (EPrimCall FuelTick Nil) b)
+  else pure b
+
+-- | an expression, each lambda in it given its tick where it may close
+-- | a loop
+tickedIn : (String -> Bool) -> IR.Expr -> S IR.Expr
+tickedIn inGroup (ELam xs b) = do
+  b2 <- tickedIn inGroup b
+  b3 <- ticked inGroup b2
+  pure (ELam xs b3)
+tickedIn inGroup e = IR.traverseParts (\_ p -> tickedIn inGroup p) e
+
+-- (whether a global is of the group `n`)
+sameGroup : Maybe Int -> Int -> Bool
+sameGroup (Just m) n = m == n
+sameGroup Nothing n = False
+
+ofGroup : OrdMap.OrdMap String Int -> Maybe Int -> String -> Bool
+ofGroup groups (Just n) g = sameGroup (OrdMap.lookup groups g) n
+ofGroup groups Nothing g = False
+
+defTicked : OrdMap.OrdMap String Int -> IR.Def -> S IR.Def
+defTicked groups d = do
+  b <- tickedIn (ofGroup groups (OrdMap.lookup groups d.key)) d.body
+  pure (IR.mkDef d.key d.name b)
+
+-- | the program, each function that may close a loop ticked at its
+-- | entry; where fresh names go on from
+-- | >>> fst (fuelProgram 0 [IR.mkDef "f" "f" (ELam ["n"] (ECall "f" [EVar "n"])), IR.mkDef "g" "g" (ELam ["n"] (ECall "f" [EVar "n"]))])
+-- | [{ key = "f", name = "f", body = ELam ["n"] (ELet "fuel$0" (EPrimCall FuelTick Nil) (ECall "f" [EVar "n"])) }, { key = "g", name = "g", body = ELam ["n"] (ECall "f" [EVar "n"]) }]
+-- | >>> fst (fuelProgram 0 [IR.mkDef "h" "h" (ELam ["k"] (ELam ["x"] (EApp (EVar "k") [EVar "x"])))])
+-- | [{ key = "h", name = "h", body = ELam ["k"] (ELam ["x"] (ELet "fuel$0" (EPrimCall FuelTick Nil) (EApp (EVar "k") [EVar "x"]))) }]
+fuelProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+fuelProgram n defs = traverseS (defTicked (groupsOf defs)) defs n
