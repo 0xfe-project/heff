@@ -1,0 +1,145 @@
+-- Custodians, as Racket has them: a custodian manages resources -- what
+-- ends a thing is given to it -- and the custodians made under it, and
+-- `shutdown` ends all of it at once.  A custodian is the
+-- runtime's object, as a thing a `with` holds is: the program holds it
+-- as a value, and it lives as long as the program can reach it.
+--
+-- What a `with` holds is already in the custody of the runtime: the
+-- thing is the host's own, its lifetime the runtime's.  A `with` lets go
+-- of its hold when its body ends; where nothing else holds the thing --
+-- no thread it was given to -- it is ended there, else it is ended when
+-- the last holder lets go of it (resource's `scoped`).  A `with` whose
+-- thing is let go of by a computation (resource's `held`) is the special
+-- case whose policy is to release as its block is left.  A custodian is
+-- for the program that wants more: a group of things ended together, on
+-- its say, whoever else holds them.  A custodian manages no thread: a
+-- thread that took a thing from it finds the thing ended at its next
+-- operation on it (a socket's `EBADF`), and is the one to deal with
+-- that.
+--
+-- ```haskell
+-- import co
+-- import custodian as Custodian
+--
+-- -- | `stop` managed by a custodian of its own, then all of it ended:
+-- -- | `stop` run once, by the shutdown
+-- stopped : {e : HFunctor}
+--         -> {{cu : Custodian.custodian <: e}}
+--         -> Co e Unit
+--         -> Co e (List String)
+-- stopped stop = do
+--   c <- Custodian.make
+--   _ <- Custodian.manage c stop
+--   Custodian.shutdown c
+-- ```
+--
+-- Operation | What it does
+-- --- | ---
+-- `make` | a custodian, of its own
+-- `under c` | a custodian managed by `c`: shut down with it
+-- `manage c stop` | `stop` given to `c`, to run at its shutdown; `False` where `c` is shut down already, `stop` not kept
+-- `shutdown c` | every `stop` given to `c` run, once, in the order given, then those of the custodians under it; why each that failed did
+--
+-- What a custodian is given is a computation, higher-order: it is of
+-- the world it was given in, the handlers between there and the
+-- program's top level handled where it was given, and it runs where the
+-- shutdown is, after their scope may have ended.  A handler that cannot
+-- let a computation out of its scope says so as it runs: `attempt`
+-- turns a throw that leaves one into `abandon`, which the shutdown then
+-- says, as it says any failure, in the list it comes to.  That list is
+-- where a failure to end something is heard, for now: who else is to
+-- hear it is not settled.
+--
+-- A custodian the program no longer reaches is let go of by the
+-- runtime: what it was given is dropped, not run, and what that kept
+-- alive is let go of as the program's other values are -- at once on
+-- the C backend, by the count of references, and whenever JavaScript's
+-- collector comes to it in a page.  A custodian under another is held
+-- by its parent: it lives as long as its parent does, unless the
+-- program holds it longer.
+--
+module custodian
+  ( custodian
+  , CustodianF(..)
+  , Custodian
+  , custodianThen
+  , custodianBy
+  , make
+  , under
+  , manage
+  , shutdown
+  )
+
+import co
+
+-- | A custodian: the runtime's object.
+data Custodian
+
+-- | The custodians' operations: one made, under another or of its own;
+-- | something given one, to run at its shutdown -- a function of `Unit`,
+-- | computed only where it is run, so that a handler between maps it
+-- | without computing it -- `False` where it is shut down already; and
+-- | one shut down, why each that failed did.
+data CustodianF (m : Type -> Type) x
+  = Made (Maybe Custodian) (Custodian -> x)
+  | Managed Custodian (Unit -> m Unit) (Bool -> x)
+  | ShutDown Custodian (List String -> x)
+
+-- | What comes after an operation, changed.
+custodianThen : {m : Type -> Type}
+              -> {x y : Type}
+              -> (x -> y)
+              -> CustodianF m x
+              -> CustodianF m y
+custodianThen g (Made p k) = Made p (\c -> g (k c))
+custodianThen g (Managed c s k) = Managed c s (\b -> g (k b))
+custodianThen g (ShutDown c k) = ShutDown c (\ws -> g (k ws))
+
+-- | What is given to run, put in another monad.
+custodianBy : {m n : Type -> Type}
+            -> {x : Type}
+            -> ({t : Type} -> m t -> n t)
+            -> CustodianF m x
+            -> CustodianF n x
+custodianBy nt (Made p k) = Made p k
+custodianBy nt (Managed c s k) = Managed c (\u -> nt (s u)) k
+custodianBy nt (ShutDown c k) = ShutDown c k
+
+-- | Custodians, the runtime's: a provider at the program's top level.
+custodian : HFunctor
+custodian =
+  { f = CustodianF
+  , hfmap = \m g p -> custodianThen g p
+  , hmap = \m n nt p -> custodianBy nt p
+  }
+
+-- | A custodian of its own.
+make : {e : HFunctor} -> {{cu : custodian <: e}} -> Co e Custodian
+make = op (cu (Made Nothing (\c -> c))) val
+
+-- | A custodian managed by `parent`: shut down with it.
+under : {e : HFunctor}
+      -> {{cu : custodian <: e}}
+      -> Custodian
+      -> Co e Custodian
+under parent = op (cu (Made (Just parent) (\c -> c))) val
+
+-- | `stop` given to the custodian, to run at its shutdown, once: `True`;
+-- | `False` where it is shut down already, `stop` not kept (to run
+-- | otherwise, if the program will).
+manage : {e : HFunctor}
+       -> {{cu : custodian <: e}}
+       -> Custodian
+       -> Co e Unit
+       -> Co e Bool
+manage c stop = op (cu (Managed c (\u -> stop) (\b -> b))) val
+
+-- | Everything given to the custodian run, once, in the order given,
+-- | then the custodians under it shut down too: why each that failed
+-- | did.  Shut down again, nothing is run; given more after, it is not
+-- | kept.
+shutdown : {e : HFunctor}
+         -> {{cu : custodian <: e}}
+         -> Custodian
+         -> Co e (List String)
+shutdown c = op (cu (ShutDown c (\ws -> ws))) val
