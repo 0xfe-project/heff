@@ -68,6 +68,95 @@ static const char *heff_custody_run(V stop) {
   return why;
 }
 
+// Releases kept for `with`s (resource's `held`).  A ticket holds one;
+// dropped by its `with`, the release goes with it.  A ticket the program
+// lets go of otherwise -- its `with` left by a throw, or by a handler
+// dropping the continuation -- puts its release on the queue of the
+// domain that kept it, never running it there: the domain runs what is
+// on its queue at its next operation (`heff_due_run`, which the
+// program's `heff_perform` calls where its world has custodians).
+
+typedef struct HeffDue {
+  V release;
+  struct HeffDue *next;
+} HeffDue;
+
+typedef struct HeffDueQ {
+  HeffDue *head;
+  int n;
+#ifdef HEFF_THREADS
+  pthread_mutex_t mu;
+#endif
+} HeffDueQ;
+
+// (each domain's queue, made as it first keeps one; never freed, as a
+// ticket of the domain's may outlive it)
+static HEFF_TLS HeffDueQ *heff_due_here = NULL;
+
+static HeffDueQ *heff_due_queue(void) {
+  if (!heff_due_here) {
+    HeffDueQ *q = heff_alloc(sizeof *q);
+    memset(q, 0, sizeof *q);
+#ifdef HEFF_THREADS
+    pthread_mutex_init(&q->mu, NULL);
+#endif
+    heff_due_here = q;
+  }
+  return heff_due_here;
+}
+
+typedef struct HeffTicket {
+  V release;
+  HeffDueQ *q;
+} HeffTicket;
+
+static void heff_ticket_let_go(void *p) {
+  HeffTicket *t = p;
+  if (t->release) {
+    HeffDue *d = heff_alloc(sizeof *d);
+    d->release = t->release;
+#ifdef HEFF_THREADS
+    pthread_mutex_lock(&t->q->mu);
+#endif
+    d->next = t->q->head;
+    t->q->head = d;
+    __atomic_add_fetch(&t->q->n, 1, __ATOMIC_RELEASE);
+#ifdef HEFF_THREADS
+    pthread_mutex_unlock(&t->q->mu);
+#endif
+  }
+  free(t);
+}
+
+// (what is on this domain's queue run, each once: one that fails a
+// failure of the runtime's, said, the program ended)
+static void heff_due_run(void) {
+  HeffDueQ *q = heff_due_here;
+#ifdef HEFF_THREADS
+  pthread_mutex_lock(&q->mu);
+#endif
+  HeffDue *d = q->head;
+  q->head = NULL;
+  __atomic_store_n(&q->n, 0, __ATOMIC_RELEASE);
+#ifdef HEFF_THREADS
+  pthread_mutex_unlock(&q->mu);
+#endif
+  // (in the order kept: the list is pushed at its front)
+  HeffDue *in = NULL;
+  while (d) { HeffDue *n = d->next; d->next = in; in = d; d = n; }
+  while (in) {
+    HeffDue *n = in->next;
+    const char *why = heff_custody_run(in->release);
+    free(in);
+    if (why) {
+      fflush(stdout);
+      fprintf(stderr, "heff: a release, run after its `with` was left: %s\n", why);
+      exit(1);
+    }
+    in = n;
+  }
+}
+
 static V heff_provider_custodian(V p, V k) {
   V x;
   switch (heff_tag_of(p)) {
@@ -129,6 +218,24 @@ static V heff_provider_custodian(V p, V k) {
     }
     free(whys);
     x = heff_answer(g, l);
+    break;
+  }
+  case TAG_Kept: {
+    HeffTicket *t = heff_alloc(sizeof *t);
+    t->release = heff_share(heff_dup(heff_field(p, 0)));
+    t->q = heff_due_queue();
+    V g = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    x = heff_answer(g, heff_foreign(t, heff_ticket_let_go));
+    break;
+  }
+  case TAG_Dropped: {
+    HeffTicket *t = heff_foreign_ptr(heff_field(p, 0));
+    V r = t->release;
+    t->release = 0;
+    x = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    if (r) heff_drop(r);
     break;
   }
   default:

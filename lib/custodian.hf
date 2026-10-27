@@ -68,12 +68,22 @@ module custodian
   , under
   , manage
   , shutdown
+  , Ticket
+  , kept
+  , dropped
+  , untended
   )
 
 import co
 
 -- | A custodian: the runtime's object.
 data Custodian
+
+-- | A release the program's top level keeps for a `with` (resource's
+-- | `held`): the runtime's object, dropped by the `with` as its block is
+-- | left, the release then run there.  (`Unkept` is `untended`'s: kept
+-- | by none.)
+data Ticket = Unkept
 
 -- | The custodians' operations: one made, under another or of its own;
 -- | something given one, to run at its shutdown -- a function of `Unit`,
@@ -84,6 +94,8 @@ data CustodianF (m : Type -> Type) x
   = Made (Maybe Custodian) (Custodian -> x)
   | Managed Custodian (Unit -> m Unit) (Bool -> x)
   | ShutDown Custodian (List String -> x)
+  | Kept (Unit -> m Unit) (Ticket -> x)
+  | Dropped Ticket x
 
 -- | What comes after an operation, changed.
 custodianThen : {m : Type -> Type}
@@ -94,6 +106,8 @@ custodianThen : {m : Type -> Type}
 custodianThen g (Made p k) = Made p (\c -> g (k c))
 custodianThen g (Managed c s k) = Managed c s (\b -> g (k b))
 custodianThen g (ShutDown c k) = ShutDown c (\ws -> g (k ws))
+custodianThen g (Kept r k) = Kept r (\t -> g (k t))
+custodianThen g (Dropped t x) = Dropped t (g x)
 
 -- | What is given to run, put in another monad.
 custodianBy : {m n : Type -> Type}
@@ -104,6 +118,8 @@ custodianBy : {m n : Type -> Type}
 custodianBy nt (Made p k) = Made p k
 custodianBy nt (Managed c s k) = Managed c (\u -> nt (s u)) k
 custodianBy nt (ShutDown c k) = ShutDown c k
+custodianBy nt (Kept r k) = Kept (\u -> nt (r u)) k
+custodianBy nt (Dropped t x) = Dropped t x
 
 -- | Custodians, the runtime's: a provider at the program's top level.
 custodian : HFunctor
@@ -143,3 +159,44 @@ shutdown : {e : HFunctor}
          -> Custodian
          -> Co e (List String)
 shutdown c = op (cu (ShutDown c (\ws -> ws))) val
+
+-- | `release` kept by the program's top level, as a `with` enters its
+-- | block: a computation of the world it is given in, the handlers
+-- | between there and the top level as they are then.  Dropped by the
+-- | `with` as its block is left (`dropped`), it is never run by the
+-- | runtime.  Where the block is left otherwise -- a throw heard outside
+-- | it, a handler between that drops the continuation -- the ticket goes
+-- | with what held it, and the runtime runs the release then: at the
+-- | next operation of the domain that kept it, on the C backend as the
+-- | count of its references comes to none, in JavaScript as the
+-- | collector comes to it.  A release that fails there is a failure of
+-- | the runtime's, said, and the program ended.
+kept : {e : HFunctor}
+     -> {{cu : custodian <: e}}
+     -> Co e Unit
+     -> Co e Ticket
+kept release = op (cu (Kept (\u -> release) (\t -> t))) val
+
+-- | The release kept dropped, not run: the `with`'s block left as it
+-- | was to be.
+dropped : {e : HFunctor} -> {{cu : custodian <: e}} -> Ticket -> Co e Unit
+dropped t = op (cu (Dropped t MkUnit)) val
+
+-- (the releases kept by none, in the handler around; a custodian's
+-- operations, which only the runtime has, abandoned)
+untendedAlg : {e : HFunctor}
+            -> {a : Type}
+            -> (hd : Handler e)
+            -> CustodianF hd.M a
+            -> hd.M a
+untendedAlg hd (Kept r k) = hd.ret (k Unkept)
+untendedAlg hd (Dropped t x) = hd.ret x
+untendedAlg hd (Made p k) = abandon
+untendedAlg hd (Managed c s k) = abandon
+untendedAlg hd (ShutDown c k) = abandon
+
+-- | `c`, its `with`s' releases kept by none, for a world with no
+-- | runtime under it (an interpreter's, a handler's own): each run as
+-- | its block is left, one whose block a throw leaves lost.
+untended : {e : HFunctor} -> {a : Type} -> Co (custodian <+> e) a -> Co e a
+untended c = within custodian e (\hd p -> untendedAlg hd p) c

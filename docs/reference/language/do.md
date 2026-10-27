@@ -187,9 +187,27 @@ with it. JavaScript keeps no such count; a `with` there lets go of its
 thing to the collector. A GPU device or buffer is the exception: like a
 file, it is released as its block is left.
 
-A `with` that releases by a computation (resource's `held`: a standard
-stream, the page's document) has the other policy: it releases as its
-block is left, whoever holds the thing still.
+A `with` that releases by a computation (resource's `held`: a port of
+a standard stream, the page's document) has the other policy: it
+releases as its block is left, whoever holds the thing still. Its
+release is kept by the program's top level while the block runs, so
+such a `with` asks for `{{cu : custodian <: e}}`, and a `main` that uses
+one has `custodian` in its world. Where a throw heard outside the block
+leaves it, or a handler drops the continuation, the release still runs:
+
+- on the C backend, at the next operation of the domain that started
+  the `with`;
+- in JavaScript, when the collector reaches what held it.
+
+A release that fails then is a failure of the runtime.
+
+`withStdin`, `withStdout` and `withStderr` give the body a port of its
+own, a copy of the stream's descriptor, and close it as the block is
+left. std.io's printing and the stream itself go on as before. A
+`withDocument` lets go of the page's document as its block is left,
+but that closes nothing. The document is the page's, and the program
+still has it wherever it passed it on: in a handler set on an element
+and run later, or to another effect by value.
 
 For more, there are custodians, as in Racket (the `custodian` module).
 A custodian is a runtime object that the program holds as a value:
