@@ -63,11 +63,20 @@ static int net_close(NetSock *s) {
   return r;
 }
 
+// (a socket a `with` let go of not closed: a failure of the runtime's,
+// said, the program ended with it, as an uncaught one is -- whether the
+// `with` closed it or its last holder did, later)
+static void net_unclosed(NetSock *s) {
+  fflush(stdout);
+  fprintf(stderr, "heff: std.net: %s not closed: %s\n", s->address ? s->address : "a socket", strerror(errno));
+  exit(1);
+}
+
 // (the program letting go of its last reference: closed, unless the
 // `with` closed it)
 static void net_let_go(void *x) {
   NetSock *s = x;
-  net_close(s);
+  if (net_close(s) < 0) net_unclosed(s);
   s->magic = 0;
   free(s->address);
   free(s);
@@ -700,17 +709,25 @@ static V heff_provider_net(V p, V k) {
   // (the `with`'s release, or `close`: a connection's writing ended --
   // its other side reads to the end -- and it closed; a listener
   // closed.  One closed already is left as it is)
+  // (a `with` letting go: where it held the socket alone -- the
+  // operation's the one reference to it -- closed as `Release` closes
+  // it; else nothing done, the last holder's letting go closing it)
+  case TAG_LetGo:
+  case TAG_LetGoListener:
   case TAG_Release:
   case TAG_ReleaseListener: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    if (s->fd < 0) {
+    int letting = heff_tag_of(p) == TAG_LetGo || heff_tag_of(p) == TAG_LetGoListener;
+    if (s->fd < 0 || (letting && !(heff_unique(p) && heff_unique(heff_field(p, 0))))) {
       heff_drop(p);
       V x = heff_answer(f, net_right(NTAG(TAG_MkUnit)));
       return heff_tail(k, 1, &x);
     }
-    if (heff_tag_of(p) == TAG_Release) shutdown(s->fd, SHUT_WR);
-    V r = net_close(s) < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
+    if (heff_tag_of(p) == TAG_Release || heff_tag_of(p) == TAG_LetGo) shutdown(s->fd, SHUT_WR);
+    int closed = net_close(s);
+    if (closed < 0 && letting) net_unclosed(s);
+    V r = closed < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);

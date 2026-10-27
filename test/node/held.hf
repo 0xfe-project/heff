@@ -1,0 +1,80 @@
+-- `held`'s `with`s: the release kept by the program's top level while
+-- the block runs.  By C alone.
+--
+--   main     a port of the standard output written by a `with` and
+--            closed as it ends, std.io's printing going on after; a
+--            release run once as its block is left; and one whose block
+--            a throw left, heard outside it, run by the runtime at the
+--            next operation; and a domain's lock, its `with` left by a
+--            throw, let go of as the domain ends, there being no
+--            operation after, so that main takes it
+
+module test.node.held
+
+import co
+import custodian
+import exception
+import resource
+import std.file as File
+import std.domain as Domain
+import std.filesystem
+import std.io
+
+-- (a `with` whose release says so)
+said : {e : HFunctor}
+     -> {a : Type}
+     -> {{io : stdio <: e}}
+     -> {{cu : custodian <: e}}
+     -> String
+     -> ({s : Type} -> With s Int -> Co e a)
+     -> Co e a
+said what body = held (pure 1) (\x -> print ("released: " ^ what)) body
+
+left : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{cu : custodian <: e}}
+     -> {{ex : exception String <: e}}
+     -> Co e Unit
+left = said "left by a throw" (\h -> throw "thrown")
+
+-- (the lock held by a `with`, its block left by a throw heard outside
+-- it; nothing after)
+lockedLeft : {e : HFunctor}
+           -> {{dm : Domain.domain <: e}}
+           -> {{cu : custodian <: e}}
+           -> {{ex : exception String <: e}}
+           -> Domain.Mutex
+           -> Co e Unit
+lockedLeft m = held (Domain.lock m) (\u -> Domain.unlock m) (\h -> throw "thrown")
+
+-- (a domain doing so, ended; then main takes the lock)
+domainEnded : {e : HFunctor}
+            -> {{dm : Domain.domain <: e}}
+            -> {{cu : custodian <: e}}
+            -> Co e String
+domainEnded = do
+  m <- Domain.newMutex
+  d <- Domain.spawn (bind (attempt String (lockedLeft m)) (\r -> pure (MkUnit : Unit)))
+  Domain.join d
+  Domain.lock m
+  Domain.unlock m
+  pure "a domain's lock, let go of as it ended: taken by main"
+
+main : Co (stdio <+> filesystem <+> Domain.domain <+> custodian) Unit
+main = do
+  r <-
+    attempt
+      FileError
+      (File.withStdout
+         (ev := _)
+         (cu := _)
+         (\o -> File.writeString (ev := _) (ex := _) o "written by a port\n"))
+  print (ev := _) "printed after the port closed"
+  said (io := _) (cu := _) "once" (\h -> print (ev := _) "in the block")
+  t <- attempt String (left (io := _) (cu := _) (ex := _))
+  print (ev := _) "after the attempt"
+  print (ev := _) (case t of
+    Left m -> "heard: " ^ m
+    Right u -> "not thrown")
+  ended <- domainEnded (dm := _) (cu := _)
+  print (ev := _) ended

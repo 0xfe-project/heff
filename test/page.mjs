@@ -203,6 +203,7 @@ const apps = {
   },
   texts: () => { const page = loaded(files[0], withOut); if (page) said("out", page.children[0].children.map((c) => c.text).join("\n")); },
   names: () => { const page = loaded(files[0], withOut); if (page) said("out", page.children[0].text); },
+
   greet: () => {
     const page = loaded(files[0], (p) => {
       const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";

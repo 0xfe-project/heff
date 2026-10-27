@@ -241,8 +241,27 @@ entryKey : String
 entryKey = "run$entry"
 
 -- (names of its own: `$`-numbered from where erasure's ended)
-entryBody : String -> Int -> IR.Expr
-entryBody key n =
+-- | whether a program of the world whose effects are of these modules
+-- | runs the releases due before each operation: where it has the
+-- | custodian's effect
+dueWorld : List String -> Bool
+dueWorld ms = List.any (\m -> strEq m "custodian") ms
+
+-- (an operation performed: where releases are due, what is due on the
+-- domain run first)
+performed : Bool -> Int -> IR.Expr
+performed False n =
+  EPrimCall Perform [EVar ("p$" ^ debug (n + 6)), EVar ("k$" ^ debug (n + 7))]
+performed True n =
+  ELet
+    ("due$" ^ debug (n + 6))
+    (EPrimCall CustodianDue Nil)
+    (EPrimCall
+       Perform
+       [EVar ("p$" ^ debug (n + 6)), EVar ("k$" ^ debug (n + 7))])
+
+entryBody : Bool -> String -> Int -> IR.Expr
+entryBody due key n =
   EApp
     (EGlobal key)
     [ ERecord
@@ -270,11 +289,7 @@ entryBody key n =
               ]))
       , MkPair
         "malg"
-        (ELam
-           ["p$" ^ debug (n + 6), "k$" ^ debug (n + 7)]
-           (EPrimCall
-              Perform
-              [EVar ("p$" ^ debug (n + 6)), EVar ("k$" ^ debug (n + 7))]))
+        (ELam ["p$" ^ debug (n + 6), "k$" ^ debug (n + 7)] (performed due n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
@@ -582,13 +597,15 @@ pieceStep g vers ks acc (MkPair k e) =
     Nothing -> erasedPieces k acc (Erase.definition g k e acc.supply)
 
 -- (the entry's version: its computation's, if it has one)
-entryVer : OrdMap.OrdMap String String -> String -> String
-entryVer vers key = case OrdMap.lookup vers key of
-  Just v -> if strEq v "" then "" else "entry/" ^ v
+entryVer : Bool -> OrdMap.OrdMap String String -> String -> String
+entryVer due vers key = case OrdMap.lookup vers key of
+  Just v ->
+    if strEq v "" then ""
+    else (if due then "entry-due/" else "entry/") ^ v
   Nothing -> ""
 
-entryKept : String -> KeptUnit -> Piece
-entryKept key u =
+entryKept : Bool -> String -> KeptUnit -> Piece
+entryKept due key u =
   { owner = entryKey
   , key = u.def.key
   , name = u.def.name
@@ -597,21 +614,22 @@ entryKept key u =
         u.def
         (\m ->
            MkPair
-             (Just (IR.mkDef entryKey entryKey (entryBody key m)))
+             (Just (IR.mkDef entryKey entryKey (entryBody due key m)))
              (m + 11))
   , refs = u.refs
   }
 
-entryPieces : OrdMap.OrdMap String String
+entryPieces : Bool
+            -> OrdMap.OrdMap String String
             -> Keeps
             -> String
             -> Int
             -> List Piece
-entryPieces vers ks key n = case keptFor vers ks entryKey of
-  Just us -> List.map (entryKept key) us
+entryPieces due vers ks key n = case keptFor vers ks entryKey of
+  Just us -> List.map (entryKept due key) us
   Nothing ->
     Cons
-      (freshPiece entryKey (IR.mkDef entryKey entryKey (entryBody key n)))
+      (freshPiece entryKey (IR.mkDef entryKey entryKey (entryBody due key n)))
       Nil
 
 -- (each definition's version: of the definition of the core it is lifted
@@ -752,31 +770,35 @@ reachedIn r ps = List.keepIf (\(p : Piece) -> OrdMap.member r p.key) ps
 reachedPieces : List Piece -> List Piece
 reachedPieces ps = reachedIn (Shake.reached (Cons entryKey Nil) (refsMap ps)) ps
 
-piecesWith : OrdMap.OrdMap String String
+piecesWith : Bool
+           -> OrdMap.OrdMap String String
            -> Keeps
            -> String
            -> PieceAcc
            -> SimplifiedKept
-piecesWith vers ks key acc =
+piecesWith due vers ks key acc =
   simplifyPieces
     (List.reverse acc.errors)
     vers
     ks
     (acc.supply + 11)
     (reachedPieces
-       (List.reverse (revOnto (entryPieces vers ks key acc.supply) acc.pieces)))
+       (List.reverse
+          (revOnto (entryPieces due vers ks key acc.supply) acc.pieces)))
 
 -- | a program running the computation `key`, its entry (`entryKey`) and
 -- | what it reaches, simplified -- each definition of the core the cache keeps at its version (`vers`)
 -- | taken as it keeps it -- and what the cache is to keep of it
-lowerProgramKept : Globals.Globals
+lowerProgramKept : Bool
+                 -> Globals.Globals
                  -> String
                  -> OrdMap.OrdMap String String
                  -> Keeps
                  -> SimplifiedKept
-lowerProgramKept g key vers ks =
+lowerProgramKept due g key vers ks =
   piecesWith
-    (OrdMap.insert vers entryKey (entryVer vers key))
+    due
+    (OrdMap.insert vers entryKey (entryVer due vers key))
     ks
     key
     (List.foldl

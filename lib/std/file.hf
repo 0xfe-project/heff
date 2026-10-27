@@ -122,6 +122,7 @@ module std.file
 
 import bytes as Bytes
 import co
+import custodian
 import exception
 import resource
 import std.filesystem
@@ -301,43 +302,53 @@ close : {e : HFunctor}
       -> Co e Unit
 close f = bind (op (ev (CloseFile f (\r -> r))) val) answered
 
--- (a standard stream, as an open file: the same one each time, what it
--- read ahead kept)
-standard : {e : HFunctor} -> {{ev : filesystem <: e}} -> Int -> Co e File
-standard i = op (ev (Standard i (\h -> h))) val
+-- (a port of its own on standard stream `i`: a copy of its descriptor,
+-- what the stream read ahead handed to it, and back as it is closed)
+port : {e : HFunctor} -> {{ev : filesystem <: e}} -> Int -> Co e File
+port i = op (ev (StandardPort i (\h -> h))) val
 
--- (a standard stream is left open as its `with` ends)
-leftOpen : {e : HFunctor} -> File -> Co e Unit
-leftOpen f = pure MkUnit
+-- (a port closed, or the program failed: one not closed is a failure of
+-- the runtime's, as any release that fails)
+portClosedAs : {e : HFunctor} -> Either FileError Unit -> Co e Unit
+portClosedAs (Right u) = pure u
+portClosedAs (Left err) = abandon
 
--- | The standard input, as an open file held by `body`: read it so, a
--- | line at a time, or by std.io's `readStdin`, not both (what one has
--- | read ahead the other does not see).  The stream is left open when
--- | `body` ends, what was read ahead kept for the next `withStdin`.
+portClosed : {e : HFunctor} -> {{ev : filesystem <: e}} -> File -> Co e Unit
+portClosed f = bind (op (ev (CloseFile f (\r -> r))) val) portClosedAs
+
+-- | The standard input, as a port of its own held by `body`: read it
+-- | so, a line at a time, or by std.io's `readStdin`, not both (what one
+-- | has read ahead the other does not see).  The port is closed as the
+-- | block is left, the stream itself left open, what was read ahead
+-- | kept for the next `withStdin`.
 withStdin : {e : HFunctor}
           -> {a : Type}
           -> {{ev : filesystem <: e}}
+          -> {{cu : custodian <: e}}
           -> (File -> Co e a)
           -> Co e a
-withStdin body = held (standard 0) leftOpen (\f -> body (inside f))
+withStdin body = held (port 0) portClosed (\f -> body (inside f))
 
--- | The standard output, as an open file held by `body` (what std.io
--- | wrote before is written out first), left open when `body` ends.
+-- | The standard output, as a port of its own held by `body` (what
+-- | std.io wrote before is written out first), closed as the block is
+-- | left: std.io's `print` and the stream itself go on as before.
 withStdout : {e : HFunctor}
            -> {a : Type}
            -> {{ev : filesystem <: e}}
+           -> {{cu : custodian <: e}}
            -> (File -> Co e a)
            -> Co e a
-withStdout body = held (standard 1) leftOpen (\f -> body (inside f))
+withStdout body = held (port 1) portClosed (\f -> body (inside f))
 
--- | The standard error, as an open file held by `body`, left open when
--- | `body` ends.
+-- | The standard error, as a port of its own held by `body`, closed as
+-- | the block is left.
 withStderr : {e : HFunctor}
            -> {a : Type}
            -> {{ev : filesystem <: e}}
+           -> {{cu : custodian <: e}}
            -> (File -> Co e a)
            -> Co e a
-withStderr body = held (standard 2) leftOpen (\f -> body (inside f))
+withStderr body = held (port 2) portClosed (\f -> body (inside f))
 
 -- | Up to `n` bytes of the file, from where it is: as many as there are,
 -- | waiting for one at least (from a pipe or a terminal, as many as have
@@ -538,6 +549,7 @@ foldStdinLines : {e : HFunctor}
                -> {{ev : filesystem <: e}}
                -> {{ex : exception FileError <: e}}
                -> {a : Type}
+               -> {{cu : custodian <: e}}
                -> a
                -> (a -> String -> Co e a)
                -> Co e a
@@ -591,6 +603,7 @@ instanceBinderOpen = { Contents = \s -> File, Result = \r -> r }
 instance instanceHolderOpen : {e : HFunctor}
                             -> {{ev : filesystem <: e}}
                             -> {{ex : exception FileError <: e}}
+                            -> {{cu : custodian <: e}}
                             -> Holder
                               e
                               (Co e File)

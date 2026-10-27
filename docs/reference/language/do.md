@@ -163,8 +163,75 @@ takes it apart: `e (\p -> case p of (a, b) -> do ...)`.
   of on the way out.
 - As the block's last statement, its value is the block's; otherwise
   it is dropped.
-- A `with` throws what it could not acquire or release: a `try` around
-  it catches that.
+- A `with` throws what it could not acquire: a `try` around it catches
+  that. A failure to release is the runtime's (below).
+
+### What a with holds, and custodians
+
+What a `with` like `withProcess` holds lives as long as the program can
+reach it. When its body ends, the `with` lets go of its hold:
+
+- where it held the thing alone, the thing is ended there;
+- where the body gave it to another, a thread spawned in the body
+  given the `With s r` by value, it is ended once the last holder
+  lets go of it. The `with` does not wait.
+
+A thing that fails to end, now or later, is a failure of the runtime:
+it is printed and the program ends, as with an uncaught failure. It is
+not thrown to the `with`'s caller.
+
+So a thread can use a command or a connection after the `with` that
+made it has ended. On the C backend "lets go" is the runtime's count of
+references, so a thing is ended as soon as its last holder is done
+with it. JavaScript keeps no such count; a `with` there lets go of its
+thing to the collector. A GPU device or buffer is the exception: like a
+file, it is released as its block is left.
+
+A `with` that releases by a computation (resource's `held`: a port of
+a standard stream, the page's document) has the other policy: it
+releases as its block is left, whoever holds the thing still. Its
+release is kept by the program's top level while the block runs, so
+such a `with` asks for `{{cu : custodian <: e}}`, and a `main` that uses
+one has `custodian` in its world. Where a throw heard outside the block
+leaves it, or a handler drops the continuation, the release still runs:
+
+- on the C backend, at the next operation of the domain that started
+  the `with`;
+- in JavaScript, when the collector reaches what held it.
+
+A release that fails then is a failure of the runtime.
+
+`withStdin`, `withStdout` and `withStderr` give the body a port of its
+own, a copy of the stream's descriptor, and close it as the block is
+left. std.io's printing and the stream itself go on as before. A
+`withDocument` lets go of the page's document as its block is left,
+but that closes nothing. The document is the page's, and the program
+still has it wherever it passed it on: in a handler set on an element
+and run later, or to another effect by value.
+
+For more, there are custodians, as in Racket (the `custodian` module).
+A custodian is a runtime object that the program holds as a value:
+
+- `Custodian.manage c stop` gives it something to run at its shutdown;
+- `Custodian.under c` makes a custodian that `c` holds and shuts down
+  with it;
+- `Custodian.shutdown c` runs everything it was given, once and in
+  order, then does the same for the custodians under it. It comes to
+  the reasons of those that failed.
+
+A custodian manages resources, not threads. A thread that took a
+thing from a custodian that was then shut down finds the thing ended at
+its next operation on it (a socket's `EBADF`), and handles that itself.
+
+What a custodian is given is higher-order. It is a computation of the
+world it was given in, with the handlers between there and the
+program's top level already applied, so it runs after their scope may
+have ended. An `attempt` there turns a throw into `abandon`, and the
+shutdown says that in its list.
+
+A custodian the program no longer reaches is let go of by the runtime,
+and what it was given is dropped, not run. On the C backend that is at
+once. In a page it is whenever JavaScript's collector comes to it.
 
 ### with, of bindings
 

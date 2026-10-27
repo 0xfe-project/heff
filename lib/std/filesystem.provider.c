@@ -521,6 +521,9 @@ typedef struct {
   uint8_t *buf;      // (read ahead: what is not yet taken, from `at` to
   size_t cap, at, end;  //  `end`)
   uint64_t taken;    // (how many times something was taken from it)
+  int port;          // (a port of its own on standard stream `port - 1`:
+                     //  what that one read ahead given to it, and back
+                     //  as it is closed; 0 for none)
   char *path;        // (the path it was opened by, as the program wrote
                      //  it, a failure's; a standard stream's, `<stdin>`)
 } FsFile;
@@ -897,8 +900,8 @@ static V fs_go(FsOp *o, int (*step)(HeffWait *), V f, V k) {
 static V fs_write(FsFile *h, const uint8_t *data, int64_t len, V held, char *owned, V f, V k) {
   // (what std.io wrote before it, first; and what was read ahead given
   // back)
-  if (h->standard == 1 || h->standard == 2) fflush(stdout);
-  if (h->standard == 2) fflush(stderr);
+  if (h->standard == 1 || h->standard == 2 || h->port == 2 || h->port == 3) fflush(stdout);
+  if (h->standard == 2 || h->port == 3) fflush(stderr);
   if (fs_unread(h) < 0) {
     int e = errno;
     if (held) heff_drop(held);
@@ -1079,6 +1082,13 @@ static V fs_open(const FsPath *p, int64_t access, int create, int truncate, int 
 // operations are `EBADF`, and letting it go frees only what holds it)
 static int fs_close(FsFile *h) {
   int err = 0;
+  if (h->port && h->fd >= 0) {
+    FsFile *s = fs_standard[h->port - 1];
+    if (s && !s->buf) {
+      s->buf = h->buf; s->cap = h->cap; s->at = h->at; s->end = h->end;
+      h->buf = NULL; h->cap = h->at = h->end = 0;
+    }
+  }
   if (h->standard < 0 && h->fd >= 0) {
     heff_reactor_closing(h->fd);
     if (close(h->fd) != 0 && errno != EINTR) err = errno;
@@ -1160,6 +1170,31 @@ static V heff_provider_filesystem(V p, V k) {
     if (i < 0 || i > 2) heff_fail("std.filesystem: no such standard stream");
     if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i, heff_strdup(names[i]));
     return fs_answered(p, 1, fs_value(fs_standard[i]), k);
+  }
+  // (a port of its own on a standard stream: its descriptor a copy of
+  // the stream's, closed as the port is, the stream left open; what the
+  // stream read ahead its, until then)
+  case TAG_StandardPort: {
+    static const char *const names[3] = { "<stdin>", "<stdout>", "<stderr>" };
+    int64_t i = INT_OF(heff_field(p, 0));
+    if (i < 0 || i > 2) heff_fail("std.filesystem: no such standard stream");
+    if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i, heff_strdup(names[i]));
+    int fd = dup((int)i);
+    if (fd < 0) heff_fail("std.filesystem: a standard stream not duplicated");
+    FsFile *s = fs_standard[i];
+    // (what the stream is, as its own file found once: no `fstat` again)
+    FsFile *h = heff_alloc(sizeof *h);
+    memset(h, 0, sizeof *h);
+    h->magic = FS_MAGIC;
+    h->fd = fd;
+    h->path = heff_strdup(names[i]);
+    h->standard = -1;
+    h->seekable = s->seekable;
+    h->pollable = s->pollable;
+    h->port = (int)i + 1;
+    h->buf = s->buf; h->cap = s->cap; h->at = s->at; h->end = s->end;
+    s->buf = NULL; s->cap = s->at = s->end = 0;
+    return fs_answered(p, 1, fs_value(h), k);
   }
   // (an operation of an open file: one that waits keeps `p`, and so the
   // file, while it does, so that it is not let go of under it; after the

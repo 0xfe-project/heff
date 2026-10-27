@@ -8,8 +8,17 @@
 -- 1. acquires the thing;
 -- 2. runs the body with it (`scoped`'s, a `With s r` in a region `s` of
 --    its own);
--- 3. releases it when the body ends;
+-- 3. lets go of it when the body ends;
 -- 4. comes to what the body came to.
+--
+-- The thing is in the custody of the runtime, as a custodian's are (the
+-- `custodian` module): it lives as long as the program can reach it.
+-- Letting go of it, a `with` ends it there where it held it alone; where
+-- the body gave it to another -- a thread spawned in the body, given the
+-- `With s r` by value -- it is ended once the last holder lets go of it,
+-- the `with` not waiting.  That is `scoped`'s policy.  A thing let go of
+-- by a computation of the program's, a `held`'s, has the other: it is
+-- let go of as the block is left, whoever holds it still.
 --
 -- ```haskell
 -- import co
@@ -39,9 +48,13 @@
 -- acquired is no answer of the body's, so it is thrown, over the
 -- `exception` effect, the body not run -- a `with` asks for `exception
 -- err` besides its own effect, and `try` can catch it.  A release that
--- fails is thrown too, after the body, and what the body came to is lost.
--- `held` is the `with` of a thing that is always had and let go of -- a
--- standard stream, the page's document -- which throws nothing.
+-- fails is no answer of the body's either, nor the caller's to catch: it
+-- is a failure of the runtime's, said, and the program ends, whether the
+-- `with` ended the thing or its last holder did, later.
+-- `held` is the `with` of a thing that is always had and let go of by
+-- a computation -- a port of a standard stream, a handle on the page's
+-- document -- which throws nothing; its release is kept by the
+-- program's top level meanwhile, and runs however the block is left.
 --
 -- The thing is the host's own, a foreign value with a finalizer, so a
 -- body left otherwise -- a throw heard outside it, a handler between that
@@ -84,9 +97,10 @@
 -- The provider's side, how it opens and closes the thing, is its scoped
 -- operations.
 
-module resource (With, scoped, held, inside, beside)
+module resource (With, scoped, held, had, inside, beside)
 
 import co
+import custodian as Custodian
 import exception
 
 -- | A host's thing, held in the region `s` by a `with` (`scoped`,
@@ -106,8 +120,8 @@ inside (MkWith x) = x
 beside : {s : Type} -> {a b : Type} -> With s a -> b -> With s b
 beside w x = MkWith x
 
--- (what the body came to, once the thing is released; a release that
--- failed, thrown)
+-- (what the body came to, once the thing is let go of; a release that
+-- failed a failure of the program's, as the runtime's are)
 releasedTo : {e : HFunctor}
            -> {err a : Type}
            -> {{ex : exception err <: e}}
@@ -115,7 +129,7 @@ releasedTo : {e : HFunctor}
            -> Either err Unit
            -> Co e a
 releasedTo v (Right u) = pure v
-releasedTo v (Left err) = throw err
+releasedTo v (Left err) = abandon
 
 -- (the body run with the thing, then the thing released; a thing not
 -- acquired, thrown)
@@ -133,10 +147,14 @@ heldBy release body (Right x) =
     (\v -> bind (release x) (releasedTo v))
 
 -- | The thing `acquire` gives, held by `body` in a region of its own --
--- | it is not kept past it -- and released by `release` when `body`
--- | ends: what it came to.  A thing not acquired is thrown, the body
--- | not run; one not released is thrown once the body has ended, what
--- | it came to abandoned.  Should `body` be left otherwise -- a throw
+-- | it is not kept past it -- and let go of by `release` when `body`
+-- | ends: what it came to.  `release` is the `with` letting go of its
+-- | hold, the provider's to say: it ends the thing where the `with` held
+-- | it alone, and else leaves it to the last holder, ended as that one
+-- | lets go of it -- a thread the body gave it to.  A thing not acquired
+-- | is thrown, the body not run; one not released, whenever it is
+-- | ended, is a failure of the runtime's, as the provider says, the
+-- | program ended (a `release` that comes to a `Left` abandons).  Should `body` be left otherwise -- a throw
 -- | heard outside it, a handler between that drops the continuation --
 -- | the thing is let go of where the program drops its last reference
 -- | to it, as its provider says.
@@ -149,25 +167,47 @@ scoped : {e : HFunctor}
        -> Co e a
 scoped acquire release body = bind acquire (heldBy release body)
 
--- (the body run with the thing, then the thing let go of)
+-- (the body run with the thing, its release kept by the program's top
+-- level meanwhile; then the release dropped there, and run here)
 letGoAfter : {e : HFunctor}
            -> {r a : Type}
+           -> {{cu : Custodian.custodian <: e}}
            -> (r -> Co e Unit)
            -> ({s : Type} -> With s r -> Co e a)
            -> r
            -> Co e a
-letGoAfter release body x =
-  bind (body (s := r) (MkWith x)) (\v -> bind (release x) (\u -> pure v))
+letGoAfter release body x = do
+  t <- Custodian.kept (release x)
+  v <- body (s := r) (MkWith x)
+  Custodian.dropped t
+  release x
+  pure v
 
 -- | The thing `acquire` gives, which it always does, held by `body` in
--- | a region of its own and let go of by `release` when `body` ends,
--- | which always goes: what the body came to.  The `with` of a thing
--- | the program is never without: a standard stream, the page's
--- | document.
+-- | a region of its own and let go of by `release` as the block is
+-- | left, whoever holds it still: what the body came to.  The release
+-- | is a computation, kept meanwhile by the program's top level (the
+-- | custodian's `kept`): where the block is left otherwise -- a throw
+-- | heard outside it, a handler between that drops the continuation --
+-- | the runtime runs it once that is known, at the next operation of
+-- | the domain that kept it (C), or as the collector comes to it
+-- | (JavaScript).  The `with` of a port of a standard stream, or of the
+-- | page's document.
 held : {e : HFunctor}
      -> {r a : Type}
+     -> {{cu : Custodian.custodian <: e}}
      -> Co e r
      -> (r -> Co e Unit)
      -> ({s : Type} -> With s r -> Co e a)
      -> Co e a
 held acquire release body = bind acquire (letGoAfter release body)
+
+-- | `x`, held by `body` in a region of its own, nothing done as it
+-- | ends: for a library whose thing is let go of otherwise, after the
+-- | body, by an operation of its own.
+had : {e : HFunctor}
+    -> {r a : Type}
+    -> r
+    -> ({s : Type} -> With s r -> Co e a)
+    -> Co e a
+had x body = body (s := r) (MkWith x)

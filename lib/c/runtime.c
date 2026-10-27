@@ -5016,7 +5016,12 @@ HEFF_FN void heff_fail_again(const char *why) {
 // (this thread's pages and what else the runtime keeps for it given
 // back to the system, as it ends -- its pages that still hold something
 // abandoned, for another thread to adopt)
+// (what a thread does as it ends, where a part of the runtime asks for
+// it: the custodians' part, the releases due on the thread run)
+HEFF_VAR(void (*heff_thread_ending)(void));
+
 HEFF_FN void heff_thread_end(void) {
+  if (heff_thread_ending) heff_thread_ending();
 #if SMALL_MAX == 0
   for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
     void *p = heff_free_list[c];
