@@ -1181,8 +1181,16 @@ static V heff_provider_filesystem(V p, V k) {
     if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i, heff_strdup(names[i]));
     int fd = dup((int)i);
     if (fd < 0) heff_fail("std.filesystem: a standard stream not duplicated");
-    FsFile *h = fs_new(fd, -1, heff_strdup(names[i]));
     FsFile *s = fs_standard[i];
+    // (what the stream is, as its own file found once: no `fstat` again)
+    FsFile *h = heff_alloc(sizeof *h);
+    memset(h, 0, sizeof *h);
+    h->magic = FS_MAGIC;
+    h->fd = fd;
+    h->path = heff_strdup(names[i]);
+    h->standard = -1;
+    h->seekable = s->seekable;
+    h->pollable = s->pollable;
     h->port = (int)i + 1;
     h->buf = s->buf; h->cap = s->cap; h->at = s->at; h->end = s->end;
     s->buf = NULL; s->cap = s->at = s->end = 0;
