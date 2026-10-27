@@ -202,8 +202,9 @@ of).
 What the fuel counts depends on how the program is built, and this is
 an abstraction leak there is no way around:
 
-- **Built with fuel** -- `fuel = True` in its build.hf, `heff compile
-  --fuel`, `heff bench --fuel` -- the compiler ticks the program: a
+- **Built with fuel** -- `fuel = True` in its build.hf, `--fuel` to
+  `heff compile`, `heff run`, `heff test` (its integration tests) or
+  `heff bench` -- the compiler ticks the program: a
   decrement and a branch at the entry of every function that may be
   entered again before it ends (one calling a function of its own
   recursive group, or a closure), so every loop ticks, even one with no
