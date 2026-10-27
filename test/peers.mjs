@@ -20,6 +20,14 @@
 //                                   opened at once, a request each, then
 //                                   /stop; says how many of the N were
 //                                   answered
+//   node test/peers.mjs idle PORT M N
+//                                   a server's clients: M one after
+//                                   another, then N connections opened
+//                                   one after another and held open,
+//                                   silent, then a request on each, then
+//                                   /stop; says how many of the N were
+//                                   reset before they were made (each
+//                                   tried again), and how many answered
 //   node test/peers.mjs boc BIN IDLE N
 //                                   std.http.bocserver's server, BIN
 //                                   PORT IDLE, started and driven: N
@@ -232,6 +240,51 @@ if (mode === "burst") {
   for (let i = 0; i < before; i++) await got(`/before/${i}`);
   const all = await Promise.all(Array.from({ length: n }, (_, i) => got(`/${i}`)));
   const answered = all.filter((b, i) => b.startsWith("HTTP/1.1 200 ") && b.endsWith(`\r\n\r\n/${i}`)).length;
+  console.log(`answered ${answered} of ${n}`);
+  await got("/stop");
+}
+
+if (mode === "idle") {
+  const port = Number(arg), before = Number(process.argv[4]), n = Number(process.argv[5]);
+  // (a request on the connection, closed after: what came back)
+  const asked = (s, target) => new Promise((ok) => {
+    let back = "";
+    const timer = setTimeout(() => { s.destroy(); ok(`${back}(no end)`); }, 20000);
+    s.setEncoding("latin1");
+    s.on("data", (d) => { back += d; });
+    s.on("error", (e) => { back += `(${e.code})`; });
+    s.on("close", () => { clearTimeout(timer); ok(back); });
+    s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+  });
+  const got = async (target) => {
+    const s = await reached(port);
+    return s instanceof Error ? `(${s.code})` : asked(s, target);
+  };
+  for (let i = 0; i < 600 && !(await new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    s.on("connect", () => { s.destroy(); ok(true); });
+    s.on("error", () => ok(false));
+  })); i++) await new Promise((ok) => setTimeout(ok, 50));
+  for (let i = 0; i < before; i++) await got(`/before/${i}`);
+  // (each made before the next is begun: a reset counted, and tried
+  // again, as `reached` does)
+  let resets = 0;
+  const made = (tries = 100) => new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    const failed = (e) => {
+      s.destroy();
+      if (e.code === "ECONNRESET" && tries > 0) { resets++; setTimeout(() => made(tries - 1).then(ok), 50); }
+      else ok(e);
+    };
+    s.once("error", failed);
+    s.once("connect", () => { s.off("error", failed); ok(s); });
+  });
+  const held = [];
+  for (let i = 0; i < n; i++) held.push(await made());
+  await new Promise((ok) => setTimeout(ok, 100));
+  const all = await Promise.all(held.map((s, i) => s instanceof Error ? `(${s.code})` : asked(s, `/${i}`)));
+  const answered = all.filter((b, i) => b.startsWith("HTTP/1.1 200 ") && b.endsWith(`\r\n\r\n/${i}`)).length;
+  console.log(`reset before they were made: ${resets} of ${n}`);
   console.log(`answered ${answered} of ${n}`);
   await got("/stop");
 }

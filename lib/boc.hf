@@ -145,8 +145,9 @@
 -- Under `scheduledWithReactor`, each domain has a group of std.reactor's
 -- of its own: an act awaited by a behaviour is started there once that
 -- behaviour is done, pending there with the others while it waits, and
--- after each behaviour the domain takes the acts come to their values,
--- spawning the behaviours after them, which it keeps in its slot as it
+-- after every 64th behaviour the domain takes the acts come to their
+-- values -- a look at every act pending there, which costs as many as
+-- there are -- spawning the behaviours after them, which it keeps in its slot as it
 -- would one a body spawned.  A domain with no behaviour to run and acts
 -- pending waits in its reactor, until one comes to its value or a
 -- behaviour is put among those ready.  The run ends once no behaviour
@@ -236,15 +237,18 @@ type Group (w : HFunctor) = Reactor.Group (Co w Unit)
 -- reactor, its group there, opened on its domain, each of whose acts
 -- comes to what is to run once it has come to its value; the acts
 -- awaited by the behaviour it runs, to be started in the group after
--- it, the last first; and whether it waits in the reactor, to be woken
--- there.  Cells only that worker touches, but the last two, which
--- others read under the scheduler's mutex to wake it)
+-- it, the last first; whether it waits in the reactor, to be woken
+-- there; and how many behaviours it has run since it last looked at
+-- its group's acts finished.  Cells only that worker touches, but its
+-- group and whether it waits, which others read under the scheduler's
+-- mutex to wake it)
 type Worker (w : HFunctor) (b : Type) =
   { slot : Domain.Atomic (Maybe b)
   , fuel : Domain.Atomic Int
   , starting : Domain.Atomic (List (Co w (Co w Unit)))
   , group : Domain.Atomic (Maybe (Group w))
   , polling : Domain.Atomic Bool
+  , turns : Domain.Atomic Int
   }
 
 -- (a behaviour spawned: how many of its cowns it still waits for, and
@@ -1211,10 +1215,18 @@ startedEach st o g (act :: acts) = do
     Nothing -> pure ()
   startedEach st o g acts
 
+-- (how many behaviours a worker runs between two looks at its group's
+-- acts finished, not waiting: a look polls every act pending there, so
+-- a domain holding many -- a server's idle connections -- would spend
+-- its time looking after each behaviour; one with nothing else to run
+-- looks, waiting, at once)
+pollEvery : Int
+pollEvery = 64
+
 -- (after a behaviour, on its worker, where the scheduler waits on the
 -- world through the reactor: the acts it awaited started in the
--- worker's group, and those of the group finished since it last asked
--- resumed, not waiting for one)
+-- worker's group, and, every `pollEvery` behaviours, those of the group
+-- finished since it last asked resumed, not waiting for one)
 afterTurn : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
@@ -1232,8 +1244,12 @@ afterTurn st worker = case st.outside of
           _ -> do
             Domain.set worker.starting (Nil : List (Co w (Co w Unit)))
             startedEach st o g (List.reverse acts)
-        done <- o.finished g False
-        resumedAll st done
+        t <- Domain.get worker.turns
+        if t + 1 < pollEvery then Domain.set worker.turns (t + 1)
+        else do
+          Domain.set worker.turns 0
+          done <- o.finished g False
+          resumedAll st done
       Nothing -> pure ()
 
 -- (the behaviour run on the worker, its body given the fuel in full,
@@ -1277,8 +1293,11 @@ working st worker = do
 -- those ready; else, with acts pending in its group, waiting in the
 -- reactor for one to come to its value, or to be woken -- for a
 -- behaviour ready, or to stop -- and those come resumed, which may
--- fill its slot; else waiting on the condition, counted among the
--- domains idle.  `Nothing` once the domains are to stop)
+-- fill its slot; else those of its group finished and not yet taken
+-- -- an act that failed as it started, say, which no look since has
+-- taken -- resumed, where there are any; else waiting on the
+-- condition, counted among the domains idle.  `Nothing` once the
+-- domains are to stop)
 taken : {w : HFunctor}
       -> {{dm : Domain.domain <: w}}
       -> Sched w
@@ -1320,10 +1339,16 @@ taken st o worker g = do
               Domain.unlock st.mutex
               taken st o worker g
             else do
-              _ <- Domain.fetchAdd st.idle 1
-              Domain.wait st.work st.mutex
-              _ <- Domain.fetchAdd st.idle (0 - 1)
-              Domain.unlock st.mutex
+              left <- o.finished g False
+              case left of
+                Nil -> do
+                  _ <- Domain.fetchAdd st.idle 1
+                  Domain.wait st.work st.mutex
+                  _ <- Domain.fetchAdd st.idle (0 - 1)
+                  Domain.unlock st.mutex
+                _ -> do
+                  Domain.unlock st.mutex
+                  resumedAll st left
               taken st o worker g
 
 -- (a domain running behaviours, where the scheduler waits on the world
@@ -1414,6 +1439,7 @@ workersMade n =
     starting <- Domain.newAtomic (Nil : List (Co w (Co w Unit)))
     group <- Domain.newAtomic (Nothing : Maybe (Group w))
     polling <- Domain.newAtomic False
+    turns <- Domain.newAtomic 0
     rest <- workersMade (n - 1)
     pure
         ({ slot = slot
@@ -1421,6 +1447,7 @@ workersMade n =
          , starting = starting
          , group = group
          , polling = polling
+         , turns = turns
          }
          :: rest)
 
