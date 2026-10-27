@@ -5172,6 +5172,8 @@ struct HeffWait {
   int done;
   int64_t epoch;                 // (how many descriptors had been closed,
                                  //  by any thread, when it began to wait)
+  int marked;                    // (the descriptor its reactor is marked
+                                 //  as waiting on, for it, or -1)
   HeffWait *prev, *next;
 };
 
@@ -5254,6 +5256,68 @@ int64_t heff_closed_epoch;
 #endif
 HEFF_VAR(HEFF_TLS int64_t heff_closed_seen);
 
+#ifndef _WIN32
+// (which threads' reactors wait on each descriptor: a word of bits for
+// each, a bit for each reactor, set by its thread while one of its waits
+// is on it and cleared by it when none is -- so that a descriptor being
+// closed wakes those alone, and only where there are any.  The words are
+// in chunks made when first needed, never let go of; the reactors' bits
+// and their pipes are given out with their pipes, under the wakers'
+// lock, the last bit standing for every reactor beyond the others, set
+// and never cleared, which wakes every reactor.  A descriptor beyond the
+// chunks has no word, and wakes every reactor.  Of a thread's own: its
+// bit, 0 where it has no pipe, and how many of its waits are on each
+// descriptor)
+#define HEFF_MARK_CHUNK 4096
+#define HEFF_MARK_CHUNKS 1024
+#define HEFF_MARK_ANY ((uint64_t)1 << 63)
+HEFF_VAR(uint64_t *heff_marks[HEFF_MARK_CHUNKS]);
+HEFF_VAR(uint64_t heff_marks_given);
+HEFF_VAR(int heff_marks_pipe[63]);
+HEFF_VAR(HEFF_TLS uint64_t heff_mark);
+HEFF_VAR(HEFF_TLS int32_t *heff_marks_mine);
+HEFF_VAR(HEFF_TLS size_t heff_capmarks_mine);
+
+// (the word of descriptor `fd`, made where `make` and it is not; NULL
+// where it is beyond the chunks, or, not `make`, not made)
+HEFF_FN uint64_t *heff_marks_of(int fd, int make) {
+  size_t c = (size_t)fd / HEFF_MARK_CHUNK;
+  if (c >= HEFF_MARK_CHUNKS) return NULL;
+  uint64_t *m = __atomic_load_n(&heff_marks[c], __ATOMIC_SEQ_CST);
+  if (!m && make) {
+    uint64_t *made = calloc(HEFF_MARK_CHUNK, sizeof *made);
+    if (!made) heff_fail("out of memory");
+    if (__atomic_compare_exchange_n(&heff_marks[c], &m, made, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) m = made;
+    else free(made);
+  }
+  return m ? &m[(size_t)fd % HEFF_MARK_CHUNK] : NULL;
+}
+
+// (this thread's reactor marked as waiting on `fd` once more: whether it
+// is, or once less)
+HEFF_FN int heff_mark_on(int fd) {
+  if (fd < 0 || !heff_mark || (size_t)fd >= (size_t)HEFF_MARK_CHUNK * HEFF_MARK_CHUNKS) return 0;
+  if ((size_t)fd >= heff_capmarks_mine) {
+    size_t cap = heff_capmarks_mine ? heff_capmarks_mine : 256;
+    while (cap <= (size_t)fd) cap *= 2;
+    int32_t *m = heff_alloc(cap * sizeof *m);
+    if (heff_capmarks_mine) memcpy(m, heff_marks_mine, heff_capmarks_mine * sizeof *m);
+    memset(m + heff_capmarks_mine, 0, (cap - heff_capmarks_mine) * sizeof *m);
+    free(heff_marks_mine);
+    heff_marks_mine = m;
+    heff_capmarks_mine = cap;
+  }
+  if (heff_marks_mine[fd]++ == 0) __atomic_fetch_or(heff_marks_of(fd, 1), heff_mark, __ATOMIC_SEQ_CST);
+  return 1;
+}
+
+HEFF_FN void heff_mark_off(int fd) {
+  if (fd < 0 || !heff_mark || (size_t)fd >= heff_capmarks_mine) return;
+  if (--heff_marks_mine[fd] == 0 && heff_mark != HEFF_MARK_ANY)
+    __atomic_fetch_and(heff_marks_of(fd, 1), ~heff_mark, __ATOMIC_SEQ_CST);
+}
+#endif
+
 // (the group open of that number, or NULL)
 HEFF_FN HeffGroup *heff_group_of(int64_t g) {
   for (size_t i = 0; i < heff_ngroups; i++)
@@ -5278,7 +5342,12 @@ HEFF_FN void heff_wait_link(HeffWait *w) {
   if (heff_waits_last) heff_waits_last->next = w;
   else heff_waits_first = w;
   heff_waits_last = w;
-  w->epoch = __atomic_load_n(&heff_closed_epoch, __ATOMIC_ACQUIRE);
+#ifndef _WIN32
+  // (marked first, then the count read: a thread closing its descriptor
+  // sees the mark, or this the close counted)
+  w->marked = heff_mark_on(w->fd) ? w->fd : -1;
+#endif
+  w->epoch = __atomic_load_n(&heff_closed_epoch, __ATOMIC_SEQ_CST);
   heff_group_pending(w->group, 1);
 }
 
@@ -5288,6 +5357,9 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
   if (w->next) w->next->prev = w->prev;
   else heff_waits_last = w->prev;
   w->prev = w->next = NULL;
+#ifndef _WIN32
+  heff_mark_off(w->marked);
+#endif
   heff_group_pending(w->group, -1);
 }
 
@@ -5304,18 +5376,35 @@ HEFF_FN void heff_reactor_closing(int fd) {
       w->done = 1;
     }
 #ifndef _WIN32
-  // (and every other thread's, by that thread: told so, and woken)
+  // (and every other thread's that waits on it, by that thread: told so,
+  // and woken -- where none is marked, none told; a wait begun after the
+  // marks are read is as one begun after the count: one on a descriptor
+  // closed)
+  if (fd < 0) return;
+  uint64_t *word = heff_marks_of(fd, 0);
+  int beyond = (size_t)fd >= (size_t)HEFF_MARK_CHUNK * HEFF_MARK_CHUNKS;
+  uint64_t own = heff_mark == HEFF_MARK_ANY ? 0 : heff_mark;
+  uint64_t others = beyond ? HEFF_MARK_ANY : word ? __atomic_load_n(word, __ATOMIC_SEQ_CST) & ~own : 0;
+  if (!others) return;
   pthread_mutex_lock(&heff_wakers_mu);
   if (heff_nwakers) {
-    int64_t e = __atomic_add_fetch(&heff_closed_epoch, 1, __ATOMIC_RELEASE);
+    int64_t e = __atomic_add_fetch(&heff_closed_epoch, 1, __ATOMIC_SEQ_CST);
     heff_closed[e % HEFF_CLOSED_KEPT].fd = fd;
     heff_closed[e % HEFF_CLOSED_KEPT].epoch = e;
-    for (size_t i = 0; i < heff_nwakers; i++)
-      if (!heff_wake_made || heff_wakers[i].fd != heff_wake_fds[1]) {
-        char b = 0;
-        ssize_t r = write(heff_wakers[i].fd, &b, 1);
-        (void)r;
-      }
+    if (word) others |= __atomic_load_n(word, __ATOMIC_SEQ_CST) & ~own;
+    char b = 0;
+    if (others & HEFF_MARK_ANY) {
+      for (size_t i = 0; i < heff_nwakers; i++)
+        if (!heff_wake_made || heff_wakers[i].fd != heff_wake_fds[1]) {
+          ssize_t r = write(heff_wakers[i].fd, &b, 1);
+          (void)r;
+        }
+    } else
+      for (int i = 0; i < 63; i++)
+        if (others & heff_marks_given & ((uint64_t)1 << i)) {
+          ssize_t r = write(heff_marks_pipe[i], &b, 1);
+          (void)r;
+        }
   }
   pthread_mutex_unlock(&heff_wakers_mu);
 #endif
@@ -5496,6 +5585,17 @@ HEFF_FN void heff_waker_add(int64_t g) {
   heff_wakers[heff_nwakers].id = g;
   heff_wakers[heff_nwakers].fd = heff_wake_fds[1];
   heff_nwakers++;
+  if (!heff_mark) {
+    // (the reactor's bit, and its pipe by it; or, none left, the last)
+    heff_mark = HEFF_MARK_ANY;
+    for (int i = 0; i < 63; i++)
+      if (!(heff_marks_given & ((uint64_t)1 << i))) {
+        heff_marks_given |= (uint64_t)1 << i;
+        heff_marks_pipe[i] = heff_wake_fds[1];
+        heff_mark = (uint64_t)1 << i;
+        break;
+      }
+  }
   pthread_mutex_unlock(&heff_wakers_mu);
 #else
   (void)g;
@@ -5517,6 +5617,9 @@ HEFF_FN void heff_waker_remove(int64_t g) {
     close(heff_wake_fds[1]);
     heff_wake_made = 0;
     heff_woken = 0;
+    // (its bit given back: no wait of its is pending, none marked)
+    if (heff_mark != HEFF_MARK_ANY) heff_marks_given &= ~heff_mark;
+    heff_mark = 0;
   }
   pthread_mutex_unlock(&heff_wakers_mu);
 #else
@@ -5699,6 +5802,11 @@ HEFF_FN void heff_reactor_turn(int wait) {
     if (heff_polled[i].revents) {
       HeffWait *w = heff_polled_waits[i];
       if (!w->done && w->step(w) == HEFF_STEP_DONE) w->done = 1;
+      if (w->fd != w->marked) {
+        // (a step on to another descriptor: its reactor marked so)
+        heff_mark_off(w->marked);
+        w->marked = heff_mark_on(w->fd) ? w->fd : -1;
+      }
     }
   if (heff_wake_made && heff_polled[wake].revents) {
     char b[64];
