@@ -90,6 +90,12 @@ static void heff_ticket_let_go(void *p) {
 
 static V heff_provider_custodian(V p, V k) {
   V x;
+  // (an operation given no computation, taken out of its `Asked`)
+  if (heff_tag_of(p) == TAG_Asked) {
+    V q = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+    p = q;
+  }
   switch (heff_tag_of(p)) {
   case TAG_Made: {
     V at = heff_field(p, 0);
@@ -150,6 +156,14 @@ static V heff_provider_custodian(V p, V k) {
     free(whys);
     x = heff_answer(g, l);
     break;
+  }
+  // (a thing that failed to end: the program's failure, said)
+  case TAG_Failed: {
+    size_t len;
+    char *why = heff_bytes(heff_field(p, 0), &len);
+    fflush(stdout);
+    fprintf(stderr, "heff: %s\n", why);
+    exit(1);
   }
   case TAG_Kept: {
     HeffTicket *t = heff_alloc(sizeof *t);

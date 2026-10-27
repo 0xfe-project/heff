@@ -134,12 +134,14 @@ of its own effect, such as `with f := File.open path do` of `std.file`.
 ## with
 
 ```haskell
+import custodian
 import exception
 import std.process
 
 said : {e : HFunctor}
      -> {{sys : process <: e}}
      -> {{ex : exception ProcessError <: e}}
+     -> {{cu : custodian <: e}}
      -> Invocation
      -> Co e String
 said c = do
@@ -176,9 +178,12 @@ reach it. When its body ends, the `with` lets go of its hold:
   given the `With s r` by value, it is ended once the last holder
   lets go of it. The `with` does not wait.
 
-A thing that fails to end, now or later, is a failure of the runtime:
+A thing that fails to end, now or later, is a failure of the program:
 it is printed and the program ends, as with an uncaught failure. It is
-not thrown to the `with`'s caller.
+not thrown to the `with`'s caller. The `with` says it by the custodian
+effect, so every `with` of a thing asks for `{{cu : custodian <: e}}`,
+as `said` does above, and a `main` that uses one has `custodian` in its
+world.
 
 So a thread can use a command or a connection after the `with` that
 made it has ended. On the C backend "lets go" is the runtime's count of
@@ -190,9 +195,7 @@ file, it is released as its block is left.
 A `with` that releases by a computation (resource's `held`: a port of
 a standard stream, the page's document) has the other policy: it
 releases as its block is left, whoever holds the thing still. Its
-release is kept by the program's top level while the block runs, so
-such a `with` asks for `{{cu : custodian <: e}}`, and a `main` that uses
-one has `custodian` in its world. Where a throw heard outside the block
+release is kept by the program's top level while the block runs. Where a throw heard outside the block
 leaves it, or a handler drops the continuation, the release still runs:
 
 - on the C backend, at the next operation of the domain that started
