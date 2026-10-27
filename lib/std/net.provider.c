@@ -63,11 +63,20 @@ static int net_close(NetSock *s) {
   return r;
 }
 
+// (a socket a `with` let go of not closed: a failure of the runtime's,
+// said, the program ended with it, as an uncaught one is -- whether the
+// `with` closed it or its last holder did, later)
+static void net_unclosed(NetSock *s) {
+  fflush(stdout);
+  fprintf(stderr, "heff: std.net: %s not closed: %s\n", s->address ? s->address : "a socket", strerror(errno));
+  exit(1);
+}
+
 // (the program letting go of its last reference: closed, unless the
 // `with` closed it)
 static void net_let_go(void *x) {
   NetSock *s = x;
-  net_close(s);
+  if (net_close(s) < 0) net_unclosed(s);
   s->magic = 0;
   free(s->address);
   free(s);
@@ -716,7 +725,9 @@ static V heff_provider_net(V p, V k) {
       return heff_tail(k, 1, &x);
     }
     if (heff_tag_of(p) == TAG_Release || heff_tag_of(p) == TAG_LetGo) shutdown(s->fd, SHUT_WR);
-    V r = net_close(s) < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
+    int closed = net_close(s);
+    if (closed < 0 && letting) net_unclosed(s);
+    V r = closed < 0 ? net_left(errno, 0, s->address) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
