@@ -1451,17 +1451,20 @@ workersMade n =
          }
          :: rest)
 
--- (each worker on a domain of its own)
-workers : {w : HFunctor}
+-- (each worker on a domain of its own, spawned in the scheduler's
+-- scope)
+workers : {e w : HFunctor}
+        -> {s : Type}
         -> {{dm : Domain.domain <: w}}
+        -> {{sp : Domain.scoped w <: e}}
+        -> Domain.Scope s w
         -> Sched w
         -> List (Worker w (Behaviour w))
-        -> Co w (List (Domain.Domain Unit))
-workers st Nil = pure Nil
-workers st (worker :: rest) = do
-  d <- Domain.spawn (workerOn st worker)
-  ds <- workers st rest
-  pure (d :: ds)
+        -> Co e Unit
+workers sc st Nil = pure ()
+workers sc st (worker :: rest) = do
+  _ <- Domain.spawn sc (workerOn st worker)
+  workers sc st rest
 
 -- (each domain told to stop, once no behaviour is left: one `Nothing`
 -- a domain, whichever takes it; where the scheduler waits on the world
@@ -1469,7 +1472,7 @@ workers st (worker :: rest) = do
 stoppedAll : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
-           -> List (Domain.Domain Unit)
+           -> List (Worker w (Behaviour w))
            -> Co w Unit
 stoppedAll st Nil = pure ()
 stoppedAll st (d :: ds) = case st.outside of
@@ -1483,14 +1486,29 @@ stoppedAll st (d :: ds) = case st.outside of
     wokenAllPolling o st.workers
     Domain.unlock st.mutex
 
-joinedAll : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> List (Domain.Domain Unit)
-          -> Co w Unit
-joinedAll Nil = pure ()
-joinedAll (d :: ds) = do
-  Domain.join d
-  joinedAll ds
+-- (main's answer, or its failure handed on)
+mainAnswered : {w : HFunctor}
+             -> {a : Type}
+             -> {{dm : Domain.domain <: w}}
+             -> Either String a
+             -> Co w a
+mainAnswered (Right x) = pure x
+mainAnswered (Left why) = Domain.fail why
+
+-- (`c` run, its main, then every behaviour waited for, and each domain
+-- told to stop -- where main fails too, before this fails as it did)
+mainRun : {w : HFunctor}
+        -> {a : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Co (boc w <+> w) a
+        -> Co w a
+mainRun st c = do
+  r <- Domain.tried (handle (bocHandler st) c Nothing)
+  finished st
+  Domain.take st.done
+  stoppedAll st st.workers
+  mainAnswered r
 
 -- (`c` and its behaviours run, waiting on the world through the
 -- reactor where `outside` gives its operations)
@@ -1533,12 +1551,10 @@ scheduledBy outside failed c = do
     , stopping = stopping
     , workers = ws
     }
-  ds <- workers st ws
-  x <- handle (bocHandler st) c Nothing
-  finished st
-  Domain.take done
-  stoppedAll st ds
-  joinedAll ds
+  x <-
+    with sc := Domain.scope do
+      workers sc st ws
+      lift (mainRun st c)
   k <- Domain.get unreported
   case k of
     Just why -> Domain.fail why
@@ -1550,7 +1566,8 @@ scheduledBy outside failed c = do
 -- | cowns holding what they held: `failed why` is run on its domain,
 -- | while it still holds them, and the others go on.  Where a `failed`
 -- | fails too, this fails as the first such `failed` did, once every
--- | behaviour is done, instead of giving the answer.  An act awaited (`await`) is run where it is
+-- | behaviour is done, instead of giving the answer; where main fails,
+-- | every behaviour is waited for, and this fails as main did.  An act awaited (`await`) is run where it is
 -- | awaited, there and then, the behaviour holding its domain, and its
 -- | cowns, until it is done.
 scheduled : {w : HFunctor}
