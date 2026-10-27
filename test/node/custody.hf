@@ -1,0 +1,199 @@
+-- What a `with` holds, given to a cml thread: the `with` lets go of it
+-- when its block ends, and the thing is ended once the thread is done
+-- with it, not before.  By C alone (std.process, std.net).
+--
+--   main     a command a thread is given waited for by it after the
+--            `with` that started it has ended: it exits as it would;
+--            a connection a thread is given written on by it after its
+--            `with` has ended, then closed as the thread ends: the other
+--            side reads what was written, then the end; and a thread
+--            holding a connection dropped where the scheduler's scope
+--            ends: the connection closed then, its other side reading
+--            the end
+
+module test.node.custody
+
+import bytes as Bytes
+import cml as CML
+import co
+import exception
+import std.domain as Domain
+import std.io
+import std.net as Net
+import std.process
+import std.reactor as Reactor
+import resource
+
+endedAs : Ended -> String
+endedAs (Exited n) = "exited " ^ debug n
+endedAs (Signalled n) = "signalled " ^ debug n
+endedAs TimedOut = "timed out"
+endedAs (NotRun err) = "not run: " ^ err.message
+
+-- A command ----------------------------------------------------------------------------
+
+-- (a few turns, so the `with` that started it ends first, then a wait)
+waiter : {w : HFunctor}
+       -> {s : Type}
+       -> {{sys : process <: w}}
+       -> With s Started
+       -> CML.Chan w String
+       -> Co (CML.cml w <+> w) Unit
+waiter p done = do
+  CML.yield (w := w)
+  CML.yield (w := w)
+  r <- wait p
+  CML.send (w := w) done ("a thread waited: " ^ endedAs r.ended)
+
+commanded : {e w : HFunctor}
+          -> {{cm : CML.cml w <: e}}
+          -> {{sys : process <: w}}
+          -> {{sys2 : process <: e}}
+          -> {{ex : exception ProcessError <: e}}
+          -> Co e String
+commanded = do
+  done <- CML.newChan
+  with withProcess { command = "sleep", args = ["0.3"] } as p do
+    CML.spawn (waiter p done)
+  CML.recv done
+
+-- A connection -------------------------------------------------------------------------
+
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
+
+-- (what comes on the connection, to its end)
+drained : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> With s Net.TcpStream
+        -> Bytes
+        -> Co e String
+drained c got = do
+  r <- Net.read (timeout := 5000) c 4096
+  case r of
+    Left err -> pure ("failed: " ^ err.name)
+    Right b ->
+      if Bytes.length b == 0 then pure (Bytes.asString got)
+      else drained c (Bytes.append got b)
+
+-- (a few turns, so the `with` that connected ends first, then a write)
+writer : {w : HFunctor}
+       -> {s : Type}
+       -> {{nt : Net.net <: w}}
+       -> With s Net.TcpStream
+       -> Co (CML.cml w <+> w) Unit
+writer c = do
+  CML.yield (w := w)
+  CML.yield (w := w)
+  _ <- Net.write c (Bytes.fromString "written after the with")
+  pure ()
+
+-- (the other side's: accepted, read to its end)
+reader : {w : HFunctor}
+       -> {s : Type}
+       -> {{nt : Net.net <: w}}
+       -> With s Net.TcpListener
+       -> CML.Chan w String
+       -> Co (CML.cml w <+> w) Unit
+reader l done = do
+  r <- Net.accepted l
+  case r of
+    Left err -> CML.send (w := w) done ("not accepted: " ^ err.name)
+    Right c -> do
+      got <- drained c Bytes.empty
+      CML.send (w := w) done ("the other side read: " ^ got)
+
+connectedTo : {e w : HFunctor}
+            -> {s : Type}
+            -> {{cm : CML.cml w <: e}}
+            -> {{nt : Net.net <: w}}
+            -> {{nt2 : Net.net <: e}}
+            -> {{ex : exception Net.NetError <: e}}
+            -> With s Net.TcpListener
+            -> Int
+            -> Co e String
+connectedTo l port = do
+  done <- CML.newChan
+  CML.spawn (reader l done)
+  with Net.withConnection (here port) as c do
+    CML.spawn (writer c)
+  CML.recv done
+
+-- A scope's end ------------------------------------------------------------------------
+
+-- (a thread that waits for ever, holding the connection)
+holder : {w : HFunctor}
+       -> {s : Type}
+       -> With s Net.TcpStream
+       -> CML.IVar w Unit
+       -> Co (CML.cml w <+> w) Unit
+holder c never = CML.readIVar (w := w) never
+
+dropped : {e w : HFunctor}
+        -> {s : Type}
+        -> {{cm : CML.cml w <: e}}
+        -> {{nt2 : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> With s Net.TcpListener
+        -> Int
+        -> Co e (With s Net.TcpStream)
+dropped l port = do
+  never <- CML.newIVar
+  with Net.withConnection (here port) as c do
+    CML.spawn (holder c never)
+  r <- Net.accepted l
+  case r of
+    Left err -> throw err
+    Right c -> pure c
+
+-- Main ---------------------------------------------------------------------------------
+
+world : HFunctor
+world = stdio <+> Reactor.reactor <+> process <+> Net.net <+> Domain.domain
+
+said : {a : Type} -> (a -> String) -> Maybe (Either Net.NetError a) -> String
+said f Nothing = "every thread waiting"
+said f (Just (Left err)) = "thrown: " ^ err.name
+said f (Just (Right v)) = f v
+
+listened : {s : Type}
+         -> With s Net.TcpListener
+         -> Co world Unit
+listened l = do
+  a <- Net.local l
+  case a of
+    Left err -> print ("no port: " ^ err.name)
+    Right at -> do
+      r <-
+        CML.scheduledWithReactor
+          (dm := _)
+          (rx := _)
+          (attempt Net.NetError (connectedTo (w := world) (cm := _) (nt := _) l at.port))
+      print (said (\m -> m) r)
+      d <-
+        CML.scheduledWithReactor
+          (dm := _)
+          (rx := _)
+          (attempt Net.NetError (dropped (w := world) (cm := _) l at.port))
+      case d of
+        Just (Right c) -> do
+          got <- drained c Bytes.empty
+          print ("after the scope, the other side read: " ^ (if strEq got "" then "the end" else got))
+        _ -> print (said (\c -> "?") d)
+
+main : Co world Unit
+main = do
+  r <-
+    CML.scheduledWithReactor
+      (dm := _)
+      (rx := _)
+      (attempt ProcessError (commanded (w := world) (cm := _) (sys := _)))
+  print (case r of
+    Just (Right m) -> m
+    Just (Left err) -> "thrown: " ^ err.message
+    Nothing -> "every thread waiting")
+  l <- Net.withListener (here 0) 16 listened
+  case l of
+    Left err -> print ("not listening: " ^ err.name)
+    Right u -> pure ()

@@ -1570,11 +1570,14 @@ static V heff_provider_process(V p, V k) {
   }
   // (a command's value is kept through its operation: the operation may
   // hold the last reference, and dropping it lets the command go)
+  // (a `with` letting go of its command: ended here where the `with`
+  // held it alone, else left to whoever holds it still, ended as the
+  // last of them lets go of it)
   case TAG_Release: {
     V v = heff_dup(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    heff_sub_end(heff_sub_of(v));
+    if (heff_unique(v)) heff_sub_end(heff_sub_of(v));
     heff_drop(v);
     V u = NTAG(TAG_MkUnit);
     V x = heff_answer(f, heff_tag_n(TAG_Right, 1, &u));

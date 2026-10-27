@@ -132,6 +132,8 @@ data NetF (m : Type -> Type) x
   | Local TcpListener (Either NetError Address -> x)
   | Release TcpStream (Either NetError Unit -> x)
   | ReleaseListener TcpListener (Either NetError Unit -> x)
+  | LetGo TcpStream (Either NetError Unit -> x)
+  | LetGoListener TcpListener (Either NetError Unit -> x)
 
 -- | For TCP: connections made, listened for and accepted, read and
 -- | written, shut down and closed.
@@ -150,6 +152,8 @@ net =
       Local l k -> Local l (\r -> g (k r))
       Release c k -> Release c (\r -> g (k r))
       ReleaseListener l k -> ReleaseListener l (\r -> g (k r))
+      LetGo c k -> LetGo c (\r -> g (k r))
+      LetGoListener l k -> LetGoListener l (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       Connect h port ms k -> Connect h port ms k
       Listen h port b k -> Listen h port b k
@@ -162,6 +166,8 @@ net =
       Local l k -> Local l k
       Release c k -> Release c k
       ReleaseListener l k -> ReleaseListener l k
+      LetGo c k -> LetGo c k
+      LetGoListener l k -> LetGoListener l k
   }
 
 -- Connections
@@ -183,6 +189,15 @@ released : {e : HFunctor}
          -> TcpStream
          -> Co e (Either NetError Unit)
 released c = op (ev (Release c (\r -> r))) val
+
+-- (a `with` letting go of its connection: shut down and closed where
+-- the `with` held it alone, or why it did not close; else left to
+-- whoever holds it still, closed as the last of them lets go of it)
+letGo : {e : HFunctor}
+      -> {{ev : net <: e}}
+      -> TcpStream
+      -> Co e (Either NetError Unit)
+letGo c = op (ev (LetGo c (\r -> r))) val
 
 -- | A connection to `address`'s host and port -- the host a name
 -- | (resolved by the system, getaddrinfo, to IPv4 and IPv6 addresses,
@@ -206,7 +221,7 @@ withConnection : {e : HFunctor}
                -> ({s : Type} -> With s TcpStream -> Co e a)
                -> Co e a
 withConnection address body =
-  scoped (connected address.host address.port timeout) released body
+  scoped (connected address.host address.port timeout) letGo body
 
 -- | Up to `n` bytes of what the other side sent, as many as have come,
 -- | waiting for one at least; none at its end, where it has closed its
@@ -281,6 +296,15 @@ listenerReleased : {e : HFunctor}
                  -> Co e (Either NetError Unit)
 listenerReleased l = op (ev (ReleaseListener l (\r -> r))) val
 
+-- (a `with` letting go of its listener: closed where the `with` held
+-- it alone, or why it did not close; else left to whoever holds it
+-- still, closed as the last of them lets go of it)
+listenerLetGo : {e : HFunctor}
+              -> {{ev : net <: e}}
+              -> TcpListener
+              -> Co e (Either NetError Unit)
+listenerLetGo l = op (ev (LetGoListener l (\r -> r))) val
+
 -- (what the body came to, once its listener is closed; or why the
 -- listener did not close)
 closedAfter : {a : Type} -> a -> Either NetError Unit -> Either NetError a
@@ -299,7 +323,7 @@ listenedBy body (Left err) = pure (Left err)
 listenedBy body (Right l) =
   bind
     (held (pure l) (\x -> pure MkUnit) body)
-    (\v -> bind (listenerReleased l) (\r -> pure (closedAfter v r)))
+    (\v -> bind (listenerLetGo l) (\r -> pure (closedAfter v r)))
 
 -- | A socket listening on `address`'s host and port, at most `backlog`
 -- | connections waiting to be accepted -- the host one of this host's
@@ -347,7 +371,7 @@ accept : {e : HFunctor}
        -> With s TcpListener
        -> ({s2 : Type} -> With s2 TcpStream -> Co e a)
        -> Co e a
-accept l body = scoped (acceptedBy (inside l)) released body
+accept l body = scoped (acceptedBy (inside l)) letGo body
 
 -- | The next connection made to the listener, waiting for one, had in
 -- | the listener's region -- no longer than its `with` -- not by a
