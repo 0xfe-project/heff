@@ -224,7 +224,10 @@ done once they are, no thread of it left running after it.
 
 The body runs in the world of the block around, `e`, unless the
 `Binder` says another, by its field `World`: a function from `e` to the
-body's world. A handler that gives its body a count of its own:
+body's world. What the names are, its field `Contents`, is given `e`
+too, and the body's region: a name can be of a type that says the
+world around, as std.domain's scope is. A handler that gives its body
+a count of its own:
 
 ```haskell
 import state
@@ -236,7 +239,7 @@ counter k = MkCounter k
 
 instance instanceBinderCounter : Binder Counter
 instanceBinderCounter =
-  { Contents = \s -> Int
+  { Contents = \w s -> Int
   , World = \w -> state Int <+> w
   , Result = \r -> (r, Int)
   }
