@@ -84,23 +84,17 @@ step and the view together.
 ## Running it
 
 ```haskell
-program : {e : HFunctor}
-        -> {{con : Terminal.console <: e}}
-        -> {{io : stdio <: e}}
-        -> Co e Unit
-program = do
+main : Co (Terminal.console <+> stdio) Unit
+main = do
   r <- Terminal.interact app
   case r of
     Just ts -> print (joinWith "\n" (List.map show ts))
     Nothing -> pure MkUnit
-
-main : Co (Terminal.console <+> stdio) Unit
-main = program
 ```
 
 `Terminal.interact` runs the app on the terminal: it draws the view,
-reads a key, steps, and draws again, until the app is `Done`. The
-program then prints the todos.
+reads a key, steps, and draws again, until the app is `Done`. `main`
+then prints the todos.
 
 ```sh
 $ heff run app/hello/main.hf

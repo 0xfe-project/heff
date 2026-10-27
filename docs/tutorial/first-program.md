@@ -78,21 +78,18 @@ import co
 import hello.greeting
 import std.io
 
-program : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
-program = print (greeting "world")
-
 main : Co stdio Unit
-main = program
+main = do
+  print (greeting "world")
 ```
 
 `import hello.greeting` brings in the module above. A module's name is
 its path under `src/`.
 
-`program`'s type says what it does: it is a computation (`Co e Unit`)
-that needs the standard streams (`stdio`), and nothing else. `main` runs
-it and gives it those streams. [Chapter 3](effects.md#printing-the-todos)
-explains how this works. For now, read `{{io : stdio <: e}}` as "to run
-this, you need stdio".
+`main`'s type says what it does: it is a computation (`Co stdio Unit`)
+in the world of the standard streams (`stdio`), and nothing else, so it
+can `print`. [Chapter 3](effects.md#printing-the-todos) explains worlds,
+and computations that run in any world that has what they need.
 
 ## Testing it
 
