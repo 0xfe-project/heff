@@ -7,8 +7,10 @@
 // program lets go of what kept them, from whichever thread that is.
 // The domain runs them before its next operation (`heff_custodianDue`,
 // which the compiler puts before each, where the world has the
-// custodian's effect), each once, in the order kept; one that fails is
-// a failure of the runtime's, said, the program ended.
+// custodian's effect), each once, in the order kept, and what is left
+// as the domain ends (its thread's `heff_thread_end`) -- not as the
+// program ends, which the system cleans up after; one that fails is a
+// failure of the runtime's, said, the program ended.
 
 typedef struct HeffDue {
   V release;
@@ -27,8 +29,11 @@ typedef struct HeffDueQ {
 // as what a domain kept may outlive it)
 HEFF_VAR(HEFF_TLS HeffDueQ *heff_due_here);
 
+static void heff_due_drained(void);
+
 HEFF_FN HeffDueQ *heff_due_queue(void) {
   if (!heff_due_here) {
+    heff_thread_ending = heff_due_drained;
     HeffDueQ *q = heff_alloc(sizeof *q);
     memset(q, 0, sizeof *q);
 #ifdef HEFF_THREADS
@@ -91,6 +96,10 @@ HEFF_SLOW void heff_due_run(void) {
 }
 
 // (what is due on this domain run, before an operation)
+static void heff_due_drained(void) {
+  if (heff_due_here && __atomic_load_n(&heff_due_here->n, __ATOMIC_ACQUIRE)) heff_due_run();
+}
+
 static inline V heff_custodianDue(void) {
   if (__builtin_expect(heff_due_here && __atomic_load_n(&heff_due_here->n, __ATOMIC_ACQUIRE), 0))
     heff_due_run();
