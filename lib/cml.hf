@@ -58,14 +58,15 @@
 -- `readIVar iv` | what `iv` holds, waiting until it does; a base event
 -- `never` | a base event never ready
 -- `choose cs` | one of the branches: each run to its first base event, one of those committed, at random where several can be
--- `withNack f` | `f nack`, the ivar `nack` written once a `choose` is left without this branch
+-- `withNack f` | `f nack`, the nack `nack` ready once a `choose` is left without this branch
+-- `awaitNack nack` | once `nack` is ready, its `choose` left without its branch; a base event
 -- `scheduled c` | `c` and its threads run, on domains: `Just` main's answer, or `Nothing` where every thread waits; failing as the first thread that failed
 -- `scheduledWithReactor c` | the same, a thread's operation of the world that would wait pending in its domain's reactor, the others going on
 -- `with _ := threads do ss` | `scheduled`'s, `ss` main, a `with`: the block's world with cml, the `with` done once its threads are
 -- `with _ := threadsWithReactor do ss` | `scheduledWithReactor`'s, as a `with`
 --
 -- An event is a computation, and its base events are operations: a
--- `send`, a `recv`, an ivar's read, `never`.  Run alone, an event is
+-- `send`, a `recv`, an ivar's read, a nack's await, `never`.  Run alone, an event is
 -- its first base event, committed once it can be, the thread waiting
 -- until then, and what follows.  In a `choose`, each branch is run, in
 -- order and on this thread, up to its first base event -- what comes
@@ -226,7 +227,9 @@ module cml
   , readIVar
   , never
   , choose
+  , Nack
   , withNack
+  , awaitNack
   , scheduled
   , scheduledWithReactor
   , Threads
@@ -525,7 +528,7 @@ data CmlF (w : HFunctor) (m : Type -> Type) x
   | PutIVar (Some (Putting w x))
   | Sync (List (Base w x))
   | Choose (Some (Choosing m x))
-  | Nack (IVar w Unit) (Unit -> x)
+  | MadeNack (IVar w Unit) (Unit -> x)
   | Settled Int (Unit -> x)
 
 -- (what comes after an operation, changed)
@@ -542,7 +545,7 @@ stepThen g (NewIVar s) = NewIVar (someThen (makingIVarThen g) s)
 stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
 stepThen g (Sync bs) = Sync (List.map (baseThen g) bs)
 stepThen g (Choose s) = Choose (someThen (choosingThen g) s)
-stepThen g (Nack iv k) = Nack iv (\u -> g (k u))
+stepThen g (MadeNack iv k) = MadeNack iv (\u -> g (k u))
 stepThen g (Settled n k) = Settled n (\u -> g (k u))
 
 -- | For CML threads run in the world `w`: spawned and yielding,
@@ -559,7 +562,7 @@ cml w =
       PutIVar s -> PutIVar s
       Sync bs -> Sync bs
       Choose s -> Choose (someThen (choosingMapped nt) s)
-      Nack iv k -> Nack iv k
+      MadeNack iv k -> MadeNack iv k
       Settled n k -> Settled n k
   }
 
@@ -676,24 +679,35 @@ choose : {e w : HFunctor}
        -> Co e a
 choose bs = op (cm (Choose (\r use -> use a (MkChoosing bs (\v -> v))))) val
 
+-- | A nack, of threads run in the world `w`: ready once the `choose`
+-- | its branch is in is left without that branch.  Only `withNack`
+-- | makes one, and only `awaitNack` waits for it: no thread readies it,
+-- | the scheduler does.  (The ivar the scheduler writes.)
+data Nack (w : HFunctor) = MkNack (IVar w Unit)
+
 -- | `f` given its nack, the computation run: `f nack`, run as the rest
--- | of its branch, and `nack` an ivar written once the `choose` it is
--- | in is left without this branch -- another committed, its guard work
--- | failed, or its thread dropped before going on from it -- so a
--- | thread reading it (`readIVar nack`, a base event) knows it was not
--- | chosen.  A value, not a computation of this thread's world, so
--- | that a thread spawned in the guard, of the scheduler's world, can
--- | be given it.  Outside a `choose`, or where its branch is the one
--- | committed and its thread goes on, `nack` is never written.
+-- | of its branch, and `nack` ready once the `choose` it is in is left
+-- | without this branch -- another committed, its guard work failed, or
+-- | its thread dropped before going on from it -- so a thread waiting
+-- | for it (`awaitNack nack`, a base event) knows it was not chosen.  A
+-- | value, not a computation of this thread's world, so that a thread
+-- | spawned in the guard, of the scheduler's world, can be given it.
+-- | Outside a `choose`, or where its branch is the one committed and its
+-- | thread goes on, `nack` is never ready.
 withNack : {e w : HFunctor}
          -> {a : Type}
          -> {{cm : cml w <: e}}
-         -> (IVar w Unit -> Co e a)
+         -> (Nack w -> Co e a)
          -> Co e a
 withNack f = do
   nack <- (newIVar : Co e (IVar w Unit))
-  op (cm (Nack nack (\u -> u))) val
-  f nack
+  op (cm (MadeNack nack (\u -> u))) val
+  f (MkNack nack)
+
+-- | Once the nack is ready: its `choose` left without its branch.  A
+-- | base event, as an ivar's read is.
+awaitNack : {e w : HFunctor} -> {{cm : cml w <: e}} -> Nack w -> Co e Unit
+awaitNack (MkNack iv) = readIVar iv
 
 -- The handler: a thread as a resumption
 --------------------------------------------------------------------------------
@@ -1776,7 +1790,7 @@ branched st turnOf runner (sb :: rest) acc =
                 runner
                 ((\t use -> use a (MkBranch k up around)) :: rest)
                 acc)
-        Nack nack k -> do
+        MadeNack nack k -> do
           r <-
             Domain.tried
               (branched
@@ -1988,7 +2002,7 @@ stepped st turnOf runner (RStep (Choose s)) =
            Co w (Branches w))
       chosen <- pendingChoice st br
       synced st turnOf runner chosen (branchesNacks br) (committable br))
-stepped st turnOf runner (RStep (Nack nack k)) = do
+stepped st turnOf runner (RStep (MadeNack nack k)) = do
   next <- later k
   pure (GoesOn next)
 stepped st turnOf runner (RStep (Settled n k)) = do
@@ -2143,7 +2157,7 @@ readyAlone st (sb :: rest) =
           s (Co w (Maybe x)) (\c pt -> do
             k <- written Nothing pt
             readyAlone st ((\t use -> use a (MkAloneBranch k up)) :: rest))
-        Nack nack k ->
+        MadeNack nack k ->
           readyAlone
             st
             ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
@@ -2190,7 +2204,7 @@ alone st (RStep (NewIVar s)) =
 alone st (RStep (PutIVar s)) =
   s (Co w a) (\t p -> bind (written Nothing p) (\k -> alone st k))
 alone st (RStep (Sync bs)) = abandon
-alone st (RStep (Nack nack k)) = alone st (k MkUnit)
+alone st (RStep (MadeNack nack k)) = alone st (k MkUnit)
 alone st (RStep (Settled n k)) = alone st (k MkUnit)
 alone st (RStep (Choose s)) =
   s (Co w a) (\t ch -> case ch of
