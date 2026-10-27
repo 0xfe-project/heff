@@ -4806,6 +4806,45 @@ HEFF_FN void *heff_foreign_ptr(V v) {
   return ((Fgn *)v)->p;
 }
 
+// The custodian current.  Where a program's world has the custodian's
+// effect, its handler's monad reads the custodian current (heff's
+// entry, as Reader does), and tells it here just before each operation
+// (`heff_custodyIn`): a `Maybe Custodian`, held until the next, for the
+// provider performing it to read.  A computation an operation carries
+// to run later -- a domain's, a custodian's `stop` -- is of that monad,
+// and the provider takes it given the custodian current where it was
+// asked (`heff_carried`).  In a world without custodians nothing is told,
+// and a computation is taken as it is.
+HEFF_VAR(HEFF_TLS V heff_custody_env);
+
+static inline V heff_custodyIn(V c) {
+  V old = heff_custody_env;
+  heff_custody_env = c;
+  if (old) heff_drop(old);
+  return NTAG(TAG_MkUnit);
+}
+
+// (a computation an operation carries, `m a`, consumed: as the provider
+// runs it, given the custodian current where the operation was asked)
+static inline V heff_carried(V m) {
+  return heff_custody_env ? heff_answer(m, heff_dup(heff_custody_env)) : m;
+}
+
+static V heff_carried_then(V self, V *a) {
+  V *e = heff_env(self);
+  V f = heff_dup(e[0]), c = heff_dup(e[1]);
+  heff_drop(self);
+  return heff_answer(heff_answer(f, a[0]), c);
+}
+
+// (... of a function to one, `a -> m b`, consumed: what it comes to
+// given the custodian current where the operation was asked)
+static inline V heff_carried_fn(V f) {
+  if (!heff_custody_env) return f;
+  V e[2] = { f, heff_dup(heff_custody_env) };
+  return heff_clo(heff_carried_then, 1, 2, e);
+}
+
 // (an errno's name, the same on every system where its number is not)
 HEFF_FN const char *heff_errno_name(int e) {
   switch (e) {

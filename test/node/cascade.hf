@@ -1,5 +1,7 @@
 -- A failed release cascades up the custodians, by C alone (std.net,
--- std.domain, and flaky.hf's things, one of which fails to end).
+-- std.domain, cml, and flaky.hf's things, one of which fails to end).
+-- Each `with` of a custodian is written in a world of its own, as a
+-- program's `main` is.
 --
 --   main     a server with a custodian of its own for each connection,
 --            one that contains its failures: the second connection's
@@ -10,13 +12,18 @@
 --            its client reads nothing -- and the failure said, the
 --            server going on to the third
 --   rooted   a thing that fails to end, in the custody of a custodian
---            under another, neither containing it: the failure goes up
---            through both to the root, the program's, said, the program
---            ended
+--            under another, in the same block, neither containing it:
+--            the failure goes up through both to the root, the
+--            program's, said, the program ended
+--   threads  two cml threads, one spawned in a custodian that contains
+--            its failures, the other not, taking turns: the first's
+--            thing that fails to end takes its custodian down alone; the
+--            other's, the root's still, ends the program
 
 module test.node.cascade
 
 import bytes as Bytes
+import cml as CML
 import co
 import custodian as Custodian
 import exception
@@ -65,22 +72,23 @@ keeper t go = do
   g <- Domain.get go
   if g then pure () else keeper t go
 
+-- (the world, and the server's within it, hearing its throws)
+world : HFunctor
+world =
+  stdio <+> Net.net <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian
+
+guarded : HFunctor
+guarded = exception Net.NetError <+> (exception String <+> world)
+
 -- (the `i`th connection, by its client and the server: the server's in
 -- a custodian of its own, which contains its failures, with one under
 -- it; the connection's thing held by a domain past its `with`)
-served : {e : HFunctor}
-       -> {s : Type}
-       -> {{nt : Net.net <: e}}
-       -> {{dm : Domain.domain <: e}}
-       -> {{fl : Flaky.flaky <: e}}
-       -> {{cu : Custodian.custodian <: e}}
-       -> {{ex : exception Net.NetError <: e}}
-       -> {{fx : exception String <: e}}
+served : {s : Type}
        -> With s Net.TcpListener
        -> Int
        -> Domain.Atomic (List String)
        -> Int
-       -> Co e Unit
+       -> Co guarded Unit
 served l port log i = do
   with Net.withConnection (here port) as cl do
     with k := Custodian.contained do
@@ -111,10 +119,6 @@ printed Nil = pure ()
 printed (l :: ls) = do
   print l
   printed ls
-
-world : HFunctor
-world =
-  stdio <+> Net.net <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian
 
 listened : {s : Type}
          -> Domain.Atomic (List String)
@@ -148,31 +152,59 @@ main = do
     Left err -> print ("not listening: " ^ err.name)
     Right u -> pure ()
 
--- (a thing that fails to end, in the custody of a custodian of its own)
-inner : {e : HFunctor}
-      -> {{io : stdio <: e}}
-      -> {{fl : Flaky.flaky <: e}}
-      -> {{cu : Custodian.custodian <: e}}
-      -> {{fx : exception String <: e}}
-      -> Co e Unit
-inner = do
-  with k := Custodian.custody do
-    with Flaky.withThing True as t do
-      print "held"
-
--- (... under another)
-nested : {e : HFunctor}
-       -> {{io : stdio <: e}}
-       -> {{fl : Flaky.flaky <: e}}
-       -> {{cu : Custodian.custodian <: e}}
-       -> {{fx : exception String <: e}}
-       -> Co e Unit
-nested = do
-  with outer := Custodian.custody do
-    inner
-  print "not reached"
-
 rooted : Co world Unit
 rooted = do
-  r <- attempt String (nested (io := _) (fl := _) (cu := _))
+  r <-
+    attempt
+      String (do
+        with outer := Custodian.custody do
+          with inner := Custodian.custody do
+            with Flaky.withThing True as t do
+              print "held"
+        print "not reached")
   print "nor this"
+
+-- (a thread's thing, one that fails to end, after some turns: its
+-- failure its custodian's, the one current as it was spawned)
+thingAfter : {w : HFunctor}
+           -> {{io : stdio <: w}}
+           -> {{fl : Flaky.flaky <: w}}
+           -> {{cu : Custodian.custodian <: w}}
+           -> String
+           -> CML.Chan w Unit
+           -> CML.Chan w Unit
+           -> Co (CML.cml w <+> w) Unit
+thingAfter name go done = do
+  CML.yield (w := w)
+  CML.recv (w := w) go
+  CML.yield (w := w)
+  r <-
+    attempt
+      String
+      (Flaky.withThing True (\t -> print (name ^ " held its thing")))
+  print (name ^ " went on")
+  CML.send (w := w) done ()
+
+-- (two threads, the first spawned in a custodian of its own, each told
+-- in turn to take its thing)
+inTurns : {w : HFunctor}
+        -> {{io : stdio <: w}}
+        -> {{fl : Flaky.flaky <: w}}
+        -> {{cu : Custodian.custodian <: w}}
+        -> Co (CML.cml w <+> w) Unit
+inTurns = do
+  go1 <- CML.newChan
+  go2 <- CML.newChan
+  done <- CML.newChan
+  with k := Custodian.contained do
+    CML.spawn (thingAfter "the contained" go1 done)
+  CML.spawn (thingAfter "the root's" go2 done)
+  CML.send go1 ()
+  CML.recv (w := w) done
+  CML.send go2 ()
+  CML.recv (w := w) done
+
+threads : Co world Unit
+threads = do
+  r <- CML.scheduled (inTurns (w := world))
+  print "not reached"

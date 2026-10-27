@@ -221,15 +221,12 @@ Custodian.custody do` is how a thing comes to be in `k`'s:
 import bytes as Bytes
 import custodian as Custodian
 import exception
+import std.io
 import std.net as Net
 
-served : {e : HFunctor}
-       -> {s : Type}
-       -> {{nt : Net.net <: e}}
-       -> {{cu : Custodian.custodian <: e}}
-       -> {{ex : exception Net.NetError <: e}}
+served : {s : Type}
        -> With s Net.TcpListener
-       -> Co e Unit
+       -> Co (exception Net.NetError <+> (stdio <+> Net.net <+> Custodian.custodian)) Unit
 served l = do
   with k := Custodian.contained do
     with Net.accept l as c do
@@ -239,12 +236,18 @@ served l = do
 ```
 
 - `with k := Custodian.custody do` runs its body with `k` a new
-  custodian, under the one the `with` is in. The things the body's
-  `with`s hold are in `k`'s custody, and the custodians made in the body
-  are under `k`. It is Racket's `parameterize` of the current custodian,
-  but by the world, not a variable: the body runs in `custodian <+> e`,
-  its own handler answering for `k`. Outside every such `with`, a thing
-  is in the root's custody.
+  custodian, under the one current, and `k` current in the body. The
+  things the body's `with`s hold are in `k`'s custody, and the
+  custodians made in the body are under `k`. Outside every such `with`,
+  the root's custodian is current.
+- It is Racket's `parameterize` of the current custodian, `custodied k
+  c`. The body runs in the block's world, with no effect added: the
+  one `custodian` there is handled by the runtime, whose monad carries
+  the custodian current, as Reader's does, and runs the body with `k`.
+  So a throw, a continuation resumed later, or one resumed twice each
+  keep the custodian current where they were made. A `with` of a
+  custodian may be written in any world that has `custodian`, inside
+  another's body too.
 - `with k := Custodian.contained do` is the same, and `k` contains its
   failures (below).
 - `Custodian.manage c stop` gives it something to run at its shutdown;
@@ -273,11 +276,14 @@ serves each connection in a `contained` custodian loses only that
 connection when its close fails. What the custodians were given runs
 on the domain that made them, at its next operation.
 
-The world of a custodian's body has `custodian` twice, its own and the
-one around it, so the evidence for it is found only where the world
-around is a variable, `e`, with its evidence in scope: write such a
-`with` in a function of any world, as `served` is, and a `with` of a
-custodian inside another in a function of its own.
+What starts to run later keeps the custodian current where it was
+started, as Racket's threads do. A domain spawned in a custodian's
+body has that custodian current, and so does a cml thread spawned
+there, in each of its turns, while the other threads keep theirs. A
+`with` of a custodian in a cml thread runs its body alone, as cml runs
+every operation of the world that holds a computation, so the thread
+does not wait at a channel in it. To serve a connection in a custodian
+of its own, spawn the thread that serves it inside the `with`.
 
 What a custodian is given is higher-order. It is a computation of the
 world it was given in, with the handlers between there and the
