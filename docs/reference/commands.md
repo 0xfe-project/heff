@@ -228,16 +228,25 @@ stopped = Fuel.limited 100000 (later (\u -> spin 0))  -- Nothing, with fuel
 It cannot be avoided because pure code carries no effect: the compiler
 cannot tell which code runs under a limit, so a program built with fuel
 pays for the ticks in every loop, limited or not. A tick is cheap, but it
-is a branch to a call in each round, which keeps the C compiler from
-unrolling or vectorising a tight loop. Measured (one machine, median of
-three, a tick each round):
+is a branch to a call, which keeps the C compiler from unrolling or
+vectorising a loop round it. So a tight loop -- one calling itself last
+and nothing in its rounds -- is ticked once a batch of its rounds, its
+body copied as many times as make about sixty-four of the compiler's
+steps (at most `Fuel.batchMost`, 64), and charged the batch: `limited`
+stops such a loop up to a batch before its limit, and charges it up to a
+batch more each time it is entered. A loop calling anything, and a
+recursion not last or round other functions, ticks once a round.
+Measured (one machine, median of three):
 
-| | without fuel | with fuel |
-|---|---|---|
-| a loop counting to a thousand | 558 ns | 734 ns |
-| a thousand gets and puts of a state handler | 460 ns | 575 ns |
-| summing an array of floats, 10⁹ elements | 0.51 s, 2.2 G instructions | 0.64 s, 12.2 G |
-| the compiler compiling itself | 112.8 G instructions | 121.6 G |
+| | without fuel | a tick each round | batched |
+|---|---|---|---|
+| a loop counting to a thousand | 638 ns | 783 ns | 610 ns |
+| a thousand gets and puts of a state handler | 459 ns | 595 ns | 411 ns |
+| summing an array of floats, 10⁹ elements | 2.25 G instructions | 12.2 G | 9.5 G |
+| the compiler's C, built with fuel | 30.95 MB | 31.45 MB | 33.57 MB |
+
+(The float sum stays far above: its copies are each checked in range,
+where without fuel the loop's index is checked once.)
 
 So only a program that must stop pure work it does not trust should be
 built with fuel.
