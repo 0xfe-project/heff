@@ -13,29 +13,31 @@ module test.node.domains-program
 import co
 import std.domain as Domain
 
--- (domains `i` to `n - 1`, each running `c` of its number)
-spawnedFrom : {e : HFunctor}
-            -> {a : Type}
-            -> {{dm : Domain.domain <: e}}
+-- (domains `i` to `n - 1` of the scope, each running `c` of its number)
+spawnedFrom : {e w : HFunctor}
+            -> {s a : Type}
+            -> {{sp : Domain.scoped w <: e}}
+            -> Domain.Scope s w
             -> Int
             -> Int
-            -> (Int -> Co e a)
+            -> (Int -> Co w a)
             -> Co e (List (Domain.Domain a))
-spawnedFrom i n c =
+spawnedFrom sc i n c =
   if i >= n then pure Nil
   else do
-    d <- Domain.spawn (c i)
-    rest <- spawnedFrom (i + 1) n c
+    d <- Domain.spawn sc (c i)
+    rest <- spawnedFrom sc (i + 1) n c
     pure (d :: rest)
 
--- (`n` domains, each running `c i`, `i` its number from 0)
-spawned : {e : HFunctor}
-        -> {a : Type}
-        -> {{dm : Domain.domain <: e}}
+-- (`n` domains of the scope, each running `c i`, `i` its number from 0)
+spawned : {e w : HFunctor}
+        -> {s a : Type}
+        -> {{sp : Domain.scoped w <: e}}
+        -> Domain.Scope s w
         -> Int
-        -> (Int -> Co e a)
+        -> (Int -> Co w a)
         -> Co e (List (Domain.Domain a))
-spawned n c = spawnedFrom 0 n c
+spawned sc n c = spawnedFrom sc 0 n c
 
 joined : {e : HFunctor}
        -> {a : Type}
@@ -64,8 +66,10 @@ adding counter k = do
 counted : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
 counted = do
   counter <- Domain.newAtomic 0
-  ds <- spawned 4 (\i -> adding counter 100000)
-  _ <- joined ds
+  with s := Domain.scope do
+    ds <- spawned s 4 (\i -> adding counter 100000)
+    _ <- joined ds
+    pure ()
   Domain.get counter
 
 -- By cas, retried ----------------------------------------------------------------------
@@ -98,8 +102,10 @@ bumping counter k = do
 casCounted : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
 casCounted = do
   counter <- Domain.newAtomic 0
-  ds <- spawned 4 (\i -> bumping counter 50000)
-  _ <- joined ds
+  with s := Domain.scope do
+    ds <- spawned s 4 (\i -> bumping counter 50000)
+    _ <- joined ds
+    pure ()
   Domain.get counter
 
 -- (`x` pushed onto the list the cell holds, by a cas of the list read:
@@ -129,8 +135,10 @@ pushing stack i k = do
 stacked : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Int, Int)
 stacked = do
   stack <- Domain.newAtomic Nil
-  ds <- spawned 4 (\i -> pushing stack i 1000)
-  _ <- joined ds
+  with s := Domain.scope do
+    ds <- spawned s 4 (\i -> pushing stack i 1000)
+    _ <- joined ds
+    pure ()
   xs <- Domain.get stack
   pure (List.length xs, List.sum xs)
 
@@ -178,12 +186,13 @@ handed = do
   mu <- Domain.newMutex
   cd <- Domain.newCondition
   box <- Domain.newAtomic Nil
-  ds <- spawned 6 (\i -> given mu cd box (i * i))
-  Domain.lock mu
-  xs <- awaited mu cd box 6
-  Domain.unlock mu
-  _ <- joined ds
-  pure (List.sum xs)
+  with s := Domain.scope do
+    ds <- spawned s 6 (\i -> given mu cd box (i * i))
+    Domain.lock mu
+    xs <- awaited mu cd box 6
+    Domain.unlock mu
+    _ <- joined ds
+    pure (List.sum xs)
 
 -- Waiting on one another ------------------------------------------------------------
 
@@ -201,10 +210,22 @@ spun flag = do
 spinning : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Bool
 spinning = do
   flag <- Domain.newAtomic False
-  d <- Domain.spawn (Domain.set flag True)
-  spun flag
-  Domain.join d
-  pure True
+  with s := Domain.scope do
+    d <- Domain.spawn s (Domain.set flag True)
+    spun flag
+    Domain.join d
+    pure True
+
+-- (1 added, the mutex held)
+lockedAdd : {e : HFunctor}
+          -> {{dm : Domain.domain <: e}}
+          -> Domain.Mutex
+          -> Domain.Atomic Int
+          -> Co e Unit
+lockedAdd mu box = do
+  Domain.lock mu
+  _ <- Domain.fetchAdd box 1
+  Domain.unlock mu
 
 -- | a mutex main holds, a domain spawned then locking it: it waits
 -- | until main lets go, and adds once
@@ -213,13 +234,10 @@ parentFirst = do
   mu <- Domain.newMutex
   box <- Domain.newAtomic 0
   Domain.lock mu
-  d <-
-    Domain.spawn (do
-    Domain.lock mu
-    _ <- Domain.fetchAdd box 1
-    Domain.unlock mu)
-  Domain.unlock mu
-  Domain.join d
+  with s := Domain.scope do
+    d <- Domain.spawn s (lockedAdd mu box)
+    Domain.unlock mu
+    Domain.join d
   Domain.get box
 
 -- Through a queue --------------------------------------------------------------------
@@ -257,10 +275,11 @@ taking q k (MkPair cells heads) = do
 queued : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Int, Int)
 queued = do
   q <- Domain.newQueue
-  takers <- spawned 2 (\i -> taking q 2000 (MkPair 0 0))
-  putters <- spawned 4 (\i -> putting q i 1000)
-  _ <- joined putters
-  taken <- joined takers
+  taken <- with s := Domain.scope do
+    takers <- spawned s 2 (\i -> taking q 2000 (MkPair 0 0))
+    putters <- spawned s 4 (\i -> putting q i 1000)
+    _ <- joined putters
+    joined takers
   pure
       ( List.sum (List.map fst taken)
       , List.sum (List.map snd taken)
@@ -293,10 +312,11 @@ takenAll q k = do
 inOrder : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List Int)
 inOrder = do
   q <- Domain.newQueue
-  d <- Domain.spawn (counting q 1 5)
-  xs <- takenAll q 5
-  Domain.join d
-  pure xs
+  with s := Domain.scope do
+    d <- Domain.spawn s (counting q 1 5)
+    xs <- takenAll q 5
+    Domain.join d
+    pure xs
 
 -- Let go of ---------------------------------------------------------------------------
 
@@ -318,22 +338,36 @@ letGoOf k n = do
   held <- Domain.get cell
   letGoOf (k - 1) (n + List.length held)
 
--- (`k` domains spawned and never joined, their handles let go of while
--- they may still run: each freed by the later of its end and the drop)
-unjoined : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Int -> Co e Unit
-unjoined 0 = pure ()
-unjoined k = do
-  _ <- Domain.spawn (pure k)
-  unjoined (k - 1)
+-- (`k` domains of the scope spawned and never joined, their handles let
+-- go of while they may still run: each freed by the later of its end,
+-- the drop and the scope's)
+unjoined : {e w : HFunctor}
+         -> {s : Type}
+         -> {{sp : Domain.scoped w <: e}}
+         -> Domain.Scope s w
+         -> Int
+         -> Co e Unit
+unjoined sc 0 = pure ()
+unjoined sc k = do
+  _ <- Domain.spawn sc (pure k)
+  unjoined sc (k - 1)
 
 -- | 100000 cells, mutexes, conditions and queues made and let go of; 20
 -- | domains never joined
 letGo : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
 letGo = do
-  unjoined 20
+  with s := Domain.scope do
+    unjoined s 20
   letGoOf 100000 0
 
 -- The lines ---------------------------------------------------------------------------
+
+-- | 3 domains' answers, joined
+answers : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
+answers = do
+  with s := Domain.scope do
+    ds <- spawned s 3 (\i -> pure (debug i ^ "!"))
+    joined ds
 
 -- | what the program says, line by line
 said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
@@ -343,8 +377,7 @@ said = do
   s <- stacked
   b <- notTheSame
   h <- handed
-  answers <- spawned 3 (\i -> pure (debug i ^ "!"))
-  ws <- joined answers
+  ws <- answers
   sp <- spinning
   pf <- parentFirst
   qd <- queued

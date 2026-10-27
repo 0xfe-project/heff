@@ -262,7 +262,10 @@ and closed; with boc's `r := BOC.await act` last, `act` run outside
 every behaviour, and the body a behaviour once it has come to `r`; with
 cml's `_ := CML.threads`, the body cml's main thread, in a world with
 cml, it and the threads it spawns scheduled on domains, and the `with`
-done once they are, no thread of it left running after it.
+done once they are, no thread of it left running after it; with
+std.domain's `s := Domain.scope`, the body run here and every domain
+spawned in `s` waited for at its end
+([a scope of domains](#a-scope-of-domains)).
 
 - The names are the body's variables: they can be set, `a := a - n`.
   The handler is told which ones the body sets, and is given what they
@@ -291,7 +294,10 @@ done once they are, no thread of it left running after it.
 
 The body runs in the world of the block around, `e`, unless the
 `Binder` says another, by its field `World`: a function from `e` to the
-body's world. A handler that gives its body a count of its own:
+body's world. What the names are, its field `Contents`, is given `e`
+too, and the body's region: a name can be of a type that says the
+world around, as std.domain's scope is. A handler that gives its body
+a count of its own:
 
 ```haskell
 import state
@@ -303,7 +309,7 @@ counter k = MkCounter k
 
 instance instanceBinderCounter : Binder Counter
 instanceBinderCounter =
-  { Contents = \s -> Int
+  { Contents = \w s -> Int
   , World = \w -> state Int <+> w
   , Result = \r -> (r, Int)
   }
@@ -344,6 +350,74 @@ world adds is the body's own, even where `e` has it too, and `print`
 is `e`'s `stdio`, through the `io` in scope, with nothing written. A
 world `\w -> stdio <+> w` makes a `with` whose holder sends what its
 body prints elsewhere, to a file or a buffer.
+
+### A scope of domains
+
+```haskell
+import std.domain as Domain
+
+-- | `n` rounds of `step`, fewer where the scope is cancelled
+rounds : {e w : HFunctor}
+       -> {s : Type}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Scope s w
+       -> Int
+       -> Co e Unit
+       -> Co e Unit
+rounds sc 0 step = pure ()
+rounds sc n step = do
+  stop <- Domain.cancelled sc
+  if stop then pure ()
+  else do
+    step
+    rounds sc (n - 1) step
+
+both : {e : HFunctor}
+     -> {{dm : Domain.domain <: e}}
+     -> Co e Unit
+     -> Co e Unit
+     -> Co e Unit
+both one other = do
+  with s := Domain.scope do
+    _ <- Domain.spawn s (rounds s 1000 one)
+    _ <- Domain.spawn s (rounds s 1000 other)
+    pure ()
+```
+
+`with s := Domain.scope do` is structured concurrency, as Rust's
+`std::thread::scope`: its body runs here, and `Domain.spawn s c` spawns
+`c` on a domain of its own, one of the scope's. At the body's end the
+`with` waits for every domain spawned in `s`; the body is free to do
+other work before. `Domain.join` gives a domain's answer.
+
+- A domain is spawned in a scope, and only there: there is no `spawn`
+  of any world. The body runs in the block's world with the scope's own
+  effect, `Domain.scoped e <+> e`, and `Domain.spawn s c` is that
+  effect's. `c` is a computation of `e`, the world around the `with`,
+  which has no `scoped`: a domain cannot spawn in its own scope, so
+  none is spawned after the body ends, and none outlives the `with`. A
+  domain that wants domains of its own opens a scope of its own.
+- A domain of the scope that fails fails the scope: once all of them
+  have ended, the `with` fails as the first to fail did (a
+  `Domain.tried` around it catches that). Where the body fails, its
+  domains are waited for too, and the `with` fails as the body did.
+- Cancelling is cooperative. The scope carries a cancel mark, set by
+  `Domain.cancel s`, or when one of its domains fails, or its body does.
+  A domain looks at it where it chooses, `Domain.cancelled s`, and
+  winds up as it chooses: here `rounds` stops between steps. The
+  `with` still waits for it, and a scope that is only cancelled comes
+  to its body's value.
+- No domain is stopped from outside. Stopped at an arbitrary operation,
+  it would leave a `Domain.lock` it holds locked, and the release of a
+  resource it holds (a `with`'s, a `held`'s) would not run, its
+  continuation dropped: that is why cancelling a thread of the system
+  from outside is unsafe. A domain waiting in a call of the system, or
+  in a loop with no operation, stops only where it looks at the mark;
+  a pure loop that never ends is std.fuel's to stop
+  ([fuel](../commands.md#fuel)).
+- `s` cannot leave the body: its type, `Domain.Scope s e`, is of the
+  `with`'s region. A body left by a throw handled outside the `with`
+  (an `exception`'s) does not wait: its domains run on.
 
 `with` and `as` are [keywords](definitions.md#keywords): neither is a
 name.

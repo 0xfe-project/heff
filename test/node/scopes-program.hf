@@ -1,0 +1,228 @@
+-- What the scopes' tests run, on every backend: the same program, by
+-- std.domain's scopes alone, on the C backend's threads and in
+-- JavaScript's one domain, the same lines said.  A scope's `with`
+-- waiting for its domains, and for those they spawn in it; a domain
+-- failing, the scope failing as it did and its sibling, seeing the
+-- mark, winding up; a body failing, its domain winding up before the
+-- `with` fails; a scope cancelled; scopes in scopes.
+
+module test.node.scopes-program
+
+import co
+import std.domain as Domain
+
+-- (1 added `k` times)
+adding : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Atomic Int
+       -> Int
+       -> Co e Unit
+adding counter 0 = pure ()
+adding counter k = do
+  _ <- Domain.fetchAdd counter 1
+  adding counter (k - 1)
+
+-- (rounds taken until the scope is cancelled, 1 added to `rounds` each;
+-- then `wound` set)
+untilCancelled : {e : HFunctor}
+               -> {w : HFunctor}
+               -> {s : Type}
+               -> {{dm : Domain.domain <: e}}
+               -> Domain.Scope s w
+               -> Domain.Atomic Int
+               -> Domain.Atomic Bool
+               -> Co e Unit
+untilCancelled sc rounds wound = do
+  stop <- Domain.cancelled sc
+  if stop then Domain.set wound True
+  else do
+    _ <- Domain.fetchAdd rounds 1
+    untilCancelled sc rounds wound
+
+-- Waiting ----------------------------------------------------------------------
+
+-- | 3 domains adding 100000 each, never joined: the `with` waits for
+-- | them
+waited : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+waited = do
+  counter <- Domain.newAtomic 0
+  with s := Domain.scope do
+    _ <- Domain.spawn s (adding counter 100000)
+    _ <- Domain.spawn s (adding counter 100000)
+    _ <- Domain.spawn s (adding counter 100000)
+    pure ()
+  Domain.get counter
+
+-- (a domain of a scope opening one of its own, 2 domains in it, then
+-- adding)
+spawningMore : {e : HFunctor}
+             -> {{dm : Domain.domain <: e}}
+             -> Domain.Atomic Int
+             -> Co e Unit
+spawningMore counter = do
+  with t := Domain.scope do
+    _ <- Domain.spawn t (adding counter 1000)
+    _ <- Domain.spawn t (adding counter 1000)
+    adding counter 1000
+
+-- | domains spawned in scopes of a scope's domains, waited for too; and
+-- | an answer joined
+grandchildren : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (Int, Int)
+grandchildren = do
+  counter <- Domain.newAtomic 0
+  answer <-
+    with s := Domain.scope do
+      _ <- Domain.spawn s (spawningMore counter)
+      _ <- Domain.spawn s (spawningMore counter)
+      d <- Domain.spawn s (pure 42)
+      Domain.join d
+  n <- Domain.get counter
+  pure (n, answer)
+
+-- Failing ----------------------------------------------------------------------
+
+-- (this domain failing as `why` says)
+broken : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> String -> Co e Unit
+broken why = Domain.fail why
+
+-- (a scope whose domain fails, beside one going until cancelled)
+failingScope : {e : HFunctor}
+             -> {{dm : Domain.domain <: e}}
+             -> Domain.Atomic Int
+             -> Domain.Atomic Bool
+             -> Co e Unit
+failingScope rounds wound = do
+  with s := Domain.scope do
+    _ <- Domain.spawn s (untilCancelled s rounds wound)
+    _ <- Domain.spawn s (broken "broken")
+    pure ()
+
+-- (a scope whose body fails, its domain going until cancelled)
+bodyFailingScope : {e : HFunctor}
+                 -> {{dm : Domain.domain <: e}}
+                 -> Domain.Atomic Int
+                 -> Domain.Atomic Bool
+                 -> Co e Unit
+bodyFailingScope rounds wound = do
+  with s := Domain.scope do
+    _ <- Domain.spawn s (untilCancelled s rounds wound)
+    broken "the body broke"
+
+-- (what the scope's failure was)
+saidOf : Either String Unit -> String
+saidOf (Left why) = "failed " ^ why
+saidOf (Right u) = "did not fail"
+
+-- | a domain failing: the scope fails as it did, and its sibling, which
+-- | looks at the mark, winds up
+failing : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e String
+failing = do
+  rounds <- Domain.newAtomic 0
+  wound <- Domain.newAtomic False
+  r <- Domain.tried (failingScope rounds wound)
+  w <- Domain.get wound
+  pure (saidOf r ^ ", its sibling " ^ (if w then "wound up" else "still going"))
+
+-- | the body failing: the scope cancelled, its domain winding up, and
+-- | waited for before the `with` fails as the body did
+bodyFailing : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e String
+bodyFailing = do
+  rounds <- Domain.newAtomic 0
+  wound <- Domain.newAtomic False
+  r <- Domain.tried (bodyFailingScope rounds wound)
+  w <- Domain.get wound
+  pure
+      (saidOf r
+       ^ ", its domain "
+       ^ (if w then "wound up first" else "still going"))
+
+-- Cancelling -------------------------------------------------------------------
+
+-- | the scope cancelled by its body: its domain winds up, and the `with`
+-- | comes to the body's answer
+cancelling : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e String
+cancelling = do
+  rounds <- Domain.newAtomic 0
+  wound <- Domain.newAtomic False
+  v <-
+    with s := Domain.scope do
+      _ <- Domain.spawn s (untilCancelled s rounds wound)
+      before <- Domain.cancelled s
+      Domain.cancel s
+      after <- Domain.cancelled s
+      pure (if not before && after then 7 else 0)
+  w <- Domain.get wound
+  pure
+      ("came to "
+       ^ debug v
+       ^ ", its domain "
+       ^ (if w then "wound up" else "still going"))
+
+-- Nested -----------------------------------------------------------------------
+
+-- (an inner scope, cancelled, in a domain of the outer: whether the
+-- outer was cancelled with it)
+inner : {e : HFunctor}
+      -> {w : HFunctor}
+      -> {s : Type}
+      -> {{dm : Domain.domain <: e}}
+      -> Domain.Scope s w
+      -> Domain.Atomic Int
+      -> Domain.Atomic Bool
+      -> Co e Unit
+inner outer counter outerCancelled = do
+  rounds <- Domain.newAtomic 0
+  wound <- Domain.newAtomic False
+  with t := Domain.scope do
+    _ <- Domain.spawn t (adding counter 1000)
+    _ <- Domain.spawn t (untilCancelled t rounds wound)
+    Domain.cancel t
+  c <- Domain.cancelled outer
+  Domain.set outerCancelled c
+
+-- (a scope in a scope, a domain of the inner failing)
+failingInside : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Unit
+failingInside = do
+  with s := Domain.scope do
+    with t := Domain.scope do
+      _ <- Domain.spawn t (broken "inner broke")
+      pure ()
+
+-- | scopes in scopes: each waits for its own, an inner one cancelled
+-- | alone; and one failing inside fails the outer
+nested : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e String
+nested = do
+  counter <- Domain.newAtomic 0
+  outerCancelled <- Domain.newAtomic True
+  with outer := Domain.scope do
+    _ <- Domain.spawn outer (inner outer counter outerCancelled)
+    with t := Domain.scope do
+      _ <- Domain.spawn t (adding counter 1000)
+      _ <- Domain.spawn outer (adding counter 1000)
+      pure ()
+  n <- Domain.get counter
+  oc <- Domain.get outerCancelled
+  r <- Domain.tried failingInside
+  pure
+      (debug n
+       ^ ", the outer "
+       ^ (if oc then "cancelled" else "not cancelled")
+       ^ "; one inside "
+       ^ saidOf r)
+
+said : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e (List String)
+said = do
+  w <- waited
+  g <- grandchildren
+  f <- failing
+  b <- bodyFailing
+  c <- cancelling
+  n <- nested
+  pure
+      [ "waited for 3: " ^ debug w
+      , "spawned by its domains: " ^ debug (fst g) ^ ", joined " ^ debug (snd g)
+      , "a domain failing: " ^ f
+      , "the body failing: " ^ b
+      , "cancelled: " ^ c
+      , "nested: " ^ n
+      ]

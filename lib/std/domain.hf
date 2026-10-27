@@ -30,17 +30,20 @@
 --         -> Co e Unit
 -- counted = do
 --   counter <- Domain.newAtomic 0
---   one <- Domain.spawn (adding counter 1000)
---   two <- Domain.spawn (adding counter 1000)
---   Domain.join one
---   Domain.join two
+--   with s := Domain.scope do
+--     _ <- Domain.spawn s (adding counter 1000)
+--     _ <- Domain.spawn s (adding counter 1000)
+--     pure ()
 --   n <- Domain.get counter
 --   print (debug n)
 -- ```
 --
 -- Operation | What it does
 -- --- | ---
--- `spawn c` | `c` run on a domain of its own; this one goes on
+-- `with s := scope do ss` | `ss` run with `s` a scope: the `with` waits, at its end, for every domain spawned in it
+-- `spawn s c` | `c` run on a domain of its own, one of the scope's; this one goes on
+-- `cancel s` | the scope's mark set: no domain stopped
+-- `cancelled s` | whether the mark is set: by `cancel`, a domain of the scope failing, or its body
 -- `join d` | the domain's answer, waiting for it to end
 -- `tried c` | `c` run here: `Right` its answer, or `Left why` where it fails
 -- `fail why` | this domain fails as `why` says: a `tried`'s `Left` handed on
@@ -68,16 +71,38 @@
 -- is handed to the one domain that takes it, first in first out: a
 -- `take` waits while the queue is empty, a `put` never waits.
 --
--- `spawn` and `tried` hold computations of the world they are performed
--- in: `tried`'s runs here, at the call, in what is around it, and so
--- does `spawn`'s, on a domain of its own -- every handler between the
--- spawn and the program's world runs it too (a domain of the runtime's
--- can only be given the program's world's computations, and those it
--- is given are the spawn's, handled on their way to it).  So the
--- schedulers written on domains -- cml's, boc's -- take their threads
--- and behaviours as closed computations of their own world instead, and
--- each runs them on its workers, with none of the handlers around where
--- they were spawned.
+-- Domains are spawned in a scope, and only there: structured
+-- concurrency.  `with s := Domain.scope do ss` runs `ss` here, in the
+-- block's world with `scoped`, the scope's own, and, at its end, waits
+-- for every domain spawned in the scope, the body free to do other work
+-- meanwhile.  `spawn s c` is `scoped`'s: only the body spawns in the
+-- scope.  `c` is a computation of the world around the `with`, which
+-- has no `scoped`, so a domain cannot spawn in its own scope -- one that
+-- wants domains of its own opens a scope of its own.  A domain of the
+-- scope that fails fails the scope: the `with` fails, once all of them
+-- have ended, as the first to fail did; one where the body fails, as
+-- the body did.
+--
+-- Cancelling is cooperative: the scope carries a mark, set by `cancel`,
+-- or where one of its domains fails, or its body does, and each domain
+-- looks at it where it chooses (`cancelled`) and winds up as it
+-- chooses.  No domain is stopped from outside: stopped at an arbitrary
+-- operation, it would keep a mutex it holds locked, and the release of
+-- what it holds would not run.  A domain in a call of the system that
+-- waits, or in a loop with no operation, ends only where it looks at
+-- the mark; a loop that never ends is fuel's to stop.  A body left by a
+-- throw handled outside the `with` (an `exception`'s) leaves its
+-- domains running, not waited for.
+--
+-- A domain's computation is of the world around its scope's `with`, and
+-- every handler between there and the program's world runs it too, on
+-- its domain (a domain of the runtime's can only be given the program's
+-- world's computations, and those it is given are the spawn's, handled
+-- on their way to it); `tried`'s runs here, at the call, in what is
+-- around it.  So the schedulers written on domains -- cml's, boc's --
+-- take their threads and behaviours as closed computations of their own
+-- world instead, and each runs them on its workers, in a scope of its
+-- own, with none of the handlers around where they were spawned.
 --
 -- What runs the domains is the backend's runtime, the program the same
 -- on each.  A domain, a cell, a mutex and a condition are the
@@ -109,7 +134,13 @@ module std.domain
   , Mutex
   , Condition
   , Queue
+  , Scope
+  , Scoping
+  , scoped
+  , scope
   , spawn
+  , cancel
+  , cancelled
   , join
   , tried
   , fail
@@ -129,6 +160,8 @@ module std.domain
   , newQueue
   , put
   , take
+  , instanceBinderScope
+  , instanceHolderScope
   )
 
 import co
@@ -320,17 +353,16 @@ domain =
 -- Domains
 --------------------------------------------------------------------------------
 
--- | `c` run on a domain of its own; this one goes on.  `join` waits for
--- | its answer.  `c` is of this domain's world, `e`, so each handler
--- | between here and the program's world runs it too, on its domain:
--- | a scheduler whose workers are domains is best run in the program's
--- | world itself, nothing of the program's own around it.
-spawn : {e : HFunctor}
-      -> {a : Type}
-      -> {{dm : domain <: e}}
-      -> Co e a
-      -> Co e (Domain a)
-spawn c = op (dm (Spawn (\r use -> use a (MkSpawning c (\d -> d))))) val
+-- (`c` run on a domain of its own, this one going on: a scope's, which
+-- spawns in itself alone.  `c` is of this domain's world, `e`, so each
+-- handler between here and the program's world runs it too, on its
+-- domain)
+started : {e : HFunctor}
+        -> {a : Type}
+        -> {{dm : domain <: e}}
+        -> Co e a
+        -> Co e (Domain a)
+started c = op (dm (Spawn (\r use -> use a (MkSpawning c (\d -> d))))) val
 
 -- | The domain's answer, waiting for it to end; where it failed, this
 -- | one fails as it did.
@@ -466,3 +498,249 @@ put q v = op (dm (PutQueue (\r use -> use a (MkPutting q v MkUnit)))) val
 -- | while the queue is empty.
 take : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> Queue a -> Co e a
 take q = op (dm (TakeQueue (\r use -> use a (MkTaking q (\v -> v))))) val
+
+-- Scopes
+--------------------------------------------------------------------------------
+
+-- | A scope of domains, `with s := Domain.scope do`: its domains and
+-- | its cancel mark.  `s` is the region of the `with` that made it, so
+-- | the scope cannot leave the block; `w` is the world of the block
+-- | around, its domains' world.
+data Scope s (w : HFunctor)
+  = MkScope (Atomic Bool) (Atomic (Maybe String)) (Atomic (List (Some Domain)))
+
+-- (whether it is cancelled)
+markOf : {s : Type} -> {w : HFunctor} -> Scope s w -> Atomic Bool
+markOf (MkScope mark failure children) = mark
+
+-- (why its first domain to fail failed)
+failureOf : {s : Type} -> {w : HFunctor} -> Scope s w -> Atomic (Maybe String)
+failureOf (MkScope mark failure children) = failure
+
+-- (its domains)
+childrenOf : {s : Type}
+           -> {w : HFunctor}
+           -> Scope s w
+           -> Atomic (List (Some Domain))
+childrenOf (MkScope mark failure children) = children
+
+data SpawningIn (w : HFunctor) x a = MkSpawningIn (Co w a) (Domain a -> x)
+
+spawningInThen : {w : HFunctor}
+               -> {x y a : Type}
+               -> (x -> y)
+               -> SpawningIn w x a
+               -> SpawningIn w y a
+spawningInThen g (MkSpawningIn c k) = MkSpawningIn c (\d -> g (k d))
+
+data ScopedF (w : HFunctor) (m : Type -> Type) x
+  = SpawnIn (Some (SpawningIn w x))
+
+-- | A scope's body's own: domains spawned in the scope, computations of
+-- | `w`, the world of the block around the `with`.  Only the body has
+-- | it, not a domain's computation: no domain spawns in its own scope.
+scoped : HFunctor -> HFunctor
+scoped w =
+  { f = ScopedF w
+  , hfmap = \m g p -> case p of
+      SpawnIn s -> SpawnIn (someThen (spawningInThen g) s)
+  , hmap = \m n nt p -> case p of
+      SpawnIn s -> SpawnIn s
+  }
+
+-- | What a `with s := Domain.scope do` opens: a scope of domains.
+data Scoping = OpenScope
+
+-- | `with s := Domain.scope do ss`: `ss` run here, in the block's world
+-- | with `scoped`, its own, `s` a scope its domains are spawned in
+-- | (`spawn s c`); the `with` waits, at its end, for every domain
+-- | spawned in it, and comes to what `ss` came to.
+scope : Scoping
+scope = OpenScope
+
+-- | `c` run on a domain of its own, one of the scope's; this one goes on.
+-- | The scope's `with` waits for it at its end, and `join` gives its
+-- | answer.  Where it fails, the scope is cancelled, and fails at its
+-- | end as the first of its domains to fail did.  Only the scope's body
+-- | spawns in it: `c` is of the world around the `with`, `w`, where
+-- | there is no `scoped`; each handler between there and the program's
+-- | world runs it too, on its domain.
+spawn : {e w : HFunctor}
+      -> {s a : Type}
+      -> {{sp : scoped w <: e}}
+      -> Scope s w
+      -> Co w a
+      -> Co e (Domain a)
+spawn sc c = op (sp (SpawnIn (\r use -> use a (MkSpawningIn c (\d -> d))))) val
+
+-- | The scope cancelled: its mark set.  No domain of it is stopped:
+-- | each looks at the mark where it chooses (`cancelled`), and winds up
+-- | as it chooses.
+cancel : {e w : HFunctor}
+       -> {s : Type}
+       -> {{dm : domain <: e}}
+       -> Scope s w
+       -> Co e Unit
+cancel sc = set (markOf sc) True
+
+-- | Whether the scope is cancelled: by `cancel`, or as one of its
+-- | domains failed, or its body did.
+cancelled : {e w : HFunctor}
+          -> {s : Type}
+          -> {{dm : domain <: e}}
+          -> Scope s w
+          -> Co e Bool
+cancelled sc = get (markOf sc)
+
+-- (`v` pushed onto the list the cell holds, again until no other domain
+-- came between: a domain of an inner scope may spawn in this one)
+pushed : {e : HFunctor}
+       -> {a : Type}
+       -> {{dm : domain <: e}}
+       -> Atomic (List a)
+       -> a
+       -> Co e Unit
+pushed cell v = do
+  l <- get cell
+  ok <- cas cell l (v :: l)
+  if ok then pure () else pushed cell v
+
+-- (a domain of the scope ended: its answer, or, where it failed, the
+-- scope's failure, if it is the first, and its mark set, and this
+-- domain fails as it did)
+childEnded : {e w : HFunctor}
+           -> {s a : Type}
+           -> {{dm : domain <: e}}
+           -> Scope s w
+           -> Either String a
+           -> Co e a
+childEnded sc (Right v) = pure v
+childEnded sc (Left why) = do
+  _ <- cas (failureOf sc) Nothing (Just why)
+  set (markOf sc) True
+  fail why
+
+-- (`c` spawned, one of the scope's)
+spawnedIn : {e : HFunctor}
+          -> {s a : Type}
+          -> {{dm : domain <: e}}
+          -> Scope s e
+          -> Co e a
+          -> Co e (Domain a)
+spawnedIn sc c = do
+  d <- started (bind (tried c) (childEnded sc))
+  pushed (childrenOf sc) (\r use -> use a d)
+  pure d
+
+-- (a `spawn` of the body's, answered in the handler around it)
+spawnAnswered : {e : HFunctor}
+              -> {s x b : Type}
+              -> {{dm : domain <: e}}
+              -> Scope s e
+              -> (hd : Handler e)
+              -> SpawningIn e x b
+              -> hd.M x
+spawnAnswered sc hd (MkSpawningIn c k) =
+  hd.bind (handle hd (spawnedIn sc c)) (\d -> hd.ret (k d))
+
+-- (what the body's `scoped` does: its domains spawned in the scope)
+scopeAlgebra : {e : HFunctor}
+             -> {s x : Type}
+             -> {{dm : domain <: e}}
+             -> Scope s e
+             -> (hd : Handler e)
+             -> ScopedF e hd.M x
+             -> hd.M x
+scopeAlgebra sc hd (SpawnIn sp) = sp (hd.M x) (\b p -> spawnAnswered sc hd p)
+
+-- (the domain waited for, how it ended said by the scope already)
+waitedFor : {e : HFunctor} -> {{dm : domain <: e}} -> Some Domain -> Co e Unit
+waitedFor child =
+  child (Co e Unit) (\a d -> bind (tried (join d)) (\r -> pure ()))
+
+-- (each domain waited for)
+allWaitedFor : {e : HFunctor}
+             -> {{dm : domain <: e}}
+             -> List (Some Domain)
+             -> Co e Unit
+allWaitedFor Nil = pure ()
+allWaitedFor (d :: ds) = do
+  waitedFor d
+  allWaitedFor ds
+
+-- (the body's answer, where none of the scope's domains failed)
+answered : {e : HFunctor}
+         -> {a : Type}
+         -> {{dm : domain <: e}}
+         -> Maybe String
+         -> a
+         -> Co e a
+answered Nothing v = pure v
+answered (Just why) v = fail why
+
+-- (the scope's end, the body's: every domain spawned in it waited for
+-- -- none is spawned once the body has ended -- then the body's
+-- failure, or the first domain's, or the body's answer)
+scopeEnded : {e w : HFunctor}
+           -> {s a : Type}
+           -> {{dm : domain <: e}}
+           -> Scope s w
+           -> Either String a
+           -> Co e a
+scopeEnded sc (Left why) = do
+  set (markOf sc) True
+  ds <- get (childrenOf sc)
+  allWaitedFor ds
+  fail why
+scopeEnded sc (Right v) = do
+  ds <- get (childrenOf sc)
+  allWaitedFor ds
+  why <- get (failureOf sc)
+  answered why v
+
+-- (a scope made, the body run with it, its `scoped` handled here, and
+-- its domains waited for)
+heldScope : {e : HFunctor}
+          -> {r : Type}
+          -> {{dm : domain <: e}}
+          -> (Scope Unit e -> Co (scoped e <+> e) (r, Scope Unit e))
+          -> Co e r
+heldScope body = do
+  mark <- newAtomic False
+  failure <- newAtomic Nothing
+  children <- newAtomic Nil
+  sc <- pure (MkScope mark failure children)
+  ended <-
+    tried
+      (within
+         (scoped e)
+         e
+         (scopeAlgebra sc)
+         (bind (body sc) (\p -> pure (fst p))))
+  scopeEnded sc ended
+
+-- | A `with` of a scope: its name the scope, of the world of the block
+-- | around, its body in that world with `scoped`, and the `with` comes
+-- | to what the body came to.
+instance instanceBinderScope : Binder Scoping
+instanceBinderScope =
+  { Contents = \w s -> Scope s w
+  , World = \w -> scoped w <+> w
+  , Result = \r -> r
+  }
+
+-- | A scope held by a `with`: made, the body run with it, and every
+-- | domain spawned in it waited for at the body's end -- where the body
+-- | fails too, the scope cancelled first.  Then the `with` fails as the
+-- | body did, or as the first of the scope's domains to fail did, or
+-- | comes to the body's answer.
+instance instanceHolderScope : {e : HFunctor}
+                             -> {{dm : domain <: e}}
+                             -> Holder
+                               e
+                               Scoping
+                               (\s -> Scope s e)
+                               (\w -> scoped w <+> w)
+                               (\r -> r)
+instanceHolderScope =
+  { held = \c written body -> heldScope (\sc -> body (s := Unit) sc) }

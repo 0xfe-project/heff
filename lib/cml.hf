@@ -173,7 +173,7 @@
 -- a pure loop that is to give the others their turns performs `yield`
 -- every so many rounds, what comes after it computed once the yield
 -- has taken effect.  A computation held by an operation of `w`
--- (`Domain.spawn c` holds `c`) is run alone, as the operation does
+-- (`Domain.tried c` holds `c`) is run alone, as the operation does
 -- it: its `spawn`s, channels and ivars are the scheduler's, but a
 -- base event in it has no thread to meet, and is abandoned -- unless
 -- it is in a `choose` with a branch that ends before its own.
@@ -2185,7 +2185,7 @@ readyAlone st (sb :: rest) =
                  ++ rest)))
 
 -- (a thread run alone to its end: what an operation of `w` holding
--- computations is given, as `Domain.spawn c` holds `c`.  Its spawns,
+-- computations is given, as `Domain.tried c` holds `c`.  Its spawns,
 -- channels and ivars are the scheduler's, the threads it readies put
 -- among those ready; a base event in it has no thread to meet, and is
 -- abandoned, unless a `choose` has a branch that ends first.)
@@ -2546,17 +2546,20 @@ workerOn st slot = case waitsOf st slot of
     Domain.set ws.group (Nothing : Maybe (Group w))
     o.close g
 
--- (a domain for each slot, its worker)
-workers : {w : HFunctor}
+-- (a domain for each slot, its worker, spawned in the scheduler's
+-- scope)
+workers : {e w : HFunctor}
+        -> {s : Type}
         -> {{dm : Domain.domain <: w}}
+        -> {{sp : Domain.scoped w <: e}}
+        -> Domain.Scope s w
         -> Sched w
         -> List (Slot w)
-        -> Co w (List (Domain.Domain Unit))
-workers st Nil = pure Nil
-workers st (slot :: slots) = do
-  d <- Domain.spawn (workerOn st slot)
-  ds <- workers st slots
-  pure (d :: ds)
+        -> Co e Unit
+workers sc st Nil = pure ()
+workers sc st (slot :: slots) = do
+  _ <- Domain.spawn sc (workerOn st slot)
+  workers sc st slots
 
 -- (`n` empty slots, numbered from `i`)
 slotsMade : {w : HFunctor}
@@ -2585,15 +2588,6 @@ waitsMade n =
     rest <- waitsMade (n - 1)
     pure ({ group = group, polling = polling, inbox = inbox } :: rest)
 
-joinedAll : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> List (Domain.Domain Unit)
-          -> Co w Unit
-joinedAll Nil = pure ()
-joinedAll (d :: ds) = do
-  Domain.join d
-  joinedAll ds
-
 -- (waiting, the mutex held, until main is done or every thread waits)
 idleUntilDone : {w : HFunctor}
               -> {{dm : Domain.domain <: w}}
@@ -2605,6 +2599,18 @@ idleUntilDone st = do
   else do
     Domain.wait st.finished st.mutex
     idleUntilDone st
+
+-- (the workers told to stop, once main is done or every thread waits)
+stopped : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
+stopped st = do
+  Domain.lock st.mutex
+  idleUntilDone st
+  Domain.set st.stopping True
+  Domain.broadcast st.work
+  case st.outside of
+    Just o -> wokenAllPolling o st.waits
+    Nothing -> pure ()
+  Domain.unlock st.mutex
 
 -- (`c` and its threads scheduled, waiting on the world through the
 -- reactor where `outside` gives its operations)
@@ -2666,16 +2672,9 @@ scheduledBy outside c = do
                 finishedWith st
                 pure (RDone MkUnit))))
   readyAgain st Nothing (\on -> run st True on main)
-  ds <- workers st slots
-  Domain.lock mutex
-  idleUntilDone st
-  Domain.set stopping True
-  Domain.broadcast work
-  case outside of
-    Just o -> wokenAllPolling o waits
-    Nothing -> pure ()
-  Domain.unlock mutex
-  joinedAll ds
+  with sc := Domain.scope do
+    workers sc st slots
+    lift (stopped st)
   dropped <- Domain.get waiting
   toldDropped dropped
   failed <- Domain.get failure
@@ -2760,12 +2759,12 @@ threadsWithReactor = OnReactors
 -- | and the `with` comes to what main's answer is.
 instance instanceBinderThreads : Binder Threads
 instanceBinderThreads =
-  { Contents = \s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
+  { Contents = \w s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
 
 -- | ... with a reactor.
 instance instanceBinderThreadsWithReactor : Binder ThreadsWithReactor
 instanceBinderThreadsWithReactor =
-  { Contents = \s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
+  { Contents = \w s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
 
 -- | cml's threads held by a `with`: the body scheduled, its value main's.
 instance instanceHolderThreads : {e : HFunctor}
