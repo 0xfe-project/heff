@@ -190,14 +190,17 @@
 --
 -- A thread that fails -- abandons, fails in the runtime, or a throw no
 -- handler of its own hears comes to the scheduler's world as a failure
--- -- is done with that, caught in its turn by the worker running it,
--- which goes on: the other threads are not stopped.  The scope collects
--- it: once the run is over -- main done, or every thread waiting -- and
--- the domains stopped, the first failure of a thread is the scope's,
--- `scheduled` (or the `with`) failing as that thread did, its words kept
--- (`Domain.fail`), caught by a `Domain.tried` around it as a `Left`.  A
--- failure of main's own ends the run there, as main's answer would, the
--- other threads dropped, and is the scope's the same way.
+-- -- is done with that, caught by the worker running it, which goes on
+-- with its loop: the other threads are not stopped.  (One catch around
+-- a worker's whole loop, not one around each turn; main's turns, alone,
+-- each catch their own, so that a failure of main's is known as such.)
+-- The scope collects it: once the run is over -- main done, or every
+-- thread waiting -- and the domains stopped, the first failure of a
+-- thread is the scope's, `scheduled` (or the `with`) failing as that
+-- thread did, its words kept (`Domain.fail`), caught by a `Domain.tried`
+-- around it as a `Left`.  A failure of main's own ends the run there, as
+-- main's answer would, the other threads dropped, and is the scope's the
+-- same way.
 --
 -- Under `scheduledWithReactor`, each worker opens a group of the reactor
 -- on its domain, its threads' operations of the world started there:
@@ -2080,7 +2083,9 @@ threadFailed st main why = do
 -- (a thread run, on `runner`, from where it stopped until it ends,
 -- waits, or gives up its turn, its fuel full; the turns of the threads
 -- it readies run them so, on the worker that takes each.  A failure in
--- the turn is the thread's, caught there: the worker goes on)
+-- a thread's turn is caught by the worker's loop, which goes on
+-- (`guarded`); one in main's turn, here, in the turn, so that the run
+-- ends with it)
 run : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
@@ -2088,7 +2093,9 @@ run : {w : HFunctor}
     -> Runner w
     -> Res w Unit
     -> Co w Unit
-run st main runner r = do
+run st False runner r =
+  ranOn st (\k on -> run st False on (k MkUnit)) runner fuelPerRun r
+run st True runner r = do
   out <-
     Domain.tried
       (bind
@@ -2096,14 +2103,14 @@ run st main runner r = do
             (\u ->
                ranOn
                  st
-                 (\k on -> run st main on (k MkUnit))
+                 (\k on -> run st True on (k MkUnit))
                  runner
                  fuelPerRun
                  r))
          (\c -> c))
   case out of
     Right u -> pure ()
-    Left why -> threadFailed st main why
+    Left why -> threadFailed st True why
 
 -- (a branch of a choice run alone, of whatever type: what is left of
 -- it to run up to its commit point, and `up` making what follows that)
@@ -2505,6 +2512,23 @@ worker st slot rounds = do
       worker st slot (if rounds >= roundsBetween then 0 else rounds + 1)
     Nothing -> pure ()
 
+-- (a worker's loop, a thread's failure in it caught: the first failure
+-- of the run kept, the thread counted no more, and the loop gone on
+-- with, the other threads not stopped.  One catch for the whole loop,
+-- not one for each turn; main's turns catch their own, `run`)
+guarded : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Slot w
+        -> Co w Unit
+guarded st slot = do
+  out <- Domain.tried (bind (later (\u -> worker st slot 0)) (\c -> c))
+  case out of
+    Right u -> pure ()
+    Left why -> do
+      threadFailed st False why
+      guarded st slot
+
 -- (a worker, on its domain: where the scheduler waits on the world
 -- through the reactor, its group opened there first, and closed once it
 -- stops, what is pending in it let go of)
@@ -2514,11 +2538,11 @@ workerOn : {w : HFunctor}
          -> Slot w
          -> Co w Unit
 workerOn st slot = case waitsOf st slot of
-  Nothing -> worker st slot 0
+  Nothing -> guarded st slot
   Just (MkPair o ws) -> do
     g <- o.open
     Domain.set ws.group (Just g)
-    worker st slot 0
+    guarded st slot
     Domain.set ws.group (Nothing : Maybe (Group w))
     o.close g
 
