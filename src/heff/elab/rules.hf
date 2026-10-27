@@ -151,6 +151,7 @@ withScope e sc =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , named = e.named
   , evidence = e.evidence
   }
 
@@ -162,6 +163,7 @@ withFor e ef =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , named = e.named
   , evidence = e.evidence
   }
 
@@ -173,6 +175,7 @@ intoLam e sc v =
   , lams = e.lams + 1
   , self = e.self
   , insts = e.insts
+  , named = e.named
   , evidence = e.evidence
   }
 
@@ -184,6 +187,7 @@ intoLamQuiet e sc v =
   , lams = e.lams
   , self = e.self
   , insts = e.insts
+  , named = e.named
   , evidence = e.evidence
   }
 
@@ -207,8 +211,39 @@ intoSilent e implicit y dom sc v counted =
       if Params.eqPlicity implicit Inst
       then Cons { name = y, ty = dom, v = v } e.insts
       else e.insts
+  , named = e.named
   , evidence = e.evidence
   }
+
+withNamed : ElabEnv -> Bool -> ElabEnv
+withNamed e named =
+  { scope = e.scope
+  , globals = e.globals
+  , elabFor = e.elabFor
+  , lams = e.lams
+  , self = e.self
+  , insts = e.insts
+  , named = named
+  , evidence = e.evidence
+  }
+
+-- | an implicit binder inserted: by its name where it is the
+-- | definition's own (`e.named`), else name-free (`BInserted`), so that
+-- | it captures no name the text wrote (#139)
+withImplicit : {a : Type}
+             -> ElabEnv
+             -> String
+             -> Value.Ty
+             -> Scope
+             -> (Value.V -> Scope -> a)
+             -> a
+withImplicit e x a c action =
+  if e.named then withBound x a c action else withInserted x a c action
+
+-- | checked as no definition's own: the implicit binders inserted in it
+-- | are name-free
+unnamed : Chk -> Chk
+unnamed c = MkChk (\e a -> runChk c (withNamed e False) a)
 
 -- | an error hole of a type: what did not elaborate, in its place
 errorHole : Value.Ty -> Memoed.El
@@ -1655,7 +1690,7 @@ implicitLams c =
     case Value.behavior a of
       LikeFunction level dom cod implicit ->
         if Params.eqPlicity implicit Expl then runChk c e a
-        else withBound (cloNameOr cod) dom e.scope (\v scope' -> do
+        else withImplicit e (cloNameOr cod) dom e.scope (\v scope' -> do
           ebody <-
             runChk
               (implicitLams c)
@@ -1821,7 +1856,7 @@ lambdaChk waits sp x body =
         -- a lambda checked at an implicit (or instance) function type:
         -- that argument is bound silently, and the lambda is for the
         -- next one
-        else withBound (cloNameOr cod) dom e.scope (\v scope' -> do
+        else withImplicit e (cloNameOr cod) dom e.scope (\v scope' -> do
           ebody <-
             runChk
               (lambdaChk waits sp x body)
@@ -1926,7 +1961,7 @@ functionIntroAnn sp x dom body =
                    e.scope.locals
                    (Memoed.fromVTy N e.scope.len a)
                    (MkAbs x ebody)))
-        else withBound (cloNameOr cod) fdom e.scope (\v scope' -> do
+        else withImplicit e (cloNameOr cod) fdom e.scope (\v scope' -> do
           ebody <-
             runChk
               (functionIntroAnn sp x dom body)
@@ -3076,6 +3111,11 @@ varGo x names (CBind c' (BDelayedBy k) a) locals n i = case names of
       else varGo x xs c' vs n (i + 1)
     _ -> Left NotInScope
   _ -> Left NotInScope
+varGo x names (CBind c' BInserted a) locals n i = case names of
+  Cons _ xs -> case locals of
+    LSnoc vs v -> varGo x xs c' vs n (i + 1)
+    _ -> Left NotInScope
+  _ -> Left NotInScope
 varGo x names CEmpty locals n i = Left NotInScope
 
 findLocal : ElabEnv -> String -> Either VarError (Pair Memoed.El Value.Ty)
@@ -3619,7 +3659,9 @@ written : ElabEnv
         -> Elab Given
 written e it x fty fs rest = do
   recordName e it.ty fs.name fs.nameSpan fty
-  m <- runChk fs.chk (withFor e (projElabFor e.elabFor x)) fty
+  -- (a field is a definition at the type its record declares: the
+  -- implicit binders inserted for it are named, as a definition's own)
+  m <- runChk fs.chk (withNamed (withFor e (projElabFor e.elabFor x)) True) fty
   pure { el = m, span = fs.span, dflt = False, rest = rest }
 
 -- | field `x`, of type `fty`: the next setting, if it is `x`'s, else
@@ -4733,6 +4775,7 @@ fixEnv e x a =
   , lams = 0
   , self = e.self
   , insts = e.insts
+  , named = True
   , evidence = e.evidence
   }
 
