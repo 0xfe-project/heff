@@ -190,3 +190,76 @@ Other calls take stack:
 
 What must go deeper should use a tail call (`List.foldl`, not
 `List.foldr`), or run as a C program.
+
+## Fuel
+
+std.fuel's `limited n c` runs `c` on `n` of fuel: `Just` its answer, or
+`Nothing` where it runs out first, the rest of `c` not run. It is a
+watchdog, not a time slice: a computation that runs out is stopped, never
+resumed (in C jumped out of, as a failure is; in JavaScript, thrown out
+of).
+
+What the fuel counts depends on how the program is built, and this is
+an abstraction leak there is no way around:
+
+- **Built with fuel** -- `fuel = True` in its build.hf, `heff compile
+  --fuel`, `heff bench --fuel` -- the compiler ticks the program: a
+  decrement and a branch at the entry of every function that may be
+  entered again before it ends (one calling a function of its own
+  recursive group, or a closure), so every loop ticks, even one with no
+  operation in it, and `limited` stops it near its limit.
+- **Built without** -- the default -- nothing is ticked but the world's
+  operations: `limited` stops `c` only at one, and a pure loop with none
+  runs past its limit, to its end or for ever. heff warns (W0390) at each
+  use of `limited` in such a program. The program is compiled exactly as
+  if there were no fuel at all: not a byte of it differs.
+
+```haskell
+import co
+import std.fuel as Fuel
+
+spin : Int -> Int
+spin n = spin (n + 1)
+
+stopped : {e : HFunctor} -> {{fl : Fuel.fuel <: e}} -> Co e (Maybe Int)
+stopped = Fuel.limited 100000 (later (\u -> spin 0))  -- Nothing, with fuel
+```
+
+It cannot be avoided because pure code carries no effect: the compiler
+cannot tell which code runs under a limit, so a program built with fuel
+pays for the ticks in every loop, limited or not. A tick is cheap, but it
+is a branch to a call, which keeps the C compiler from unrolling or
+vectorising a loop round it. So a tight loop -- one calling itself last
+and nothing in its rounds -- is ticked once a batch of its rounds, its
+body copied as many times as make about sixty-four of the compiler's
+steps (at most `Fuel.batchMost`, 64), and charged the batch: `limited`
+stops such a loop up to a batch before its limit, and charges it up to a
+batch more each time it is entered. A loop calling anything, and a
+recursion not last or round other functions, ticks once a round.
+Measured (one machine, median of three):
+
+| | without fuel | a tick each round | batched |
+|---|---|---|---|
+| a loop counting to a thousand | 638 ns | 783 ns | 610 ns |
+| a thousand gets and puts of a state handler | 459 ns | 595 ns | 411 ns |
+| summing an array of floats, 10⁹ elements | 2.25 G instructions | 12.2 G | 9.5 G |
+| the compiler's C, built with fuel | 30.95 MB | 31.45 MB | 33.57 MB |
+
+(The float sum stays far above: its copies are each checked in range,
+where without fuel the loop's index is checked once.)
+
+So only a program that must stop pure work it does not trust should be
+built with fuel.
+
+- A limit within a limit gets at most what is left of the outer one,
+  and what it uses is the outer's. Where the inner runs out of its own,
+  it is `Nothing` and the outer goes on; where it runs out of what was
+  left of the outer, the outer is `Nothing` too.
+- A failure inside is handed on as it came.
+- The count is each domain's (a thread of the system's): a domain
+  spawned inside runs with no limit. In JavaScript it is the one domain's.
+- What the stopped computation had not finished is left undone, as a
+  failure leaves it. A `with`'s release it skips is not run: the thing
+  is let go of by its finalizer, as where a continuation is dropped --
+  where its last reference is dropped. What only the stopped frames
+  held on C is leaked, as a failure's.

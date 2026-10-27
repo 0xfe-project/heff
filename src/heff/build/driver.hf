@@ -2452,3 +2452,82 @@ withRefused rs sources c = case List.find
     sources of
   Just s -> withDiags c (refusedIn rs s)
   Nothing -> c
+
+-- Fuel's warning
+--------------------------------------------------------------------------------
+
+-- A program built without fuel ticks nothing but its world's operations,
+-- so std.fuel's `limited` stops a computation only at one: a pure loop
+-- with none runs past its limit.  Where such a program uses `limited`,
+-- each use, as it is written -- `Fuel.limited` by the name it imports
+-- std.fuel as, or `limited` where it opens it -- is warned of.
+
+-- (a byte of a name, or a qualifier's dot)
+nameByte : Int -> Bool
+nameByte c =
+  c == 95
+  || c == 39
+  || c == 46
+  || 97 <= c && c <= 122
+  || 65 <= c && c <= 90
+  || 48 <= c && c <= 57
+
+-- (where the line `j` is on begins)
+lineStart : String -> Int -> Int
+lineStart src j =
+  if j <= 0 then 0
+  else if byteAt src (j - 1) == 10 then j
+  else lineStart src (j - 1)
+
+-- (whether `src` has a line comment begun before `j` on `j`'s line)
+commentedAt : String -> Int -> Bool
+commentedAt src j = contains "--" (strSlice src (lineStart src j) j)
+
+-- (where `name` is written in `src` from `i`, a name of its own, out of
+-- comments)
+writtenFrom : String -> String -> Int -> List Int
+writtenFrom src name i = case indexOf name src i of
+  Nothing -> Nil
+  Just j ->
+    if (j == 0 || not (nameByte (byteAt src (j - 1))))
+       && (j + strLength name >= strLength src
+           || not (nameByte (byteAt src (j + strLength name))))
+       && not (commentedAt src j)
+    then Cons j (writtenFrom src name (j + strLength name))
+    else writtenFrom src name (j + 1)
+
+-- (the names `limited` is written by in a module)
+limitedNames : Checked -> List String
+limitedNames c =
+  List.append
+    (List.map
+       (\(a : AliasQ) -> a.alias ^ ".limited")
+       (List.keepIf (\(a : AliasQ) -> strEq a.module "std.fuel") c.aliases))
+    (if List.any (\m -> strEq m "std.fuel") c.opens then ["limited"] else Nil)
+
+-- | the warning at a use of `limited` in a program built without fuel
+limitedWarning : Int -> Int -> Diag
+limitedWarning at n =
+  { code = 390
+  , severity = SWarning
+  , msg =
+      "this program is built without fuel: `limited` stops it only at an operation, so a pure loop with none runs past its limit"
+  , span = { start = at, end = at + n }
+  , note =
+      Just
+        "build it with fuel -- `fuel = True` in its build.hf, or `heff compile --fuel` -- for every loop to be ticked, at a cost to every loop"
+  }
+
+-- | a module of a program built without fuel, each use of std.fuel's
+-- | `limited` in it warned of
+withLimitedWarned : Checked -> Checked
+withLimitedWarned c =
+  if strEq c.module "std.fuel" then c
+  else withDiags
+      c
+      (List.concatMap
+         (\x ->
+            List.map
+              (\j -> limitedWarning j (strLength x))
+              (writtenFrom c.source x 0))
+         (limitedNames c))

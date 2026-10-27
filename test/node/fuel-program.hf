@@ -1,0 +1,195 @@
+-- What the fuel tests run, on every backend: the same program, by
+-- std.fuel's `limited` alone, on the C backend (test/node/fuel.hf) and
+-- in JavaScript (test/apps/fuel.hf), the same lines said.  A pure loop
+-- with no operation in it stopped; a computation finishing within its
+-- fuel; limits within limits, the inner running out of its own and of
+-- the outer's; and the program going
+-- on, unlimited, after them.  Then how near its limit each kind of loop
+-- stops: the least fuel it finishes on, searched for, held to what its
+-- rounds take -- a loop calling itself, one
+-- inside another's rounds, one calling a closure or a function that
+-- loops each round, functions calling one another, last or not, and a
+-- loop after a limit inside, whose inner ran out.  Each loop's length is
+-- `Bench.keep`'s, not known to the compiler, which would compute it.
+
+module test.node.fuel-program
+
+import bench as Bench
+import co
+import std.fuel as Fuel
+
+-- (a loop of no operation, never ending)
+spin : Int -> Int
+spin n = spin (n + 1)
+
+-- (`1 + ... + n`, by a loop)
+sumTo : Int -> Int -> Int
+sumTo n acc = if n <= 0 then acc else sumTo (n - 1) (acc + n)
+
+-- (a loop calling itself, `n` rounds)
+count : Int -> Int -> Int
+count n acc = if n <= 0 then acc else count (n - 1) (acc + 1)
+
+-- (`i` rounds, each a loop of `j`)
+rows : Int -> Int -> Int -> Int
+rows i j acc = if i <= 0 then acc else rows (i - 1) j (count j acc)
+
+-- (`n` rounds, each calling `f`)
+applied : (Int -> Int) -> Int -> Int -> Int
+applied f n acc = if n <= 0 then acc else applied f (n - 1) (f acc)
+
+-- (`n` rounds, each calling a loop of 10)
+summed : Int -> Int -> Int
+summed n acc = if n <= 0 then acc else summed (n - 1) (acc + count 10 0)
+
+-- (calling one another last, neither itself)
+mutual
+  ping : Int -> Int
+  ping n = if n <= 0 then 0 else pong (n - 1)
+
+  pong : Int -> Int
+  pong n = if n <= 0 then 1 else ping (n - 1)
+
+-- (... not last)
+mutual
+  deepA : Int -> Int
+  deepA n = if n <= 0 then 0 else 1 + deepB (n - 1)
+
+  deepB : Int -> Int
+  deepB n = if n <= 0 then 0 else 1 + deepA (n - 1)
+
+-- (fuel enough for `c`: `n`, doubled until it is)
+enough : {e : HFunctor}
+       -> {a : Type}
+       -> {{fl : Fuel.fuel <: e}}
+       -> Co e a
+       -> Int
+       -> Co e Int
+enough c n = do
+  r <- Fuel.limited n c
+  case r of
+    Just _ -> pure n
+    Nothing -> enough c (n * 2)
+
+-- (the least fuel `c` finishes on, above `lo`, not enough, up to `hi`,
+-- enough)
+leastIn : {e : HFunctor}
+        -> {a : Type}
+        -> {{fl : Fuel.fuel <: e}}
+        -> Co e a
+        -> Int
+        -> Int
+        -> Co e Int
+leastIn c lo hi =
+  if hi - lo <= 1 then pure hi
+  else do
+    r <- Fuel.limited ((lo + hi) / 2) c
+    case r of
+      Just _ -> leastIn c lo ((lo + hi) / 2)
+      Nothing -> leastIn c ((lo + hi) / 2) hi
+
+-- (the least fuel `c` finishes on)
+least : {e : HFunctor}
+      -> {a : Type}
+      -> {{fl : Fuel.fuel <: e}}
+      -> Co e a
+      -> Co e Int
+least c = do
+  hi <- enough c 1
+  leastIn c 0 hi
+
+-- (how near what `c` takes is to `rounds`, of fuel, its loops entered
+-- `entries` times: a batch more each time at most (`Fuel.batchMost`),
+-- and 4; or the two)
+near : {e : HFunctor}
+     -> {a : Type}
+     -> {{fl : Fuel.fuel <: e}}
+     -> String
+     -> Int
+     -> Int
+     -> Co e a
+     -> Co e String
+near what rounds entries c = do
+  n <- least c
+  pure
+      (what
+       ^ ": "
+       ^ (if n >= rounds && n <= rounds + entries * Fuel.batchMost + 4
+          then "near its rounds"
+          else debug n ^ " of fuel for " ^ debug rounds ^ " rounds"))
+
+-- | how near its limit each kind of loop stops
+nearness : {e : HFunctor} -> {{fl : Fuel.fuel <: e}} -> Co e (List String)
+nearness = do
+  a <-
+    near
+      "a loop calling itself"
+      100000
+      1
+      (later (\u -> count (Bench.keep 100000) 0))
+  b <-
+    near
+      "a loop in a loop's rounds"
+      (300 * 102)
+      300
+      (later (\u -> rows (Bench.keep 300) (Bench.keep 100) 0))
+  c <-
+    near
+      "a closure called each round"
+      20000
+      1
+      (later (\u -> applied (\x -> x + Bench.keep 1) (Bench.keep 20000) 0))
+  d <-
+    near
+      "a loop called each round"
+      (2000 * 12)
+      2000
+      (later (\u -> summed (Bench.keep 2000) 0))
+  e <-
+    near
+      "calling one another last"
+      20000
+      1
+      (later (\u -> ping (Bench.keep 20000)))
+  f <-
+    near
+      "calling one another, not last"
+      2000
+      1
+      (later (\u -> deepA (Bench.keep 2000)))
+  g <-
+    near
+      "a loop after a limit inside run out"
+      (1000 + 5000)
+      2 (do
+      _ <- Fuel.limited 1000 (later (\u -> spin 0))
+      later (\u -> count (Bench.keep 5000) 0))
+  pure [a, b, c, d, e, f, g]
+
+-- (what a limit came to)
+said : {a : Type} -> {{sh : Debug a}} -> Maybe a -> String
+said (Just x) = "Just " ^ debug x
+said Nothing = "Nothing"
+
+-- | the lines said
+lines : {e : HFunctor} -> {{fl : Fuel.fuel <: e}} -> Co e (List String)
+lines = do
+  stopped <- Fuel.limited 100000 (later (\u -> spin 0))
+  within <- Fuel.limited 100000 (later (\u -> sumTo 100 0))
+  nested <-
+    Fuel.limited 1000000 (do
+      inner <- Fuel.limited 1000 (later (\u -> spin 0))
+      s <- later (\u -> sumTo 100 0)
+      pure (said inner ^ " then " ^ debug s))
+  outer <-
+    Fuel.limited 1000 (do
+      inner <- Fuel.limited 1000000 (later (\u -> spin 0))
+      pure (said inner))
+  after <- later (\u -> sumTo 1000000 0)
+  pure
+      [ "a pure loop stopped: " ^ said stopped
+      , "finished within its fuel: " ^ said within
+      , "the inner out of its own: " ^ said nested
+      , "the inner out of the outer's: " ^ said outer
+      , "after them, unlimited: " ^ debug after
+      ]

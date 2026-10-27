@@ -104,6 +104,7 @@ defining `build`, of type `Build`:
 | `backend` | `C` for a native program, `Page` for a web page's script |
 | `run` | the definition run, usually `main` |
 | `ships` | files and directories of the project that `heff install` puts beside the program; default `[]` |
+| `fuel` | `True` to build it with fuel: every loop ticked, so that std.fuel's `limited` stops a loop with no operation in it, at a cost to every loop (see [Fuel](commands.md#fuel)); default `False` |
 
 `heff build` builds every program into `.heff/bin/`. `heff install`
 builds them to run fastest, into `~/.heff/bin/`, with what they ship.

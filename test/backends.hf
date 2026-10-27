@@ -1226,15 +1226,20 @@ defunTags = do
 -- (whether each of `defs` reads a rune and its width once, `decode`, and
 -- none reads either apart, `apart`)
 readOnce : String -> List String -> List String -> Bool
-readOnce decode apart defs =
-  not (List.null defs)
+readOnce decode apart defs0 =
+  let defs =
+        List.keepIf
+          (\d -> contains decode d || List.any (\a -> contains a d) apart)
+          defs0
+  in not (List.null defs)
   && List.all
     (\d -> contains decode d && not (List.any (\a -> contains a d) apart))
     defs
 
 -- | a rune and its width read once (heff.compile.runes): of the test
 -- | program `runes`, `walkFrom` and `goodFrom` read both by one
--- | primitive, in the code either backend makes
+-- | primitive, in the code either backend makes (those of them that read
+-- | one: a function or the loop it enters, keeping its fuel)
 runesOnce : {e : HFunctor}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
@@ -1262,7 +1267,7 @@ runesOnce = do
              ["$strRuneAt(", "$strRuneWidth("]
              (List.concatMap
                 (\f -> definitionsOf ("const " ^ f ^ " = (") "\n};\n" jsCode)
-                ["walkFrom", "goodFrom"])
+                ["walkFrom", "goodFrom", "walkFrom_fuel", "goodFrom_fuel"])
           then Nil
           else ["js: a rune and its width read apart"])
          (if readOnce
@@ -1270,7 +1275,7 @@ runesOnce = do
              ["heff_strRuneAt", "heff_strRuneWidth"]
              (List.concatMap
                 (\f -> definitionsOf ("runes_2e" ^ f ^ "(V ") "\n}\n" cCode)
-                ["walkFrom", "goodFrom"])
+                ["walkFrom", "goodFrom", "walkFrom_24fuel", "goodFrom_24fuel"])
           then Nil
           else ["c: a rune and its width read apart"]))
 
@@ -1278,8 +1283,37 @@ runesOnce = do
 --------------------------------------------------------------------------------
 
 -- | the program `name` of a file (the repository's, or a path), compiled
--- | to C and built, with the C compiler's flags `cflags` more: where it
+-- | to C, `heff compile` given `flags` more (`--fuel`), and built, with
+-- | the C compiler's flags `cflags` more: where it
 -- | is, its C beside it (`.c`), named by its name and `tag`; or why not
+programBy : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> List String
+          -> String
+          -> String
+          -> List String
+          -> String
+          -> Co e (Either String String)
+programBy flags file name cflags tag = do
+  root <- given "HEFF_TEST_ROOT"
+  working <- workingDir
+  let here = show working
+  base <- pure (here ^ "/" ^ baseName file ^ "-" ^ name ^ tag)
+  r <-
+    heffIn
+      root
+      (List.append
+         ["compile", file, base ^ ".c", "--name", name, "--backend=c"]
+         flags)
+  if not (succeeded r) then pure (Left (said r))
+    else do
+      b <- buildC [base ^ ".c"] (base ^ ".zig") base cflags
+      pure (case b of
+        Just why -> Left why
+        Nothing -> Right base)
+
+-- | ... compiled as `heff compile` alone does
 program : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
@@ -1288,18 +1322,7 @@ program : {e : HFunctor}
         -> List String
         -> String
         -> Co e (Either String String)
-program file name cflags tag = do
-  root <- given "HEFF_TEST_ROOT"
-  working <- workingDir
-  let here = show working
-  base <- pure (here ^ "/" ^ baseName file ^ "-" ^ name ^ tag)
-  r <- heffIn root ["compile", file, base ^ ".c", "--name", name, "--backend=c"]
-  if not (succeeded r) then pure (Left (said r))
-    else do
-      b <- buildC [base ^ ".c"] (base ^ ".zig") base cflags
-      pure (case b of
-        Just why -> Left why
-        Nothing -> Right base)
+program file name cflags tag = programBy Nil file name cflags tag
 
 -- | the program, built; else the test fails
 built : {e : HFunctor}
@@ -3466,6 +3489,96 @@ domains = do
          Nil
          { out = Just "spawned\n", err = Just "heff:abandon\n", status = Exited 1 })
 
+-- (what the fuel program says, test/node/fuel-program.hf's: the same
+-- on the C backend, test/backends.hf's, and in JavaScript, test/apps.hf's)
+fuelSaid : String
+fuelSaid =
+  "a pure loop stopped: Nothing\nfinished within its fuel: Just 5050\n"
+  ^ "the inner out of its own: Just \"Nothing then 5050\"\n"
+  ^ "the inner out of the outer's: Nothing\n"
+  ^ "after them, unlimited: 500000500000\n"
+  ^ "a loop calling itself: near its rounds\n"
+  ^ "a loop in a loop's rounds: near its rounds\n"
+  ^ "a closure called each round: near its rounds\n"
+  ^ "a loop called each round: near its rounds\n"
+  ^ "calling one another last: near its rounds\n"
+  ^ "calling one another, not last: near its rounds\n"
+  ^ "a loop after a limit inside run out: near its rounds\n"
+
+-- | fuel, by std.domain's `limited` (#133), on the C backend: a pure
+-- | loop with no operation in it stopped, a computation finishing within
+-- | its fuel, limits within limits, a `tried` not catching running out
+fuel : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> Co e Unit
+fuel = do
+  p <- programBy ["--fuel"] "test/node/fuel.hf" "main" Nil ""
+  case p of
+    Left why -> failure ("not compiled: " ^ why)
+    Right bin -> do
+      r <- run { command = bin, timeout = 60000 }
+      failingWith (against "main" { out = Just fuelSaid, err = Just "" } r)
+
+-- | a computation an operation of the world holds, in a thread of cml's,
+-- | computed where the operation runs it: std.fuel's `limited` stops a
+-- | pure loop at its start, std.domain's `tried` catches a failure there;
+-- | and a `tried` in a limit does not catch running out of it (with fuel)
+fuelCml : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> Co e Unit
+fuelCml = do
+  p <- programBy ["--fuel"] "test/node/fuel-cml.hf" "main" Nil ""
+  case p of
+    Left why -> failure ("not compiled: " ^ why)
+    Right bin -> do
+      r <- run { command = bin, timeout = 60000 }
+      failingWith
+          (against
+             "main"
+             { out =
+                 Just
+                   ("limited in a cml thread: Nothing\ntried in a cml thread: Left heff:abandon\n"
+                    ^ "a tried in a limit: Nothing\n")
+             , err = Just ""
+             }
+             r)
+
+-- | std.fuel's `limited` in a program built without fuel: heff warns at
+-- | each of its three uses (W0390), and the program runs a pure loop past
+-- | its limit, to its end, while a loop of operations is stopped
+unfueled : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Co e Unit
+unfueled = do
+  root <- given "HEFF_TEST_ROOT"
+  working <- workingDir
+  let base = show working ^ "/unfueled"
+  r <-
+    heffIn
+      root
+      [ "compile"
+      , "test/node/unfueled.hf"
+      , base ^ ".c"
+      , "--name"
+      , "main"
+      , "--backend=c"
+      ]
+  b <- buildC [base ^ ".c"] (base ^ ".zig") base Nil
+  ran <- run { command = base, timeout = 60000 }
+  failingWith
+      (List.append
+         (if List.length (split "warning[W0390]" r.err) == 4 then Nil
+          else ["not warned at each use: " ^ r.err])
+         (List.append
+            (maybe Nil (\why -> ["not built: " ^ why]) b)
+            (against
+               "main"
+               { out = Just "a pure loop: Just 5000050000\noperations: Nothing\n" }
+               ran)))
+
 -- (a module of a big value of constants, `n` records in a list, its codes
 -- summed by four domains at once -- two changing each record first -- and
 -- by main after them)
@@ -3943,6 +4056,9 @@ backends =
       , integration "processes" processes
       , integration "threads" threads
       , integration "domains" domains
+      , integration "fuel" fuel
+      , integration "fuel, without it" unfueled
+      , integration "fuel, in cml's threads" fuelCml
       , integration "a value of constants, static" statics
       , integration "cowns" cowns
       , withinTime 180000 (integration "boc, acts awaited" bocAwait)

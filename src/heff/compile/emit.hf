@@ -1373,6 +1373,14 @@ trampolineStr : String
 trampolineStr =
   "let $dep = 0; function $Bnc(f, a) { this.f = f; this.a = a; } const $trs = (r) => { do { $dep = 0; r = r.f(r.a); } while (r instanceof $Bnc); return r; }; const $tr = (r) => r instanceof $Bnc ? $trs(r) : r;"
 
+-- | fuel (heff.compile.fuel): what is left of it, counted down by each
+-- | tick, and how many limits are set (none: as good as endless); out of
+-- | it under a limit, the computation is stopped, thrown out of, as a
+-- | failure is, `heff:fuel`, for the limit to catch (std.domain's)
+fuelStr : String
+fuelStr =
+  "let $fuel = Infinity, $fuelOn = 0; const $fuelOut = () => { if ($fuelOn === 0) { $fuel = Infinity; return; } $fuel = 0; throw new Error(\"heff:fuel\"); };"
+
 -- | a value of the program given to JavaScript: a function's value is
 -- | asked for through its bounces, and so are a record's functions' (a
 -- | `Bytes`, a `Uint8Array`, is no record, nor an array of numbers, a
@@ -1394,6 +1402,7 @@ runtime code =
        then Just
            "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
        else Nothing
+       , whenHas code "$fuel" fuelStr
        , whenHas
          code
          "$abandon"
@@ -1798,8 +1807,9 @@ emitDefs facts defs roots = (emitKept facts defs roots OrdMap.empty).emitted
 -- each time: every so often it goes on after the stack is let go of,
 -- lest a long loop of them overflow it.)
 
-runStr : String
-runStr =
+-- (... each operation a tick of fuel, or not)
+runStrBy : Bool -> String
+runStrBy ticked =
   joinWith
     "\n"
     [ "let $performer;"
@@ -1807,10 +1817,15 @@ runStr =
     , "  const later = typeof setImmediate === \"function\" ? setImmediate : (f) => setTimeout(f, 0);"
     , "  let depth = 0;"
     , "  const now = (k) => (x) => { x = $tr(x); if (depth > 1000) { depth = 0; later(() => $tr(k(x))); return; } depth++; $tr(k(x)); };"
-    , "  $performer = (p, k) => perform(p, now(k));"
+    , if ticked
+    then "  $performer = (p, k) => { if (--$fuel < 0) $fuelOut(); return perform(p, now(k)); };"
+    else "  $performer = (p, k) => perform(p, now(k));"
     , "  return $tr(entry());"
     , "};"
     ]
+
+runStr : String
+runStr = runStrBy False
 
 sumStr : String
 sumStr =
@@ -1893,6 +1908,14 @@ provStrHelpers have provs =
     (\l -> not (List.any (\h -> strEq h l) have))
     (strHelpersIn (joinWith "\n" (List.map (\(p : Provider) -> p.text) provs)))
 
+-- (the program run, where a provider counts fuel -- std.fuel's -- each
+-- operation of the world a tick, the fuel's runtime there, `had` by the
+-- code or given here)
+fueledRun : Bool -> Bool -> List String
+fueledRun had False = [runStr]
+fueledRun had True =
+  List.append (if had then Nil else [fuelStr]) [runStrBy True]
+
 runtimeFor : Bool -> List String -> List Provider -> Effect.Effect -> String
 runtimeFor hasTr have provs eff =
   joinWith
@@ -1900,7 +1923,9 @@ runtimeFor hasTr have provs eff =
     (List.append
        (List.append
           (if hasTr then Nil else Cons trampolineStr Nil)
-          [runStr])
+          (fueledRun
+             (List.any (\l -> strEq l fuelStr) have)
+             (List.any (\(p : Provider) -> contains "$fuel" p.text) provs)))
        (List.append
           (if hasSum eff then Cons sumStr Nil else Nil)
           (List.append (provStrHelpers have provs) (bundleAll 0 provs))))
@@ -2031,20 +2056,22 @@ keptLowered provs eff key kept sk l =
     l
     (emitKept l.facts l.defs (Cons Lower.entryKey Nil) kept)
 
-keptOutput : List Provider
+keptOutput : Bool
+           -> List Provider
            -> Effect.Effect
            -> String
            -> OrdMap.OrdMap String JsKept
            -> Lower.SimplifiedKept
            -> OutputKept
-keptOutput provs eff key kept sk =
-  keptLowered provs eff key kept sk (Lower.sharedKeptOf sk)
+keptOutput fuel provs eff key kept sk =
+  keptLowered provs eff key kept sk (Lower.sharedKeptOf fuel sk)
 
 -- | the program running `key`, of the effect `eff`, each definition of
 -- | the core the cache keeps at its version (`vers`, `ks`, heff.compile.lower) taken
 -- | as it keeps it, and each definition's JavaScript as it keeps it at
 -- | what it is made of (`kept`)
-compileProgramKept : List Provider
+compileProgramKept : Bool
+                   -> List Provider
                    -> Globals.Globals
                    -> String
                    -> Effect.Effect
@@ -2052,8 +2079,9 @@ compileProgramKept : List Provider
                    -> Lower.Keeps
                    -> OrdMap.OrdMap String JsKept
                    -> OutputKept
-compileProgramKept available g key eff vers ks kept =
+compileProgramKept fuel available g key eff vers ks kept =
   keptOutput
+    fuel
     (provsFor available eff)
     eff
     key

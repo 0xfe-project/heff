@@ -3,7 +3,9 @@
 --
 --   core ─[Erase]→ IR ─[Lift]→ ─[Shake]→ ─[Simplify]→ ─[Shake]→
 --        ─[Once]→ ─[Fuse]→ ─[Shake]→ ─[Defun]→ ─[Call arity]→ ─[Arity]→ ─[TRMC]→
---        ─[Cycles]→ ─[Scalars]→ ─[Unbox]→ ─[CPR]→ ─[Shake]→ IR
+--        ─[Cycles]→ ─[Scalars]→ ─[Unbox]→ ─[CPR]→ ─[Shake]→ ─[Fuel]→ IR
+--
+-- (Fuel only where the program is built with fuel: heff.compile.fuel)
 --
 -- then, for the JavaScript backend, for each definition ─[Monadic]→
 -- ─[Runes]→ ─[Imp]→ (`jsDef`, heff.compile.runes, heff.compile.imperative);
@@ -40,6 +42,7 @@ import heff.compile.defun as Defun
 import heff.compile.erase as Erase
 import heff.compile.facts as Facts
 import heff.compile.fields as Fields
+import heff.compile.fuel as Fuel
 import heff.compile.fuse as Fuse
 import heff.compile.generate as Generate
 import heff.elab.globals as Globals
@@ -104,10 +107,20 @@ shakenCprd : List String -> CPR.Cprd -> CPR.Cprd
 shakenCprd roots c =
   { defs = Shake.shake roots c.defs, supply = c.supply, tuples = c.tuples }
 
+fueledWith : CPR.Cprd -> Pair (List IR.Def) Int -> CPR.Cprd
+fueledWith c (MkPair defs n) = { defs = defs, supply = n, tuples = c.tuples }
+
+-- (... each function that may loop ticked at its entry, heff.compile.fuel,
+-- where the program is built with fuel)
+fueled : Bool -> CPR.Cprd -> CPR.Cprd
+fueled False c = c
+fueled True c = fueledWith c (Fuel.fuelProgram c.supply c.defs)
+
 -- (... a function giving back what it builds given a worker giving it
 -- back taken apart, what is reached from `roots` of that)
-cprShared : List String -> TRMC.Trmced -> CPR.Cprd
-cprShared roots t = shakenCprd roots (CPR.cprProgram t.supply t.defs)
+cprShared : Bool -> List String -> TRMC.Trmced -> CPR.Cprd
+cprShared fuel roots t =
+  fueled fuel (shakenCprd roots (CPR.cprProgram t.supply t.defs))
 
 -- (a copy's continuations made tags, heff.compile.defun; then each call
 -- at the arity it is made at)
@@ -121,11 +134,13 @@ defunCalled (MkPair defs n) = CallArity.callArity n defs
 -- | another last round a cycle made one loop (heff.compile.cycles), a loop's record parameters carried round as
 -- | their fields, and its tag parameters too (heff.compile.scalars), a
 -- | function giving back a tag it builds given a worker giving back its
--- | fields (heff.compile.cpr); where fresh
+-- | fields (heff.compile.cpr), each function that may loop ticked at its
+-- | entry (heff.compile.fuel); where fresh
 -- | names go on from, and the workers giving back tuples
-shared : List String -> Int -> List IR.Def -> CPR.Cprd
-shared roots supply kept =
+shared : Bool -> List String -> Int -> List IR.Def -> CPR.Cprd
+shared fuel roots supply kept =
   cprShared
+    fuel
     roots
     (unboxShared
        (scalarsShared
@@ -165,9 +180,9 @@ jsDef d (MkPair b0 n) =
        (runesRead
           (Monadic.monadicFrom n (Cons (IR.mkDef d.key d.name b0) Nil))))
 
-lowerKept : Rest
-lowerKept roots supply kept errors =
-  sharedLowered errors (shared roots supply kept)
+lowerKept : Bool -> Rest
+lowerKept fuel roots supply kept errors =
+  sharedLowered errors (shared fuel roots supply kept)
 
 -- (... fused (heff.compile.fuse), and what is reached of that: what a
 -- consumer was called on, made by a producer, gone)
@@ -212,7 +227,7 @@ erasedWith rest roots er =
 -- | >>> (lower Globals.emptyGlobals Nil).defs
 -- | []
 lower : Globals.Globals -> List String -> Lowered
-lower g roots = erasedWith lowerKept roots (Erase.eraseProgram g)
+lower g roots = erasedWith (lowerKept False) roots (Erase.eraseProgram g)
 
 -- A program's entry: its computation (`key`) given the runtime's handler,
 -- as a definition of its own.  The handler's monad is the continuation
@@ -348,19 +363,24 @@ cShared errors t =
 
 -- (... each `generate` of a lambda worth a loop made one first,
 -- heff.compile.arrayloops)
-cLooped : List String -> List String -> Pair (List IR.Def) Int -> Lowered
-cLooped roots errors (MkPair defs n) = cShared errors (shared roots n defs)
+cLooped : Bool
+        -> List String
+        -> List String
+        -> Pair (List IR.Def) Int
+        -> Lowered
+cLooped fuel roots errors (MkPair defs n) =
+  cShared errors (shared fuel roots n defs)
 
 -- (as both backends have it, in monadic form: names from where the
 -- simplifier's ended)
-cKept : Rest
-cKept roots supply kept errors =
-  cLooped roots errors (ArrayLoops.loopsProgram supply kept)
+cKept : Bool -> Rest
+cKept fuel roots supply kept errors =
+  cLooped fuel roots errors (ArrayLoops.loopsProgram supply kept)
 
 -- | what is reached from `roots`, lowered as `lower` does, then in
 -- | monadic form
 lowerC : Globals.Globals -> List String -> Lowered
-lowerC g roots = erasedWith cKept roots (Erase.eraseProgram g)
+lowerC g roots = erasedWith (cKept False) roots (Erase.eraseProgram g)
 
 -- (a definition made imperative, its variables kept unboxed where they
 -- may be (heff.compile.repr), its references counted (heff.compile.refcount),
@@ -453,17 +473,18 @@ type LoweredKept =
 -- | ... lowered on for the C backend, then in monadic form
 -- | (heff.compile.monadic): what it emits, a binding for each value
 -- | computed (where, with Perceus, references are taken and dropped)
-cKeptOf : SimplifiedKept -> LoweredKept
-cKeptOf sk =
-  { lowered = simplifiedWith cKept (Cons entryKey Nil) sk.errors sk.simplified
+cKeptOf : Bool -> SimplifiedKept -> LoweredKept
+cKeptOf fuel sk =
+  { lowered =
+      simplifiedWith (cKept fuel) (Cons entryKey Nil) sk.errors sk.simplified
   , groups = sk.groups
   , copies = sk.copies
   }
 
 -- | ... lowered on for the JavaScript backend
-sharedKeptOf : SimplifiedKept -> Lowered
-sharedKeptOf sk =
-  simplifiedWith lowerKept (Cons entryKey Nil) sk.errors sk.simplified
+sharedKeptOf : Bool -> SimplifiedKept -> Lowered
+sharedKeptOf fuel sk =
+  simplifiedWith (lowerKept fuel) (Cons entryKey Nil) sk.errors sk.simplified
 
 -- (what is to be simplified, from the definition of the core `owner`;
 -- what it mentions)

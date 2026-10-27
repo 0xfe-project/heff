@@ -1,0 +1,304 @@
+-- Fuel, the compiler's part (#133): a tick -- the fuel counted down, and
+-- the computation stopped where it runs out -- at the entry of each
+-- function that may be entered again before it ends, so that any loop,
+-- even one doing no operation, runs out where a limit is set on it.
+--
+-- In heff a loop is a call: of itself (made a jump, heff.compile.trmc
+-- and heff.compile.cycles, whose next round enters the body again), of
+-- a function that calls it back, or of a closure.  So a function's body
+-- -- a definition's or a lambda's, not counting the lambdas in it -- is
+-- given a tick where it calls a definition of its own group (the
+-- strongly connected component of the definitions mentioning one
+-- another it is in: a call that may lead back to it), or calls what is
+-- not known (a closure, which may be anything, a type of data holding
+-- a function of itself among them).  Every round of a loop makes one
+-- such call, from a body entered each round: a body that calls only
+-- what cannot call it back, and no closure, has none, so a leaf -- and
+-- a function calling only leaves -- pays nothing.
+--
+--   count acc n = if n <= 0 then acc     count acc n = let t = fuelTick
+--                 else count (acc+1) (n-1)   in if n <= 0 then ...
+--
+-- The tick is a primitive that may fail, `fuelTick`, bound first in the
+-- body: no pass drops it nor moves it.  This runs on what both backends
+-- are given (heff.compile.lower's `shared`), last, so that the calls are
+-- those the backends make.
+
+module heff.compile.fuel
+
+import heff.compile.cycles as Cycles
+import heff.compile.ir as IR
+import heff.elab.primitive
+import heff.compile.supply
+import std.ordmap as OrdMap
+
+-- The groups
+--------------------------------------------------------------------------------
+
+-- (each definition by the globals it mentions)
+mentions : List IR.Def -> OrdMap.OrdMap String (List String)
+mentions defs =
+  List.foldl
+    (\m (d : IR.Def) -> OrdMap.insert m d.key (IR.globalsIn d.body))
+    OrdMap.empty
+    defs
+
+-- (each definition of a group by the group's number)
+numbered : OrdMap.OrdMap String Int
+         -> Int
+         -> List (List String)
+         -> OrdMap.OrdMap String Int
+numbered m i Nil = m
+numbered m i (Cons g gs) =
+  numbered (List.foldl (\acc k -> OrdMap.insert acc k i) m g) (i + 1) gs
+
+groupsBy : OrdMap.OrdMap String (List String)
+         -> List IR.Def
+         -> OrdMap.OrdMap String Int
+groupsBy refs defs =
+  numbered
+    OrdMap.empty
+    0
+    (Cycles.foundOf
+       (List.foldl
+          (\(w : Cycles.Walk) (d : IR.Def) ->
+             if OrdMap.member w.index d.key then w
+             else Cycles.strong refs w d.key)
+          Cycles.startWalk
+          defs))
+
+-- | each definition by the number of its group: those mentioning one
+-- | another, round a cycle, of one number
+groupsOf : List IR.Def -> OrdMap.OrdMap String Int
+groupsOf defs = groupsBy (mentions defs) defs
+
+-- The calls that may close a loop
+--------------------------------------------------------------------------------
+
+-- (the global an application calls, if it calls one by name)
+calleeOf : IR.Expr -> Maybe String
+calleeOf (EGlobal g) = Just g
+calleeOf _ = Nothing
+
+-- | whether a body, not the lambdas in it, calls a definition of its
+-- | group (`inGroup`) or what is not known (an application of anything
+-- | but a global): a worklist of its parts
+closes : (String -> Bool) -> List IR.Expr -> Bool
+closes inGroup Nil = False
+closes inGroup (Cons (ELam _ _) rest) = closes inGroup rest
+closes inGroup (Cons (ECall g args) rest) =
+  inGroup g || closes inGroup (IR.appendI args rest)
+closes inGroup (Cons (EApp f args) rest) =
+  maybe True inGroup (calleeOf f) || closes inGroup (IR.appendI args rest)
+closes inGroup (Cons e rest) = closes inGroup (IR.partsOnto e rest)
+
+-- The ticks
+--------------------------------------------------------------------------------
+
+-- (a body, its tick first where it may close a loop)
+ticked : (String -> Bool) -> IR.Expr -> S IR.Expr
+ticked inGroup b =
+  if closes inGroup (Cons b Nil)
+  then do
+    t <- freshS "fuel"
+    pure (ELet t (EPrimCall FuelTick Nil) b)
+  else pure b
+
+-- | an expression, each lambda in it given its tick where it may close
+-- | a loop
+tickedIn : (String -> Bool) -> IR.Expr -> S IR.Expr
+tickedIn inGroup (ELam xs b) = do
+  b2 <- tickedIn inGroup b
+  b3 <- ticked inGroup b2
+  pure (ELam xs b3)
+tickedIn inGroup e = IR.traverseParts (\_ p -> tickedIn inGroup p) e
+
+-- (whether a global is of the group `n`)
+sameGroup : Maybe Int -> Int -> Bool
+sameGroup (Just m) n = m == n
+sameGroup Nothing n = False
+
+ofGroup : OrdMap.OrdMap String Int -> Maybe Int -> String -> Bool
+ofGroup groups (Just n) g = sameGroup (OrdMap.lookup groups g) n
+ofGroup groups Nothing g = False
+
+-- Batches of a loop's rounds
+--------------------------------------------------------------------------------
+
+-- A loop calling itself last, calling nothing in its rounds (no call
+-- but of itself, last; no closure; no primitive that calls a function),
+-- is ticked once a batch of its rounds, charged the batch: its body is
+-- copied `k` times, each copy's calls of itself the next copy, its
+-- parameters bound anew, the last's the loop's next round, and the tick,
+-- of `k`, before the first.  Each copy keeps its own ways out.  So a
+-- batch has no branch to the runtime in it, and the C compiler may
+-- unroll it, and the count stops a loop within a batch of its limit,
+-- before it.  `k` is what makes a batch of about `batchWork` of the IR's
+-- nodes, of the body's size, from 1 to `batchMost`; a body that calls
+-- anything is one round a tick, its calls costing more than the tick.
+--
+--   f x = if c then e else f x2      f x = let t = fuelTicks 2
+--                                          in if c then e
+--                                             else let y = x2
+--                                                  in if c' then e' else f y2
+
+-- | the most rounds of a loop charged at once
+batchMost : Int
+batchMost = 64
+
+-- | the IR's nodes a batch of rounds is made of, about
+batchWork : Int
+batchWork = 64
+
+-- (`n` within `lo` and `hi`)
+clamped : Int -> Int -> Int -> Int
+clamped lo hi n = if n < lo then lo else if n > hi then hi else n
+
+-- | the rounds of a batch of a loop of body `b`
+batchOf : IR.Expr -> Int
+batchOf b = clamped 1 batchMost (batchWork / IR.size b)
+
+-- (a calling nothing)
+noCall : String -> Bool
+noCall g = False
+
+-- (a primitive that calls a function, or ticks)
+callsOut : Prim -> Bool
+callsOut Perform = True
+callsOut ArrayGenerate = True
+callsOut FuelTick = True
+callsOut FuelTicks = True
+callsOut _ = False
+
+-- | whether code, not the lambdas in it, calls nothing: no global, no
+-- | closure, no primitive that calls a function
+callsNothing : List IR.Expr -> Bool
+callsNothing Nil = True
+callsNothing (Cons (ELam _ _) rest) = callsNothing rest
+callsNothing (Cons (ECall _ _) rest) = False
+callsNothing (Cons (EApp _ _) rest) = False
+callsNothing (Cons (EPrimCall p args) rest) =
+  not (callsOut p) && callsNothing (IR.appendI args rest)
+callsNothing (Cons e rest) = callsNothing (IR.partsOnto e rest)
+
+-- (whether a way out is a call of `k`)
+selfCall : String -> IR.Expr -> Bool
+selfCall k (ECall g _) = strEq g k
+selfCall k _ = False
+
+-- | whether each round of the loop `k`'s body calls nothing: what is
+-- | computed on the way to each way out, and the arguments of its calls
+-- | of itself (its other ways out are not of a round)
+roundCalls : String -> IR.Expr -> Bool
+roundCalls k (ELet _ a b) = not (callsNothing (Cons a Nil)) || roundCalls k b
+roundCalls k (ESet _ a b) = not (callsNothing (Cons a Nil)) || roundCalls k b
+roundCalls k (EMatch s arms) =
+  not (callsNothing (Cons s Nil))
+  || List.any (\a -> roundCalls k (IR.armBody a)) arms
+roundCalls k (ECall g args) = strEq g k && not (callsNothing args)
+roundCalls k e = False
+
+-- | how many rounds of the loop `k`, of body `b`, a tick is charged: a
+-- | batch, where its rounds call nothing; else one (not a loop: none)
+roundsOf : String -> IR.Expr -> Int
+roundsOf k b =
+  if not (List.any (selfCall k) (IR.waysList b)) then 0
+  else if roundCalls k b then 1
+  else batchOf b
+
+-- (what a call gives a parameter, put for it where it is a name or a
+-- number -- so that an array the loop goes round is the same name in each
+-- copy, read in place -- else a name bound to it, first)
+atom : IR.Expr -> Bool
+atom (EVar _) = True
+atom (EInt _) = True
+atom (EFloat _) = True
+atom (EFixed _ _) = True
+atom _ = False
+
+-- (the parameters `xs` given `args` around the copy `c`: each put for,
+-- where it is an atom, else bound anew, in order, as `ys` say)
+given : List String
+      -> List String
+      -> List IR.Expr
+      -> OrdMap.OrdMap String IR.Expr
+      -> IR.Expr
+      -> IR.Expr
+given (Cons x xs) (Cons y ys) (Cons a args) m c =
+  if atom a then given xs ys args (OrdMap.insert m x a) c
+  else ELet y a (given xs ys args (OrdMap.insert m x (EVar y)) c)
+given _ _ _ m c = IR.subst m c
+
+-- (a copy of `b`, its names drawn afresh)
+copied : IR.Expr -> S IR.Expr
+copied b = \n -> IR.freshen n b
+
+-- (a way out of a copy: a call of the loop `k` the next copy -- made by
+-- `next` -- else as it is)
+nextOf : String
+       -> List String
+       -> IR.Expr
+       -> (IR.Expr -> S IR.Expr)
+       -> IR.Expr
+       -> S IR.Expr
+nextOf k xs b next (ECall g args) =
+  if strEq g k
+  then do
+    c <- copied b
+    ys <- traverseS (\x -> freshS (IR.baseOf x)) xs
+    next (given xs ys args OrdMap.empty c)
+  else pure (ECall g args)
+nextOf k xs b next e = pure e
+
+-- | a copy `e` of the loop `k`'s body `b`, of parameters `xs`, `j` copies
+-- | after it, each the next round of the one before
+unrolled : String -> List String -> IR.Expr -> Int -> IR.Expr -> S IR.Expr
+unrolled k xs b j e =
+  if j <= 0 then pure e
+  else IR.waysM
+      (mo := instanceMonadS)
+      (nextOf k xs b (\c -> unrolled k xs b (j - 1) c))
+      e
+
+-- | the loop `k`'s body `b`, of parameters `xs`, in batches of `n` rounds,
+-- | its tick, of `n`, first
+batched : String -> List String -> Int -> IR.Expr -> S IR.Expr
+batched k xs n b = do
+  e <- unrolled k xs b (n - 1) b
+  t <- freshS "fuel"
+  pure (ELet t (EPrimCall FuelTicks (Cons (EInt n) Nil)) e)
+
+-- (a function's body: a loop's in batches, where they are of more than
+-- a round, else ticked as any)
+lamTicked : (String -> Bool)
+          -> String
+          -> List String
+          -> IR.Expr
+          -> S IR.Expr
+lamTicked inGroup k xs b = do
+  b2 <- tickedIn inGroup b
+  if roundsOf k b2 > 1 then batched k xs (roundsOf k b2) b2
+  else ticked inGroup b2
+
+bodyTicked : (String -> Bool) -> String -> IR.Expr -> S IR.Expr
+bodyTicked inGroup k (ELam xs b) = do
+  b2 <- lamTicked inGroup k xs b
+  pure (ELam xs b2)
+bodyTicked inGroup k e = tickedIn inGroup e
+
+defTicked : OrdMap.OrdMap String Int -> IR.Def -> S IR.Def
+defTicked groups d = do
+  b <- bodyTicked (ofGroup groups (OrdMap.lookup groups d.key)) d.key d.body
+  pure (IR.mkDef d.key d.name b)
+
+-- | the program, each function that may close a loop ticked at its
+-- | entry, a loop calling nothing in batches of its rounds; where fresh
+-- | names go on from
+-- | >>> fst (fuelProgram 0 [IR.mkDef "f" "f" (ELam ["n"] (ECall "g" [EVar "n"])), IR.mkDef "g" "g" (ELam ["n"] (ECall "f" [EVar "n"]))])
+-- | [{ key = "f", name = "f", body = ELam ["n"] (ELet "fuel$0" (EPrimCall FuelTick Nil) (ECall "g" [EVar "n"])) }, { key = "g", name = "g", body = ELam ["n"] (ELet "fuel$1" (EPrimCall FuelTick Nil) (ECall "f" [EVar "n"])) }]
+-- | >>> fst (fuelProgram 0 [IR.mkDef "h" "h" (ELam ["k"] (ELam ["x"] (EApp (EVar "k") [EVar "x"])))])
+-- | [{ key = "h", name = "h", body = ELam ["k"] (ELam ["x"] (ELet "fuel$0" (EPrimCall FuelTick Nil) (EApp (EVar "k") [EVar "x"]))) }]
+-- | >>> roundsOf "f" (EMatch (EVar "n") [MkArm "A" [] (ECall "f" [EVar "n"]), MkArm "B" [] (EVar "n")])
+-- | 12
+fuelProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+fuelProgram n defs = traverseS (defTicked (groupsOf defs)) defs n

@@ -1,0 +1,122 @@
+-- Fuel: a computation run on so much of it, stopped where it runs out --
+-- a watchdog, killing a runaway computation, not a time slice.  Import it
+-- by a name, `import std.fuel as Fuel`, its effect in the program's world.
+--
+-- > [!CAUTION]
+-- > Unstable: concurrency in heff is not settled. What this module offers
+-- > may change, or go, in any release.
+--
+-- ```haskell
+-- import co
+-- import std.fuel as Fuel
+-- import std.io
+--
+-- spin : Int -> Int
+-- spin n = spin (n + 1)
+--
+-- main : Co (stdio <+> Fuel.fuel) Unit
+-- main = do
+--   r <- Fuel.limited 100000 (later (\u -> spin 0))
+--   print (debug r)
+-- ```
+--
+-- Built with fuel -- `fuel = True` in its build.hf, `heff compile --fuel`
+-- -- a program is ticked by the compiler: a decrement and a branch at the
+-- entry of each function that may loop (one calling a function of its own
+-- recursive group, or a closure); a loop calling nothing in its rounds
+-- (a tight one) is ticked once a batch of them, charged the batch, as
+-- many rounds as make a batch of some sixty-four steps of the compiler's
+-- -- at most `batchMost`.  So `limited n c` stops any loop of `c`, one
+-- doing no operation too, near its `n`th tick: a batched loop at most a
+-- batch before it, charged a batch more at most each time it is entered
+-- (the program above says `Nothing`).  Without it, nothing is ticked but
+-- the operations of the world, so `limited` stops `c` only at one: a pure
+-- loop with none runs past its limit, to its end or for ever, and heff
+-- warns where `limited` is used.
+--
+-- The ticks are an abstraction leak there is no way around: pure code
+-- carries no effect, so the compiler cannot tell which code runs under a
+-- limit, and every loop of a program built with fuel pays -- a tight
+-- loop's branch keeps the C compiler from unrolling it, its rounds four
+-- to six times the instructions (see the reference's Fuel).  So a program
+-- says it is built with fuel, and only one that limits pure work should.
+--
+-- A limit within a limit gets at most what is left of the outer, and
+-- what it uses is the outer's: where the inner runs out of its own, it is
+-- `Nothing` and the outer goes on; where it runs out of what was left of
+-- the outer, the outer is `Nothing` too.  A failure inside is handed on
+-- as it came.  The count is the domain's (a thread of the system's): a
+-- domain spawned inside runs with no limit.  What the stopped computation
+-- had not done is left undone, as a failure leaves it: a `with`'s release
+-- it skips is not run, the thing let go of by its finalizer where its
+-- last reference is dropped -- what only the stopped frames held, on C,
+-- leaked.
+--
+-- The C backend's (fuel.provider.c): `c` run under `heff_try`, the
+-- runtime's count set, a stop jumped out of.  JavaScript's
+-- (fuel.provider.js): thrown out of; the count is the one domain's.
+
+module std.fuel (fuel, limited, batchMost)
+
+import co
+
+-- | A value of some type, the type hidden: what an operation of a type
+-- | of its own holds.
+type Some (f : Type -> Type) = (r : Type) -> ((a : Type) -> f a -> r) -> r
+
+someThen : {f g : Type -> Type}
+         -> ({a : Type} -> f a -> g a)
+         -> Some f
+         -> Some g
+someThen h s = \r use -> s r (\a v -> use a (h v))
+
+-- (the computation is given as a function of `Unit`, computed only where
+-- the limit is set: a handler between, a scheduler's, maps it without
+-- computing it)
+data Limiting (m : Type -> Type) x a
+  = MkLimiting Int (Unit -> m a) (Maybe a -> x)
+
+limitingThen : {m : Type -> Type}
+             -> {x y a : Type}
+             -> (x -> y)
+             -> Limiting m x a
+             -> Limiting m y a
+limitingThen g (MkLimiting n c k) = MkLimiting n c (\r -> g (k r))
+
+limitingBy : {m n : Type -> Type}
+           -> {x a : Type}
+           -> ({t : Type} -> m t -> n t)
+           -> Limiting m x a
+           -> Limiting n x a
+limitingBy nt (MkLimiting f c k) = MkLimiting f (\u -> nt (c u)) k
+
+data FuelF (m : Type -> Type) x = Limited (Some (Limiting m x))
+
+-- | For a computation run on so much fuel.
+fuel : HFunctor
+fuel =
+  { f = FuelF
+  , hfmap = \m g p -> case p of
+      Limited s -> Limited (someThen (limitingThen g) s)
+  , hmap = \m n nt p -> case p of
+      Limited s -> Limited (someThen (limitingBy nt) s)
+  }
+
+-- | the most rounds of a loop charged at once, a batch's: a limit stops a
+-- | batched loop no more than these many rounds before it, and charges no
+-- | more than these more each time it is entered (the compiler's own)
+batchMost : Int
+batchMost = 64
+
+-- | `c` run here on at most `n` of fuel: `Just` its answer, or `Nothing`
+-- | where it runs out first, the rest of it not run.  The fuel is the
+-- | program's ticks where it is built with fuel, else the world's
+-- | operations alone (see above).
+limited : {e : HFunctor}
+        -> {a : Type}
+        -> {{fl : fuel <: e}}
+        -> Int
+        -> Co e a
+        -> Co e (Maybe a)
+limited n c =
+  op (fl (Limited (\r use -> use a (MkLimiting n (\u -> c) (\r -> r))))) val
