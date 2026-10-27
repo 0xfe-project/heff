@@ -146,11 +146,15 @@ static V dm_tried_answered(V self, V *a) {
   return NTAG(TAG_MkUnit);
 }
 
+// (`c`, a function of `Unit`, computed and run here, its failure caught
+// -- running out of fuel, a limit's, handed on: std.fuel's)
 static V dm_tried(V c) {
   V answer = 0;
   V env = MK_INT((int64_t)(intptr_t)&answer);
   V out;
-  const char *why = heff_try(c, heff_clo(dm_tried_answered, 1, 1, &env), &out);
+  const char *why = heff_try(c, NTAG(TAG_MkUnit), &out);
+  if (!why) why = heff_try(out, heff_clo(dm_tried_answered, 1, 1, &env), &out);
+  if (why && strcmp(why, "heff:fuel") == 0) heff_fail_again(why);
   if (why) {
     V x = heff_str_text(why);
     return heff_tag_n(TAG_Left, 1, &x);
