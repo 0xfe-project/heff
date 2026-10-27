@@ -151,8 +151,6 @@ static V dm_tried(V c) {
   V env = MK_INT((int64_t)(intptr_t)&answer);
   V out;
   const char *why = heff_try(c, heff_clo(dm_tried_answered, 1, 1, &env), &out);
-  // (fuel run out is the limit's to catch, not a failure: handed on)
-  if (why && strcmp(why, HEFF_FUEL) == 0) heff_fail_again(why);
   if (why) {
     V x = heff_str_text(why);
     return heff_tag_n(TAG_Left, 1, &x);
@@ -160,23 +158,6 @@ static V dm_tried(V c) {
   heff_drop(out);
   if (!answer) heff_fail("domain: a computation tried ended without an answer");
   return heff_tag_n(TAG_Right, 1, &answer);
-}
-
-// (`c` run here, as a `tried`'s is, on at most `n` of fuel, the
-// runtime's (`heff_fuel_limit`): `Just` its answer, or `Nothing` where it
-// ran out of it; a failure, or running out of the limit around it, is
-// handed on.  `c` consumed)
-static V dm_limited(int64_t n, V c) {
-  V answer = 0;
-  V env = MK_INT((int64_t)(intptr_t)&answer);
-  V out;
-  HeffFuelLimit l = heff_fuel_limit(n);
-  const char *why = heff_try(c, heff_clo(dm_tried_answered, 1, 1, &env), &out);
-  if (heff_fuel_unlimit(l, why)) return NTAG(TAG_Nothing);
-  if (why) heff_fail_again(why);
-  heff_drop(out);
-  if (!answer) heff_fail("domain: a computation limited ended without an answer");
-  return heff_tag_n(TAG_Just, 1, &answer);
 }
 
 // (a domain running `c`, moved to it where held alone; `c` consumed)
@@ -448,17 +429,6 @@ static V heff_provider_domain(V p, V k) {
     V c = heff_dup(heff_field(t, 0)), g = heff_dup(heff_field(t, 1));
     heff_drop(t);
     x = heff_answer(g, dm_tried(c));
-    break;
-  }
-  case TAG_Limited: {
-    V t = dm_open(heff_dup(heff_field(p, 0)));
-    heff_drop(p);
-    // (a big number of fuel as good as endless, a negative one none)
-    V nv = heff_field(t, 0);
-    int64_t n = IS_INT(nv) ? INT_OF(nv) : heff_int_neg(nv) ? 0 : HEFF_FUEL_ENDLESS - 1;
-    V c = heff_dup(heff_field(t, 1)), g = heff_dup(heff_field(t, 2));
-    heff_drop(t);
-    x = heff_answer(g, dm_limited(n, c));
     break;
   }
   // (this domain failed as the string says: a `tried`'s `Left` handed

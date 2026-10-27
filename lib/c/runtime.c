@@ -541,8 +541,6 @@ typedef struct {
   HeffHeap heap;
 #endif
   long dep;
-  int64_t fuel;
-  long fuel_on;
   V room[HEFF_ROOM];
   V *dead;
   size_t ndead, cdead;
@@ -575,8 +573,6 @@ static inline HeffTls *heff_tls(void) {
 #define heff_heap (heff_tls()->heap)
 #endif
 #define heff_dep (heff_tls()->dep)
-#define heff_fuel (heff_tls()->fuel)
-#define heff_fuel_on (heff_tls()->fuel_on)
 #define heff_room (heff_tls()->room)
 #define heff_dead (heff_tls()->dead)
 #define heff_ndead (heff_tls()->ndead)
@@ -4983,69 +4979,6 @@ HEFF_FN void heff_unwatch_stack(void) {}
 // that a failure there is the thread's to hand back, not the end of the
 // process; and ends by `heff_thread_end`.
 // ---------------------------------------------------------------------
-
-// Fuel (#133): what is left of it, counted down by each tick the
-// compiler puts at a function's entry (where the function may be entered
-// again before it ends: heff.compile.fuel), and how many limits are set
-// on this thread -- each thread's own, a thread started with none, the
-// runtime knowing nothing of what a limit is for.  With none, a tick
-// that finds the fuel out (as a thread's first does, its count 0) fills
-// it again, all but endless; under one, it stops the computation: fails
-// as `heff_fail` does, `HEFF_FUEL`, caught by the innermost `heff_try`
-// -- the limit's, which says how much is left of it then.  It does not
-// resume: what the frames jumped over were doing is left undone, what
-// they made leaked, as a failure leaves it.
-// ---------------------------------------------------------------------
-
-#define HEFF_FUEL "heff:fuel"
-#define HEFF_FUEL_ENDLESS INT64_MAX
-
-#ifndef HEFF_THREADS
-HEFF_VAR(int64_t heff_fuel);
-HEFF_VAR(long heff_fuel_on);
-#endif
-
-// (the fuel found out by a tick: filled again, there being no limit, or
-// the computation stopped)
-HEFF_SLOW void heff_fuel_out(void) {
-  if (heff_fuel_on == 0) { heff_fuel = HEFF_FUEL_ENDLESS; return; }
-  heff_fuel = 0;
-  heff_fail(HEFF_FUEL);
-}
-
-// (a tick: a decrement and a branch, the branch seldom taken)
-static inline V heff_fuelTick(void) {
-  if (__builtin_expect(--heff_fuel < 0, 0)) heff_fuel_out();
-  return NTAG(TAG_MkUnit);
-}
-
-// (a limit of `n` set, under what is left of this thread's: where there
-// is less left than `n`, the limit is what is left, and running out of
-// it is running out of the one around it too)
-typedef struct { int64_t outer, given; int bounded; } HeffFuelLimit;
-
-HEFF_FN HeffFuelLimit heff_fuel_limit(int64_t n) {
-  HeffFuelLimit l;
-  l.outer = heff_fuel_on > 0 ? (heff_fuel > 0 ? heff_fuel : 0) : HEFF_FUEL_ENDLESS;
-  l.bounded = n >= l.outer;
-  l.given = n < 0 ? 0 : l.bounded ? l.outer : n;
-  heff_fuel = l.given;
-  heff_fuel_on++;
-  return l;
-}
-
-// (... the limit ended, as the computation ended or was stopped: what
-// it used taken from the fuel around it.  Whether the computation ran
-// out of this limit's own (not of the one around it): it is stopped
-// there, the one around going on; else, out of the one around too)
-HEFF_FN int heff_fuel_unlimit(HeffFuelLimit l, const char *why) {
-  int64_t left = heff_fuel > 0 ? heff_fuel : 0;
-  heff_fuel_on--;
-  int out = why && strcmp(why, HEFF_FUEL) == 0;
-  heff_fuel = heff_fuel_on == 0 ? HEFF_FUEL_ENDLESS
-    : out && l.bounded ? 0 : l.outer - (l.given - left);
-  return out && !l.bounded;
-}
 
 // (`f x`, asked for here, a failure caught: 0, its value at `*out`; or
 // why it failed -- "heff:abandon" where it abandoned (`heff_abandon`),

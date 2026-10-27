@@ -668,7 +668,21 @@ writeOut outPath done o = do
 -- | program's C -- among the parts as `heff.zig`, or beside a program
 -- | of one file `F.c` as `F.zig` -- for zig to build into an object of
 -- | its own
-type RuntimeC = { c : String, zig : String }
+-- | the runtime: its C, its Zig, and its part for fuel, bundled only
+-- | where it is needed (`runtimeOf`)
+type RuntimeC = { c : String, zig : String, fuel : String }
+
+-- (a provider that needs the runtime's part for fuel says so)
+saysFuel : Emit.Provider -> Bool
+saysFuel p = List.any (\l -> startsWith "#define HEFF_FUEL" l) (lines p.text)
+
+-- | the runtime's C a program is bundled with: with its part for fuel
+-- | where the program is built with fuel (`fuel`), or a provider of its
+-- | needs it -- else as it is, so that a program with neither is as it
+-- | would be with no fuel at all
+runtimeOf : Bool -> List Emit.Provider -> RuntimeC -> String
+runtimeOf fuel provs rt =
+  if fuel || List.any saysFuel provs then rt.c ^ "\n" ^ rt.fuel else rt.c
 
 -- (where the runtime's Zig goes beside a program of one file: `F.zig`,
 -- for `F.c` or `F`)
@@ -784,6 +798,7 @@ type BackIn =
   { paths : Load.Paths
   , hashes : OrdMap.OrdMap String String
   , modules : List String
+  , fuel : Bool
   }
 
 backDirOf : Load.Paths -> String
@@ -960,7 +975,8 @@ keptWith bi dir rt done c available r id texts backs =
     backs
     done
     (EmitC.compileProgramPartsKept
-       rt.c
+       bi.fuel
+       (runtimeOf bi.fuel available rt)
        available
        c.top.globals
        r.key
@@ -1047,6 +1063,7 @@ jsKept bi outPath done c available r = do
       (backsOf id texts)
       done
       (Emit.compileProgramKept
+         bi.fuel
          available
          c.top.globals
          r.key
@@ -1129,12 +1146,14 @@ compileDiags bi sources file name outPath done badL checked = do
   if badL || anyErrors cs then exit 1
   else compileLast bi sources file name outPath done cs
 
--- (what the backend's cache is given, of a program loaded and checked)
-backInOf : Load.Loaded -> Session.CacheAcc -> BackIn
-backInOf l acc =
+-- (what the backend's cache is given, of a program loaded and checked,
+-- built with fuel or not)
+backInOf : Bool -> Load.Loaded -> Session.CacheAcc -> BackIn
+backInOf fuel l acc =
   { paths = l.paths
   , hashes = acc.hashes
   , modules = List.map (\(c : Driver.Checked) -> c.module) acc.done
+  , fuel = fuel
   }
 
 -- | compile the computation `name` of FILE to a page's script, then go
@@ -1144,17 +1163,18 @@ compileThen : {e : HFunctor}
             -> {{sys : process <: e}}
             -> {{disk : filesystem <: e}}
             -> {{rep : Report.report <: e}}
+            -> Bool
             -> Maybe String
             -> String
             -> String
             -> Co e Unit
             -> Co e Unit
-compileThen name outPath file done = do
+compileThen fuel name outPath file done = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
   acc <- Session.cachedAcc l
   compileDiags
-      (backInOf l acc)
+      (backInOf fuel l acc)
       l.sources
       file
       name
@@ -1170,12 +1190,14 @@ appCmd : {e : HFunctor}
        -> {{sys : process <: e}}
        -> {{disk : filesystem <: e}}
        -> {{rep : Report.report <: e}}
+       -> Bool
        -> Maybe String
        -> String
        -> String
        -> Co e Unit
-appCmd name outPath file =
+appCmd fuel name outPath file =
   compileThen
+    fuel
     name
     outPath
     file
@@ -1312,7 +1334,13 @@ compileFoundC bi file name outPath rt failed done c available = case Driver.find
         outPath
         rt.zig
         done
-        (EmitC.compileProgramC rt.c available c.top.globals r.key r.effect)
+        (EmitC.compileProgramC
+           bi.fuel
+           (runtimeOf bi.fuel available rt)
+           available
+           c.top.globals
+           r.key
+           r.effect)
 
 -- (a file of the runtime, the library's `c/NAME`: its text)
 readRuntimeFile : {e : HFunctor}
@@ -1343,7 +1371,8 @@ readRuntimeC : {e : HFunctor}
 readRuntimeC = do
   c <- readRuntimeFile "runtime.c"
   zig <- readRuntimeFile "runtime.zig"
-  pure { c = c, zig = zig }
+  fuel <- readRuntimeFile "fuel.c"
+  pure { c = c, zig = zig, fuel = fuel }
 
 compileLastC : {e : HFunctor}
              -> {{io : stdio <: e}}
@@ -1417,6 +1446,7 @@ cLoadedOr : {e : HFunctor}
           -> {{sys : process <: e}}
           -> {{disk : filesystem <: e}}
           -> {{rep : Report.report <: e}}
+          -> Bool
           -> (String -> Co e Unit)
           -> Load.Loaded
           -> Maybe String
@@ -1424,7 +1454,7 @@ cLoadedOr : {e : HFunctor}
           -> String
           -> Co e Unit
           -> Co e Unit
-cLoadedOr failed l name outPath file done = do
+cLoadedOr fuel failed l name outPath file done = do
   badL <- printErrs "heff" l.errors 0
   acc <- Session.cachedAcc l
   cs <- refusedChecked "c" l.sources acc.done
@@ -1435,7 +1465,7 @@ cLoadedOr failed l name outPath file done = do
          (file ^ ": it does not check")
          (firstErrorOf cs))
   else compileLastC
-      (backInOf l acc)
+      (backInOf fuel l acc)
       l.sources
       file
       name
@@ -1449,14 +1479,15 @@ cLoaded : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
         -> {{rep : Report.report <: e}}
+        -> Bool
         -> Load.Loaded
         -> Maybe String
         -> String
         -> String
         -> Co e Unit
         -> Co e Unit
-cLoaded l name outPath file done =
-  cLoadedOr (\why -> exit 1) l name outPath file done
+cLoaded fuel l name outPath file done =
+  cLoadedOr fuel (\why -> exit 1) l name outPath file done
 
 -- | compile the computation `name` of FILE to C, as `cLoaded`
 cThen : {e : HFunctor}
@@ -1464,26 +1495,29 @@ cThen : {e : HFunctor}
       -> {{sys : process <: e}}
       -> {{disk : filesystem <: e}}
       -> {{rep : Report.report <: e}}
+      -> Bool
       -> Maybe String
       -> String
       -> String
       -> Co e Unit
       -> Co e Unit
-cThen name outPath file done = do
+cThen fuel name outPath file done = do
   l <- load file
-  cLoaded l name outPath file done
+  cLoaded fuel l name outPath file done
 
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}
      -> {{sys : process <: e}}
      -> {{disk : filesystem <: e}}
      -> {{rep : Report.report <: e}}
+     -> Bool
      -> Maybe String
      -> String
      -> String
      -> Co e Unit
-cCmd name outPath file =
+cCmd fuel name outPath file =
   cThen
+    fuel
     name
     outPath
     file
@@ -1506,7 +1540,7 @@ dumpCCmd : {e : HFunctor}
          -> String
          -> String
          -> Co e Unit
-dumpCCmd file outPath = cThen Nothing outPath file (pure MkUnit)
+dumpCCmd file outPath = cThen False Nothing outPath file (pure MkUnit)
 
 ranOut : Ran -> String
 ranOut r = r.out
@@ -1864,6 +1898,7 @@ runCmd file progArgs = do
   p <- Progress.start Progress.root file 2
   c <- Progress.start p "compiling to C" 0
   cLoaded
+      False
       l
       (Just "main")
       (runDir l.paths file ^ "/")
@@ -1902,6 +1937,7 @@ buildApp st t bp x a next =
     p <- Progress.start bp x 2
     c <- Progress.start p "compiling to C" 0
     cThen
+        a.fuel
         (Just a.run)
         (partsDir st t x ^ "/")
         (appFile st t x "main.hf")
@@ -1912,6 +1948,7 @@ buildApp st t bp x a next =
     c <- Progress.start p "compiling for a page" 0
     made <- Files.makeDirectory (partsDir st t x)
     compileThen
+        a.fuel
         (Just a.run)
         (builtAt st t x (x ^ ".js"))
         (appFile st t x "main.hf")
@@ -2434,8 +2471,16 @@ installCmd dir = do
          else onPathHint st t.bin)
 
 -- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
+-- | `heff compile`'s: what is compiled, to where, the computation run, by
+-- | what, and whether with fuel (`--fuel`: each loop ticked, as a
+-- | build.hf's `fuel = True`)
 type CompileOpts =
-  { file : String, outPath : String, name : Maybe String, backend : String }
+  { file : String
+  , outPath : String
+  , name : Maybe String
+  , backend : String
+  , fuel : Bool
+  }
 
 -- (the directory OUT is to be written in, if it is not there; a C
 -- program's `DIR/`, its parts, is made, the directories above it too)
@@ -2471,9 +2516,9 @@ compileThere o = do
       exit 1
     Nothing ->
       if strEq o.backend "page"
-      then appCmd (Just (fromMaybe "main" o.name)) o.outPath o.file
+      then appCmd o.fuel (Just (fromMaybe "main" o.name)) o.outPath o.file
       else if strEq o.backend "esm" then compileJsCmd o.file o.outPath
-      else cCmd (Just (fromMaybe "main" o.name)) o.outPath o.file
+      else cCmd o.fuel (Just (fromMaybe "main" o.name)) o.outPath o.file
 
 -- | `heff compile`, by its backend: a page's script or a C program runs
 -- | NAME, `main` without `--name`; an ES module runs nothing, each
