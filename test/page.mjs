@@ -11,7 +11,7 @@
 //                                      slept, clocked, painted, texts,
 //                                      names, greet, two (counter's and
 //                                      clock's), vecadd, pixels, domains,
-//                                      cowns, cml, fuel
+//                                      cowns, cml, fuel, fuel-async
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -179,6 +179,7 @@ const apps = {
   cml: () => apps.domains(),
   // (std.domain's limits, in its one domain: as `domains`)
   fuel: () => apps.domains(),
+  "fuel-async": () => apps.domains(),
   slept: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;

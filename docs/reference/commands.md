@@ -261,7 +261,10 @@ built with fuel.
   left of the outer, the outer is `Nothing` too.
 - A failure inside is handed on as it came.
 - The count is each domain's (a thread of the system's): a domain
-  spawned inside runs with no limit. In JavaScript it is the one domain's.
+  spawned inside runs with no limit. In JavaScript the limit is the
+  computation's too: it holds across an operation that finishes later (a
+  sleep, a fetch) and across other domains' turns, which run on counts of
+  their own.
 - What the stopped computation had not finished is left undone, as a
   failure leaves it. A `with`'s release it skips is not run: the thing
   is let go of by its finalizer, as where a continuation is dropped --
