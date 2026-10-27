@@ -26,8 +26,8 @@
 -- `withConnection address body` connects and runs `body` with the
 -- connection, a `With s TcpStream` in a region `s` of its own, and shuts
 -- it down and closes it when `body` ends; `withListener`, the same for a
--- socket listening; `accept listener body`, for the next connection made
--- to it.  So a connection is had only by the operations here, in its body,
+-- socket listening, what the body came to a `Right`; `accept listener
+-- body`, for the next connection made to it.  So a connection is had only by the operations here, in its body,
 -- and never past it.  A server of many connections at once accepts each in
 -- a thread of its own (cml's), its `with` inside that thread, the threads
 -- talking over channels.  One whose connections are served a piece at a
@@ -42,8 +42,11 @@
 -- An operation that fails gives a value, an `Either NetError a`, the
 -- system's errno, what it says of it and the address -- never data: a read at the end
 -- of what the other side sends is no error but no bytes.  A connection not
--- made, a socket not listening, a connection not accepted is no answer of
--- the body its `with` runs, so it is thrown, over the `exception` effect.
+-- made or not accepted is no answer of the body its `with` runs, so it is
+-- thrown, over the `exception` effect.  A socket not listening is a value
+-- too, `withListener`'s `Left`, its body not run: so a listener needs no
+-- handler of the program's around it, and a scheduler run in its body is
+-- run on the program's world itself, nothing between them.
 --
 -- Each operation waits until it is done (a read, until there is something
 -- to read), and the whole program with it, as the rest of a program's
@@ -278,25 +281,46 @@ listenerReleased : {e : HFunctor}
                  -> Co e (Either NetError Unit)
 listenerReleased l = op (ev (ReleaseListener l (\r -> r))) val
 
+-- (what the body came to, once its listener is closed; or why the
+-- listener did not close)
+closedAfter : {a : Type} -> a -> Either NetError Unit -> Either NetError a
+closedAfter v (Right u) = Right v
+closedAfter v (Left err) = Left err
+
+-- (the body run with the listener, then the listener closed; or why
+-- there is none, the body not run)
+listenedBy : {e : HFunctor}
+           -> {a : Type}
+           -> {{ev : net <: e}}
+           -> ({s : Type} -> With s TcpListener -> Co e a)
+           -> Either NetError TcpListener
+           -> Co e (Either NetError a)
+listenedBy body (Left err) = pure (Left err)
+listenedBy body (Right l) =
+  bind
+    (held (pure l) (\x -> pure MkUnit) body)
+    (\v -> bind (listenerReleased l) (\r -> pure (closedAfter v r)))
+
 -- | A socket listening on `address`'s host and port, at most `backlog`
 -- | connections waiting to be accepted -- the host one of this host's
 -- | (`127.0.0.1`, `::1`, a name), or `""` for all of them; the port 0
 -- | for one the system picks, which `local` says -- held by `body` in a
--- | region of its own, and closed when `body` ends: what it came to.
--- | A socket that does not listen is thrown (a `NetError`), the body
--- | not run; one not closed, once the body has ended.  A connection accepted from
--- | it is had by `accept`'s body, not the listener's: the listener
--- | closed, the connections stay.
+-- | region of its own, and closed when `body` ends: `Right` what it
+-- | came to.  A socket that does not listen is a `Left`, the body not
+-- | run; one not closed, once the body has ended, a `Left` too, what
+-- | the body came to let go of.  Nothing is thrown, so no handler of
+-- | the program's need be around it.  A connection accepted from it is
+-- | had by `accept`'s body, not the listener's: the listener closed,
+-- | the connections stay.
 withListener : {e : HFunctor}
              -> {a : Type}
              -> {{ev : net <: e}}
-             -> {{ex : exception NetError <: e}}
              -> Address
              -> Int
              -> ({s : Type} -> With s TcpListener -> Co e a)
-             -> Co e a
+             -> Co e (Either NetError a)
 withListener address backlog body =
-  scoped (listening address.host address.port backlog) listenerReleased body
+  bind (listening address.host address.port backlog) (listenedBy body)
 
 -- (the next connection made to the listener, the host's own, waited
 -- for; or why none was accepted)
