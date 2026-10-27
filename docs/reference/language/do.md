@@ -166,7 +166,7 @@ takes it apart: `e (\p -> case p of (a, b) -> do ...)`.
 - As the block's last statement, its value is the block's; otherwise
   it is dropped.
 - A `with` throws what it could not acquire: a `try` around it catches
-  that. A failure to release is the runtime's (below).
+  that. A failure to release is its custodian's (below).
 
 ### What a with holds, and custodians
 
@@ -178,12 +178,10 @@ reach it. When its body ends, the `with` lets go of its hold:
   given the `With s r` by value, it is ended once the last holder
   lets go of it. The `with` does not wait.
 
-A thing that fails to end, now or later, is a failure of the program:
-it is printed and the program ends, as with an uncaught failure. It is
-not thrown to the `with`'s caller. The `with` says it by the custodian
-effect, so every `with` of a thing asks for `{{cu : custodian <: e}}`,
-as `said` does above, and a `main` that uses one has `custodian` in its
-world.
+A thing that fails to end, now or later, is not thrown to the
+`with`'s caller. It is a failure of the thing's custodian (below);
+outside every custodian's `with`, that is the program's failure: it is
+printed and the program ends, as with an uncaught failure.
 
 So a thread can use a command or a connection after the `with` that
 made it has ended. On the C backend "lets go" is the runtime's count of
@@ -195,14 +193,16 @@ file, it is released as its block is left.
 A `with` that releases by a computation (resource's `held`: a port of
 a standard stream, the page's document) has the other policy: it
 releases as its block is left, whoever holds the thing still. Its
-release is kept by the program's top level while the block runs. Where a throw heard outside the block
+release is kept by the program's top level while the block runs. Every
+`with` of a thing asks for `{{cu : custodian <: e}}`, as `said` does
+above, and a `main` that uses one has `custodian` in its world. Where a throw heard outside the block
 leaves it, or a handler drops the continuation, the release still runs:
 
 - on the C backend, at the next operation of the domain that started
   the `with`;
 - in JavaScript, when the collector reaches what held it.
 
-A release that fails then is a failure of the runtime.
+A release that fails then is a failure of its custodian, as any other.
 
 `withStdin`, `withStdout` and `withStderr` give the body a port of its
 own, a copy of the stream's descriptor, and close it as the block is
@@ -212,19 +212,72 @@ but that closes nothing. The document is the page's, and the program
 still has it wherever it passed it on: in a handler set on an element
 and run later, or to another effect by value.
 
-For more, there are custodians, as in Racket (the `custodian` module).
-A custodian is a runtime object that the program holds as a value:
+There are custodians, as in Racket (the `custodian` module). A
+custodian is a runtime object that the program holds as a value. Every
+thing a `with` holds is in the custody of one, and `with k :=
+Custodian.custody do` is how a thing comes to be in `k`'s:
 
+```haskell
+import bytes as Bytes
+import custodian as Custodian
+import exception
+import std.net as Net
+
+served : {e : HFunctor}
+       -> {s : Type}
+       -> {{nt : Net.net <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> {{ex : exception Net.NetError <: e}}
+       -> With s Net.TcpListener
+       -> Co e Unit
+served l = do
+  with k := Custodian.contained do
+    with Net.accept l as c do
+      _ <- Net.write c (Bytes.fromString "hello")
+      pure ()
+  served l
+```
+
+- `with k := Custodian.custody do` runs its body with `k` a new
+  custodian, under the one the `with` is in. The things the body's
+  `with`s hold are in `k`'s custody, and the custodians made in the body
+  are under `k`. It is Racket's `parameterize` of the current custodian,
+  but by the world, not a variable: the body runs in `custodian <+> e`,
+  its own handler answering for `k`. Outside every such `with`, a thing
+  is in the root's custody.
+- `with k := Custodian.contained do` is the same, and `k` contains its
+  failures (below).
 - `Custodian.manage c stop` gives it something to run at its shutdown;
-- `Custodian.under c` makes a custodian that `c` holds and shuts down
-  with it;
-- `Custodian.shutdown c` runs everything it was given, once and in
-  order, then does the same for the custodians under it. It comes to
-  the reasons of those that failed.
+- `Custodian.make` makes a custodian under the one it is made in;
+  `Custodian.under c`, one under `c`, shut down with it;
+- `Custodian.shutdown c` ends the things in its custody, runs
+  everything it was given, once and in order, then does the same for
+  the custodians under it. It comes to the reasons of the given things
+  that failed.
 
-A custodian manages resources, not threads. A thread that took a
-thing from a custodian that was then shut down finds the thing ended at
-its next operation on it (a socket's `EBADF`), and handles that itself.
+A `with` does not shut its custodian down as its body ends: each thing
+is let go of by its own `with`, as above. A custodian manages
+resources, not threads. A thread that took a thing in a custodian's
+custody that was then shut down finds the thing ended at its next
+operation on it (a socket's `EBADF`), and handles that itself. The
+thing is ended, not freed: whoever still holds it holds a closed
+socket, not freed memory.
+
+A thing that fails to end, whether its `with`, its last holder or a
+shutdown ends it, is a failure of its custodian. The custodian is shut
+down, with the custodians under it, and the failure goes on to the one
+it is under. A custodian made by `contained` stops it there: the
+failure is printed, and the program goes on. At the root, the failure
+is the program's: it is printed and the program ends. So a server that
+serves each connection in a `contained` custodian loses only that
+connection when its close fails. What the custodians were given runs
+on the domain that made them, at its next operation.
+
+The world of a custodian's body has `custodian` twice, its own and the
+one around it, so the evidence for it is found only where the world
+around is a variable, `e`, with its evidence in scope: write such a
+`with` in a function of any world, as `served` is, and a `with` of a
+custodian inside another in a function of its own.
 
 What a custodian is given is higher-order. It is a computation of the
 world it was given in, with the handlers between there and the
@@ -232,9 +285,10 @@ program's top level already applied, so it runs after their scope may
 have ended. An `attempt` there turns a throw into `abandon`, and the
 shutdown says that in its list.
 
-A custodian the program no longer reaches is let go of by the runtime,
-and what it was given is dropped, not run. On the C backend that is at
-once. In a page it is whenever JavaScript's collector comes to it.
+A custodian the program no longer reaches, and that has no living
+thing in its custody, is let go of by the runtime, and what it was
+given is dropped, not run. On the C backend that is at once. In a page
+it is whenever JavaScript's collector comes to it.
 
 ### with, of bindings
 

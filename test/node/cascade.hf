@@ -1,0 +1,178 @@
+-- A failed release cascades up the custodians, by C alone (std.net,
+-- std.domain, and flaky.hf's things, one of which fails to end).
+--
+--   main     a server with a custodian of its own for each connection,
+--            one that contains its failures: the second connection's
+--            thing, held by a domain past its `with`, fails to end as
+--            that domain lets go of it; its custodian is shut down --
+--            what it was given run, the one under it shut down too, its
+--            connection closed, so the server's write on it fails and
+--            its client reads nothing -- and the failure said, the
+--            server going on to the third
+--   rooted   a thing that fails to end, in the custody of a custodian
+--            under another, neither containing it: the failure goes up
+--            through both to the root, the program's, said, the program
+--            ended
+
+module test.node.cascade
+
+import bytes as Bytes
+import co
+import custodian as Custodian
+import exception
+import std.domain as Domain
+import std.io
+import std.net as Net
+import resource
+import test.node.flaky as Flaky
+
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
+
+-- (`what` put at the end of the log)
+logged : {e : HFunctor}
+       -> {{dm : Domain.domain <: e}}
+       -> Domain.Atomic (List String)
+       -> String
+       -> Co e Unit
+logged log what = do
+  ls <- Domain.get log
+  Domain.set log (List.append ls [what])
+
+-- (what comes on the connection, to its end)
+drained : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> With s Net.TcpStream
+        -> Bytes
+        -> Co e String
+drained c got = do
+  r <- Net.read (timeout := 5000) c 4096
+  case r of
+    Left err -> pure ("failed: " ^ err.name)
+    Right b ->
+      if Bytes.length b == 0 then pure (Bytes.asString got)
+      else drained c (Bytes.append got b)
+
+-- (a domain holding the thing until it is told to let go of it)
+keeper : {w : HFunctor}
+       -> {s : Type}
+       -> {{dm : Domain.domain <: w}}
+       -> With s Flaky.Thing
+       -> Domain.Atomic Bool
+       -> Co w Unit
+keeper t go = do
+  g <- Domain.get go
+  if g then pure () else keeper t go
+
+-- (the `i`th connection, by its client and the server: the server's in
+-- a custodian of its own, which contains its failures, with one under
+-- it; the connection's thing held by a domain past its `with`)
+served : {e : HFunctor}
+       -> {s : Type}
+       -> {{nt : Net.net <: e}}
+       -> {{dm : Domain.domain <: e}}
+       -> {{fl : Flaky.flaky <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> {{ex : exception Net.NetError <: e}}
+       -> {{fx : exception String <: e}}
+       -> With s Net.TcpListener
+       -> Int
+       -> Domain.Atomic (List String)
+       -> Int
+       -> Co e Unit
+served l port log i = do
+  with Net.withConnection (here port) as cl do
+    with k := Custodian.contained do
+      _ <-
+        Custodian.manage k (logged log ("custodian " ^ debug i ^ " shut down"))
+      sub <- Custodian.make
+      _ <-
+        Custodian.manage
+          sub
+          (logged log ("the one under " ^ debug i ^ " shut down"))
+      with Net.accept l as c do
+        go <- Domain.newAtomic False
+        with sc := Domain.scope do
+          with Flaky.withThing (i == 2) as t do
+            _ <- Domain.spawn sc (keeper t go)
+            pure ()
+          Domain.set go True
+        w <- Net.write c (Bytes.fromString ("served " ^ debug i))
+        case w of
+          Left err -> logged log ("connection " ^ debug i ^ ": " ^ err.name)
+          Right u -> logged log ("connection " ^ debug i ^ " written")
+    got <- drained cl Bytes.empty
+    logged log ("client " ^ debug i ^ " read: " ^ got)
+
+-- (each line printed)
+printed : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
+printed Nil = pure ()
+printed (l :: ls) = do
+  print l
+  printed ls
+
+world : HFunctor
+world =
+  stdio <+> Net.net <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian
+
+listened : {s : Type}
+         -> Domain.Atomic (List String)
+         -> With s Net.TcpListener
+         -> Co world Unit
+listened log l = do
+  a <- Net.local l
+  case a of
+    Left err -> print ("no port: " ^ err.name)
+    Right at -> do
+      r <-
+        attempt
+          String
+          (attempt
+             Net.NetError (do
+               served l at.port log 1
+               served l at.port log 2
+               served l at.port log 3))
+      case r of
+        Left why -> print ("thrown: " ^ why)
+        Right (Left err) -> print ("thrown: " ^ err.name)
+        Right (Right u) -> pure ()
+      ls <- Domain.get log
+      printed ls
+
+main : Co world Unit
+main = do
+  log <- Domain.newAtomic (Nil : List String)
+  r <- Net.withListener (here 0) 16 (listened log)
+  case r of
+    Left err -> print ("not listening: " ^ err.name)
+    Right u -> pure ()
+
+-- (a thing that fails to end, in the custody of a custodian of its own)
+inner : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{fl : Flaky.flaky <: e}}
+      -> {{cu : Custodian.custodian <: e}}
+      -> {{fx : exception String <: e}}
+      -> Co e Unit
+inner = do
+  with k := Custodian.custody do
+    with Flaky.withThing True as t do
+      print "held"
+
+-- (... under another)
+nested : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{fl : Flaky.flaky <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> {{fx : exception String <: e}}
+       -> Co e Unit
+nested = do
+  with outer := Custodian.custody do
+    inner
+  print "not reached"
+
+rooted : Co world Unit
+rooted = do
+  r <- attempt String (nested (io := _) (fl := _) (cu := _))
+  print "nor this"

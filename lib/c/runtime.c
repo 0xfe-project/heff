@@ -266,8 +266,20 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[]; } Str
   static struct { Obj h; int32_t n; uint32_t flat; uint32_t *lbl; V f[size]; } name = {{0x80000000u, K_REC, 0}, size, 0, shape, {__VA_ARGS__}}
 typedef struct { Obj h; double d; } Flt;
 // (a foreign value: a pointer of the host's, the function that lets it
-// go, called when the program drops the last reference)
-typedef struct { Obj h; void *p; void (*let_go)(void *); } Fgn;
+// go, called when the program drops the last reference; and, of a thing
+// that can be ended before it is let go of, the function that ends it
+// -- 0, or why it failed -- whether it is ended already, and the
+// custodian it is in the custody of, 0 for the root's, and where it is
+// among that one's things ("Foreign values", below))
+typedef struct Fgn {
+  Obj h;
+  void *p;
+  void (*let_go)(void *);
+  const char *(*end)(void *);
+  V owner;
+  int32_t at;
+  int32_t ended;
+} Fgn;
 // (an array: its elements, `n` of them, `V`s or flat -- a number's C
 // type, as its header's `tag` says, `HEFF_ARR_V` or another of these
 // ("Arrays", below), in the low byte of the tag.  Its room is told by
@@ -1435,6 +1447,8 @@ static inline void heff_dead_push(V v) {
   heff_dead_put(v);
 }
 
+static void heff_foreign_gone(struct Fgn *g);
+
 // (an object whose last reference is gone: what it holds counted down,
 // its size reckoned as it is looked at, and it freed; of what it holds,
 // each whose last reference that was is given back after it -- the last
@@ -1468,7 +1482,14 @@ __attribute__((noinline)) HEFF_FN void heff_free(V v) {
     case K_ARR: { Arr *r = (Arr *)v; n = heff_arr_slots(r); f = r->a; size = heff_arr_bytes(r); break; }
     case K_BNC: { Bnc *b = (Bnc *)v; heff_dead_push(b->fun); n = b->n; f = b->a; size = sizeof(Bnc) + n * sizeof(V); break; }
     // (a foreign value's last reference gone: the host's thing let go of)
-    case K_FGN: { Fgn *g = (Fgn *)v; if (g->let_go) g->let_go(g->p); size = sizeof(Fgn); break; }
+    // (and its custodian counted down after, where it has one)
+    case K_FGN: {
+      Fgn *g = (Fgn *)v;
+      heff_foreign_gone(g);
+      if (g->owner) { n = 1; f = &g->owner; }
+      size = sizeof(Fgn);
+      break;
+    }
     // (a view: its root counted down)
     case K_STR: case K_BYT: case K_BIT: {
       Str *x = (Str *)v; size = sizeof(Str) + x->cap;
@@ -4730,7 +4751,54 @@ HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
   Fgn *g = heff_obj_alloc(sizeof(Fgn));
   g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go;
+  g->end = NULL; g->owner = 0; g->at = 0; g->ended = 0;
   return (V)g;
+}
+
+// A thing that can be ended before it is let go of -- a socket closed,
+// a command killed, while another domain may hold it still -- is made
+// with what ends it, `end`, besides what lets it go: `end` ends it, and
+// says why it failed, or 0; `let_go` frees what is left.  A custodian
+// ends it at its shutdown (the custodians' part of the runtime), the
+// struct kept for those that hold it, each of whose operations finds it
+// ended; else it is ended as the program drops its last reference, just
+// before it is let go of.  `end` is asked once, at most, by the runtime;
+// the provider's own operations may end it before, so `end` finds it
+// ended, and says 0.  A thing that fails to end there is a failure of
+// its custodian's (`heff_foreign_failed`), or, of the root's, the
+// program's: said, and the program ended.
+HEFF_FN V heff_foreign_ending(void *p, void (*let_go)(void *), const char *(*end)(void *)) {
+  V v = heff_foreign(p, let_go);
+  ((Fgn *)v)->end = end;
+  return v;
+}
+
+// (the custodians' part, where a program has it: a thing taken out of
+// its custodian's custody, as it is let go of; and a failure of its
+// custodian's, `owner`, why said)
+HEFF_VAR(void (*heff_foreign_disowned)(struct Fgn *g));
+HEFF_VAR(void (*heff_foreign_failed)(V owner, const char *why));
+
+// (a failure of the root's custodian: the program's, said, and the
+// program ended)
+HEFF_FN void heff_root_failed(const char *why) {
+  fflush(stdout);
+  fprintf(stderr, "heff: %s\n", why);
+  exit(1);
+}
+
+// (a foreign value let go of: taken out of its custodian's custody,
+// ended where it is not already, then let go of; where it fails to end,
+// its custodian's failure)
+static void heff_foreign_gone(Fgn *g) {
+  if (g->owner && heff_foreign_disowned) heff_foreign_disowned(g);
+  const char *why = g->end && !g->ended ? g->end(g->p) : NULL;
+  char *said = why ? heff_strdup(why) : NULL;
+  if (g->let_go) g->let_go(g->p);
+  if (!said) return;
+  if (g->owner && heff_foreign_failed) heff_foreign_failed(g->owner, said);
+  else heff_root_failed(said);
+  free(said);
 }
 
 HEFF_FN void *heff_foreign_ptr(V v) {
