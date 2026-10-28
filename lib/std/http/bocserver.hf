@@ -24,6 +24,7 @@
 -- import std.net as Net
 -- import std.reactor as Reactor
 -- import std.signal as Signal
+-- import std.time as Time
 -- import resource
 --
 -- -- | each request answered at once
@@ -40,6 +41,7 @@
 --        -> {s : Type}
 --        -> {{bc : BOC.boc w <: e}}
 --        -> {{nt : Net.net <: w}}
+--        -> {{clock : Time.time <: w}}
 --        -> {{sg : Signal.signals <: w}}
 --        -> With s Net.TcpListener
 --        -> Co e Unit
@@ -54,6 +56,7 @@
 -- -- | program's world itself; done once they are
 -- helloServed : {e : HFunctor}
 --             -> {{nt : Net.net <: e}}
+--             -> {{clock : Time.time <: e}}
 --             -> {{sg : Signal.signals <: e}}
 --             -> {{rx : Reactor.reactor <: e}}
 --             -> {{dm : Domain.domain <: e}}
@@ -93,7 +96,17 @@
 -- milliseconds -- 30 seconds unless another is given, by name,
 -- `BocServer.serve (idle := 5000) l handle`; 0 for no limit -- is
 -- closed, within a request or between two; a response not taken in that
--- time too.
+-- time too.  A client that is not silent but sends a request's head a
+-- little at a time, which `idle` alone would let hold its connection
+-- for ever, is held to `headerWithin` milliseconds for the whole head --
+-- 30 seconds unless another is given, by name; 0 for no limit --
+-- counted from the connection's accept, or from the response before it
+-- (so on a connection kept open, the wait for the next request counts
+-- too): past that, the connection is closed, unanswered, as one silent
+-- too long is.  The time is std.time's monotonic clock, so the server's
+-- world has `time`.  A head's end is looked for in each piece only as
+-- it is read, with the three bytes before it, and the head is parsed
+-- once, when all of it is read.
 --
 -- The server stops where a connection cannot be accepted: the listener
 -- closed (`Net.closeListener`, as above on a signal), or the program
@@ -115,15 +128,29 @@ import boc as BOC
 import bytes as Bytes
 import co
 import exception
+import std.duration as Duration
 import std.http as HTTP
 import std.http.server as Server
 import std.net as Net
 import std.ordmap as OrdMap
+import std.time as Time
+import uint8 as UInt8
 import resource
 
 -- (how much is read at a time, at least)
 readSize : Int
 readSize = 65536
+
+-- (how much is read at a time of a head not read all at once: so a
+-- client sending its head a little at a time is waited for with a small
+-- buffer, not `readSize`)
+headPiece : Int
+headPiece = 4096
+
+-- (a head's most, std.http.server's: past it, its end not read, a
+-- request is refused, `431`)
+headMost : Int
+headMost = 65536
 
 -- (how much of what a client still sends, after a request refused, is
 -- read and let go of before its connection is closed)
@@ -138,16 +165,30 @@ drainMost = 1048576
 -- or being closed)
 data Phase = Reading | Answering | Writing | Closing
 
+-- (how far the next request is read: its head not yet -- the last bytes
+-- looked through for its end, three at most, kept, for an end read
+-- in two pieces -- or its head, its body to come, from where that
+-- starts)
+data Part = InHead Bytes | InBody Server.Request Int
+
+-- (when the head being read is to be read by, on the monotonic clock,
+-- in milliseconds: at no time -- a body is read, or there is no limit
+-- -- within so many of the next read's start, or by then)
+data HeadBy = Whenever | Within Int | By Int
+
 -- (a connection's cown: what it is doing; what is read of its next
--- request, the last read first, `got` bytes in all, and how many in all
--- are wanted before it is read again; whether a `100 Continue` was
--- written for it; and whether the server has stopped, for the
--- connection to be closed once the request in hand is answered)
+-- request, the last read first, `got` bytes in all, how many in all
+-- are wanted before it is read again, and how far that is; when its
+-- head is to be read by; whether a `100 Continue` was written for it;
+-- and whether the server has stopped, for the connection to be closed
+-- once the request in hand is answered)
 type Conn =
   { phase : Phase
   , parts : List Bytes
   , got : Int
   , want : Int
+  , part : Part
+  , by : HeadBy
   , continued : Bool
   , stopping : Bool
   }
@@ -174,11 +215,12 @@ type Served (w : HFunctor) (rg : Type) =
 type Responder (w : HFunctor) =
   {e : HFunctor} -> {{bc : BOC.boc w <: e}} -> HTTP.Response -> Co e Unit
 
--- (what every behaviour of the server knows: the time limit, the
--- server's cown, and the handler, of the scheduler's world, which may
--- throw an `err`)
+-- (what every behaviour of the server knows: the time limits, a
+-- silence's and a head's, the server's cown, and the handler, of the
+-- scheduler's world, which may throw an `err`)
 type Serving (w : HFunctor) (rg : Type) (err : Type) =
   { idle : Int
+  , headerWithin : Int
   , served : BOC.Cown w (Served w rg)
   , handler :
         Server.Request
@@ -208,13 +250,22 @@ stopped : {w : HFunctor}
         -> (Served w rg, List (Pair Int (Connection w rg)))
 stopped sv = ({ sv | stopped = True }, OrdMap.toList sv.open)
 
--- (a connection just accepted: nothing read of it)
-fresh : Conn
-fresh =
+-- (when a head begun is to be read by, given `headerWithin`: 0, at no
+-- time)
+headStart : Int -> HeadBy
+headStart 0 = Whenever
+headStart within = Within within
+
+-- (a connection just accepted: nothing read of it, its head to be read
+-- within `within` milliseconds)
+fresh : Int -> Conn
+fresh within =
   { phase = Reading
   , parts = Nil
   , got = 0
   , want = 1
+  , part = InHead Bytes.empty
+  , by = headStart within
   , continued = False
   , stopping = False
   }
@@ -223,6 +274,44 @@ fresh =
 -- `readSize`, whichever is more)
 sizeFor : Conn -> Int
 sizeFor st = if st.want - st.got > readSize then st.want - st.got else readSize
+
+-- Looking for a head's end
+--------------------------------------------------------------------------------
+
+-- (the byte at `k` of `a`'s bytes, then `b`'s)
+byteOf : Bytes -> Bytes -> Int -> Int
+byteOf a b k =
+  if k < Bytes.length a then UInt8.toInt (Bytes.bytesAt a k)
+  else UInt8.toInt (Bytes.bytesAt b (k - Bytes.length a))
+
+-- (where the blank line after a head starts, `\r\n\r\n`, in `a`'s bytes,
+-- then `b`'s, from `k` on; -1 where it is not)
+blankIn : Bytes -> Bytes -> Int -> Int
+blankIn a b k =
+  if k + 4 > Bytes.length a + Bytes.length b then 0 - 1
+  else if byteOf a b k == 13
+          && byteOf a b (k + 1) == 10
+          && byteOf a b (k + 2) == 13
+          && byteOf a b (k + 3) == 10
+  then k
+  else blankIn a b (k + 1)
+
+-- (the last three bytes of `a`'s, then `b`'s; all, where there are
+-- fewer)
+lastThree : Bytes -> Bytes -> Bytes
+lastThree a b =
+  if Bytes.length b >= 3
+  then Bytes.slice b (Bytes.length b - 3) (Bytes.length b)
+  else let ab = Bytes.append a b
+       in Bytes.slice
+         ab
+         (if Bytes.length ab > 3 then Bytes.length ab - 3 else 0)
+         (Bytes.length ab)
+
+-- (what a request answered leaves to be read of the next: a piece)
+leftOf : List Bytes -> Bytes
+leftOf (b :: Nil) = b
+leftOf parts = Bytes.concat (List.reverse parts)
 
 -- The acts
 --------------------------------------------------------------------------------
@@ -250,6 +339,61 @@ acceptedFrom l = do
         Left err -> do
           _ <- Net.close c
           pure (Right Nothing)
+
+-- (what a read came to: its bytes -- none at the connection's end --
+-- and when the head is to be read by after it; or nothing, the read
+-- failed, or the head's time passed)
+data Arrived = Came HeadBy Bytes | Failed
+
+came : HeadBy -> Either Net.NetError Bytes -> Arrived
+came by (Right b) = Came by b
+came by (Left err) = Failed
+
+-- (the monotonic clock, in milliseconds)
+millisecondsNow : {w : HFunctor} -> {{clock : Time.time <: w}} -> Co w Int
+millisecondsNow =
+  bind Time.monotonic (\d -> pure (Duration.totalNanoseconds d / 1000000))
+
+-- (the shorter of two time limits, 0 none)
+shorter : Int -> Int -> Int
+shorter 0 left = left
+shorter idle left = if idle < left then idle else left
+
+-- (a read, `now`, of `size` bytes at most, within `idle` milliseconds,
+-- and by `until`: where that has passed, none)
+readUntil : {w : HFunctor}
+          -> {rg : Type}
+          -> {{nt : Net.net <: w}}
+          -> Int
+          -> Int
+          -> Int
+          -> With rg Net.TcpStream
+          -> Int
+          -> Co w Arrived
+readUntil idle until now c size =
+  if now >= until then pure Failed
+  else bind
+      (Net.read (timeout := shorter idle (until - now)) c size)
+      (\r -> pure (came (By until) r))
+
+-- (a read of `size` bytes at most, within `idle` milliseconds, and where
+-- a head is read by a time, by then: its time taken at this read's start
+-- where it is the head's first)
+readBy : {w : HFunctor}
+       -> {rg : Type}
+       -> {{nt : Net.net <: w}}
+       -> {{clock : Time.time <: w}}
+       -> Int
+       -> HeadBy
+       -> With rg Net.TcpStream
+       -> Int
+       -> Co w Arrived
+readBy idle Whenever c size =
+  bind (Net.read (timeout := idle) c size) (\r -> pure (came Whenever r))
+readBy idle (Within within) c size =
+  bind millisecondsNow (\now -> readUntil idle (now + within) now c size)
+readBy idle (By until) c size =
+  bind millisecondsNow (\now -> readUntil idle until now c size)
 
 -- (what the client still sends read and let go of, `got` bytes of it
 -- already, until it ends or there has been `drainMost` of it)
@@ -325,6 +469,11 @@ expects (Just r) =
     (\v -> HTTP.sameName v "100-continue")
     (Server.header "expect" r)
 
+-- (how far a request is read, its head read, its body starting `at`)
+bodyPart : Maybe Server.Request -> Int -> Part
+bodyPart (Just r) at = InBody r at
+bodyPart Nothing at = InHead Bytes.empty
+
 -- The behaviours
 --------------------------------------------------------------------------------
 
@@ -361,36 +510,32 @@ refusing sg cn status = do
 
 mutual
   -- (more of the connection read, `size` bytes at most, in `idle`
-  -- milliseconds: what it comes to added to what was read)
+  -- milliseconds, and where its head is read, by `by`: what it comes to
+  -- taken with what was read)
   reading : {e w : HFunctor}
           -> {rg : Type}
           -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
+          -> {{clock : Time.time <: w}}
           -> Serving w rg err
           -> Connection w rg
           -> Int
+          -> HeadBy
           -> Co e Unit
-  reading sg cn size = do
+  reading sg cn size by = do
     with st := cn.state
-         got := BOC.await (Net.read (timeout := sg.idle) cn.socket size) do
+         got := BOC.await (readBy sg.idle by cn.socket size) do
       case st.phase of
         Closing -> pure ()
         _ -> case got of
-          Right b ->
+          Came after b ->
             if Bytes.length b == 0
             then do
               closing sg cn
               st := { st | phase = Closing }
-            else st :=
-              (<- advanced
-                sg
-                cn
-                { st
-                | parts = b :: st.parts
-                , got = st.got + Bytes.length b
-                })
-          Left err -> do
+            else st := (<- took sg cn { st | by = after } st.part b)
+          Failed -> do
             closing sg cn
             st := { st | phase = Closing }
 
@@ -400,6 +545,7 @@ mutual
              -> {err : Type}
              -> {{bc : BOC.boc w <: e}}
              -> {{nt : Net.net <: w}}
+             -> {{clock : Time.time <: w}}
              -> Serving w rg err
              -> Connection w rg
              -> Co e Unit
@@ -414,7 +560,7 @@ mutual
       case st.phase of
         Closing -> pure ()
         _ -> case sent of
-          Right u -> reading sg cn (sizeFor st)
+          Right u -> reading sg cn (sizeFor st) Whenever
           Left err -> do
             closing sg cn
             st := { st | phase = Closing }
@@ -427,6 +573,7 @@ mutual
           -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
+          -> {{clock : Time.time <: w}}
           -> Serving w rg err
           -> Connection w rg
           -> Bool
@@ -443,26 +590,118 @@ mutual
             then do
               closing sg cn
               st := { st | phase = Closing }
-            else st :=
-              (<- advanced
-                sg
-                cn
-                { st
-                | phase = Reading
-                , want = if st.got > 0 then 0 else 1
-                })
+            else st := (<- nextRequest sg cn { st | phase = Reading })
           Left err -> do
             closing sg cn
             st := { st | phase = Closing }
 
-  -- (what is read of the connection, `st`, taken as far as it goes: more
-  -- read, where too little is; a `100 Continue` written, where the
-  -- client waits for one; a request handed to the handler; or refused:
-  -- the connection's state after)
+  -- (the next request read, a response written: looked for first in
+  -- what was read after the last, where there is any)
+  nextRequest : {w : HFunctor}
+              -> {rg : Type}
+              -> {err : Type}
+              -> {{nt : Net.net <: w}}
+              -> {{clock : Time.time <: w}}
+              -> Serving w rg err
+              -> Connection w rg
+              -> Conn
+              -> Co (BOC.boc w <+> w) Conn
+  nextRequest sg cn st =
+    if st.got > 0
+    then looked
+        sg
+        cn
+        { st | parts = Nil, got = 0 }
+        Bytes.empty
+        (leftOf st.parts)
+    else do
+      reading sg cn readSize st.by
+      pure { st | want = 1 }
+
+  -- (bytes `b` read, taken as far as they go, where the request is,
+  -- `part`: the connection's state after)
+  took : {w : HFunctor}
+       -> {rg : Type}
+       -> {err : Type}
+       -> {{nt : Net.net <: w}}
+       -> {{clock : Time.time <: w}}
+       -> Serving w rg err
+       -> Connection w rg
+       -> Conn
+       -> Part
+       -> Bytes
+       -> Co (BOC.boc w <+> w) Conn
+  took sg cn st (InHead tail) b = looked sg cn st tail b
+  took sg cn st (InBody r at) b =
+    advanced sg cn { st | parts = b :: st.parts, got = st.got + Bytes.length b }
+
+  -- (bytes `b` read of a head, its end looked for in them alone, and in
+  -- `tail`, the last bytes read before them: where it is found, the
+  -- head parsed, once; else more read, or, the head too long, refused)
+  looked : {w : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{nt : Net.net <: w}}
+         -> {{clock : Time.time <: w}}
+         -> Serving w rg err
+         -> Connection w rg
+         -> Conn
+         -> Bytes
+         -> Bytes
+         -> Co (BOC.boc w <+> w) Conn
+  looked sg cn st tail b = do
+    let at = blankIn tail b 0
+    let read = { st | parts = b :: st.parts, got = st.got + Bytes.length b }
+    if at >= 0 then headed sg cn read (st.got - Bytes.length tail + at)
+    else if read.got > headMost
+    then do
+      refusing sg cn 431
+      pure { st | phase = Closing }
+    else do
+      reading sg cn headPiece st.by
+      pure { read | want = read.got + 1, part = InHead (lastThree tail b) }
+
+  -- (the head read, its blank line at `i` of what is read: parsed, and
+  -- its body read; a `100 Continue` written, where the client waits for
+  -- one; or the request handed to the handler, or refused)
+  headed : {w : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{nt : Net.net <: w}}
+         -> {{clock : Time.time <: w}}
+         -> Serving w rg err
+         -> Connection w rg
+         -> Conn
+         -> Int
+         -> Co (BOC.boc w <+> w) Conn
+  headed sg cn st i = do
+    let buf = leftOf st.parts
+    case Server.requestIn (from := i) cn.peer buf of
+      Left (head, want) -> do
+        let more =
+          { st
+          | parts = [buf]
+          , got = Bytes.length buf
+          , want = want
+          , part = bodyPart head (i + 4)
+          , by = Whenever
+          }
+        if expects head && not st.continued
+        then do
+          continuing sg cn
+          pure { more | continued = True }
+        else do
+          reading sg cn (sizeFor more) Whenever
+          pure more
+      Right g -> answered sg cn st g
+
+  -- (what is read of a request's body, `st`: more read, where too
+  -- little is; else the request handed to the handler)
   advanced : {w : HFunctor}
            -> {rg : Type}
            -> {err : Type}
            -> {{nt : Net.net <: w}}
+           -> {{clock : Time.time <: w}}
            -> Serving w rg err
            -> Connection w rg
            -> Conn
@@ -470,41 +709,69 @@ mutual
   advanced sg cn st =
     if st.got < st.want
     then do
-      reading sg cn (sizeFor st)
+      reading sg cn (sizeFor st) Whenever
       pure st
-    else do
-      let buf = Bytes.concat (List.reverse st.parts)
-      case Server.requestIn cn.peer buf of
-        Left (head, want) -> do
-          let more = { st | parts = [buf], got = Bytes.length buf, want = want }
-          if expects head && not st.continued
-          then do
-            continuing sg cn
-            pure { more | continued = True }
-          else do
-            reading sg cn (sizeFor more)
-            pure more
-        Right (Asked r rest) -> do
-          outcome <- attempt err (sg.handler r (\res -> responder sg cn r res))
-          case outcome of
-            Right u ->
-              pure
-                { st
-                | phase = Answering
-                , parts = [rest]
-                , got = Bytes.length rest
-                , want = 0
-                , continued = False
-                }
-            Left thrown -> do
-              closing sg cn
-              pure { st | phase = Closing }
-        Right (Refused status) -> do
-          refusing sg cn status
-          pure { st | phase = Closing }
-        Right Ended -> do
-          closing sg cn
-          pure { st | phase = Closing }
+    else bodied sg cn st st.part
+
+  -- (the request whose head is read, `part`, its body all read: handed
+  -- to the handler, what was read after it kept)
+  bodied : {w : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{nt : Net.net <: w}}
+         -> {{clock : Time.time <: w}}
+         -> Serving w rg err
+         -> Connection w rg
+         -> Conn
+         -> Part
+         -> Co (BOC.boc w <+> w) Conn
+  bodied sg cn st (InBody r at) = do
+    let buf = leftOf st.parts
+    answered
+        sg
+        cn
+        st
+        (Asked
+           { r | body = Bytes.slice buf at st.want }
+           (Bytes.slice buf st.want (Bytes.length buf)))
+  bodied sg cn st (InHead tail) =
+    looked sg cn { st | parts = Nil, got = 0 } Bytes.empty (leftOf st.parts)
+
+  -- (what a request read came to: handed to the handler, or refused, or
+  -- the connection's end: the connection's state after)
+  answered : {w : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{nt : Net.net <: w}}
+           -> {{clock : Time.time <: w}}
+           -> Serving w rg err
+           -> Connection w rg
+           -> Conn
+           -> Server.Got
+           -> Co (BOC.boc w <+> w) Conn
+  answered sg cn st (Asked r rest) = do
+    outcome <- attempt err (sg.handler r (\res -> responder sg cn r res))
+    case outcome of
+      Right u ->
+        pure
+          { st
+          | phase = Answering
+          , parts = [rest]
+          , got = Bytes.length rest
+          , want = 0
+          , part = InHead Bytes.empty
+          , by = headStart sg.headerWithin
+          , continued = False
+          }
+      Left thrown -> do
+        closing sg cn
+        pure { st | phase = Closing }
+  answered sg cn st (Refused status) = do
+    refusing sg cn status
+    pure { st | phase = Closing }
+  answered sg cn st Ended = do
+    closing sg cn
+    pure { st | phase = Closing }
 
   -- (what the handler is given to answer `r` by: its first response
   -- written, the connection closed after where the request or the
@@ -514,6 +781,7 @@ mutual
             -> {err : Type}
             -> {{bc : BOC.boc w <: e}}
             -> {{nt : Net.net <: w}}
+            -> {{clock : Time.time <: w}}
             -> Serving w rg err
             -> Connection w rg
             -> Server.Request
@@ -581,6 +849,7 @@ accepting : {e w : HFunctor}
           -> {err : Type}
           -> {{bc : BOC.boc w <: e}}
           -> {{nt : Net.net <: w}}
+          -> {{clock : Time.time <: w}}
           -> Serving w rg err
           -> With rg Net.TcpListener
           -> Co e Unit
@@ -589,13 +858,14 @@ accepting sg l = do
        c := BOC.await (acceptedFrom l) do
     case c of
       Right (Just (sock, peer)) -> do
-        state <- BOC.newCown fresh
+        let st = fresh sg.headerWithin
+        state <- BOC.newCown st
         let (more, cn) =
           added
             sv
             (\n -> { socket = sock, number = n, peer = peer, state = state })
         sv := more
-        reading sg cn readSize
+        reading sg cn readSize st.by
         accepting sg l
       Right Nothing -> accepting sg l
       Left err -> do
@@ -611,16 +881,21 @@ accepting sg l = do
 -- | `EMFILE`): then the connections waiting for a request are closed,
 -- | and the others once the request in hand is answered.  A client that
 -- | sends nothing for `idle` milliseconds, or takes no response in that
--- | time, is closed.  The handler, of the scheduler's world, may throw
--- | an `err`: that connection is closed at once, unanswered, and what
--- | was thrown let go of.  For `scheduledWithReactor`: under
--- | `scheduled`, each act holds a domain until it is done.
+-- | time, is closed; so is one that has not sent all of a request's
+-- | head within `headerWithin` milliseconds of the connection's accept,
+-- | or of the response before it.  The handler, of the scheduler's
+-- | world, may throw an `err`: that connection is closed at once,
+-- | unanswered, and what was thrown let go of.  For
+-- | `scheduledWithReactor`: under `scheduled`, each act holds a domain
+-- | until it is done.
 serve : {e w : HFunctor}
       -> {rg : Type}
       -> {idle : Int := 30000}
+      -> {headerWithin : Int := 30000}
       -> (err : Type)
       -> {{bc : BOC.boc w <: e}}
       -> {{nt : Net.net <: w}}
+      -> {{clock : Time.time <: w}}
       -> With rg Net.TcpListener
       -> (Server.Request
           -> Responder w
@@ -630,4 +905,10 @@ serve err l handle = do
   served <-
     BOC.newCown
       ({ open = OrdMap.empty, next = 0, stopped = False } : Served w rg)
-  accepting { idle = idle, served = served, handler = handle } l
+  accepting
+      { idle = idle
+      , headerWithin = headerWithin
+      , served = served
+      , handler = handle
+      }
+      l

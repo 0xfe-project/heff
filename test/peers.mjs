@@ -28,6 +28,13 @@
 //                                   /stop; says how many of the N were
 //                                   reset before they were made (each
 //                                   tried again), and how many answered
+//   node test/peers.mjs head PORT HEAD
+//                                   a server's clients, its head limit
+//                                   HEAD ms: one sending a head a byte
+//                                   every 100 ms, never all of it; one
+//                                   sending a head of 4 KiB in 40 pieces,
+//                                   20 ms apart; one sending it at once;
+//                                   then /stop; says what each came to
 //   node test/peers.mjs boc BIN IDLE N
 //                                   std.http.bocserver's server, BIN
 //                                   PORT IDLE, started and driven: N
@@ -287,6 +294,54 @@ if (mode === "idle") {
   console.log(`reset before they were made: ${resets} of ${n}`);
   console.log(`answered ${answered} of ${n}`);
   await got("/stop");
+}
+
+if (mode === "head") {
+  const port = Number(arg), head = Number(process.argv[4]);
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  // (the server up: a connection made, closed at once)
+  for (let i = 0; i < 600 && !(await new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    s.on("connect", () => { s.destroy(); ok(true); });
+    s.on("error", () => ok(false));
+  })); i++) await wait(50);
+  // (a connection: `pieces` written `gap` ms apart, then what came back
+  // once the server closed it, or `(open)` after 10 s; and how long that
+  // took from the first write)
+  const sent = async (pieces, gap) => {
+    const s = await reached(port);
+    if (s instanceof Error) return { back: `(${s.code})`, ms: 0 };
+    s.setNoDelay(true);
+    s.setEncoding("latin1");
+    let back = "", closed = false;
+    const t0 = Date.now();
+    const ended = new Promise((ok) => s.on("close", () => { closed = true; ok(); }));
+    s.on("data", (d) => { back += d; });
+    s.on("error", () => {});
+    (async () => {
+      for (const p of pieces) {
+        if (closed) return;
+        s.write(p);
+        await wait(gap);
+      }
+    })();
+    await Promise.race([ended, wait(10000)]);
+    if (!closed) { s.destroy(); back += "(open)"; }
+    return { back, ms: Date.now() - t0 };
+  };
+  // (a head never ended: its first line, then a byte a write, 300 of
+  // them, each write sooner than any idle limit would close it)
+  const trickle = await sent(["GET /trickle HTTP/1.1\r\n", ..."X".repeat(300)], 100);
+  console.log(`a head sent a byte at a time: ${trickle.back === "" && trickle.ms >= head - 50 && trickle.ms < head + 1500 ? "closed in time, unanswered" : `${JSON.stringify(trickle.back)} in ${trickle.ms} ms`}`);
+  // (a head of 4 KiB, its last bytes, the blank line's, apart)
+  const whole = `GET /pieces HTTP/1.1\r\nHost: x\r\nX-Pad: ${"p".repeat(4000)}\r\nConnection: close\r\n\r\n`;
+  const size = Math.ceil((whole.length - 3) / 37);
+  const pieces = Array.from({ length: 37 }, (_, i) => whole.slice(i * size, Math.min((i + 1) * size, whole.length - 3)));
+  const inPieces = await sent([...pieces, "\n", "\r", "\n"], 20);
+  console.log(`a head sent in 40 pieces: ${inPieces.back.startsWith("HTTP/1.1 200 ") && inPieces.back.endsWith("\r\n\r\n/pieces") ? "answered" : JSON.stringify(inPieces.back.slice(0, 60))}`);
+  const atOnce = await sent(["GET /at-once HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"], 0);
+  console.log(`a head sent at once: ${atOnce.back.startsWith("HTTP/1.1 200 ") && atOnce.back.endsWith("\r\n\r\n/at-once") ? "answered" : JSON.stringify(atOnce.back.slice(0, 60))}`);
+  await sent(["GET /stop HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"], 0);
 }
 
 if (mode === "boc") {
