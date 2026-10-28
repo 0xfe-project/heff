@@ -284,18 +284,20 @@ A cml thread is a user of a custodian, not one of its things. What it
 carries is which custodian its `with`s give to: at first the one the
 `with`s gave to where it was spawned. No shutdown stops a thread. A
 thread's world, `CML.cml w <+> custodian <+> w`, has a custodian of
-the scheduler's, and that one covers the one outside. The scheduler's
-world `w` has none of its own, and `CML.scheduled` runs in `w <+>
-custodian`. Thread code is written for any world `e`, asking for
-`{{cm : CML.cml w <: e}}` and `{{cu : custodian <: e}}`, as other
-code is; the concrete world appears only where `scheduled` runs it. A
-`main` that starts its threads by `with _ := CML.threads do` names no
-custodian in its world, `main : Co (stdio <+> Net.net <+>
-Domain.domain) Unit`: the custodian in the threads' world is then the
-only one, and the `with` reaches the runtime's custodians through the
-domains' (`Domain.rooted`), so the threads' `with`s, a failure that
-cascades, and one that reaches the root, which ends the program, are
-as in a world that names it.
+the scheduler's, and that one covers the one outside. `CML.scheduled`
+runs in the scheduler's world `w` itself, `Co (CML.cml w <+> custodian
+<+> w) a -> Co w (Maybe a)`, and `w` need not name a custodian: the
+scheduler reaches the runtime's custodians through the domains'
+(`Domain.rooted`), or, where `w` names one, the one current where it
+runs. So a `main` that starts cml names no custodian, whether by
+`scheduled` or by `with _ := CML.threads do`: `main : Co (stdio <+>
+Net.net <+> Domain.domain) Unit`. The custodian in the threads' world
+is then the only one, and the threads' `with`s, a failure that
+cascades, and one that reaches the root, which ends the program, are as
+in a world that names it. Thread code is written for any world `e`,
+asking for `{{cm : CML.cml w <: e}}` and `{{cu : custodian <: e}}`, as
+other code is; the concrete world appears only where the program
+starts cml.
 
 So a `with k := Custodian.custody do` in a cml thread is cml's to
 answer. The body stays in the thread. It waits at a channel as
@@ -312,6 +314,7 @@ own:
 ```haskell
 import bytes as Bytes
 import cml as CML
+import co
 import custodian as Custodian
 import exception
 import resource
