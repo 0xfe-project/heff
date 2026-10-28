@@ -275,17 +275,14 @@ import std.reactor as Reactor
 --------------------------------------------------------------------------------
 
 -- (a worker's slot, for the turn it is to take next: the worker's
--- number; whether it holds one -- `slotEmpty`, `slotHeld`, or
--- `slotChanging` while a domain puts one in or takes it out -- and the
--- turn, the thread run from where it stopped, given the worker that
--- takes it)
+-- number, and the turn it holds, if any -- the thread run from where it
+-- stopped, given the worker that takes it.  One cell: the worker puts a
+-- turn in where it finds none, and any domain takes out the very turn
+-- it read, by `Domain.cas`, so that two never take the same)
 data Slot (w : HFunctor)
-  = MkSlot Int (Domain.Atomic Int) (Domain.Atomic
-                                      (Maybe
-                                         (Maybe (Slot w)
-                                          -> Co
-                                            (w <+> Custodian.custodian)
-                                            Unit)))
+  = MkSlot Int (Domain.Atomic
+                  (Maybe
+                     (Maybe (Slot w) -> Co (w <+> Custodian.custodian) Unit)))
 
 -- (where a thread is readied from: a worker, as its slot; or none, a
 -- computation run alone or `scheduled` starting main)
@@ -295,37 +292,29 @@ type Runner (w : HFunctor) = Maybe (Slot w)
 -- given the worker that takes it)
 type Turn (w : HFunctor) = Runner w -> Co (w <+> Custodian.custodian) Unit
 
-slotEmpty : Int
-slotEmpty = 0
-
-slotHeld : Int
-slotHeld = 1
-
-slotChanging : Int
-slotChanging = 2
-
 -- (an empty slot, of the `i`th worker)
 slotMade : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Int
          -> Co (w <+> Custodian.custodian) (Slot w)
 slotMade i = do
-  state <- Domain.newAtomic slotEmpty
   held <- Domain.newAtomic (Nothing : Maybe (Turn w))
-  pure (MkSlot i state held)
+  pure (MkSlot i held)
 
 -- (the number of the slot's worker)
 slotNumber : {w : HFunctor} -> Slot w -> Int
-slotNumber (MkSlot i state held) = i
+slotNumber (MkSlot i held) = i
 
 -- (whether the slot holds a turn, as far as this domain sees now)
 isHolding : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Slot w
           -> Co (w <+> Custodian.custodian) Bool
-isHolding (MkSlot i state held) = do
-  s <- Domain.get state
-  pure (s == slotHeld)
+isHolding (MkSlot i held) = do
+  t <- Domain.get held
+  pure (case t of
+    Just turn -> True
+    Nothing -> False)
 
 -- (the turn kept in the slot, where it is empty: whether it was.  By
 -- the slot's worker alone, so that a slot found empty stays so until
@@ -335,30 +324,27 @@ keptIn : {w : HFunctor}
        -> Slot w
        -> Turn w
        -> Co (w <+> Custodian.custodian) Bool
-keptIn (MkSlot i state held) t = do
-  s <- Domain.get state
-  if s == slotEmpty
-  then do
-    Domain.set held (Just t)
-    Domain.set state slotHeld
-    pure True
-  else pure False
+keptIn (MkSlot i held) t = do
+  s <- Domain.get held
+  case s of
+    Nothing -> do
+      Domain.set held (Just t)
+      pure True
+    Just other -> pure False
 
 -- (the turn the slot holds, taken out, where it holds one and no other
--- domain is taking it meanwhile)
+-- domain takes it meanwhile)
 takenFrom : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Slot w
           -> Co (w <+> Custodian.custodian) (Maybe (Turn w))
-takenFrom (MkSlot i state held) = do
-  ok <- Domain.cas state slotHeld slotChanging
-  if ok
-  then do
-    t <- Domain.get held
-    Domain.set held (Nothing : Maybe (Turn w))
-    Domain.set state slotEmpty
-    pure t
-  else pure Nothing
+takenFrom (MkSlot i held) = do
+  s <- Domain.get held
+  case s of
+    Nothing -> pure Nothing
+    Just t -> do
+      ok <- Domain.cas held s (Nothing : Maybe (Turn w))
+      pure (if ok then Just t else Nothing)
 
 -- Offers, channels and ivars
 --------------------------------------------------------------------------------
