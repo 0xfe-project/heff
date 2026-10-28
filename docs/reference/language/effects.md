@@ -53,7 +53,12 @@ scope: in a world `state Int <+> e`, as `runState`'s computation's,
 `get` is the first's, whatever `e` has. An effect in no place of the
 world is E0355; in more than one, E0356 (give the
 evidence there); an argument that is no `h <: e`, given `(x := _)`, or a
-world not known where the call is, E0357.
+world not known where the call is, E0357. The world must be known, not
+the effect's parameters: `boc ?w <: boc e <+> e`, a behaviour's under
+`scheduled`, is found by the one leaf `boc ?w` fits, which says `w` is
+`e`; so a body given to `scheduled`, to a `spawn` or to a `with _ :=
+CML.threads do` needs no `(w := e)`. Where more than one leaf fits, the
+parameter is waited for, and E0356 at the end.
 
 A value of `h <: e` is a function, and shows where `h` is in `e`:
 

@@ -6,6 +6,7 @@
 
 - `Show` is now `Debug` (`debug x`: the value as the source writes it, a string quoted, as Rust's `Debug`), and `ToString` is now `Show` (`show x`: text for a reader, as Rust's `Display`). Instances are named so: `instanceDebugInt`, `instanceShowString`.
 - Instance search: a goal with unsolved metavariables is taken at once by its one candidate where that candidate fits it without deciding any of them (`Binder (Co ?e a)` by an instance for `Co e a`), instead of waiting; so `with f := File.open path do` needs no annotation.
+- Evidence search: `h <: e` whose world is known but whose effect has an unsolved parameter, `boc ?w <: boc e <+> e`, is found by the one leaf of the world it fits, which solves the parameter; so a body given to `scheduled`, to a `spawn` or to a `with _ := CML.threads do` needs no `(w := e)`. Only a world not known where the call is stays E0357; an effect that fits more than one leaf waits for its parameter, and is E0356 at the end.
 - Lazy values: `~A` is the type `Lazy A`, `~e` delays `e` until it is forced (#107).
 - A theory's fields are fixed by named application, `Th (t := Bool)`, replacing `Th ~ { t = Bool }`. `~` is now an ordinary operator symbol.
 - `T @ { x = v, y = w }` specialises a theory again, decided at parse time. Named arguments name arguments only.
