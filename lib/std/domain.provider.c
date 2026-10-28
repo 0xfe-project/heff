@@ -416,6 +416,9 @@ static V heff_custodian_at(V p, V k, V here);
 
 static V heff_provider_domain(V p, V k) {
   V x;
+  // (an operation holding computations or none, as the effect sorts
+  // them: the operation itself, inside)
+  { V q = heff_dup(heff_field(p, 0)); heff_drop(p); p = q; }
   switch (heff_tag_of(p)) {
   case TAG_Spawn: {
     V sp = dm_open(heff_dup(heff_field(p, 0)));

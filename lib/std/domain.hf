@@ -282,10 +282,16 @@ puttingThen g (MkPutting q v x) = MkPutting q v (g x)
 takingThen : {x y a : Type} -> (x -> y) -> Taking x a -> Taking y a
 takingThen g (MkTaking q k) = MkTaking q (\v -> g (k v))
 
-data DomainF (m : Type -> Type) x
+-- (an operation holding a computation: a domain spawned, a computation
+-- tried, and the custodian's, from `rooted`)
+data HoldingF (m : Type -> Type) x
   = Spawn (Some (Spawning m x))
-  | Join (Some (Joining x))
   | Tried (Some (Trying m x))
+  | CustodyOp (Maybe Custodian.Custodian) (Custodian.CustodianF m x)
+
+-- (an operation holding none: the same whatever its computations are)
+data PlainF x
+  = Join (Some (Joining x))
   | Fail String
   | Cores (Int -> x)
   | NewAtomic (Some (Making x))
@@ -303,7 +309,49 @@ data DomainF (m : Type -> Type) x
   | NewQueue (Some (MakingQueue x))
   | PutQueue (Some (Putting x))
   | TakeQueue (Some (Taking x))
-  | CustodyOp (Maybe Custodian.Custodian) (Custodian.CustodianF m x)
+
+-- (the operations, those holding computations apart: what a handler
+-- between maps is those few, and every other operation passes it as it
+-- is, at no cost but a look at its tag)
+data DomainF (m : Type -> Type) x = Holding (HoldingF m x) | Plain (PlainF x)
+
+holdingThen : {m : Type -> Type}
+            -> {x y : Type}
+            -> (x -> y)
+            -> HoldingF m x
+            -> HoldingF m y
+holdingThen g (Spawn s) = Spawn (someThen (spawningThen g) s)
+holdingThen g (Tried s) = Tried (someThen (tryingThen g) s)
+holdingThen g (CustodyOp at q) = CustodyOp at (Custodian.custodianThen g q)
+
+holdingBy : {m n : Type -> Type}
+          -> {x : Type}
+          -> ({t : Type} -> m t -> n t)
+          -> HoldingF m x
+          -> HoldingF n x
+holdingBy nt (Spawn s) = Spawn (someThen (spawningBy nt) s)
+holdingBy nt (Tried s) = Tried (someThen (tryingBy nt) s)
+holdingBy nt (CustodyOp at q) = CustodyOp at (Custodian.custodianBy nt q)
+
+plainThen : {x y : Type} -> (x -> y) -> PlainF x -> PlainF y
+plainThen g (Join s) = Join (someThen (joiningThen g) s)
+plainThen g (Fail why) = Fail why
+plainThen g (Cores k) = Cores (\n -> g (k n))
+plainThen g (NewAtomic s) = NewAtomic (someThen (makingThen g) s)
+plainThen g (GetAtomic s) = GetAtomic (someThen (readingThen g) s)
+plainThen g (SetAtomic s) = SetAtomic (someThen (writingThen g) s)
+plainThen g (CasAtomic s) = CasAtomic (someThen (comparingThen g) s)
+plainThen g (FetchAdd at n k) = FetchAdd at n (\o -> g (k o))
+plainThen g (NewMutex k) = NewMutex (\mu -> g (k mu))
+plainThen g (Lock mu x) = Lock mu (g x)
+plainThen g (Unlock mu x) = Unlock mu (g x)
+plainThen g (NewCondition k) = NewCondition (\cd -> g (k cd))
+plainThen g (Wait cd mu x) = Wait cd mu (g x)
+plainThen g (Signal cd x) = Signal cd (g x)
+plainThen g (Broadcast cd x) = Broadcast cd (g x)
+plainThen g (NewQueue s) = NewQueue (someThen (makingQueueThen g) s)
+plainThen g (PutQueue s) = PutQueue (someThen (puttingThen g) s)
+plainThen g (TakeQueue s) = TakeQueue (someThen (takingThen g) s)
 
 -- | For OS threads, domains: spawned and joined, a failure caught, and
 -- | what they share -- atomics, mutexes, conditions and queues.
@@ -311,49 +359,11 @@ domain : HFunctor
 domain =
   { f = DomainF
   , hfmap = \m g p -> case p of
-      Spawn s -> Spawn (someThen (spawningThen g) s)
-      Join s -> Join (someThen (joiningThen g) s)
-      Tried s -> Tried (someThen (tryingThen g) s)
-      Fail why -> Fail why
-      Cores k -> Cores (\n -> g (k n))
-      NewAtomic s -> NewAtomic (someThen (makingThen g) s)
-      GetAtomic s -> GetAtomic (someThen (readingThen g) s)
-      SetAtomic s -> SetAtomic (someThen (writingThen g) s)
-      CasAtomic s -> CasAtomic (someThen (comparingThen g) s)
-      FetchAdd at n k -> FetchAdd at n (\o -> g (k o))
-      NewMutex k -> NewMutex (\mu -> g (k mu))
-      Lock mu x -> Lock mu (g x)
-      Unlock mu x -> Unlock mu (g x)
-      NewCondition k -> NewCondition (\cd -> g (k cd))
-      Wait cd mu x -> Wait cd mu (g x)
-      Signal cd x -> Signal cd (g x)
-      Broadcast cd x -> Broadcast cd (g x)
-      NewQueue s -> NewQueue (someThen (makingQueueThen g) s)
-      PutQueue s -> PutQueue (someThen (puttingThen g) s)
-      TakeQueue s -> TakeQueue (someThen (takingThen g) s)
-      CustodyOp at q -> CustodyOp at (Custodian.custodianThen g q)
+      Holding h -> Holding (holdingThen g h)
+      Plain q -> Plain (plainThen g q)
   , hmap = \m n nt p -> case p of
-      Spawn s -> Spawn (someThen (spawningBy nt) s)
-      Join s -> Join s
-      Tried s -> Tried (someThen (tryingBy nt) s)
-      Fail why -> Fail why
-      Cores k -> Cores k
-      NewAtomic s -> NewAtomic s
-      GetAtomic s -> GetAtomic s
-      SetAtomic s -> SetAtomic s
-      CasAtomic s -> CasAtomic s
-      FetchAdd at v k -> FetchAdd at v k
-      NewMutex k -> NewMutex k
-      Lock mu x -> Lock mu x
-      Unlock mu x -> Unlock mu x
-      NewCondition k -> NewCondition k
-      Wait cd mu x -> Wait cd mu x
-      Signal cd x -> Signal cd x
-      Broadcast cd x -> Broadcast cd x
-      NewQueue s -> NewQueue s
-      PutQueue s -> PutQueue s
-      TakeQueue s -> TakeQueue s
-      CustodyOp at q -> CustodyOp at (Custodian.custodianBy nt q)
+      Holding h -> Holding (holdingBy nt h)
+      Plain q -> Plain q
   }
 
 -- Domains
@@ -368,7 +378,8 @@ started : {e : HFunctor}
         -> {{dm : domain <: e}}
         -> Co e a
         -> Co e (Domain a)
-started c = op (dm (Spawn (\r use -> use a (MkSpawning c (\d -> d))))) val
+started c =
+  op (dm (Holding (Spawn (\r use -> use a (MkSpawning c (\d -> d)))))) val
 
 -- | The domain's answer, waiting for it to end; where it failed, this
 -- | one fails as it did.
@@ -377,7 +388,7 @@ join : {e : HFunctor}
      -> {{dm : domain <: e}}
      -> Domain a
      -> Co e a
-join d = op (dm (Join (\r use -> use a (MkJoining d (\v -> v))))) val
+join d = op (dm (Plain (Join (\r use -> use a (MkJoining d (\v -> v)))))) val
 
 -- | `c` run here, on this domain, its failure caught: `Right` its
 -- | answer, or `Left why` where it fails -- abandons (`heff:abandon`),
@@ -388,7 +399,8 @@ tried : {e : HFunctor}
       -> {{dm : domain <: e}}
       -> Co e a
       -> Co e (Either String a)
-tried c = op (dm (Tried (\r use -> use a (MkTrying (\u -> c) (\r -> r))))) val
+tried c =
+  op (dm (Holding (Tried (\r use -> use a (MkTrying (\u -> c) (\r -> r)))))) val
 
 -- | This domain fails as `why` says, as one joined fails where the
 -- | domain it joins failed: caught by a `tried` around it, `Left why`,
@@ -396,12 +408,12 @@ tried c = op (dm (Tried (\r use -> use a (MkTrying (\u -> c) (\r -> r))))) val
 -- | failure caught (a `tried`'s `Left`) is handed on as it came, its
 -- | words kept; `"heff:abandon"`, an abandon's, abandons.
 fail : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> String -> Co e a
-fail why = op (dm (Fail why)) val
+fail why = op (dm (Plain (Fail why))) val
 
 -- | How many domains the machine runs at once: its cores, as the system
 -- | says (1 where it does not).
 cores : {e : HFunctor} -> {{dm : domain <: e}} -> Co e Int
-cores = op (dm (Cores (\n -> n))) val
+cores = op (dm (Plain (Cores (\n -> n)))) val
 
 -- Cells
 --------------------------------------------------------------------------------
@@ -412,11 +424,13 @@ newAtomic : {e : HFunctor}
           -> {{dm : domain <: e}}
           -> a
           -> Co e (Atomic a)
-newAtomic v = op (dm (NewAtomic (\r use -> use a (MkMaking v (\at -> at))))) val
+newAtomic v =
+  op (dm (Plain (NewAtomic (\r use -> use a (MkMaking v (\at -> at)))))) val
 
 -- | What the cell holds.
 get : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> Atomic a -> Co e a
-get at = op (dm (GetAtomic (\r use -> use a (MkReading at (\v -> v))))) val
+get at =
+  op (dm (Plain (GetAtomic (\r use -> use a (MkReading at (\v -> v)))))) val
 
 -- | ... and it holds `v` now.
 set : {e : HFunctor}
@@ -425,7 +439,8 @@ set : {e : HFunctor}
     -> Atomic a
     -> a
     -> Co e Unit
-set at v = op (dm (SetAtomic (\r use -> use a (MkWriting at v MkUnit)))) val
+set at v =
+  op (dm (Plain (SetAtomic (\r use -> use a (MkWriting at v MkUnit))))) val
 
 -- | The cell holds `v` now, where it held `seen` (compared by identity):
 -- | whether it did.
@@ -437,7 +452,9 @@ cas : {e : HFunctor}
     -> a
     -> Co e Bool
 cas at seen v =
-  op (dm (CasAtomic (\r use -> use a (MkComparing at seen v (\b -> b))))) val
+  op
+    (dm (Plain (CasAtomic (\r use -> use a (MkComparing at seen v (\b -> b))))))
+    val
 
 -- | `n` added to the number the cell holds: what it held.
 fetchAdd : {e : HFunctor}
@@ -445,40 +462,40 @@ fetchAdd : {e : HFunctor}
          -> Atomic Int
          -> Int
          -> Co e Int
-fetchAdd at n = op (dm (FetchAdd at n (\o -> o))) val
+fetchAdd at n = op (dm (Plain (FetchAdd at n (\o -> o)))) val
 
 -- Mutexes and conditions
 --------------------------------------------------------------------------------
 
 -- | A mutex, held by no domain.
 newMutex : {e : HFunctor} -> {{dm : domain <: e}} -> Co e Mutex
-newMutex = op (dm (NewMutex (\mu -> mu))) val
+newMutex = op (dm (Plain (NewMutex (\mu -> mu)))) val
 
 -- | The mutex held by this domain, waiting while another holds it.
 lock : {e : HFunctor} -> {{dm : domain <: e}} -> Mutex -> Co e Unit
-lock mu = op (dm (Lock mu MkUnit)) val
+lock mu = op (dm (Plain (Lock mu MkUnit))) val
 
 -- | ... let go of: it fails where this domain does not hold it.
 unlock : {e : HFunctor} -> {{dm : domain <: e}} -> Mutex -> Co e Unit
-unlock mu = op (dm (Unlock mu MkUnit)) val
+unlock mu = op (dm (Plain (Unlock mu MkUnit))) val
 
 -- | A condition, for domains to wait on.
 newCondition : {e : HFunctor} -> {{dm : domain <: e}} -> Co e Condition
-newCondition = op (dm (NewCondition (\cd -> cd))) val
+newCondition = op (dm (Plain (NewCondition (\cd -> cd)))) val
 
 -- | The mutex, held by this domain, let go of until the condition is
 -- | signalled, and held again before it goes on.  It may end without a
 -- | signal: what it waits for is checked again.
 wait : {e : HFunctor} -> {{dm : domain <: e}} -> Condition -> Mutex -> Co e Unit
-wait cd mu = op (dm (Wait cd mu MkUnit)) val
+wait cd mu = op (dm (Plain (Wait cd mu MkUnit))) val
 
 -- | One domain waiting on the condition woken, if one is.
 signal : {e : HFunctor} -> {{dm : domain <: e}} -> Condition -> Co e Unit
-signal cd = op (dm (Signal cd MkUnit)) val
+signal cd = op (dm (Plain (Signal cd MkUnit))) val
 
 -- | Every domain waiting on the condition woken.
 broadcast : {e : HFunctor} -> {{dm : domain <: e}} -> Condition -> Co e Unit
-broadcast cd = op (dm (Broadcast cd MkUnit)) val
+broadcast cd = op (dm (Plain (Broadcast cd MkUnit))) val
 
 -- Queues
 --------------------------------------------------------------------------------
@@ -488,7 +505,8 @@ newQueue : {e : HFunctor}
          -> {a : Type}
          -> {{dm : domain <: e}}
          -> Co e (Queue a)
-newQueue = op (dm (NewQueue (\r use -> use a (MkMakingQueue (\q -> q))))) val
+newQueue =
+  op (dm (Plain (NewQueue (\r use -> use a (MkMakingQueue (\q -> q)))))) val
 
 -- | `v` put at the back of the queue, for one domain to take; never
 -- | waits.
@@ -498,12 +516,14 @@ put : {e : HFunctor}
     -> Queue a
     -> a
     -> Co e Unit
-put q v = op (dm (PutQueue (\r use -> use a (MkPutting q v MkUnit)))) val
+put q v =
+  op (dm (Plain (PutQueue (\r use -> use a (MkPutting q v MkUnit))))) val
 
 -- | The front of the queue taken out, this domain's alone now; waits
 -- | while the queue is empty.
 take : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> Queue a -> Co e a
-take q = op (dm (TakeQueue (\r use -> use a (MkTaking q (\v -> v))))) val
+take q =
+  op (dm (Plain (TakeQueue (\r use -> use a (MkTaking q (\v -> v)))))) val
 
 -- Scopes
 --------------------------------------------------------------------------------
@@ -779,7 +799,7 @@ rootingAlg (InR (Given (Under k s))) c =
   s (Co e a) (\b r -> case r of
     MkRunning body after -> bind (body (Just k)) (\v -> pure (after v)))
 rootingAlg (InR q) c =
-  op (dm (CustodyOp c (Custodian.custodianBy (\m -> m c) q))) val
+  op (dm (Holding (CustodyOp c (Custodian.custodianBy (\m -> m c) q)))) val
 
 -- | `c`, its custodian's operations the runtime's custodians', as a
 -- | world with the custodian's effect has them: the things its `with`s
