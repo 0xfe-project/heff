@@ -21,6 +21,7 @@
 -- import std.net as Net
 -- import std.reactor as Reactor
 -- import std.signal as Signal
+-- import custodian as Custodian
 -- import resource
 --
 -- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
@@ -28,15 +29,15 @@
 --
 -- -- | `hello` served on the listener, each connection a thread of its
 -- -- | own, until one cannot be accepted, or until SIGTERM or Ctrl-C
--- served : {e w : HFunctor}
+-- served : {w : HFunctor}
 --        -> {s : Type}
---        -> {{cm : CML.cml w <: e}}
 --        -> {{nt : Net.net <: w}}
---        -> {{sg : Signal.signals <: e}}
+--        -> {{sg : Signal.signals <: w}}
 --        -> With s Net.TcpListener
---        -> Co e Unit
+--        -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
 -- served l =
 --   CML.choose
+--     (w := w)
 --     [ CmlServer.serve Empty l hello
 --     , bind (Signal.wait [Terminate, Interrupt]) (\s -> pure ())
 --     ]
@@ -50,24 +51,25 @@
 --         { host = "127.0.0.1", port = 8080 }
 --         128
 --         (\l ->
---            CML.scheduledWithReactor
---              (served
---                 (w := Net.net <+> Reactor.reactor <+> Domain.domain <+> Signal.signals)
---                 l))
+--            CML.scheduledWithReactor (served l))
 --   pure ()
 -- ```
 --
 -- One thread accepts, in a loop: each connection accepted is given a
 -- thread of its own, which serves it and closes it as it ends, and the
 -- loop goes on to accept the next.  A connection's thread is of cml's
--- world, `cml w <+> custodian <+> w`, as every thread is, so the
--- handler is too, with what it may throw, an `err` (`Empty` where it throws nothing): a throw
--- no `recover` of the handler's hears closes that connection at once,
+-- world, `cml w <+> custodian <+> w`, as every thread is, and so is
+-- `serve`, a thread's or main's own: its `w` is said by where it is
+-- run -- a `spawn`, a function of a thread's world -- and a `choose`
+-- around it, which says none, is given it, `CML.choose (w := w)`, as
+-- above.  The handler is of that world too, with what it may throw,
+-- an `err` (`Empty` where it throws nothing): a throw no `recover` of
+-- the handler's hears closes that connection at once,
 -- unanswered, what was thrown let go of -- a handler that is to say why
 -- catches it itself -- and the others are served on.  A connection whose
 -- client sends nothing for `idle` milliseconds -- 30 seconds unless
--- another is given, by name, `CmlServer.serve (idle := 5000) l
--- handle`; 0 for no limit -- is closed, its thread done.  Where a
+-- another is given, by name, `CmlServer.serve (idle := 5000) Empty
+-- l handle`; 0 for no limit -- is closed, its thread done.  Where a
 -- connection cannot be accepted (the program out of descriptors,
 -- `EMFILE`; the listener closed, `EBADF`) the server stops: `serve`
 -- comes back, the connections being served going on, the listener left
@@ -135,6 +137,26 @@ acceptor stop idle l handle = do
       CML.spawn (servedOn idle handle c)
       acceptor stop idle l handle
 
+-- (the listener's connections accepted by a thread of their own, until
+-- it stops: then this comes back)
+acceptedUntilStopped : {e w : HFunctor}
+                     -> {s : Type}
+                     -> {err : Type}
+                     -> {{cm : CML.cml w <: e}}
+                     -> {{nt : Net.net <: w}}
+                     -> Int
+                     -> With s Net.TcpListener
+                     -> (Server.Request
+                         -> Co
+                           (exception err
+                            <+> (CML.cml w <+> Custodian.custodian <+> w))
+                           HTTP.Response)
+                     -> Co e Unit
+acceptedUntilStopped idle l handle = do
+  stopped <- CML.newIVar
+  CML.spawn (acceptor (CML.putIVar stopped ()) idle l handle)
+  CML.readIVar stopped
+
 -- | The listener's connections served at once, each by a cml thread of
 -- | its own (`Server.serveConnection`), spawned by one thread accepting
 -- | them in a loop, and closed as it is served.  Until one fails to be
@@ -144,20 +166,17 @@ acceptor stop idle l handle = do
 -- | connection's thread, in the scheduler's world, and may throw an
 -- | `err` (`Empty` for one that throws nothing): that connection is
 -- | closed at once, unanswered, and what was thrown let go of; the
--- | others go on.
-serve : {e w : HFunctor}
+-- | others go on.  It is of cml's world, a thread's, so its `w` is the
+-- | one the thread runs in.
+serve : {w : HFunctor}
       -> {s : Type}
       -> {idle : Int := 30000}
       -> (err : Type)
-      -> {{cm : CML.cml w <: e}}
       -> {{nt : Net.net <: w}}
       -> With s Net.TcpListener
       -> (Server.Request
           -> Co
             (exception err <+> (CML.cml w <+> Custodian.custodian <+> w))
             HTTP.Response)
-      -> Co e Unit
-serve err l handle = do
-  stopped <- CML.newIVar
-  CML.spawn (acceptor (CML.putIVar stopped ()) idle l handle)
-  CML.readIVar stopped
+      -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
+serve err l handle = acceptedUntilStopped idle l handle
