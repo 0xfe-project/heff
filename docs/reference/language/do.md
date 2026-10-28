@@ -338,6 +338,46 @@ serving l ch = do
   serving l ch
 ```
 
+A boc behaviour is a user of a custodian too. It takes the custodian
+current where it is spawned, and its body runs with that one current:
+the things its `with`s hold are in its custody, and the behaviours it
+spawns take it as well. An act awaited by `BOC.await`, and the
+behaviour after it, take the one current at the `await`. A behaviour
+runs to its end without waiting, so a `with` of a custodian in its body
+is the body's own, for its extent. The custodian is the one of the
+scheduler's world, so `BOC.scheduled` asks for `custodian <: w`, and a
+`main` that runs it names `custodian` in its world. A behaviour spawned
+in a `contained` custodian loses only that custodian when its file
+fails to close:
+
+```haskell
+import boc as BOC
+import co
+import custodian as Custodian
+import exception
+import std.file as File
+import std.filesystem
+import std.path
+
+saved : {e w : HFunctor}
+      -> {{bc : BOC.boc w <: e}}
+      -> {{cu : Custodian.custodian <: e}}
+      -> {{disk : filesystem <: w}}
+      -> {{cw : Custodian.custodian <: w}}
+      -> BOC.Cown w Int
+      -> Path
+      -> Co e Unit
+saved c path = do
+  with k := Custodian.contained do
+    with n := c do
+      r <-
+        attempt
+          FileError (do
+            with f := File.open (access := Write { exists = Append }) path do
+              File.writeString f (debug n ^ "\n"))
+      pure ()
+```
+
 What a custodian is given is higher-order. It is a computation of the
 world it was given in, with the handlers between there and the
 program's top level already applied, so it runs after their scope may
