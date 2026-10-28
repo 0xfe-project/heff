@@ -1,0 +1,272 @@
+-- Captures lent (#150), for the C backend: a lambda's body gives its
+-- closure up where it starts (`CTakeSelf`, heff.compile.refcount), what
+-- it holds taken -- its last reference, the cell freed; else each of
+-- what it holds counted up, the closure down.  A closure called more
+-- than once -- a resumption, called for each choice -- is not its last
+-- reference there, and a way through the body that only looks at what
+-- it holds, lends it or takes a reference of it, and drops it, counts
+-- each up at the start and down again at the drop.  So the take is put
+-- off, down each way through the body, to where what it holds is first
+-- given up; and a way that gives up nothing of it but its drops takes
+-- nothing: the closure, holding it all the while, is given up once,
+-- where the last of those drops was (`CDropSelf`).
+
+module heff.compile.captures
+
+import heff.compile.borrow as Borrow
+import heff.compile.owned as Owned
+import heff.compile.refcount as RefCount
+import std.ordmap as OrdMap
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+-- What gives none of them up
+--------------------------------------------------------------------------------
+
+-- | what a lambda's closure holds, its names in the body, and the
+-- | parameters lent to each function (heff.compile.facts's `lent`)
+type Held = { cs : List String, bor : OrdMap.OrdMap String (List Int) }
+
+-- (a drop of none of them)
+dropNone : Held -> RefCount.Drop -> Bool
+dropNone h (MkDrop x _) = not (elemS x h.cs)
+
+-- (an operand of a call, as `k` has its values, at a parameter lent or
+-- not: a variable there, lent; a variable lent and dropped after the
+-- call none of them)
+keepsArg : (RefCount.Value -> Bool) -> Held -> Bool -> RefCount.Operand -> Bool
+keepsArg k h True (Given (RLocal x)) = True
+keepsArg k h lent (LentVar x drops) = List.all (dropNone h) drops
+keepsArg k h lent a = List.all k (Owned.argKids a)
+
+-- (the operands of a call of `g`)
+keepsArgs : (RefCount.Value -> Bool)
+          -> Held
+          -> List Int
+          -> Int
+          -> List RefCount.Operand
+          -> Bool
+keepsArgs k h bi i Nil = True
+keepsArgs k h bi i (Cons a rest) =
+  keepsArg k h (List.elem i bi) a && keepsArgs k h bi (i + 1) rest
+
+-- (a condition, as `k` has its values: a name bound in it dropped
+-- where it is decided none of them)
+keepsCond : (RefCount.Value -> Bool) -> Held -> RefCount.Test -> Bool
+keepsCond k h (CondNot c) = keepsCond k h c
+keepsCond k h (CondIf a b c) =
+  keepsCond k h a && keepsCond k h b && keepsCond k h c
+keepsCond k h (CondLet _ e c drops) =
+  k e && keepsCond k h c && List.all (dropNone h) drops
+keepsCond k h c = List.all k (Owned.condKids c)
+
+-- | whether a value gives up none of what the closure holds -- a
+-- | reference taken of one, one lent or a field of it looked at, but
+-- | none given, taken apart, built in, or dropped after a call it is
+-- | lent to (not in a lambda's body, which holds its own)
+keeps : Held -> RefCount.Value -> Bool
+keeps h (RLocal x) = not (elemS x h.cs)
+keeps h (RTakeField x _) = not (elemS x h.cs)
+keeps h (RField (RLocal x) _) = True
+keeps h (RFieldU _ _ (RLocal x) _) = True
+keeps h (RRecIn x _ _ _ _ _ fs _) =
+  not (elemS x h.cs) && List.all (\f -> keeps h (snd f)) fs
+keeps h (RCall g _ _ args) = keepsArgs (keeps h) h (Borrow.borOf h.bor g) 0 args
+keeps h (RBool c) = keepsCond (keeps h) h c
+keeps h e = List.all (keeps h) (Owned.kids e)
+
+-- (whether a value names one of them at all, a reference taken of it
+-- too)
+names : Held -> RefCount.Value -> Bool
+names h (RDup x) = elemS x h.cs
+names h (RLocal x) = elemS x h.cs
+names h e = not (keeps h e) || List.any (names h) (Owned.kids e)
+
+-- | whether a statement gives up none of them, nor goes back to where
+-- | it was before (a label, the loop again), past which nothing is put
+-- | off
+keepsSt : Held -> RefCount.Statement -> Bool
+keepsSt h (CDrop d) = dropNone h d
+keepsSt h (CLet _ e) = keeps h e
+keepsSt h (CDecl _) = True
+keepsSt h (CSet x e) = not (elemS x h.cs) && keeps h e
+keepsSt h (CIf c a b) =
+  keepsCond (keeps h) h c
+  && List.all (keepsSt h) a
+  && List.all (keepsSt h) b
+keepsSt h (CSwitch e arms _) =
+  not (names h e)
+  && List.all
+    (\arm -> List.all (keepsSt h) (RefCount.caseArmBody arm))
+    arms
+keepsSt h (CReturn e) = keeps h e
+keepsSt h (CInPlace f es) = List.all (keeps h) (Cons f es)
+keepsSt h (CRoomed f es) = List.all (keeps h) (Cons f es)
+keepsSt h (CTail f es) = List.all (keeps h) (Cons f es)
+keepsSt h CAbandon = True
+keepsSt h s = False
+
+-- The take put off
+--------------------------------------------------------------------------------
+
+-- (a drop of one of them, where it is a statement of its own)
+dropsOne : Held -> RefCount.Statement -> Bool
+dropsOne h (CDrop d) = not (dropNone h d)
+dropsOne h s = False
+
+-- (a way that gives up nothing of them but its drops, one at least)
+onlyDrops : Held -> List RefCount.Statement -> Bool
+onlyDrops h ss =
+  List.all (\s -> dropsOne h s || keepsSt h s) ss
+  && List.any (dropsOne h) ss
+
+-- (... those drops gone, the closure dropped where the last was)
+droppedAtLast : Held -> List RefCount.Statement -> List RefCount.Statement
+droppedAtLast h Nil = Nil
+droppedAtLast h (Cons s rest) =
+  if dropsOne h s
+  then (if List.any (dropsOne h) rest then droppedAtLast h rest
+        else Cons CDropSelf rest)
+  else Cons s (droppedAtLast h rest)
+
+-- (an arm's way, `go` putting its take off)
+putOffArm : (List RefCount.Statement -> List RefCount.Statement)
+          -> RefCount.CaseArm
+          -> RefCount.CaseArm
+putOffArm go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+-- (a way that gives up more than drops of them: taken where it first
+-- does, or down each arm of a test or a match it ends with, as `go`
+-- puts it off there)
+putOffOn : (List RefCount.Statement -> List RefCount.Statement)
+         -> Held
+         -> Int
+         -> List RefCount.Statement
+         -> List RefCount.Statement
+putOffOn go h n (Cons (CIf c a b) Nil) =
+  if keepsCond (keeps h) h c then Cons (CIf c (go a) (go b)) Nil
+  else Cons (CTakeSelf n) (Cons (CIf c a b) Nil)
+putOffOn go h n (Cons (CSwitch e arms r) Nil) =
+  if names h e then Cons (CTakeSelf n) (Cons (CSwitch e arms r) Nil)
+  else Cons (CSwitch e (List.map (putOffArm go) arms) r) Nil
+putOffOn go h n (Cons s rest) =
+  if not (List.null rest) && keepsSt h s then Cons s (go rest)
+  else Cons (CTakeSelf n) (Cons s rest)
+putOffOn go h n Nil = Cons (CTakeSelf n) Nil
+
+-- | a way through a lambda's body, its closure, holding `n`, given up as
+-- | late as it may be: dropped, where the way gives up nothing it holds
+-- | but its drops; else taken where it first gives one up -- down each
+-- | arm of a test or a match it ends with
+putOff : Held -> Int -> List RefCount.Statement -> List RefCount.Statement
+putOff h n ss =
+  if onlyDrops h ss then droppedAtLast h ss
+  else putOffOn (putOff h n) h n ss
+
+-- (a lambda's body, its take put off)
+lamBody : OrdMap.OrdMap String (List Int)
+        -> List String
+        -> List RefCount.Statement
+        -> List RefCount.Statement
+lamBody bor fv (Cons (CTakeSelf n) rest) = putOff { cs = fv, bor = bor } n rest
+lamBody bor fv ss = ss
+
+-- Everywhere
+--------------------------------------------------------------------------------
+
+-- | a value, each lambda's take in it put off (`go`: a lambda's body,
+-- | so -- the lambdas in it first)
+capExp : OrdMap.OrdMap String (List Int)
+       -> (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.Value
+       -> RefCount.Value
+capExp bor go (RTag t b es) = RTag t b (List.map (capExp bor go) es)
+capExp bor go (RTagIn e t b es) =
+  RTagIn (capExp bor go e) t b (List.map (capExp bor go) es)
+capExp bor go (RRec ls b es) = RRec ls b (List.map (capExp bor go) es)
+capExp bor go (RRecIn x n k f s ls fs sure) =
+  RRecIn
+    x
+    n
+    k
+    f
+    s
+    ls
+    (List.map (\p -> MkPair (fst p) (capExp bor go (snd p))) fs)
+    sure
+capExp bor go (RField e i) = RField (capExp bor go e) i
+capExp bor go (RDupE e) = RDupE (capExp bor go e)
+capExp bor go (RFieldV e i) = RFieldV (capExp bor go e) i
+capExp bor go (RGetN e i n) = RGetN (capExp bor go e) i n
+capExp bor go (RFieldU r s e i) = RFieldU r s (capExp bor go e) i
+capExp bor go (RGetNU r s e i n) = RGetNU r s (capExp bor go e) i n
+capExp bor go (RWord r e) = RWord r (capExp bor go e)
+capExp bor go (RGetLabel e l) = RGetLabel (capExp bor go e) l
+capExp bor go (RPrim p es) = RPrim p (List.map (capExp bor go) es)
+capExp bor go (RPrimAt p r es) = RPrimAt p r (List.map (capExp bor go) es)
+capExp bor go (RLam xs fv held (MkCode body)) =
+  RLam xs fv (List.map (capExp bor go) held) (MkCode (lamBody bor fv (go body)))
+capExp bor go (RCall g tr w args) =
+  RCall g tr w (List.map (Owned.mapArg (capExp bor go)) args)
+capExp bor go (RApply f es) =
+  RApply (capExp bor go f) (List.map (capExp bor go) es)
+capExp bor go (RBool c) = RBool (Owned.mapCond (capExp bor go) c)
+capExp bor go (RBox r e) = RBox r (capExp bor go e)
+capExp bor go (RUnbox r e) = RUnbox r (capExp bor go e)
+capExp bor go (RPeek r e) = RPeek r (capExp bor go e)
+capExp bor go (RPrimU p es) = RPrimU p (List.map (capExp bor go) es)
+capExp bor go e = e
+
+capArm : (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.CaseArm
+       -> RefCount.CaseArm
+capArm go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+capSt : OrdMap.OrdMap String (List Int)
+      -> (List RefCount.Statement -> List RefCount.Statement)
+      -> RefCount.Statement
+      -> RefCount.Statement
+capSt bor go (CLet x e) = CLet x (capExp bor go e)
+capSt bor go (CSet x e) = CSet x (capExp bor go e)
+capSt bor go (CIf c a b) = CIf (Owned.mapCond (capExp bor go) c) (go a) (go b)
+capSt bor go (CSwitch e arms r) =
+  CSwitch (capExp bor go e) (List.map (capArm go) arms) r
+capSt bor go (CReturn e) = CReturn (capExp bor go e)
+capSt bor go (CInPlace f es) =
+  CInPlace (capExp bor go f) (List.map (capExp bor go) es)
+capSt bor go (CRoomed f es) =
+  CRoomed (capExp bor go f) (List.map (capExp bor go) es)
+capSt bor go (CTail f es) =
+  CTail (capExp bor go f) (List.map (capExp bor go) es)
+capSt bor go (CLoop ps es) = CLoop ps (List.map (capExp bor go) es)
+capSt bor go (CLoopTo t ps es) = CLoopTo t ps (List.map (capExp bor go) es)
+capSt bor go (CJump g w es) = CJump g w (List.map (capExp bor go) es)
+capSt bor go s = s
+
+-- | statements, each lambda's take in them put off
+capStmts : OrdMap.OrdMap String (List Int)
+         -> List RefCount.Statement
+         -> List RefCount.Statement
+capStmts bor ss = List.map (capSt bor (capStmts bor)) ss
+
+capFun : OrdMap.OrdMap String (List Int) -> RefCount.Fun -> RefCount.Fun
+capFun bor f =
+  { key = f.key
+  , params = f.params
+  , lent = f.lent
+  , entry = capStmts bor f.entry
+  , body = capStmts bor f.body
+  , reprs = f.reprs
+  , ret = f.ret
+  , wrapper = f.wrapper
+  }
+
+-- | a definition of the C backend's, each lambda's take in it put off,
+-- | the parameters lent to each function as `bor` says
+capturesDef : OrdMap.OrdMap String (List Int) -> RefCount.Def -> RefCount.Def
+capturesDef bor (DFun f) = DFun (capFun bor f)
+capturesDef bor (DVal key ss reprs) = DVal key (capStmts bor ss) reprs
