@@ -71,6 +71,7 @@
 -- `with a := c` / `r := BOC.await act do ...` | the same, the body a behaviour on `c` once `act` has come to `r`
 -- `scheduled failed c` | `c` and its behaviours run, on domains, every behaviour waited for; `failed why` where one fails
 -- `scheduledWithReactor failed c` | the same, each domain running acts awaited in a reactor of its own, every act waited for too
+-- `scheduled (batch := n) failed c` | either, each domain running at most `n` behaviours in a row before the others ready get their turn (16 when not given)
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
@@ -197,10 +198,24 @@
 -- -- unless its turn came by a behaviour running on one of those
 -- domains, spawning it or ending and handing it a cown: then that
 -- domain keeps it, one at a time, and runs it next itself, as the
--- paper's threads keep a batch of their own, until it has run 64 in a
--- row, when it puts the next in the queue, so the others are not
--- starved.  No domain steals from another's batch, which is one
+-- paper's threads keep a batch of their own, until it has run its
+-- batch in a row, when it puts the next in the queue, so the others
+-- are not starved.  No domain steals from another's batch, which is one
 -- behaviour; a behaviour spawned by main is put in the queue.
+--
+-- The batch is 16 behaviours, or what `batch` is given (`scheduled
+-- (batch := 64) failed c`).  Longer batches keep a chain of behaviours
+-- on one domain, its cowns' cells warm there, and go through the queue
+-- -- its lock, and waking the domain that takes from it -- less often;
+-- the behaviours waiting in the queue wait for them meanwhile.  On 14
+-- cores a run of 64 chains, each behaviour spawning the next on its
+-- cown, did 1.17 million behaviours a second with batches of 64, 1.03
+-- million with 16 and 0.50 million with 4; std.http.bocserver, 256
+-- connections on 14 domains, answered with a 99th percentile of 82 ms
+-- with batches of 64, 22 ms with 16 and 8 ms with 4, at the same rate,
+-- its domains spending half the time with 4.  Shorter batches for
+-- many connections, or more domains than the cores free for them;
+-- longer ones for long chains of behaviours.
 --
 -- A behaviour is never stopped partway -- its body runs to its end,
 -- holding its cowns -- so the one a domain keeps would wait for the
@@ -292,7 +307,9 @@ type Outside (w : HFunctor) =
 -- its back reversed -- the domains with nothing to do waiting on a
 -- condition, counted, or in the reactor, where they have acts pending,
 -- counted too; whether the domains are to stop; and the workers, for
--- those waiting in the reactor to be woken.  Of the behaviours `b`:
+-- those waiting in the reactor to be woken; and how many behaviours a
+-- domain runs in a row from its slot, its batch, before it puts the
+-- next among those ready.  Of the behaviours `b`:
 -- each worker holds a copy of its own, made on its domain, and a
 -- behaviour is run with the copy of the worker running it, so that no
 -- record of it is counted by every domain at once)
@@ -311,6 +328,7 @@ type Scheduler (w : HFunctor) (b : Type) =
   , polling : Domain.Atomic Int
   , stopping : Domain.Atomic Bool
   , workers : List (Worker w b)
+  , batch : Int
   }
 
 -- (a behaviour spawned: how many of its cowns it still waits for, and
@@ -772,11 +790,6 @@ instanceHolderCownsAwait =
 
 -- The scheduler
 --------------------------------------------------------------------------------
-
--- (how many behaviours in a row a domain runs from its slot, before it
--- puts the next among those ready instead)
-batchLimit : Int
-batchLimit = 64
 
 -- (how many operations a body does, on a worker, before the worker
 -- lets its slot out: puts the behaviour in it among those ready)
@@ -1319,7 +1332,8 @@ afterTurn st worker = case st.outside of
 
 -- (the behaviour run on the worker, its body given the fuel in full,
 -- and after it the one left in the slot, and so on, `n` run so far in a
--- row: the limit reached, the next is put among those ready instead)
+-- row: the batch run, the next is put among those ready instead, at
+-- their back)
 ran : {w : HFunctor}
     -> {{dm : Domain.domain <: w}}
     -> Sched w
@@ -1335,7 +1349,7 @@ ran st worker (MkBehaviour count turn) n = do
   case next of
     Just b -> do
       Domain.set worker.slot (Nothing : Maybe (Behaviour w))
-      if n < batchLimit then ran st worker b (n + 1) else readied st b
+      if n < st.batch then ran st worker b (n + 1) else readied st b
     Nothing -> pure ()
 
 -- (a domain running behaviours, each ready one it takes and those left
@@ -1499,6 +1513,7 @@ heldHere st =
   , polling = st.polling
   , stopping = st.stopping
   , workers = st.workers
+  , batch = st.batch
   }
 
 -- (a worker, on its domain.  Where the scheduler waits on the world
@@ -1639,10 +1654,11 @@ scheduledBy : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> {{cu : Custodian.custodian <: w}}
             -> Maybe (Outside w)
+            -> Int
             -> (String -> Co w Unit)
             -> Co (boc w <+> w) a
             -> Co w a
-scheduledBy outside failed c = do
+scheduledBy outside batch failed c = do
   numbers <- Domain.newAtomic 0
   live <- Domain.newAtomic 1
   unreported <- Domain.newAtomic (Nothing : Maybe String)
@@ -1673,6 +1689,7 @@ scheduledBy outside failed c = do
     , polling = polling
     , stopping = stopping
     , workers = ws
+    , batch = batch
     }
   x <-
     with sc := Domain.scope do
@@ -1693,15 +1710,19 @@ scheduledBy outside failed c = do
 -- | every behaviour is waited for, and this fails as main did.  An act awaited (`await`) is run where it is
 -- | awaited, there and then, the behaviour holding its domain, and its
 -- | cowns, until it is done.  A behaviour runs with the custodian
--- | current where it was spawned, `w`'s.
+-- | current where it was spawned, `w`'s.  A domain runs at most `batch`
+-- | behaviours in a row that it made ready itself before the others
+-- | ready get their turn: fewer, for the others to wait less; more, for
+-- | long chains of behaviours to run faster.
 scheduled : {w : HFunctor}
           -> {a : Type}
+          -> {batch : Int := 16}
           -> {{dm : Domain.domain <: w}}
           -> {{cu : Custodian.custodian <: w}}
           -> (String -> Co w Unit)
           -> Co (boc w <+> w) a
           -> Co w a
-scheduled failed c = scheduledBy Nothing failed c
+scheduled failed c = scheduledBy Nothing (max 1 batch) failed c
 
 -- | `scheduled`, each domain waiting on the world through a reactor of
 -- | its own (std.reactor's, the C backend's): an act awaited (`await`)
@@ -1713,9 +1734,10 @@ scheduled failed c = scheduledBy Nothing failed c
 -- | behaviour is ready.  Every behaviour, and every act awaited, is
 -- | waited for.  An act that fails -- abandons, or fails in the runtime
 -- | -- is as a body that fails: `failed` given why, its `with`'s body
--- | not run, the others going on.
+-- | not run, the others going on.  `batch` as `scheduled`'s.
 scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
+                     -> {batch : Int := 16}
                      -> {{dm : Domain.domain <: w}}
                      -> {{cu : Custodian.custodian <: w}}
                      -> {{rx : Reactor.reactor <: w}}
@@ -1732,5 +1754,6 @@ scheduledWithReactor failed c =
        , close = \g -> Reactor.close g
        , wake = \g -> Reactor.wake g
        })
+    (max 1 batch)
     failed
     c
