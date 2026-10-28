@@ -77,10 +77,11 @@ static HeffCustody *heff_custody_of(V at) {
   return at && heff_tag_of(at) == TAG_Just ? heff_foreign_ptr(heff_field(at, 0)) : NULL;
 }
 
-// (the custodian current where the operation was asked, as the runtime
-// was told: its foreign value, or 0 for the root's)
-static V heff_custody_current(void) {
-  V at = heff_custody_env;
+// (the custodian current where the operation was asked: `here`, where
+// it says one -- std.domain's `rooted` says it -- else as the runtime
+// was told; its foreign value, or 0 for the root's)
+static V heff_custody_current(V here) {
+  V at = here && heff_tag_of(here) == TAG_Just ? here : heff_custody_env;
   return at && heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : 0;
 }
 
@@ -127,7 +128,10 @@ static void heff_ticket_let_go(void *p) {
   free(t);
 }
 
-static V heff_provider_custodian(V p, V k) {
+// (an operation, `here` the custodian current where it was asked, if
+// its asker says so -- std.domain's `rooted`, in a world without the
+// custodian's effect -- else 0, the one the runtime was told)
+static V heff_custodian_at(V p, V k, V here) {
   V x;
   // (an operation, taken out of its `Asked` or `Given`)
   if (heff_tag_of(p) == TAG_Asked || heff_tag_of(p) == TAG_Given) {
@@ -146,7 +150,7 @@ static V heff_provider_custodian(V p, V k) {
     c->contains = contains;
     c->q = heff_due_queue();
     V cv = heff_share(heff_foreign(c, heff_custody_let_go));
-    V pv = heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : heff_custody_current();
+    V pv = heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : heff_custody_current(here);
     HeffCustody *parent = pv ? heff_foreign_ptr(pv) : NULL;
     if (parent) {
       HEFF_CUSTODY_LOCK();
@@ -209,7 +213,7 @@ static V heff_provider_custodian(V p, V k) {
     break;
   }
   case TAG_Own: {
-    V cv = heff_custody_current();
+    V cv = heff_custody_current(here);
     // (a thing of the root's: as it is)
     if (!cv) {
       x = heff_dup(heff_field(p, 1));
@@ -238,7 +242,7 @@ static V heff_provider_custodian(V p, V k) {
     break;
   }
   case TAG_Failed: {
-    V cv = heff_custody_current();
+    V cv = heff_custody_current(here);
     size_t len;
     char *why = heff_bytes(heff_field(p, 0), &len);
     if (cv) heff_custody_failed(heff_foreign_ptr(cv), why);
@@ -250,7 +254,8 @@ static V heff_provider_custodian(V p, V k) {
   }
   case TAG_Current: {
     V g = heff_dup(heff_field(p, 0));
-    V at = heff_custody_env ? heff_dup(heff_custody_env) : NTAG(TAG_Nothing);
+    V at = here && heff_tag_of(here) == TAG_Just ? heff_dup(here)
+         : heff_custody_env ? heff_dup(heff_custody_env) : NTAG(TAG_Nothing);
     heff_drop(p);
     x = heff_answer(g, at);
     break;
@@ -270,7 +275,7 @@ static V heff_provider_custodian(V p, V k) {
   }
   case TAG_Kept: {
     HeffTicket *t = heff_alloc(sizeof *t);
-    V cv = heff_custody_current();
+    V cv = heff_custody_current(here);
     t->owner = cv ? heff_dup(cv) : 0;
     t->release = heff_share(heff_carried_fn(heff_dup(heff_field(p, 0))));
     t->q = heff_due_queue();
@@ -294,3 +299,5 @@ static V heff_provider_custodian(V p, V k) {
   }
   return heff_tail(k, 1, &x);
 }
+
+static V heff_provider_custodian(V p, V k) { return heff_custodian_at(p, k, 0); }

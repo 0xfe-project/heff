@@ -406,6 +406,10 @@ static void dm_wait(pthread_cond_t *c, pthread_mutex_t *m) {
 
 // The operations --------------------------------------------------------------------
 
+// (the custodian's provider, bundled wherever this one is: `rooted`'s
+// operations are answered by it, the custodian current as `rooted` says)
+static V heff_custodian_at(V p, V k, V here);
+
 #define DM_ATOMIC(v) ((DmAtomic *)heff_foreign_ptr(v))
 #define DM_DOMAIN(v) ((DmDomain *)heff_foreign_ptr(v))
 #define DM_QUEUE(v) ((DmQueue *)heff_foreign_ptr(v))
@@ -574,6 +578,15 @@ static V heff_provider_domain(V p, V k) {
     heff_drop(tk);
     x = heff_answer(g, v);
     break;
+  }
+  // (an operation of the custodian's, from `rooted`: the custodian's
+  // provider's, the custodian current the one `rooted` says)
+  case TAG_CustodyOp: {
+    V here = heff_dup(heff_field(p, 0)), q = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V r = heff_custodian_at(q, k, here);
+    heff_drop(here);
+    return r;
   }
   default:
     heff_fail("not an operation of domain");

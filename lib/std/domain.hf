@@ -58,6 +58,7 @@
 -- `signal c` / `broadcast c` | one domain waiting on `c` woken; ... every one
 -- `newQueue` | a queue, for every domain: what is put in it is taken out once
 -- `put q v` / `take q` | `v` put at the back, never waiting; the front taken out, waiting while empty
+-- `rooted c` | `c`'s custodian the runtime's custodians, for a world that names none: its `with`s in their custody, a failure at the root the program's
 --
 -- `cas` compares by identity, as OCaml's `Atomic.compare_and_set`: a
 -- number of a word or a constructor without fields is itself, anything
@@ -162,9 +163,11 @@ module std.domain
   , take
   , instanceBinderScope
   , instanceHolderScope
+  , rooted
   )
 
 import co
+import custodian as Custodian
 
 -- | A domain whose answer is an `a`.  (The runtime's own, a foreign
 -- | value: no value of the program has it.)
@@ -300,6 +303,7 @@ data DomainF (m : Type -> Type) x
   | NewQueue (Some (MakingQueue x))
   | PutQueue (Some (Putting x))
   | TakeQueue (Some (Taking x))
+  | CustodyOp (Maybe Custodian.Custodian) (Custodian.CustodianF m x)
 
 -- | For OS threads, domains: spawned and joined, a failure caught, and
 -- | what they share -- atomics, mutexes, conditions and queues.
@@ -327,6 +331,7 @@ domain =
       NewQueue s -> NewQueue (someThen (makingQueueThen g) s)
       PutQueue s -> PutQueue (someThen (puttingThen g) s)
       TakeQueue s -> TakeQueue (someThen (takingThen g) s)
+      CustodyOp at q -> CustodyOp at (Custodian.custodianThen g q)
   , hmap = \m n nt p -> case p of
       Spawn s -> Spawn (someThen (spawningBy nt) s)
       Join s -> Join s
@@ -348,6 +353,7 @@ domain =
       NewQueue s -> NewQueue s
       PutQueue s -> PutQueue s
       TakeQueue s -> TakeQueue s
+      CustodyOp at q -> CustodyOp at (Custodian.custodianBy nt q)
   }
 
 -- Domains
@@ -744,3 +750,57 @@ instance instanceHolderScope : {e : HFunctor}
                                (\r -> r)
 instanceHolderScope =
   { held = \c written body -> heldScope (\sc -> body (s := Unit) sc) }
+
+-- The runtime's custodians, for a world without them
+--------------------------------------------------------------------------------
+
+-- (what `rooted` handles a computation into: one given the custodian
+-- current, `Nothing` the one the runtime has where it runs)
+type Rooting (e : HFunctor) a = Maybe Custodian.Custodian -> Co e a
+
+rootingFunctor : (e : HFunctor) -> RawFunctor
+rootingFunctor e =
+  { f = \a -> Rooting e a
+  , fmap = \g m -> \c -> bind (m c) (\x -> val (g x))
+  }
+
+-- (an operation of `e`, its computations given the custodian current;
+-- a computation run with a custodian current, given it; and the
+-- custodian's others, with the one current, the runtime's to answer)
+rootingAlg : {e : HFunctor}
+           -> {a : Type}
+           -> {{dm : domain <: e}}
+           -> (e <+> Custodian.custodian).f (\t -> Rooting e t) a
+           -> Maybe Custodian.Custodian
+           -> Co e a
+rootingAlg (InL q) c =
+  op (e.hmap (rootingFunctor e) (coFunctor e) (\m -> m c) q) val
+rootingAlg (InR (Given (Under k s))) c =
+  s (Co e a) (\b r -> case r of
+    MkRunning body after -> bind (body (Just k)) (\v -> pure (after v)))
+rootingAlg (InR q) c =
+  op (dm (CustodyOp c (Custodian.custodianBy (\m -> m c) q))) val
+
+-- | `c`, its custodian's operations the runtime's custodians', as a
+-- | world with the custodian's effect has them: the things its `with`s
+-- | hold in their custody, a failure that reaches the root the
+-- | program's.  So a world without that effect -- a `main` that does
+-- | not name it -- has custodians all the same, through the domains',
+-- | whose provider passes the operations on; and `c`'s is the only one
+-- | in its world.  In a world with the custodian's effect, `c`'s are
+-- | under the one current where it runs.
+rooted : {e : HFunctor}
+       -> {a : Type}
+       -> {{dm : domain <: e}}
+       -> Co (e <+> Custodian.custodian) a
+       -> Co e a
+rooted c =
+  handle
+    ({ M = \t -> Rooting e t
+     , ret = \x -> \cur -> pure x
+     , bind = \m f -> \cur -> bind (m cur) (\x -> f x cur)
+     , malg = \p -> \cur -> rootingAlg p cur
+     } :
+       Handler (e <+> Custodian.custodian))
+    c
+    Nothing

@@ -244,17 +244,35 @@ lower g roots = erasedWith (lowerKept False) roots (Erase.eraseProgram g)
 -- the runtime the one it is performed in (`CustodyIn`) just before it,
 -- for the providers to read.  What an operation carries to run is given
 -- the custodian current there by the provider that runs it.  A world
--- without custodians has no such argument.
+-- without custodians has no such argument; where it has std.domain's
+-- effect, whose `rooted` reaches the runtime's custodians, what is due
+-- is run before each operation all the same.
 
 entryKey : String
 entryKey = "run$entry"
 
+-- | What a program's entry does of custodians: nothing; runs the
+-- | releases due before each operation; or that, and reads the
+-- | custodian current too.
+data EntryCustody = NoCustody | DueOnly | Reading
+
 -- (names of its own: `$`-numbered from where erasure's ended)
--- | whether a program of the world whose effects are of these modules
--- | runs the releases due before each operation, and reads the
--- | custodian current: where it has the custodian's effect
-dueWorld : List String -> Bool
-dueWorld ms = List.any (\m -> strEq m "custodian") ms
+-- | what a program of the world whose effects are of these modules does
+-- | of custodians: where it has the custodian's effect, it reads the one
+-- | current and runs the releases due; where it has std.domain's, whose
+-- | `rooted` gives a world without the custodian's effect the runtime's
+-- | custodians, it runs the releases due
+-- | >>> dueWorld ["std.io", "custodian"]
+-- | Reading
+-- | >>> dueWorld ["std.domain"]
+-- | DueOnly
+-- | >>> dueWorld ["std.io"]
+-- | NoCustody
+dueWorld : List String -> EntryCustody
+dueWorld ms =
+  if List.any (\m -> strEq m "custodian") ms then Reading
+  else if List.any (\m -> strEq m "std.domain") ms then DueOnly
+  else NoCustody
 
 -- (a name of the entry's own, the `i`th after `n`)
 entryName : String -> Int -> Int -> String
@@ -262,10 +280,15 @@ entryName s n i = s ^ "$" ^ debug (n + i)
 
 -- (an operation performed: where releases are due, what is due on the
 -- domain run first, and the custodian current told the runtime)
-performed : Bool -> Int -> IR.Expr
-performed False n =
+performed : EntryCustody -> Int -> IR.Expr
+performed NoCustody n =
   EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]
-performed True n =
+performed DueOnly n =
+  ELet
+    (entryName "due" n 6)
+    (EPrimCall CustodianDue Nil)
+    (EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)])
+performed Reading n =
   ELet
     (entryName "due" n 6)
     (EPrimCall CustodianDue Nil)
@@ -276,8 +299,8 @@ performed True n =
 
 -- (the continuation monad's `ret`, `bind` and algebra, and the program's
 -- computation run: given its handler, what follows it, and its end)
-entryCps : String -> Int -> IR.Expr
-entryCps key n =
+entryCps : EntryCustody -> String -> Int -> IR.Expr
+entryCps due key n =
   EApp
     (EGlobal key)
     [ ERecord
@@ -300,7 +323,7 @@ entryCps key n =
               ]))
       , MkPair
         "malg"
-        (ELam [entryName "p" n 6, entryName "k" n 7] (performed False n))
+        (ELam [entryName "p" n 6, entryName "k" n 7] (performed due n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
@@ -344,7 +367,7 @@ entryReading key n =
         "malg"
         (ELam
            [entryName "p" n 6, entryName "c" n 12, entryName "k" n 7]
-           (performed True n))
+           (performed Reading n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
@@ -354,9 +377,9 @@ entryReading key n =
     , ELam [entryName "x" n 10] (ETag "MkUnit" Nil Nil)
     ]
 
-entryBody : Bool -> String -> Int -> IR.Expr
-entryBody False key n = entryCps key n
-entryBody True key n = entryReading key n
+entryBody : EntryCustody -> String -> Int -> IR.Expr
+entryBody Reading key n = entryReading key n
+entryBody due key n = entryCps due key n
 
 -- (... its workers, of what else is known)
 withWorkersOf : List IR.Def -> Facts.Facts -> Facts.Facts
@@ -657,14 +680,18 @@ pieceStep g vers ks acc (MkPair k e) =
     Nothing -> erasedPieces k acc (Erase.definition g k e acc.supply)
 
 -- (the entry's version: its computation's, if it has one)
-entryVer : Bool -> OrdMap.OrdMap String String -> String -> String
+-- (the entry's version's prefix, by what it does of custodians)
+entryPrefix : EntryCustody -> String
+entryPrefix NoCustody = "entry/"
+entryPrefix DueOnly = "entry-dueonly/"
+entryPrefix Reading = "entry-due/"
+
+entryVer : EntryCustody -> OrdMap.OrdMap String String -> String -> String
 entryVer due vers key = case OrdMap.lookup vers key of
-  Just v ->
-    if strEq v "" then ""
-    else (if due then "entry-due/" else "entry/") ^ v
+  Just v -> if strEq v "" then "" else entryPrefix due ^ v
   Nothing -> ""
 
-entryKept : Bool -> String -> KeptUnit -> Piece
+entryKept : EntryCustody -> String -> KeptUnit -> Piece
 entryKept due key u =
   { owner = entryKey
   , key = u.def.key
@@ -679,7 +706,7 @@ entryKept due key u =
   , refs = u.refs
   }
 
-entryPieces : Bool
+entryPieces : EntryCustody
             -> OrdMap.OrdMap String String
             -> Keeps
             -> String
@@ -830,7 +857,7 @@ reachedIn r ps = List.keepIf (\(p : Piece) -> OrdMap.member r p.key) ps
 reachedPieces : List Piece -> List Piece
 reachedPieces ps = reachedIn (Shake.reached (Cons entryKey Nil) (refsMap ps)) ps
 
-piecesWith : Bool
+piecesWith : EntryCustody
            -> OrdMap.OrdMap String String
            -> Keeps
            -> String
@@ -849,7 +876,7 @@ piecesWith due vers ks key acc =
 -- | a program running the computation `key`, its entry (`entryKey`) and
 -- | what it reaches, simplified -- each definition of the core the cache keeps at its version (`vers`)
 -- | taken as it keeps it -- and what the cache is to keep of it
-lowerProgramKept : Bool
+lowerProgramKept : EntryCustody
                  -> Globals.Globals
                  -> String
                  -> OrdMap.OrdMap String String
