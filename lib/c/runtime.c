@@ -2965,17 +2965,13 @@ HEFF_FN V heff_onWindows(V u) {
 #endif
 }
 
-// (std.math's: libm's, as JavaScript's `Math` has them)
+// (std.math's: libm's, as JavaScript's `Math` has them -- but sin, cos,
+// tan, exp and log, the runtime's own, bundled after it)
 #define FLT1(name, f) \
   HEFF_FN V name(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(f(x)); }
-FLT1(heff_floatSin, sin)
-FLT1(heff_floatCos, cos)
-FLT1(heff_floatTan, tan)
 FLT1(heff_floatAsin, asin)
 FLT1(heff_floatAcos, acos)
 FLT1(heff_floatAtan, atan)
-FLT1(heff_floatExp, exp)
-FLT1(heff_floatLog, log)
 FLT2(heff_floatAtan2, heff_flt(atan2(x, y)))
 FLT2(heff_floatPow, heff_flt(pow(x, y)))
 
