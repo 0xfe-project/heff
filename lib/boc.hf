@@ -15,6 +15,7 @@
 -- ```haskell
 -- import boc as BOC
 -- import co
+-- import custodian as Custodian
 -- import std.domain as Domain
 --
 -- -- | `n` moved from one account to the other: one behaviour on both
@@ -49,7 +50,10 @@
 --   pure seen
 --
 -- -- | the behaviours run, every one done: what bob has, 5
--- bobHas : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
+-- bobHas : {e : HFunctor}
+--        -> {{dm : Domain.domain <: e}}
+--        -> {{cu : Custodian.custodian <: e}}
+--        -> Co e Int
 -- bobHas = do
 --   seen <-
 --     BOC.scheduled
@@ -89,6 +93,19 @@
 -- is to come after others on a cown is spawned after them on it, and
 -- `scheduled` gives main's answer once every behaviour is done.  The
 -- same cown twice in one `when` is abandoned when the `when` runs.
+--
+-- A behaviour is a user of a custodian, not one of its things, as a
+-- cml thread is: it takes the custodian current where it is spawned --
+-- `k` in a `with k := Custodian.custody do` (or `contained`), else the
+-- one current where `scheduled` runs -- and its body runs with that
+-- one current, so the things its `with`s hold are in its custody, and
+-- the behaviours it spawns take it too.  An act awaited, and the
+-- behaviour after it, take the one current at the `await`.  No
+-- shutdown stops a behaviour.  A `with` of a custodian in a body is
+-- the body's, for its extent, since a behaviour runs to its end without
+-- waiting.  The custodian is the one of the scheduler's world:
+-- `scheduled` asks for `custodian <: w`, and a `main` that runs it
+-- names `custodian` in its world.
 --
 -- A behaviour whose body fails -- abandons, or fails in the runtime --
 -- is done with that: its cowns hold what they held, since what they
@@ -220,6 +237,7 @@ module boc
   )
 
 import co
+import custodian as Custodian
 import std.domain as Domain
 import std.reactor as Reactor
 
@@ -1112,11 +1130,26 @@ runnerFunctor w =
   , fmap = \g m -> \runner -> bind (m runner) (\x -> val (g x))
   }
 
+-- (`c` run with `k` the custodian current, where there is one: a body
+-- run later, elsewhere, as the custodian current where it was spawned
+-- has it)
+custodiedAt : {w : HFunctor}
+            -> {t : Type}
+            -> {{cu : Custodian.custodian <: w}}
+            -> Maybe Custodian.Custodian
+            -> Co w t
+            -> Co w t
+custodiedAt Nothing c = c
+custodiedAt (Just k) c = Custodian.custodied k c
+
 -- (an operation, on `runner`, charged to the body's fuel: the world's
--- own forwarded, their computations given the runner)
+-- own forwarded, their computations given the runner; a behaviour
+-- spawned, and an act awaited and what comes after it, run with the
+-- custodian current here)
 bocAlg : {w : HFunctor}
        -> {x : Type}
        -> {{dm : Domain.domain <: w}}
+       -> {{cu : Custodian.custodian <: w}}
        -> Sched w
        -> ({t : Type} -> Body (BocF w) w t -> Runner w -> Co w t)
        -> Runner w
@@ -1127,16 +1160,30 @@ bocAlg st opened runner (InL (NewCown s)) = do
   s (Co w x) (\a mk -> madeCown st mk)
 bocAlg st opened runner (InL (When s)) = do
   charged st runner
+  cust <- Custodian.current
   s (Co w x) (\t bh -> case bh of
     MkBehaving hs rd wr body k ->
       bind
-        (spawnedOn st runner hs rd wr (\v -> opened (body v)))
+        (spawnedOn
+           st
+           runner
+           hs
+           rd
+           wr
+           (\v on -> custodiedAt cust (opened (body v) on)))
         (\u -> pure k))
 bocAlg st opened runner (InL (Awaits s)) = do
   charged st runner
+  cust <- Custodian.current
   s (Co w x) (\t aw -> case aw of
     MkAwaiting act k next ->
-      bind (awaited st runner act (\v -> opened (k v))) (\u -> pure next))
+      bind
+        (awaited
+           st
+           runner
+           (custodiedAt cust act)
+           (\v on -> custodiedAt cust (opened (k v) on)))
+        (\u -> pure next))
 bocAlg st opened runner (InR q) = do
   charged st runner
   op (w.hmap (runnerFunctor w) (coFunctor w) (\m -> m runner) q) val
@@ -1146,6 +1193,7 @@ bocAlg st opened runner (InR q) = do
 -- is run)
 bocHandlerBy : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
+             -> {{cu : Custodian.custodian <: w}}
              -> Sched w
              -> ({t : Type} -> Body (BocF w) w t -> Runner w -> Co w t)
              -> Handler (boc w <+> w)
@@ -1161,6 +1209,7 @@ bocHandlerBy st opened =
 opening : {w : HFunctor}
         -> {t : Type}
         -> {{dm : Domain.domain <: w}}
+        -> {{cu : Custodian.custodian <: w}}
         -> Sched w
         -> Body (BocF w) w t
         -> Runner w
@@ -1173,6 +1222,7 @@ opening st b =
 -- (the handler, its bodies spawned run by it too)
 bocHandler : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
+           -> {{cu : Custodian.custodian <: w}}
            -> Sched w
            -> Handler (boc w <+> w)
 bocHandler st = bocHandlerBy st (\b -> opening st b)
@@ -1500,6 +1550,7 @@ mainAnswered (Left why) = Domain.fail why
 mainRun : {w : HFunctor}
         -> {a : Type}
         -> {{dm : Domain.domain <: w}}
+        -> {{cu : Custodian.custodian <: w}}
         -> Sched w
         -> Co (boc w <+> w) a
         -> Co w a
@@ -1515,6 +1566,7 @@ mainRun st c = do
 scheduledBy : {w : HFunctor}
             -> {a : Type}
             -> {{dm : Domain.domain <: w}}
+            -> {{cu : Custodian.custodian <: w}}
             -> Maybe (Outside w)
             -> (String -> Co w Unit)
             -> Co (boc w <+> w) a
@@ -1569,10 +1621,12 @@ scheduledBy outside failed c = do
 -- | behaviour is done, instead of giving the answer; where main fails,
 -- | every behaviour is waited for, and this fails as main did.  An act awaited (`await`) is run where it is
 -- | awaited, there and then, the behaviour holding its domain, and its
--- | cowns, until it is done.
+-- | cowns, until it is done.  A behaviour runs with the custodian
+-- | current where it was spawned, `w`'s.
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
+          -> {{cu : Custodian.custodian <: w}}
           -> (String -> Co w Unit)
           -> Co (boc w <+> w) a
           -> Co w a
@@ -1592,6 +1646,7 @@ scheduled failed c = scheduledBy Nothing failed c
 scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
                      -> {{dm : Domain.domain <: w}}
+                     -> {{cu : Custodian.custodian <: w}}
                      -> {{rx : Reactor.reactor <: w}}
                      -> (String -> Co w Unit)
                      -> Co (boc w <+> w) a
