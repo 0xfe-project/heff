@@ -52,14 +52,19 @@
 static HEFF_TLS V dm_held;
 
 static V dm_open_fn(V self, V *a) {
+  (void)self;
   dm_held = a[0];
-  heff_drop(self);
   return NTAG(TAG_MkUnit);
 }
 
+// (`dm_open_fn` as a function of the program's: one for good, never
+// counted, as a lambda capturing nothing is -- not one made for each
+// operation)
+static Clo dm_open_clo = {{0x80000000u, K_CLO, 0}, dm_open_fn, 1, 0};
+
 // (what `s` holds; `s` consumed)
 static V dm_open(V s) {
-  heff_drop(heff_answer(s, heff_clo(dm_open_fn, 1, 0, NULL)));
+  heff_drop(heff_answer(s, (V)&dm_open_clo));
   return dm_held;
 }
 
