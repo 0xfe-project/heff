@@ -55,7 +55,8 @@ module parse.surface (parse, Token, Tree(..), (<+>))
 The list after the name says what an importer sees:
 
 - A name not in the list belongs to the module. An importer does not
-  see it, as a name or as an instance.
+  see it, as a name or as an instance; `M.x` of it, through an alias,
+  is E0353.
 - A data type listed as `T` is seen without its tags: an importer can
   use the type, but cannot build or match its values with the tags
   (E0353). `T(..)` exposes the tags too.
@@ -128,4 +129,4 @@ Tags are not definitions: two data types may have tags of the same name.
 | E0155 | an export list names something twice, or `(..)` on what is not a data type |
 | E0156 | the module claim is missing |
 | E0157 | the module claim names another module |
-| E0353 | a tag the module does not export |
+| E0353 | a name or a tag the module does not export |
