@@ -1,0 +1,167 @@
+-- A `with` of bindings with a condition, `with x := M where p do`, held
+-- by a holder of the program's own: what it offers is taken, `p`
+-- checked, and where it does not hold, let go of and the next taken,
+-- until one holds -- each taking and letting go written to a log, a
+-- state of the block around.  The holder is told which names `p`
+-- reads; one that offers nothing more gives up, its `with` coming to
+-- `Nothing`.
+
+module test.programs.with-where
+
+import co
+import state
+
+data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
+
+nothingElse : HFunctor
+nothingElse =
+  { f = NoneF
+  , hfmap = \m g p -> case p of
+      NoneOf q -> abandon
+  , hmap = \m n nt p -> case p of
+      NoneOf q -> abandon
+  }
+
+noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
+noneAlg (NoneOf q) = noneAlg q
+
+ranAlone : Handler nothingElse
+ranAlone =
+  { M = \x -> x
+  , ret = \x -> x
+  , bind = \m k -> k m
+  , malg = \p -> noneAlg p
+  }
+
+ran : {a : Type} -> Co nothingElse a -> a
+ran c = handle ranAlone c
+
+-- (numbers offered in turn: a `with n := offered xs` takes the first,
+-- and, let go of, the next)
+data Offered = MkOffered (List Int)
+
+offered : List Int -> Offered
+offered xs = MkOffered xs
+
+instance instanceBinderOffered : Binder Offered
+instanceBinderOffered =
+  { Contents = \w s -> Int, World = \w -> w, Result = \r -> Maybe (r, Int) }
+
+-- (a piece of the log, appended)
+logged : {e : HFunctor} -> {{lg : state String <: e}} -> String -> Co e Unit
+logged str = do
+  l <- get
+  put (l ^ str)
+
+-- (a holder that cannot wait: the first offered, the body run with it)
+instance instanceHolderOffered : {e : HFunctor}
+                               -> {{lg : state String <: e}}
+                               -> Holder
+                                 e
+                                 Offered
+                                 (\s -> Int)
+                                 (\w -> w)
+                                 (\r -> Maybe (r, Int))
+instanceHolderOffered =
+  { held = \c written body -> case c of
+      MkOffered (x :: rest) ->
+        bind (body (s := Unit) x) (\p -> pure (Just (fst p, snd p)))
+      MkOffered Nil -> pure Nothing
+  }
+
+-- (each offered taken in turn: where `p` does not hold of it, let go
+-- of, and the next taken)
+taken : {e : HFunctor}
+      -> {{lg : state String <: e}}
+      -> {r : Type}
+      -> List Int
+      -> (Int -> Bool)
+      -> (Int -> Co e (r, Int))
+      -> Co e (Maybe (r, Int))
+taken Nil p body = do
+  logged "none held; "
+  pure Nothing
+taken (x :: rest) p body = do
+  logged ("took " ^ debug x)
+  if p x
+  then do
+    logged "; "
+    q <- body x
+    pure (Just q)
+  else do
+    logged ", let go; "
+    taken rest p body
+
+instance instanceWaiterOffered : {e : HFunctor}
+                               -> {{lg : state String <: e}}
+                               -> Waiter
+                                 e
+                                 Offered
+                                 (\s -> Int)
+                                 (\w -> w)
+                                 (\r -> Maybe (r, Int))
+instanceWaiterOffered =
+  { heldWhere = \c written read p body -> case c of
+      MkOffered xs -> do
+        logged ("reads " ^ debug read ^ "; ")
+        taken xs (\v -> p (s := Unit) v) (\v -> body (s := Unit) v)
+  }
+
+-- (taken until one is past 3: 1 and 2 let go of, 4 held, and set)
+past : {e : HFunctor}
+     -> {{lg : state String <: e}}
+     -> Co e (Maybe (String, Int))
+past = do
+  with n := offered [1, 2, 4, 7]
+    where n > 3
+  do
+    logged ("held " ^ debug n ^ "; ")
+    n := n * 10
+    pure "past 3"
+
+-- | what the `with` came to, and the log
+-- | >>> pastAlone
+-- | MkPair (Just (MkPair "past 3" 40)) "reads [True]; took 1, let go; took 2, let go; took 4; held 4; "
+pastAlone : (Maybe (String, Int), String)
+pastAlone = ran (runState "" (past (lg := _)))
+
+-- (a condition that holds of none: each let go of, and the holder gives
+-- up)
+never : {e : HFunctor} -> {{lg : state String <: e}} -> Co e (Maybe (Int, Int))
+never = do
+  with n := offered [1, 2]
+    where n < 0
+  do
+    pure n
+
+-- | >>> neverAlone
+-- | MkPair Nothing "reads [True]; took 1, let go; took 2, let go; none held; "
+neverAlone : (Maybe (Int, Int), String)
+neverAlone = ran (runState "" (never (lg := _)))
+
+-- (a condition of no name: it reads none)
+unread : {e : HFunctor}
+       -> {{lg : state String <: e}}
+       -> Int
+       -> Co e (Maybe (Int, Int))
+unread k = do
+  with n := offered [5, 6]
+    where k > 0
+  do
+    pure (n + k)
+
+-- | >>> unreadAlone
+-- | MkPair (Just (MkPair 6 5)) "reads [False]; took 5; "
+unreadAlone : (Maybe (Int, Int), String)
+unreadAlone = ran (runState "" (unread (lg := _) 1))
+
+-- (with no condition, the holder's `held`: the first offered)
+plain : {e : HFunctor} -> {{lg : state String <: e}} -> Co e (Maybe (Int, Int))
+plain = do
+  with n := offered [1, 2] do
+    pure n
+
+-- | >>> plainAlone
+-- | MkPair (Just (MkPair 1 1)) ""
+plainAlone : (Maybe (Int, Int), String)
+plainAlone = ran (runState "" (plain (lg := _)))

@@ -395,12 +395,15 @@ data ExprF
   -- | statements, its body
   | EWith (Params.Spanned ExprF) String Params.Span (Stmts
                                                        (Params.Spanned ExprF))
-  -- | `with x := M do ...`: the bindings, the statements, its body (a
-  -- | block of its own: the names its variables, nothing of the block
-  -- | around set or left from it)
-  | EWithBound (List (Params.Spanned (Binding (Params.Spanned ExprF)))) (Stmts
+  -- | `with x := M where p do ...`: the bindings, its condition, if it
+  -- | has one (of the names), the statements, its body (a block of its
+  -- | own: the names its variables, nothing of the block around set or
+  -- | left from it)
+  | EWithBound (List (Params.Spanned (Binding (Params.Spanned ExprF)))) (Maybe
                                                                            (Params.Spanned
-                                                                              ExprF))
+                                                                              ExprF)) (Stmts
+                                                                                         (Params.Spanned
+                                                                                            ExprF))
 
 type Expr = Params.Spanned ExprF
 
@@ -965,6 +968,15 @@ bindingAcc : {s : Type}
 bindingAcc f st (At (MkBinding x xsp e) sp) =
   pairK (f st e) (\st1 e' -> MkPair st1 (At (MkBinding x xsp e') sp))
 
+-- (the expression there is, by `f`)
+maybeAcc : {s : Type}
+         -> (s -> Expr -> Pair s Expr)
+         -> s
+         -> Maybe Expr
+         -> Pair s (Maybe Expr)
+maybeAcc f st Nothing = MkPair st Nothing
+maybeAcc f st (Just e) = pairK (f st e) (\st1 e' -> MkPair st1 (Just e'))
+
 -- | each expression of a `try`'s statements, by `f` (its type, none)
 tryAcc : {s : Type}
        -> (s -> Expr -> Pair s Expr)
@@ -1068,11 +1080,15 @@ childrenAcc f st (At (EWith w x xsp body) sp) =
        pairK
          (accList (stmtAcc f) st1 body)
          (\st2 body' -> MkPair st2 (At (EWith w' x xsp body') sp)))
--- (a `with`'s bindings: its body is a block of its own)
-childrenAcc f st (At (EWithBound bs body) sp) =
+-- (a `with`'s bindings and its condition: its body is a block of its
+-- own)
+childrenAcc f st (At (EWithBound bs w body) sp) =
   pairK
     (accList (bindingAcc f) st bs)
-    (\st1 bs' -> MkPair st1 (At (EWithBound bs' body) sp))
+    (\st1 bs' ->
+       pairK
+         (maybeAcc f st1 w)
+         (\st2 w' -> MkPair st2 (At (EWithBound bs' w' body) sp)))
 childrenAcc f st e = MkPair st e
 
 -- | the expressions an expression holds, each by `f`
@@ -1165,10 +1181,17 @@ guardE g (At (EDo ss) sp) =
        , inLam = False
        })
     (At (EDo ss) sp)
-guardE g (At (EWithBound bs body) sp) =
+-- (a `with`'s condition is checked later, perhaps again and again, as
+-- a lambda's body is)
+guardE g (At (EWithBound bs w body) sp) =
   At
     (EWithBound
        (List.map (bindingBy (guardE g)) bs)
+       (snd
+          (maybeAcc
+             (\u c -> MkPair u (guardE { muts = g.muts, inLam = True } c))
+             (MkUnit : Unit)
+             w))
        (List.map
           (\st ->
              snd
@@ -1286,12 +1309,12 @@ liftE l acc (At (ELetIn rhs (At (MkAlt p body) asp)) sp) =
 liftE l acc (At (ETry tr) sp) = MkPair acc (At (ETry tr) sp)
 liftE l acc (At (EWith w x xsp body) sp) =
   MkPair acc (At (EWith w x xsp body) sp)
--- (a `with`'s bindings' `(<- c)` bound before it; its body, a block of
--- its own, guarded)
-liftE l acc (At (EWithBound bs body) sp) =
+-- (a `with`'s bindings' `(<- c)` bound before it; its condition and
+-- its body, a block of its own, guarded)
+liftE l acc (At (EWithBound bs w body) sp) =
   pairK
     (accList (bindingAcc (liftE l)) acc bs)
-    (\acc1 bs' -> MkPair acc1 (guardE l.guard (At (EWithBound bs' body) sp)))
+    (\acc1 bs' -> MkPair acc1 (guardE l.guard (At (EWithBound bs' w body) sp)))
 liftE l acc e = childrenAcc (liftE l) acc e
 
 -- | `k` of the expression, its `(<- c)` bound before
@@ -2454,47 +2477,59 @@ assignedIn ss =
   assignsOf (At (EAssign x _ v) _) acc = assignsOf v (Cons x acc)
   assignsOf e acc = fst (childrenAcc (\a c -> MkPair (assignsOf c a) c) acc e)
 
+-- | whether the expression names `x`: a variable of that name anywhere
+-- | in it, bound again inside it or not
+mentions : String -> Expr -> Bool
+mentions x (At (EVar y) _) = strEq x y
+mentions x e = fst (childrenAcc (\b c -> MkPair (b || mentions x c) c) False e)
+
 -- | `with x := M ... do ss`: co's `holding` of what the names are bound
 -- | to (`M`, or a pair of the first and the rest's, nesting to the
 -- | right), which of them `ss` sets (a `Bool` each), and its body: `ss`
 -- | a block of its own, the names its variables, given what they are
--- | bound to and giving back its value beside what they are at its end
+-- | bound to and giving back its value beside what they are at its end.
+-- | With a condition, `with x := M ... where p do ss`: co's
+-- | `holdingWhere`, given, after which names `ss` sets, which `p` reads
+-- | (a `Bool` each) and `p` over the names
 withBoundOf : Params.Span
             -> List (Params.Spanned (Binding Expr))
+            -> Maybe Expr
             -> List (Params.Spanned (Stmt Expr))
             -> Expr
-withBoundOf sp bs body =
+withBoundOf sp bs w body =
   app
-    (At (EVar "holding") sp)
-    [ rightTuple
-      sp
-      (List.map
-         (\b -> case b of
-          At (MkBinding _ _ m) _ -> m)
-         bs)
-    , listOfE
-      sp
-      (List.map
-         (\x ->
-            boolOf
-              (At
-                 (ETag
-                    (if List.elem x (assignedIn body) then "True" else "False"))
-                 sp))
-         names)
-    , namesLam
-      (doT.stmts
-         { names = coNames
-         , muts = names
-         , loop = Nothing
-         , sp = sp
-         , depth = 0
-         , giving = Nothing
-         , bound = Just (rightTuple sp (List.map (\x -> At (EVar x) sp) names))
-         }
-         body
-         EndValue)
-    ]
+    (At
+       (EVar (case w of
+        Just _ -> "holdingWhere"
+        Nothing -> "holding"))
+       sp)
+    (List.append
+       [ rightTuple
+         sp
+         (List.map
+            (\b -> case b of
+             At (MkBinding _ _ m) _ -> m)
+            bs)
+       , flags (\x -> List.elem x (assignedIn body))
+       ]
+       (List.append
+          (case w of
+           Just p -> [flags (\x -> mentions x p), namesLam p]
+           Nothing -> Nil)
+          [ namesLam
+            (doT.stmts
+               { names = coNames
+               , muts = names
+               , loop = Nothing
+               , sp = sp
+               , depth = 0
+               , giving = Nothing
+               , bound =
+                   Just (rightTuple sp (List.map (\x -> At (EVar x) sp) names))
+               }
+               body
+               EndValue)
+          ]))
   where
   -- (`_` named, by where it is)
   nameOf : Params.Spanned (Binding Expr) -> String
@@ -2502,6 +2537,14 @@ withBoundOf sp bs body =
     if strEq x "_" then madeName "unbound" xsp else x
   names : List String
   names = List.map nameOf bs
+  -- (a `Bool` a name, in order: whether `has` says it is)
+  flags : (String -> Bool) -> Expr
+  flags has =
+    listOfE
+      sp
+      (List.map
+         (\x -> boolOf (At (ETag (if has x then "True" else "False")) sp))
+         names)
   spans : List Params.Span
   spans =
     List.map
@@ -3046,7 +3089,7 @@ classifyTermF r (At (EWith _ _ _ _) sp) =
        3
        "a `with` is a statement of a `do` block (or an arm of its `if` or `case`)"
        sp)
-classifyTermF r (At (EWithBound bs body) sp) = r.e (withBoundOf sp bs body)
+classifyTermF r (At (EWithBound bs w body) sp) = r.e (withBoundOf sp bs w body)
 classifyTermF r (At (ENest _) sp) =
   IsInferable
     (invalid
