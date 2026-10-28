@@ -1,0 +1,101 @@
+-- Bytes given to C and taken back, NULs among them: the functions are
+-- the module's own C, and the module describes each operation's
+-- function (ffi) -- bytes in as a pointer and a count, out as a pointer
+-- and a count put by the function, malloc'd and freed or kept by C.
+
+module test.node.cbytes
+
+import bytes as Bytes
+import co
+import ffi as FFI
+import std.io
+import uint8 as UInt8
+
+data CBytesF (m : Type -> Type) x
+  = Zeros Bytes (Int -> x)
+  | Reverse Bytes (Bytes -> x)
+  | Repeat Bytes Int (Either FFI.Errno Bytes -> x)
+  | Magic (Bytes -> x)
+
+cbytes : HFunctor
+cbytes =
+  { f = CBytesF
+  , hfmap = \m g p -> case p of
+      Zeros b k -> Zeros b (\n -> g (k n))
+      Reverse b k -> Reverse b (\r -> g (k r))
+      Repeat b n k -> Repeat b n (\r -> g (k r))
+      Magic k -> Magic (\r -> g (k r))
+  , hmap = \m n nt p -> case p of
+      Zeros b k -> Zeros b k
+      Reverse b k -> Reverse b k
+      Repeat b t k -> Repeat b t k
+      Magic k -> Magic k
+  }
+
+-- | The operations, each a function of the module's C.
+cbytesInC : FFI.Described
+cbytesInC =
+  FFI.describe
+    []
+    [ FFI.operation
+      "Zeros"
+      (FFI.fun "cb_zeros" [FFI.bytes] (FFI.gives FFI.int64))
+    , FFI.operation
+      "Reverse"
+      (FFI.fun "cb_reverse" [FFI.bytes] (FFI.gives FFI.ownedBytes))
+    , FFI.operation
+      "Repeat"
+      (FFI.fun
+         "cb_repeat"
+         [FFI.bytes, FFI.int64]
+         (FFI.givesOrErrno FFI.ownedBytes))
+    , FFI.operation "Magic" (FFI.fun "cb_magic" [] (FFI.gives FFI.bytes))
+    ]
+
+zeros : {e : HFunctor} -> {{ev : cbytes <: e}} -> Bytes -> Co e Int
+zeros b = op (ev (Zeros b (\n -> n))) val
+
+reverse : {e : HFunctor} -> {{ev : cbytes <: e}} -> Bytes -> Co e Bytes
+reverse b = op (ev (Reverse b (\r -> r))) val
+
+repeat : {e : HFunctor}
+       -> {{ev : cbytes <: e}}
+       -> Bytes
+       -> Int
+       -> Co e (Either FFI.Errno Bytes)
+repeat b n = op (ev (Repeat b n (\r -> r))) val
+
+magic : {e : HFunctor} -> {{ev : cbytes <: e}} -> Co e Bytes
+magic = op (ev (Magic (\r -> r))) val
+
+-- (what a repeat gave)
+repeated : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> Either FFI.Errno Bytes
+         -> Co e Unit
+repeated (Right b) = print ("repeated: " ^ debug b)
+repeated (Left err) = print ("not repeated: " ^ err.name)
+
+program : {e : HFunctor}
+        -> {{cb : cbytes <: e}}
+        -> {{io : stdio <: e}}
+        -> Co e Unit
+program = do
+  let pixels =
+    Bytes.fromList
+      [UInt8.fromInt 0, UInt8.fromInt 80, UInt8.fromInt 0, UInt8.fromInt 255]
+  n <- zeros pixels
+  print ("zeros: " ^ debug n)
+  none <- zeros Bytes.empty
+  print ("zeros of none: " ^ debug none)
+  r <- reverse pixels
+  print ("reversed: " ^ debug r)
+  twice <- repeat pixels 2
+  repeated twice
+  never <- repeat pixels (0 - 1)
+  repeated never
+  m <- magic
+  print ("magic: " ^ debug m)
+
+main : Co (cbytes <+> stdio) Unit
+main = program (cb := _) (io := _)

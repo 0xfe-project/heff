@@ -106,7 +106,7 @@ threadsInC =
 ```
 
 An operation that is one C call need not be written in the provider: a
-definition of type `Ffi.Described` in the effect's module describes it,
+definition of type `FFI.Described` in the effect's module describes it,
 and the compiler writes the glue.
 
 `FFI.describe headers operations` lists the headers to include and the
@@ -120,6 +120,7 @@ and its result.
 | `FFI.double` | `Float64` |
 | `FFI.bool` | `Bool` |
 | `FFI.string`, `FFI.text` | `String`, as `const char *` |
+| `FFI.bytes` | `Bytes`, as two arguments: `const unsigned char *` and `size_t` |
 | `FFI.pointer "FILE" "fclose"` | a host type; `fclose` lets it go |
 
 | Result | heff type |
@@ -128,6 +129,23 @@ and its result.
 | `FFI.givesOrErrno t` | `Either Errno a`: `-1` or `NULL` with `errno` is `Left` |
 | `FFI.doneOrErrno` | `Either Errno Unit` |
 | `FFI.ownedString` | a `char *` from `malloc`, copied and freed |
+| `FFI.bytes` | `Bytes` from a `const unsigned char *`, copied |
+| `FFI.ownedBytes` | `Bytes` from an `unsigned char *` from `malloc`, copied and freed |
+
+Bytes cross with their length, so a NUL among them is a byte like any
+other. As a result, the function takes one more argument after the
+described ones, a `size_t *`, and puts the length there:
+
+```haskell
+FFI.fun "cc_blit" [FFI.int64, FFI.bytes] (FFI.gives FFI.void)
+-- void cc_blit(int64_t y, const unsigned char *p, size_t n);
+
+FFI.fun "zz_pack" [FFI.bytes, FFI.int] (FFI.givesOrErrno FFI.ownedBytes)
+-- unsigned char *zz_pack(const unsigned char *p, size_t n, int level, size_t *len);
+```
+
+A bytes result is `NULL` only on failure, as a string's is. Return a
+pointer even for no bytes, with the length 0.
 
 - The compiler checks the description against the effect: a wrong tag,
   a wrong number of fields, or a field that cannot cross is an error.

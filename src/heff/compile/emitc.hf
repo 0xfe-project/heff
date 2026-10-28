@@ -1890,6 +1890,8 @@ cTypeName CBool = "bool"
 cTypeName CString = "const char *"
 cTypeName CText = "const char *"
 cTypeName COwnedString = "char *"
+cTypeName CBytes = "const unsigned char *"
+cTypeName COwnedBytes = "unsigned char *"
 cTypeName (CPointer t _) = t ^ " *"
 cTypeName CVoid = "void"
 
@@ -1898,13 +1900,36 @@ resultTypeName (Gives t) = cTypeName t
 resultTypeName (GivesOrErrno t) = cTypeName t
 resultTypeName DoneOrErrno = "int"
 
+isBytesC : Glue.CType -> Bool
+isBytesC CBytes = True
+isBytesC COwnedBytes = True
+isBytesC _ = False
+
+-- (whether the result is bytes: their count is put in a `size_t *`
+-- given after the arguments, `n`)
+bytesResult : Glue.CResult -> Bool
+bytesResult (Gives t) = isBytesC t
+bytesResult (GivesOrErrno t) = isBytesC t
+bytesResult DoneOrErrno = False
+
+-- (an argument's C types: bytes two, their pointer and their count)
+argTypeNames : Glue.CType -> List String
+argTypeNames CBytes = ["const unsigned char *", "size_t"]
+argTypeNames t = [cTypeName t]
+
+paramTypeNames : Glue.Binding -> List String
+paramTypeNames b =
+  List.append
+    (List.concatMap argTypeNames b.args)
+    (if bytesResult b.result then ["size_t *"] else Nil)
+
 -- (the function's type as described, `int (const char *, mode_t)`)
 funTypeName : Glue.Binding -> String
 funTypeName b =
   resultTypeName b.result
   ^ " ("
-  ^ (if List.null b.args then "void"
-     else joinWith ", " (List.map cTypeName b.args))
+  ^ (if List.null (paramTypeNames b) then "void"
+     else joinWith ", " (paramTypeNames b))
   ^ ")"
 
 glueName : String -> String -> String
@@ -1963,6 +1988,10 @@ isOwned : Glue.CType -> Bool
 isOwned COwnedString = True
 isOwned _ = False
 
+isOwnedBytes : Glue.CType -> Bool
+isOwnedBytes COwnedBytes = True
+isOwnedBytes _ = False
+
 isBoolC : Glue.CType -> Bool
 isBoolC CBool = True
 isBoolC _ = False
@@ -2006,6 +2035,16 @@ argLine i CString =
   "    char *a" ^ debug i ^ " = heff_cstr(heff_field(p, " ^ debug i ^ "));"
 argLine i CText =
   "    char *a" ^ debug i ^ " = heff_cstr_text(heff_field(p, " ^ debug i ^ "));"
+argLine i CBytes =
+  "    int64_t n"
+  ^ debug i
+  ^ "; const uint8_t *a"
+  ^ debug i
+  ^ " = heff_bytes_data(heff_field(p, "
+  ^ debug i
+  ^ "), &n"
+  ^ debug i
+  ^ ");"
 argLine i (CPointer t _) =
   "    "
   ^ t
@@ -2027,20 +2066,38 @@ stringArgsGo i (Cons t rest) =
   if isStringArg t then Cons i (stringArgsGo (i + 1) rest)
   else stringArgsGo (i + 1) rest
 
+-- (the C arguments of the argument `i`: bytes their pointer and count)
+callArgOf : Int -> Glue.CType -> List String
+callArgOf i CBytes = ["a" ^ debug i, "(size_t)n" ^ debug i]
+callArgOf i t = ["a" ^ debug i]
+
+callArgs : Int -> List Glue.CType -> List String
+callArgs i Nil = Nil
+callArgs i (Cons t rest) = List.append (callArgOf i t) (callArgs (i + 1) rest)
+
 glueCallOf : Glue.Binding -> String
 glueCallOf b =
   b.fun
   ^ "("
   ^ joinWith
     ", "
-    (List.map (\i -> "a" ^ debug i) (List.range 0 (List.length b.args - 1)))
+    (List.append
+       (callArgs 0 b.args)
+       (if bytesResult b.result then ["&n"] else Nil))
   ^ ")"
+
+-- (the result's declaration, `c`, and before it bytes' count, `n`)
+resultDecl : Glue.CType -> String
+resultDecl t =
+  (if isBytesC t then "size_t n = 0; " else "") ^ cTypeName t ^ " c = "
 
 -- (whether a result of this type is NULL where there is none)
 nullable : Glue.CType -> Bool
 nullable CString = True
 nullable CText = True
 nullable COwnedString = True
+nullable CBytes = True
+nullable COwnedBytes = True
 nullable (CPointer _ _) = True
 nullable _ = False
 
@@ -2056,6 +2113,8 @@ convOf leaf ptrs CBool = "NTAG(c ? TAG_True : TAG_False)"
 convOf leaf ptrs CString = "heff_str_bytes(c, (int64_t)strlen(c))"
 convOf leaf ptrs CText = "heff_str_text(c)"
 convOf leaf ptrs COwnedString = glueName leaf "owned" ^ "(c)"
+convOf leaf ptrs CBytes = "heff_bytes_in(c, (int64_t)n)"
+convOf leaf ptrs COwnedBytes = glueName leaf "owned_bytes" ^ "(c, n)"
 convOf leaf ptrs (CPointer t r) =
   "heff_foreign(c, " ^ letGoOf leaf ptrs t r ^ ")"
 convOf leaf ptrs CVoid = "NTAG(TAG_MkUnit)"
@@ -2070,7 +2129,7 @@ resultLines md leaf ptrs b = case b.result of
   Gives CVoid -> ["      " ^ glueCallOf b ^ ";", "      r = NTAG(TAG_MkUnit);"]
   Gives t ->
     List.append
-      ["      " ^ cTypeName t ^ " c = " ^ glueCallOf b ^ ";"]
+      ["      " ^ resultDecl t ^ glueCallOf b ^ ";"]
       (List.append
          (if nullable t
           then [ "      if (!c) heff_fail(\""
@@ -2082,7 +2141,7 @@ resultLines md leaf ptrs b = case b.result of
           else Nil)
          ["      r = " ^ convOf leaf ptrs t ^ ";"])
   GivesOrErrno t ->
-    [ "      " ^ cTypeName t ^ " c = " ^ glueCallOf b ^ ";"
+    [ "      " ^ resultDecl t ^ glueCallOf b ^ ";"
     , "      r = "
     ^ (if nullable t then "!c" else "c == -1")
     ^ " ? "
@@ -2203,8 +2262,8 @@ pointerFnLines leaf what i (Cons (MkPair t r) rest) =
     (pointerFnLines leaf what (i + 1) rest)
 
 -- (the glue's own helpers, those it uses: the errno record's shape and
--- `Left`/`Right` of it, a malloc'd string taken, each pointer type's
--- let-go function)
+-- `Left`/`Right` of it, a malloc'd string or bytes taken, each pointer
+-- type's let-go function)
 helperLines : Glue.Glue -> List (Pair String String) -> List String
 helperLines gl ptrs =
   List.append
@@ -2229,7 +2288,14 @@ helperLines gl ptrs =
              ^ "(char *c) { V s = heff_str_bytes(c, (int64_t)strlen(c)); free(c); return s; }"
              ]
         else Nil)
-       (pointerFnLines gl.leaf "let_go_" 0 ptrs))
+       (List.append
+          (if List.any isOwnedBytes (typesOf gl.ops)
+           then [ "static V "
+                ^ glueName gl.leaf "owned_bytes"
+                ^ "(unsigned char *c, size_t n) { V s = heff_bytes_in(c, (int64_t)n); free(c); return s; }"
+                ]
+           else Nil)
+          (pointerFnLines gl.leaf "let_go_" 0 ptrs)))
 
 -- | a leaf's glue, as a provider's text: its module's description made C
 glueProvider : Glue.Glue -> Emit.Provider
