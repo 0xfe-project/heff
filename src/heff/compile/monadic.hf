@@ -56,16 +56,16 @@ inPlace (EPrimCall p args) = not (Simplify.primFails p) && List.all atom args
 inPlace e = atom e
 
 -- | an operand, normal (by `go`), given to `k`: bound first unless it may
--- | stay; the bindings it made on the way bound before it
-bindAs : IR.Expr -> (IR.Expr -> S IR.Expr) -> S IR.Expr
-bindAs (ELet y c d) k = do
-  r <- bindAs d k
+-- | stay (`stays`); the bindings it made on the way bound before it
+bindAs : (IR.Expr -> Bool) -> IR.Expr -> (IR.Expr -> S IR.Expr) -> S IR.Expr
+bindAs stays (ELet y c d) k = do
+  r <- bindAs stays d k
   pure (ELet y c r)
-bindAs (ESet ys c d) k = do
-  r <- bindAs d k
+bindAs stays (ESet ys c d) k = do
+  r <- bindAs stays d k
   pure (ESet ys c r)
-bindAs e k =
-  if inPlace e then k e
+bindAs stays e k =
+  if stays e then k e
   else do
     t <- fresh
     body <- k (EVar t)
@@ -88,21 +88,27 @@ bindAtom e k =
     body <- k (EVar t)
     pure (ELet t e body)
 
-operandWith : (IR.Expr -> S IR.Expr)
+operandWith : (IR.Expr -> Bool)
+            -> (IR.Expr -> S IR.Expr)
             -> IR.Expr
             -> (IR.Expr -> S IR.Expr)
             -> S IR.Expr
-operandWith go e k = do
+operandWith stays go e k = do
   e' <- go e
-  bindAs e' k
+  bindAs stays e' k
 
-operandsWith : (IR.Expr -> S IR.Expr)
+operandsWith : (IR.Expr -> Bool)
+             -> (IR.Expr -> S IR.Expr)
              -> List IR.Expr
              -> (List IR.Expr -> S IR.Expr)
              -> S IR.Expr
-operandsWith go Nil k = k Nil
-operandsWith go (Cons a rest) k =
-  operandWith go a (\a' -> operandsWith go rest (\rest' -> k (Cons a' rest')))
+operandsWith stays go Nil k = k Nil
+operandsWith stays go (Cons a rest) k =
+  operandWith
+    stays
+    go
+    a
+    (\a' -> operandsWith stays go rest (\rest' -> k (Cons a' rest')))
 
 -- (a binding of a binding: the inner first, names being unique)
 flatLet : String -> IR.Expr -> IR.Expr -> IR.Expr
@@ -110,12 +116,14 @@ flatLet x (ELet y c d) b = ELet y c (flatLet x d b)
 flatLet x (ESet ys c d) b = ESet ys c (flatLet x d b)
 flatLet x a b = ELet x a b
 
-fieldN : (IR.Expr -> S IR.Expr)
+fieldN : (IR.Expr -> Bool)
+       -> (IR.Expr -> S IR.Expr)
        -> List (Pair String IR.Expr)
        -> List IR.FieldTy
        -> S IR.Expr
-fieldN go fs ts =
+fieldN stays go fs ts =
   operandsWith
+    stays
     go
     (List.map snd fs)
     (\vs -> pure (ERecord (List.zipWith (\p v -> MkPair (fst p) v) fs vs) ts))
@@ -136,64 +144,108 @@ bindScrut e k = bindAtom e k
 -- | it is computed bound before it as an operand is; what an arm of a
 -- | `CIf` computes, computed only where it is chosen, in monadic form in
 -- | its place
-condN : (IR.Expr -> S IR.Expr)
+condN : (IR.Expr -> Bool)
+      -> (IR.Expr -> S IR.Expr)
       -> IR.Cond
       -> (IR.Cond -> S IR.Expr)
       -> S IR.Expr
-condN go (CRel p a b) k =
-  operandsWith go [a, b] (\vs -> case vs of
+condN stays go (CRel p a b) k =
+  operandsWith stays go [a, b] (\vs -> case vs of
     Cons a2 (Cons b2 Nil) -> k (CRel p a2 b2)
     _ -> k (CRel p a b))
-condN go (CTest e) k = operandWith go e (\e2 -> k (CTest e2))
-condN go (CNot c) k = condN go c (\c2 -> k (CNot c2))
-condN go (CIf a b c) k =
+condN stays go (CTest e) k = operandWith stays go e (\e2 -> k (CTest e2))
+condN stays go (CNot c) k = condN stays go c (\c2 -> k (CNot c2))
+condN stays go (CIf a b c) k =
   condN
+    stays
     go
     a (\a2 -> do
       b2 <- IR.condTraverse (mo := instanceMonadS) go b
       c2 <- IR.condTraverse (mo := instanceMonadS) go c
       k (CIf a2 b2 c2))
-condN go c k = k c
+condN stays go c k = k c
 
--- | an expression in monadic form
-norm : IR.Expr -> S IR.Expr
-norm (EApp f args) =
+-- | an expression in monadic form, the operands that may stay where they
+-- | are as `stays` says
+normWith : (IR.Expr -> Bool) -> IR.Expr -> S IR.Expr
+normWith stays (EApp f args) =
   operandWith
-    norm
+    stays
+    (normWith stays)
     f
-    (\f' -> operandsWith norm args (\args' -> pure (EApp f' args')))
-norm (ECall g args) = operandsWith norm args (\args' -> pure (ECall g args'))
-norm (EPrimCall p args) =
-  operandsWith norm args (\args' -> pure (EPrimCall p args'))
-norm (ETag t args ts) =
-  operandsWith norm args (\args' -> pure (ETag t args' ts))
-norm (ERecord fs ts) = fieldN norm fs ts
-norm (EProj e l sh t) = operandWith norm e (\e' -> pure (EProj e' l sh t))
-norm (ELet x a b) = do
-  a' <- norm a
-  b' <- norm b
+    (\f' ->
+       operandsWith
+         stays
+         (normWith stays)
+         args
+         (\args' -> pure (EApp f' args')))
+normWith stays (ECall g args) =
+  operandsWith stays (normWith stays) args (\args' -> pure (ECall g args'))
+normWith stays (EPrimCall p args) =
+  operandsWith
+    stays
+    (normWith stays)
+    args
+    (\args' -> pure (EPrimCall p args'))
+normWith stays (ETag t args ts) =
+  operandsWith
+    stays
+    (normWith stays)
+    args
+    (\args' -> pure (ETag t args' ts))
+normWith stays (ERecord fs ts) = fieldN stays (normWith stays) fs ts
+normWith stays (EProj e l sh t) =
+  operandWith stays (normWith stays) e (\e' -> pure (EProj e' l sh t))
+normWith stays (ELet x a b) = do
+  a' <- normWith stays a
+  b' <- normWith stays b
   pure (flatLet x a' b')
-norm (EMatch s arms) = do
-  s0 <- norm s
+normWith stays (EMatch s arms) = do
+  s0 <- normWith stays s
   bindScrut s0 (\s' -> do
     arms' <-
-      traverseS (IR.traverseArmM (mo := instanceMonadS) (\_ b -> norm b)) arms
+      traverseS
+        (IR.traverseArmM (mo := instanceMonadS) (\_ b -> normWith stays b))
+        arms
     pure (EMatch s' arms'))
-norm (EBool c) = condN norm c (\c2 -> pure (EBool c2))
-norm (EValues es) = operandsWith norm es (\es' -> pure (EValues es'))
-norm e = IR.traverseParts (\_ p -> norm p) e
+normWith stays (EBool c) =
+  condN stays (normWith stays) c (\c2 -> pure (EBool c2))
+normWith stays (EValues es) =
+  operandsWith stays (normWith stays) es (\es' -> pure (EValues es'))
+normWith stays e = IR.traverseParts (\_ p -> normWith stays p) e
 
-defN : IR.Def -> S IR.Def
-defN d = do
-  b <- norm d.body
+defWith : (IR.Expr -> Bool) -> IR.Def -> S IR.Def
+defWith stays d = do
+  b <- normWith stays d.body
   pure (IR.mkDef d.key d.name b)
 
 -- | the definitions in monadic form, names drawn from `supply` on
 -- | >>> monadicProgram 0 [IR.mkDef "f" "f" (ELam ["x"] (ECall "g" [ECall "h" [EVar "x"], EInt 1]))]
 -- | [IR.mkDef "f" "f" (ELam ["x"] (ELet "t$0" (ECall "h" [EVar "x"]) (ECall "g" [EVar "t$0", EInt 1])))]
 monadicProgram : Int -> List IR.Def -> List IR.Def
-monadicProgram supply defs = fst (traverseS defN defs supply)
+monadicProgram supply defs = fst (traverseS (defWith inPlace) defs supply)
 
 -- | ... and where fresh names go on from
 monadicFrom : Int -> List IR.Def -> Pair (List IR.Def) Int
-monadicFrom supply defs = traverseS defN defs supply
+monadicFrom supply defs = traverseS (defWith inPlace) defs supply
+
+-- | an operand that computes nothing that could be seen where it is: a
+-- | value, a tag or record of such, a field of one, a primitive that
+-- | cannot fail given such -- so that it may stay where it is, or be
+-- | computed before or after what is bound, the same
+quiet : IR.Expr -> Bool
+quiet (ETag _ args _) = List.all quiet args
+quiet (ERecord fs _) = List.all (\p -> quiet (snd p)) fs
+quiet (EProj e _ _ _) = quiet e
+quiet (EPrimCall p args) = not (Simplify.primFails p) && List.all quiet args
+quiet (EBool c) = List.all quiet (IR.condParts c)
+quiet e = value e
+
+-- | ... each operand that computes what could be seen bound (a call, a
+-- | match, a primitive that may fail), in the order it is computed, the
+-- | others left where they are: for the passes on what both backends are
+-- | given, which look at what a tag or a call is built of
+-- | >>> fst (operandsBound 0 [IR.mkDef "f" "f" (ELam ["x"] (ETag "P" [ECall "h" [EVar "x"], ETag "P" [EPrimCall IntAdd [EVar "x", EInt 1], ETag "Nil" [] []] [FtAny, FtAny]] [FtAny, FtAny]))])
+-- | [IR.mkDef "f" "f" (ELam ["x"] (ELet "t$0" (ECall "h" [EVar "x"]) (ETag "P" [EVar "t$0", ETag "P" [EPrimCall IntAdd [EVar "x", EInt 1], ETag "Nil" [] []] [FtAny, FtAny]] [FtAny, FtAny])))]
+operandsBound : Int -> List IR.Def -> Pair (List IR.Def) Int
+operandsBound supply defs = traverseS (defWith quiet) defs supply

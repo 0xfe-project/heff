@@ -34,6 +34,7 @@ module heff.compile.trmc
 import heff.compile.ir as IR
 import heff.elab.primitive
 import heff.compile.supply
+import std.ordmap as OrdMap
 
 -- | `setField d i v`: field `i` of the cell `d`, made here and seen by
 -- | nothing else yet, set to `v`
@@ -474,6 +475,48 @@ prodStart s p j e = case prodOf s e of
     _ -> pure e
   Nothing -> pure e
 
+-- Calls bound
+--------------------------------------------------------------------------------
+
+-- What comes here is in monadic form (heff.compile.monadic): each
+-- operand that computes bound first, in the order it is computed, so a
+-- call of itself is bound too -- `let r = f xs in x :: r`, `let r = go s
+-- cs in case r of ...` -- and what is put round it is computed before
+-- it.  Where a way out is such a binding, its one use what is built
+-- round it alone, the call is put back there: nothing is computed
+-- between the two, so the order is the same, and the forms above see it.
+-- What a way out computes after the call stays after it.
+
+-- (`e` built round the name `r` alone: a tag whose last field is it, or
+-- another such tag; an append whose right is it, or another such; a
+-- match on it)
+around : String -> IR.Expr -> Bool
+around r (ETag _ args _) =
+  maybe False (\l -> isVarNamed r l || around r l) (List.last args)
+around r (EPrimCall StrAppend (Cons _ (Cons b Nil))) =
+  isVarNamed r b || around r b
+around r (EMatch c _) = isVarNamed r c
+around r e = False
+
+-- (`r` bound to `a` before `b`: the call put back where it is used, if
+-- it is one of itself, used once, by what is built round it alone)
+rebound : Self -> String -> IR.Expr -> IR.Expr -> IR.Expr
+rebound s r a b =
+  if selfCall s a && around r b && (IR.occurrences r b).count == 1
+  then IR.subst (OrdMap.singleton r a) b
+  else ELet r a b
+
+-- | the ways out of `e`, a call of itself bound there and used once, by
+-- | what is built round it alone, put back where it is used
+-- | >>> unbound { key = "f", arity = 1 } (ELet "r" (ECall "f" [EVar "xs"]) (ETag "Cons" [EVar "x", EVar "r"] [FtAny, FtAny]))
+-- | ETag "Cons" [EVar "x", ECall "f" [EVar "xs"]] [FtAny, FtAny]
+unbound : Self -> IR.Expr -> IR.Expr
+unbound s (ELet r a b) = rebound s r a (unbound s b)
+unbound s (ESet xs a b) = ESet xs a (unbound s b)
+unbound s (EMatch c arms) =
+  EMatch c (List.map (IR.mapArm (\_ b -> unbound s b)) arms)
+unbound s e = e
+
 -- Definitions
 --------------------------------------------------------------------------------
 
@@ -583,8 +626,9 @@ type Trmced = { defs : List IR.Def, supply : Int }
 
 defT : IR.Def -> S (List IR.Def)
 defT d = case d.body of
-  ELam xs b ->
+  ELam xs b0 ->
     let s : Self = { key = d.key, arity = List.length xs }
+    in let b = unbound s b0
     in if List.any (consEnds s) (IR.waysList b) then destined s d xs b
     else if List.any (appendEnds s) (IR.waysList b) then gathered s d xs b
     else productedOr s d xs b (prodsOf s b)
