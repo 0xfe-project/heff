@@ -1,0 +1,724 @@
+-- Time zones: which offset from UTC (std.offset) the clocks of a place
+-- are at when -- +08:00 in Taipei all year round, -05:00 in New York in
+-- winter and -04:00 in summer -- and so which instant a date and time
+-- on its clocks (std.localdatetime) is.  NodaTime's `DateTimeZone` is
+-- the model.  A zone is its id, `Asia/Taipei`, and its rules: the
+-- changes of the tz database, each an instant and the offset after it,
+-- and a POSIX `TZ` rule for the years after the last of them.  `fromTZif`
+-- reads a zone from the bytes of a TZif file (RFC 8536), as the tz
+-- database is kept on the system, std.tzdb reading them; `fromPosix`
+-- makes one from a POSIX rule alone, `fixed` from an offset.
+--
+-- An instant has one offset in a zone (`offsetAt`), but a date and
+-- time on its clocks may have none, where the clocks skipped over it,
+-- or two, where they went back over it (`mapLocal`): std.zoneddatetime
+-- resolves it, the program saying which instant each of those becomes.
+-- A leap second is no second here, as POSIX time has none.  Import it
+-- by a name, `import std.datetimezone as DateTimeZone`, as its names are
+-- short.
+--
+-- ```haskell
+-- import std.datetimezone as DateTimeZone
+-- import std.instant as Instant
+-- import std.offset as Offset
+--
+-- -- | the offset in New York at an instant, by its rule
+-- -- | >>> inNewYork Instant.epoch
+-- -- | "-05:00"
+-- inNewYork : Instant.Instant -> String
+-- inNewYork t =
+--   maybe
+--     ""
+--     (\z -> show (DateTimeZone.offsetAt z t))
+--     (DateTimeZone.fromPosix "EST5EDT,M3.2.0,M11.1.0")
+-- ```
+
+module std.datetimezone
+  ( DateTimeZone
+  , Mapping(..)
+  , utc
+  , fixed
+  , fromPosix
+  , fromTZif
+  , id
+  , offsetAt
+  , mapLocal
+  , instanceEqualityDateTimeZone
+  , instanceDebugDateTimeZone
+  , instanceShowDateTimeZone
+  , instanceEqualityMapping
+  , instanceDebugMapping
+  , instanceShowMapping
+  )
+
+import array as Array
+import bytes as Bytes
+import std.instant as Instant
+import std.localdate as LocalDate
+import std.localdatetime as LocalDateTime
+import std.offset as Offset
+
+-- (a day a POSIX rule changes on: `Jn`, the `n`th day of the year, 1 to
+-- 365, February 29th never counted; `n`, the `n`th from 0, 0 to 365,
+-- counted; `Mm.w.d`, the day `d` of the week, 0 for Sunday, of the `w`th
+-- week of the month `m`, 5 for its last)
+data RuleDay = JulianDay Int | YearDay Int | MonthWeekDay Int Int Int
+
+-- (a change of a POSIX rule: its day, and its time there, in seconds
+-- from the day's start, as the clocks before it tell)
+data Change = MkChange RuleDay Int
+
+-- (a POSIX rule: one offset all year, or a standard one and a daylight
+-- one, and the changes to each, the daylight one's first)
+data Rule
+  = Standard Offset.Offset
+  | Daylight Offset.Offset Offset.Offset Change Change
+
+-- (a zone's changes: the second since the epoch each is at, and the
+-- offset after it)
+type Changes = { times : Array Int, offsets : Array Offset.Offset }
+
+-- (no change)
+noChanges : Changes
+noChanges = { times = Array.empty, offsets = Array.empty }
+
+-- | A time zone: its id, the offset before its first change, its
+-- | changes, and the rule after the last of them, if there is one.
+data DateTimeZone = MkDateTimeZone String Offset.Offset Changes (Maybe Rule)
+
+-- | What a date and time on a zone's clocks is there: one instant, at
+-- | an offset; none, where the clocks skipped over it, the offsets before
+-- | and after the gap and the instant it ends at; or two, where they went
+-- | back over it, the offsets of the earlier and the later.
+data Mapping
+  = Unique Offset.Offset
+  | Skipped Offset.Offset Offset.Offset Instant.Instant
+  | Ambiguous Offset.Offset Offset.Offset
+
+-- (the nanoseconds of a second)
+nanosecondsPerSecond : Int
+nanosecondsPerSecond = 1000000000
+
+-- (the seconds of a day of UTC)
+secondsPerDay : Int
+secondsPerDay = 86400
+
+-- | UTC's own, with no change: `UTC`.
+utc : DateTimeZone
+utc = MkDateTimeZone "UTC" Offset.utc noChanges Nothing
+
+-- | Its id: `Asia/Taipei`.
+id : DateTimeZone -> String
+id (MkDateTimeZone name _ _ _) = name
+
+-- | The zone always at the offset, with no change, as NodaTime's
+-- | `ForOffset`: its id `UTC` and the offset, `UTC+08:00`, or `UTC` for
+-- | none.
+-- | >>> List.map (\n -> maybe "" (\o -> id (fixed o)) (Offset.fromSeconds n)) [0, 28800, -34200]
+-- | ["UTC", "UTC+08:00", "UTC-09:30"]
+fixed : Offset.Offset -> DateTimeZone
+fixed o =
+  MkDateTimeZone
+    (if Offset.totalSeconds o == 0 then "UTC" else "UTC" ^ show o)
+    o
+    noChanges
+    Nothing
+
+-- Instances: the prelude's operators and functions at `DateTimeZone`
+-- and `Mapping`
+--------------------------------------------------------------------------------
+
+-- | The same id, as NodaTime has it.
+-- | >>> fixed Offset.utc == utc
+-- | True
+instance instanceEqualityDateTimeZone : Equality DateTimeZone
+instanceEqualityDateTimeZone = { equal = \x y -> strEq (id x) (id y) }
+
+-- | As `show` writes it: its id.
+instance instanceDebugDateTimeZone : Debug DateTimeZone
+instanceDebugDateTimeZone = { debug = id }
+
+-- | Its id, `Asia/Taipei`.
+-- | >>> show utc
+-- | "UTC"
+instance instanceShowDateTimeZone : Show DateTimeZone
+instanceShowDateTimeZone = { show = id }
+
+-- (the two the same mapping)
+sameMapping : Mapping -> Mapping -> Bool
+sameMapping (Unique a) (Unique b) = a == b
+sameMapping (Skipped a b t) (Skipped c d u) = a == c && b == d && t == u
+sameMapping (Ambiguous a b) (Ambiguous c d) = a == c && b == d
+sameMapping _ _ = False
+
+-- | The same, at the same offsets.
+instance instanceEqualityMapping : Equality Mapping
+instanceEqualityMapping = { equal = sameMapping }
+
+-- (the mapping as its tag, then its offsets and instant)
+mappingText : Mapping -> String
+mappingText (Unique o) = "Unique " ^ show o
+mappingText (Skipped a b t) = "Skipped " ^ show a ^ " " ^ show b ^ " " ^ show t
+mappingText (Ambiguous a b) = "Ambiguous " ^ show a ^ " " ^ show b
+
+-- | As `show` writes it.
+instance instanceDebugMapping : Debug Mapping
+instanceDebugMapping = { debug = mappingText }
+
+-- | Its tag, then its offsets and its instant as they write them:
+-- | `Skipped -05:00 -04:00 2024-03-10T07:00:00Z`.
+instance instanceShowMapping : Show Mapping
+instanceShowMapping = { show = mappingText }
+
+-- The changes of a POSIX rule
+--------------------------------------------------------------------------------
+
+-- (the epoch day of the first of the month `m` of the year `y`)
+firstOfMonth : Int -> Int -> Int
+firstOfMonth y m =
+  LocalDate.epochDays
+    (fromMaybe (LocalDate.fromEpochDays 0) (LocalDate.make y m 1))
+
+-- (the epoch day the rule's day is in the year `y`)
+ruleDay : Int -> RuleDay -> Int
+ruleDay y (JulianDay n) =
+  firstOfMonth y 1
+  + n
+  - 1
+  + (if LocalDate.isLeapYear y && n >= 60 then 1 else 0)
+ruleDay y (YearDay n) = firstOfMonth y 1 + n
+ruleDay y (MonthWeekDay m w d) =
+  if day >= LocalDate.daysInMonth y m then first + day - 7 else first + day
+  where
+  -- (the month's first day)
+  first : Int
+  first = firstOfMonth y m
+  -- (the days after it of the `w`th day `d`: 1970-01-01, the day 0, a
+  -- Thursday, the day 4 of its week)
+  day : Int
+  day = (d - (first + 4) % 7 + 7) % 7 + 7 * (w - 1)
+
+-- (the second since the epoch the change is at in the year `y`, the
+-- clocks before it at the offset `o`)
+changeAt : Int -> Offset.Offset -> Change -> Int
+changeAt y o (MkChange day time) =
+  ruleDay y day * secondsPerDay + time - Offset.totalSeconds o
+
+-- (the changes of the rule in the year `y`, in order, each the second
+-- it is at and the offset after it: of two at the same second, the one
+-- to the daylight offset last, so a rule of daylight all year is so)
+changesInYear : Rule -> Int -> List (Pair Int Offset.Offset)
+changesInYear (Standard _) y = Nil
+changesInYear (Daylight std dst start end) y =
+  if changeAt y dst end <= changeAt y std start
+  then [(changeAt y dst end, std), (changeAt y std start, dst)]
+  else [(changeAt y std start, dst), (changeAt y dst end, std)]
+
+-- (the year, of UTC, of the second since the epoch)
+yearOf : Int -> Int
+yearOf s = LocalDate.year (LocalDate.fromEpochDays (s / secondsPerDay))
+
+-- (the changes of the rule in the years from `y0` to `y1`, in order)
+changesInYears : Rule -> Int -> Int -> List (Pair Int Offset.Offset)
+changesInYears rule y0 y1 =
+  List.concatMap (changesInYear rule) (List.range y0 y1)
+
+-- (the offset after the last of the changes at or before the second
+-- `s`, `o` if none is)
+offsetAfter : Int
+            -> Offset.Offset
+            -> List (Pair Int Offset.Offset)
+            -> Offset.Offset
+offsetAfter s o Nil = o
+offsetAfter s o (Cons (t, next) rest) =
+  if t <= s then offsetAfter s next rest else o
+
+-- (the offset of the rule at the second `s`: by the changes of its year
+-- and those around it)
+ruleOffsetAt : Rule -> Int -> Offset.Offset
+ruleOffsetAt (Standard o) s = o
+ruleOffsetAt (Daylight std dst start end) s =
+  offsetAfter
+    s
+    std
+    (changesInYears (Daylight std dst start end) (yearOf s - 1) (yearOf s + 1))
+
+-- (the changes of the rule after the second `lo` and up to `hi`)
+ruleChangesBetween : Maybe Rule -> Int -> Int -> List (Pair Int Offset.Offset)
+ruleChangesBetween Nothing lo hi = Nil
+ruleChangesBetween (Just rule) lo hi =
+  if lo >= hi then Nil
+  else List.keepIf
+      (\c -> lo < fst c && fst c <= hi)
+      (changesInYears rule (yearOf lo - 1) (yearOf hi + 1))
+
+-- (the offset of the rule at the second `s`, if there is a rule; `o`
+-- if not)
+ruleOr : Offset.Offset -> Maybe Rule -> Int -> Offset.Offset
+ruleOr o Nothing s = o
+ruleOr o (Just rule) s = ruleOffsetAt rule s
+
+-- POSIX TZ rules
+--------------------------------------------------------------------------------
+
+-- (whether the byte is an ASCII digit)
+isDigitByte : Int -> Bool
+isDigitByte c = 48 <= c && c <= 57
+
+-- (whether the byte is an ASCII letter)
+isLetterByte : Int -> Bool
+isLetterByte c = 65 <= c && c <= 90 || 97 <= c && c <= 122
+
+-- (whether the byte may be in a quoted name: a letter, a digit, `+`,
+-- `-`)
+isQuotedByte : Int -> Bool
+isQuotedByte c = isLetterByte c || isDigitByte c || c == 43 || c == 45
+
+-- (the first index from `i` on whose byte of `s` `p` holds not of, or
+-- its length)
+endWhere : (Int -> Bool) -> String -> Int -> Int
+endWhere p s i = if p (strByteAt s i) then endWhere p s (i + 1) else i
+
+-- (the number the digits of `s` from `i` to `j` write)
+numberIn : String -> Int -> Int -> Int
+numberIn s i j = fromMaybe 0 (parseInt (strSlice s i j))
+
+-- (where a name from `i` ends: three letters or more, or `<`, three or
+-- more letters, digits, `+`s or `-`s, and `>`)
+nameEnd : String -> Int -> Maybe Int
+nameEnd s i =
+  if strByteAt s i == 60
+  then (if quotedEnd - i > 3 && strByteAt s quotedEnd == 62
+        then Just (quotedEnd + 1)
+        else Nothing)
+  else if endWhere isLetterByte s i - i >= 3
+  then Just (endWhere isLetterByte s i)
+  else Nothing
+  where
+  -- (where a quoted name's letters end)
+  quotedEnd : Int
+  quotedEnd = endWhere isQuotedByte s (i + 1)
+
+-- (the minutes, `:mm`, of a clock at `i`, then its seconds, `:ss`, each
+-- `unit` seconds, 60 then 1, added to `n`, and where it ends; `n` where
+-- there is no `:`)
+sixtiethsFrom : String -> Int -> Int -> Int -> Maybe (Pair Int Int)
+sixtiethsFrom s n i unit =
+  if strByteAt s i /= 58 then Just (n, i)
+  else if endWhere isDigitByte s (i + 1) /= i + 3
+          || numberIn s (i + 1) (i + 3) > 59
+  then Nothing
+  else if unit == 60
+  then sixtiethsFrom s (n + 60 * numberIn s (i + 1) (i + 3)) (i + 3) 1
+  else Just (n + numberIn s (i + 1) (i + 3), i + 3)
+
+-- (the seconds a clock from `i` says, `hh[:mm[:ss]]`, the hours 0 to
+-- 167, as RFC 8536 has them, and where it ends)
+clockFrom : String -> Int -> Maybe (Pair Int Int)
+clockFrom s i =
+  if hoursEnd == i || hoursEnd - i > 3 || numberIn s i hoursEnd > 167
+  then Nothing
+  else sixtiethsFrom s (numberIn s i hoursEnd * 3600) hoursEnd 60
+  where
+  -- (where its hours end)
+  hoursEnd : Int
+  hoursEnd = endWhere isDigitByte s i
+
+-- (a clock's seconds the other way)
+negatedClock : Maybe (Pair Int Int) -> Maybe (Pair Int Int)
+negatedClock (Just (n, j)) = Just (0 - n, j)
+negatedClock Nothing = Nothing
+
+-- (a clock from `i`, perhaps after a sign)
+signedClockFrom : String -> Int -> Maybe (Pair Int Int)
+signedClockFrom s i =
+  if strByteAt s i == 45 then negatedClock (clockFrom s (i + 1))
+  else if strByteAt s i == 43 then clockFrom s (i + 1)
+  else clockFrom s i
+
+-- (a number of `s` from `i`, `lo` to `hi`, of at most three digits, and
+-- where it ends)
+boundedFrom : String -> Int -> Int -> Int -> Maybe (Pair Int Int)
+boundedFrom s lo hi i =
+  if end == i || end - i > 3 || numberIn s i end < lo || numberIn s i end > hi
+  then Nothing
+  else Just (numberIn s i end, end)
+  where
+  -- (where its digits end)
+  end : Int
+  end = endWhere isDigitByte s i
+
+-- (a day `Mm.w.d` from after its `M`, and where it ends)
+monthWeekDayFrom : String -> Int -> Maybe (Pair RuleDay Int)
+monthWeekDayFrom s i = case boundedFrom s 1 12 i of
+  Just (m, j) ->
+    if strByteAt s j /= 46 || strByteAt s (j + 2) /= 46 then Nothing
+    else (case (boundedFrom s 1 5 (j + 1), boundedFrom s 0 6 (j + 3)) of
+          (Just (w, k), Just (d, end)) ->
+            if k == j + 2 && end == j + 4
+            then Just (MonthWeekDay m w d, end)
+            else Nothing
+          _ -> Nothing)
+  Nothing -> Nothing
+
+-- (a day of a rule from `i`, `Jn`, `n` or `Mm.w.d`, and where it ends)
+dayFrom : String -> Int -> Maybe (Pair RuleDay Int)
+dayFrom s i =
+  if strByteAt s i == 74
+  then maybe
+      Nothing
+      (\p -> Just (JulianDay (fst p), snd p))
+      (boundedFrom s 1 365 (i + 1))
+  else if strByteAt s i == 77 then monthWeekDayFrom s (i + 1)
+  else maybe
+      Nothing
+      (\p -> Just (YearDay (fst p), snd p))
+      (boundedFrom s 0 365 i)
+
+-- (a change of a rule from `i`, its day and perhaps `/` and its time,
+-- 02:00:00 if none, and where it ends)
+changeFrom : String -> Int -> Maybe (Pair Change Int)
+changeFrom s i = case dayFrom s i of
+  Just (day, j) ->
+    if strByteAt s j /= 47 then Just (MkChange day 7200, j)
+    else maybe
+        Nothing
+        (\p -> Just (MkChange day (fst p), snd p))
+        (signedClockFrom s (j + 1))
+  Nothing -> Nothing
+
+-- (the rule's changes from `i`, `,start,end` to its end, between the
+-- offsets `std` and `dst`: with none, the United States', as the tz
+-- code has them, `M3.2.0,M11.1.0`)
+changesFrom : String -> Offset.Offset -> Offset.Offset -> Int -> Maybe Rule
+changesFrom s std dst i =
+  if i == strLength s
+  then Just
+      (Daylight
+         std
+         dst
+         (MkChange (MonthWeekDay 3 2 0) 7200)
+         (MkChange (MonthWeekDay 11 1 0) 7200))
+  else if strByteAt s i /= 44 then Nothing
+  else (case changeFrom s (i + 1) of
+        Just (start, j) ->
+          if strByteAt s j /= 44 then Nothing
+          else (case changeFrom s (j + 1) of
+                Just (end, k) ->
+                  if k == strLength s then Just (Daylight std dst start end)
+                  else Nothing
+                Nothing -> Nothing)
+        Nothing -> Nothing)
+
+-- (a rule's daylight part from `i`: its name, perhaps its offset, an
+-- hour ahead of `std` if none, and its changes)
+daylightFrom : String -> Offset.Offset -> Int -> Maybe Rule
+daylightFrom s std i = case nameEnd s i of
+  Just j ->
+    if isDigitByte (strByteAt s j) || strByteAt s j == 43 || strByteAt s j == 45
+    then (case signedClockFrom s j of
+          Just (n, k) ->
+            maybe
+              Nothing
+              (\dst -> changesFrom s std dst k)
+              (Offset.fromSeconds (0 - n))
+          Nothing -> Nothing)
+    else maybe
+        Nothing
+        (\dst -> changesFrom s std dst j)
+        (Offset.fromSeconds (Offset.totalSeconds std + 3600))
+  Nothing -> Nothing
+
+-- (the rule a POSIX `TZ` string writes: a name and an offset, west of
+-- UTC more than none, then perhaps a daylight part)
+ruleOf : String -> Maybe Rule
+ruleOf s = case nameEnd s 0 of
+  Just i ->
+    (case signedClockFrom s i of
+     Just (n, j) ->
+       (case Offset.fromSeconds (0 - n) of
+        Just std ->
+          if j == strLength s then Just (Standard std) else daylightFrom s std j
+        Nothing -> Nothing)
+     Nothing -> Nothing)
+  Nothing -> Nothing
+
+-- (the offset a rule starts from: its standard one)
+standardOf : Rule -> Offset.Offset
+standardOf (Standard o) = o
+standardOf (Daylight std _ _ _) = std
+
+-- | The zone of a POSIX `TZ` rule, `EST5EDT,M3.2.0,M11.1.0`, its id the
+-- | rule: a name of three letters or more (or quoted, `<+08>`), its
+-- | offset west of UTC (`5` is -05:00, `-8` is +08:00), then perhaps a
+-- | daylight name, its offset (an hour ahead if none), and when each
+-- | starts, `Jn`, `n` or `Mm.w.d`, perhaps a `/` and a time (02:00:00 if
+-- | none), as RFC 8536 has them.  With a daylight name and no changes,
+-- | the United States', as the tz code has them.  Nothing if it writes
+-- | none, or an offset beyond 18 hours.
+-- | >>> List.map (\s -> maybe "" id (fromPosix s)) ["CST-8", "<+0545>-5:45", "AEST-10AEDT,M10.1.0,M4.1.0/3"]
+-- | ["CST-8", "<+0545>-5:45", "AEST-10AEDT,M10.1.0,M4.1.0/3"]
+-- | >>> (List.map (\s -> maybe True (\_ -> False) (fromPosix s)) ["", "CS-8", "CST", "CST-8CDT,M3.2.0", "CST-8CDT,M13.2.0,M11.1.0", "CST-8CDT,J0,J365", "CST19", "<+08-8"] : List Bool)
+-- | [True, True, True, True, True, True, True, True]
+fromPosix : String -> Maybe DateTimeZone
+fromPosix s =
+  maybe
+    Nothing
+    (\rule ->
+       Just
+         (MkDateTimeZone
+            s
+            (standardOf rule)
+            noChanges
+            (Just rule)))
+    (ruleOf s)
+
+-- Offsets at instants, and instants of date-times
+--------------------------------------------------------------------------------
+
+-- (the offset of the zone at the second `s` since the epoch: before its
+-- first change, its first offset; from its last on, its rule's, if it
+-- has one)
+offsetAtSecond : DateTimeZone -> Int -> Offset.Offset
+offsetAtSecond (MkDateTimeZone _ first changes rule) s =
+  if Array.null changes.times then ruleOr first rule s
+  else if passed == 0 then first
+  else if passed == Array.length changes.times
+  then ruleOr (Array.arrayIndex changes.offsets (passed - 1)) rule s
+  else Array.arrayIndex changes.offsets (passed - 1)
+  where
+  -- (how many of the changes are at or before `s`)
+  passed : Int
+  passed = Array.search (\t -> t > s) changes.times
+
+-- | The offset of the zone at the instant.
+-- | >>> maybe "" (\z -> joinWith " " (List.map (\s -> show (offsetAt z (Instant.fromUnixNanoseconds (s * 1000000000)))) [1710054000, 1710053999, 1730613600, 1730613599])) (fromPosix "EST5EDT,M3.2.0,M11.1.0")
+-- | "-04:00 -05:00 -05:00 -04:00"
+-- | >>> List.map (\s -> maybe "" (\z -> show (offsetAt z Instant.epoch)) (fromPosix s)) ["CST-8", "<+0545>-5:45", "EST5EDT", "AEST-10AEDT,M10.1.0,M4.1.0/3", "<-03>3<-02>,M3.5.0/-2,M10.5.0/-1"]
+-- | ["+08:00", "+05:45", "-05:00", "+11:00", "-03:00"]
+offsetAt : DateTimeZone -> Instant.Instant -> Offset.Offset
+offsetAt z t =
+  offsetAtSecond z (Instant.unixNanoseconds t / nanosecondsPerSecond)
+
+-- (the changes of the zone after the second `lo` and up to `hi`, in
+-- order: its own, then its rule's after the last of them)
+changesBetween : DateTimeZone -> Int -> Int -> List (Pair Int Offset.Offset)
+changesBetween (MkDateTimeZone _ _ changes rule) lo hi =
+  List.append
+    (List.map
+       (\i ->
+          ( Array.arrayIndex changes.times i
+          , Array.arrayIndex changes.offsets i
+          ))
+       (List.range
+          (Array.search (\t -> t > lo) changes.times)
+          (Array.search (\t -> t > hi) changes.times - 1)))
+    (ruleChangesBetween
+       rule
+       (if Array.null changes.times then lo
+        else max
+            lo
+            (Array.arrayIndex changes.times (Array.length changes.times - 1)))
+       hi)
+
+-- (the offsets at which the local second `ls` is in the interval at
+-- the offset: the one from `start` at `o`, until the first of the
+-- changes `cs`, then each after one of them)
+offsetsHolding : Int
+               -> Int
+               -> Offset.Offset
+               -> List (Pair Int Offset.Offset)
+               -> List Offset.Offset
+offsetsHolding ls start o Nil =
+  if start <= ls - Offset.totalSeconds o then [o] else Nil
+offsetsHolding ls start o (Cons (t, next) rest) =
+  if start <= ls - Offset.totalSeconds o && ls - Offset.totalSeconds o < t
+  then Cons o (offsetsHolding ls t next rest)
+  else offsetsHolding ls t next rest
+
+-- (the gap the local second `ls` is in, where it is in none of the
+-- intervals: at the first change, from the offset `o`, before which it
+-- would be at the offset after it)
+gapAt : Int -> Offset.Offset -> List (Pair Int Offset.Offset) -> Mapping
+gapAt ls o Nil = Unique o
+gapAt ls o (Cons (t, next) rest) =
+  if ls - Offset.totalSeconds next < t
+  then Skipped o next (Instant.fromUnixNanoseconds (t * nanosecondsPerSecond))
+  else gapAt ls next rest
+
+-- (what a date-time is, by the offsets it holds at, the gap if none)
+mappingOf : Mapping -> List Offset.Offset -> Mapping
+mappingOf gap Nil = gap
+mappingOf gap (Cons o Nil) = Unique o
+mappingOf gap (Cons a (Cons b rest)) =
+  Ambiguous a (fromMaybe b (List.last rest))
+
+-- | What the date and time on the zone's clocks is: at one offset, the
+-- | one instant (`Unique`); at none, where the clocks skipped over it
+-- | (`Skipped`, the offsets before and after the gap, and the instant
+-- | the gap ends at); at two, where the clocks went back over it
+-- | (`Ambiguous`, the offset of the earlier instant, then the later's).
+-- | >>> maybe [] (\z -> List.map (\s -> maybe "" (\t -> show (mapLocal z t)) (LocalDateTime.parse s)) ["2024-03-10T01:59:59", "2024-03-10T02:30:00", "2024-03-10T03:00:00", "2024-11-03T01:30:00", "2024-11-03T02:00:00"]) (fromPosix "EST5EDT,M3.2.0,M11.1.0")
+-- | ["Unique -05:00", "Skipped -05:00 -04:00 2024-03-10T07:00:00Z", "Unique -04:00", "Ambiguous -04:00 -05:00", "Unique -05:00"]
+mapLocal : DateTimeZone -> LocalDateTime.LocalDateTime -> Mapping
+mapLocal z t =
+  mappingOf
+    (gapAt ls (offsetAtSecond z lo) changes)
+    (offsetsHolding ls lo (offsetAtSecond z lo) changes)
+  where
+  -- (the date-time's second, as if it were UTC's)
+  ls : Int
+  ls = Instant.unixNanoseconds (Instant.fromUtc t) / nanosecondsPerSecond
+  -- (two days before it: an offset is at most 18 hours)
+  lo : Int
+  lo = ls - 2 * secondsPerDay
+  -- (the changes from then to two days after it)
+  changes : List (Pair Int Offset.Offset)
+  changes = changesBetween z lo (ls + 2 * secondsPerDay)
+
+-- TZif
+--------------------------------------------------------------------------------
+
+-- (a TZif header: its version, 0 or a digit's byte, and how many of each
+-- of its data block's parts there are)
+type Header = { version, isut, isstd, leap, times, types, chars : Int }
+
+-- (the header the 44 bytes are)
+headerOf : Bytes -> Maybe Header
+headerOf b["TZif", version::8, _::binary-size(15), isut::32, isstd::32, leap::32, times::32, types::32, chars::32] =
+  Just
+    { version = version
+    , isut = isut
+    , isstd = isstd
+    , leap = leap
+    , times = times
+    , types = types
+    , chars = chars
+    }
+headerOf _ = Nothing
+
+-- (the bytes of the data block after the header, its times each `w`
+-- bytes)
+blockSize : Header -> Int -> Int
+blockSize h w =
+  h.times * (w + 1)
+  + h.types * 6
+  + h.chars
+  + h.leap * (w + 4)
+  + h.isstd
+  + h.isut
+
+-- (the integer the bytes write, big-endian: of 4 or 8, signed; of 1,
+-- not)
+intOf : Bytes -> Int
+intOf b[n::32-signed] = n
+intOf b[n::64-signed] = n
+intOf b[n::8] = n
+intOf _ = 0
+
+-- (the integer of the `w` bytes at `p`)
+intAt : Bytes -> Int -> Int -> Int
+intAt b p w = intOf (Bytes.slice b p (p + w))
+
+-- (whether each is less than the next)
+ascending : List Int -> Bool
+ascending (Cons a (Cons b rest)) = a < b && ascending (Cons b rest)
+ascending _ = True
+
+-- (the zone of the changes, each a second and the index of its type
+-- among the offsets `types`, the first of which is before them)
+tableOf : String
+        -> Array Offset.Offset
+        -> List Int
+        -> List Int
+        -> Maybe Rule
+        -> Either String DateTimeZone
+tableOf name types times kinds rule =
+  if List.any (\k -> k >= Array.length types) kinds
+  then Left "a TZif change's type is none of its types"
+  else if not (ascending times) then Left "TZif changes out of order"
+  else Right
+      (MkDateTimeZone
+         name
+         (Array.arrayIndex types 0)
+         { times = Array.fromList times
+         , offsets = Array.fromList (List.map (Array.arrayIndex types) kinds)
+         }
+         rule)
+
+-- (the zone of the data block at `p` after the header `h`, its times
+-- each `w` bytes, and the rule after them)
+blockZone : String
+          -> Bytes
+          -> Header
+          -> Int
+          -> Int
+          -> Maybe Rule
+          -> Either String DateTimeZone
+blockZone name b h p w rule =
+  if p + blockSize h w > Bytes.length b then Left "TZif data ends early"
+  else if h.types == 0 then Left "TZif with no local time type"
+  else (case traverse
+          (mo := instanceMonadMaybe)
+          (\i -> Offset.fromSeconds (intAt b (typesAt + 6 * i) 4))
+          (List.range 0 (h.types - 1)) of
+        Just offsets -> tableOf name (Array.fromList offsets) times kinds rule
+        Nothing -> Left "a TZif offset beyond 18 hours")
+  where
+  -- (where the local time types start)
+  typesAt : Int
+  typesAt = p + h.times * (w + 1)
+  -- (the second each change is at)
+  times : List Int
+  times = List.map (\i -> intAt b (p + w * i) w) (List.range 0 (h.times - 1))
+  -- (the type of each change)
+  kinds : List Int
+  kinds =
+    List.map
+      (\i -> intAt b (p + w * h.times + i) 1)
+      (List.range 0 (h.times - 1))
+
+-- (the rule of a footer's text, up to its newline: none if empty;
+-- nothing if it is no rule)
+footerRule : String -> Maybe (Maybe Rule)
+footerRule s =
+  if strFind "\n" s 0 < 0 then Nothing
+  else if strFind "\n" s 0 == 0 then Just Nothing
+  else maybe
+      Nothing
+      (\rule -> Just (Just rule))
+      (ruleOf (strSlice s 0 (strFind "\n" s 0)))
+
+-- (the rule of the footer at `p`, a newline, a POSIX rule, a newline:
+-- none if there is none; nothing if it is no rule)
+footerAt : Bytes -> Int -> Maybe (Maybe Rule)
+footerAt b p =
+  if p >= Bytes.length b then Just Nothing
+  else if intAt b p 1 /= 10 then Nothing
+  else footerRule (Bytes.asString (Bytes.slice b (p + 1) (Bytes.length b)))
+
+-- (the zone of version 2 and on, from its second header at `p`: its
+-- times of 8 bytes, and its footer)
+secondPartAt : String -> Bytes -> Int -> Either String DateTimeZone
+secondPartAt name b p = case headerOf (Bytes.slice b p (p + 44)) of
+  Just h ->
+    (case footerAt b (p + 44 + blockSize h 8) of
+     Just rule -> blockZone name b h (p + 44) 8 rule
+     Nothing -> Left "TZif footer no POSIX TZ rule")
+  Nothing -> Left "no second TZif header"
+
+-- | The zone the bytes of a TZif file are (RFC 8536), as the tz database
+-- | is kept on a system, its id `name`: of version 1, by its changes of 4
+-- | bytes; of version 2 and on, by its changes of 8 bytes and its footer's
+-- | POSIX rule for after them.  Its leap seconds are not read.  Why not
+-- | if the bytes are none, or an offset is beyond 18 hours.
+-- | >>> either (\why -> why) (\z -> joinWith " " (List.map (\n -> show (offsetAt z (Instant.fromUnixNanoseconds n))) [-1, 0, 4102444800000000000])) (fromTZif "Etc/Example" b["TZif2", 0::64, 0::56, 0::32, 0::32, 0::32, 1::32, 2::32, 8::32, 0::32, 1, 29160::32, 0, 0, 28800::32, 0, 4, "LMT", 0, "CST", 0, "TZif2", 0::64, 0::56, 0::32, 0::32, 0::32, 1::32, 2::32, 8::32, 0::64, 1, 29160::32, 0, 0, 28800::32, 0, 4, "LMT", 0, "CST", 0, "\nCST-8\n"])
+-- | "+08:06 +08:00 +08:00"
+-- | >>> List.map (\b -> either (\why -> why) id (fromTZif "x" b)) [Bytes.fromString "TZ", b["TZif", 0::64, 0::64, 0::64, 0::64, 0::64]]
+-- | ["no TZif header", "TZif with no local time type"]
+fromTZif : String -> Bytes -> Either String DateTimeZone
+fromTZif name b = case headerOf (Bytes.slice b 0 44) of
+  Just h ->
+    if h.version == 0 then blockZone name b h 44 4 Nothing
+    else secondPartAt name b (44 + blockSize h 4)
+  Nothing -> Left "no TZif header"

@@ -1,0 +1,170 @@
+-- std.datetimezone on TZif files of the tz database, kept beside this
+-- file in zoneinfo/ (copied from a system's, the tz database's, which is
+-- in the public domain): their offsets at instants known, from before
+-- their first change to after their last, by the footer's rule; and
+-- the date-times their clocks skipped and went back over.
+
+module test.check.datetimezone
+
+import bytes as Bytes
+import check
+import co
+import exception
+import std.datetimezone as DateTimeZone
+import std.filesystem
+import std.instant as Instant
+import std.localdatetime as LocalDateTime
+import std.offset as Offset
+import std.path as Path
+import std.process
+
+-- (the bytes of a fixture, by its id)
+fixture : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> String
+        -> Co e Bytes
+fixture name = do
+  root <- getEnv "HEFF_TEST_ROOT"
+  case root of
+    Just dir -> readBytes (Path.parse (dir ^ "/test/check/zoneinfo/" ^ name))
+    Nothing -> failure "HEFF_TEST_ROOT is not set: `heff test` sets it"
+
+-- (the zone of a fixture's bytes, else the test fails)
+fixtureZone : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
+            -> String
+            -> Co e DateTimeZone.DateTimeZone
+fixtureZone name = do
+  bytes <- fixture name
+  either failure pure (DateTimeZone.fromTZif name bytes)
+
+-- (the offsets of the zone at the seconds since the epoch, as they are
+-- written)
+offsetsAt : DateTimeZone.DateTimeZone -> List Int -> List String
+offsetsAt z =
+  List.map
+    (\s -> show (DateTimeZone.offsetAt z (Instant.fromUnixNanoseconds (s * 1000000000))))
+
+-- (what the date-times are in the zone, as they are written)
+mappingsOf : DateTimeZone.DateTimeZone -> List String -> List String
+mappingsOf z =
+  List.map
+    (\s -> maybe "no date-time" (\t -> show (DateTimeZone.mapLocal z t)) (LocalDateTime.parse s))
+
+-- (the bytes as a TZif file of version 1: its first block alone)
+versionOne : Bytes -> Bytes
+versionOne b = Bytes.concat [b["TZif", 0], Bytes.slice b 5 (Bytes.length b)]
+
+-- | the zones of the fixtures
+zones : Test
+zones =
+  group
+    "datetimezone"
+    [ integration "UTC has no change" (do
+        z <- fixtureZone "UTC"
+        assertEqual (offsetsAt z [-5000000000, 0, 4102444800]) ["Z", "Z", "Z"]
+        assertEqual
+          (mappingsOf z ["2024-03-10T02:30:00"])
+          ["Unique Z"])
+    , integration "Taipei: its local mean time, then +08:00 and summers" (do
+        z <- fixtureZone "Asia/Taipei"
+        -- 1893 (+08:06 before the first change), 1970, 1979's summer,
+        -- 2024, 2100 (by the footer, CST-8)
+        assertEqual
+          (offsetsAt z [-2400000000, 0, 300000000, 1710054000, 4118083200])
+          ["+08:06", "+08:00", "+09:00", "+08:00", "+08:00"])
+    , integration "New York: offsets, and the footer's rule beyond 2037" (do
+        z <- fixtureZone "America/New_York"
+        assertEqual
+          (offsetsAt
+             z
+             [ -2800000000
+             , 0
+             , 1710053999
+             , 1710054000
+             , 1730613599
+             , 1730613600
+             , 4102444800
+             , 4118083200
+             ])
+          [ "-04:56:02"
+          , "-05:00"
+          , "-05:00"
+          , "-04:00"
+          , "-04:00"
+          , "-05:00"
+          , "-05:00"
+          , "-04:00"
+          ]
+        -- 2100: the second Sunday of March is the 14th, the first of
+        -- November the 7th
+        assertEqual
+          (mappingsOf
+             z
+             [ "2024-03-10T01:59:59.999999999"
+             , "2024-03-10T02:00:00"
+             , "2024-03-10T02:59:59"
+             , "2024-03-10T03:00:00"
+             , "2024-11-03T00:59:59"
+             , "2024-11-03T01:00:00"
+             , "2024-11-03T01:59:59.5"
+             , "2024-11-03T02:00:00"
+             , "2100-03-14T02:30:00"
+             , "2100-11-07T01:30:00"
+             ])
+          [ "Unique -05:00"
+          , "Skipped -05:00 -04:00 2024-03-10T07:00:00Z"
+          , "Skipped -05:00 -04:00 2024-03-10T07:00:00Z"
+          , "Unique -04:00"
+          , "Unique -04:00"
+          , "Ambiguous -04:00 -05:00"
+          , "Ambiguous -04:00 -05:00"
+          , "Unique -05:00"
+          , "Skipped -05:00 -04:00 2100-03-14T07:00:00Z"
+          , "Ambiguous -04:00 -05:00"
+          ])
+    , integration "London: summer time, double summer time, the footer" (do
+        z <- fixtureZone "Europe/London"
+        -- 1970 (British Standard Time, +01:00 all year), 1944's summer
+        -- (double summer time), 2024's winter and summer, 2100's summer
+        assertEqual
+          (offsetsAt z [0, -805000000, 1704067200, 1719792000, 4118083200])
+          ["+01:00", "+02:00", "Z", "+01:00", "+01:00"]
+        assertEqual
+          (mappingsOf
+             z
+             ["2024-03-31T01:30:00", "2024-10-27T01:30:00", "2100-10-31T01:30:00"])
+          [ "Skipped Z +01:00 2024-03-31T01:00:00Z"
+          , "Ambiguous +01:00 Z"
+          , "Ambiguous +01:00 Z"
+          ])
+    , integration "a file of version 1 has no rule after its changes" (do
+        z <- fixture "America/New_York"
+        case DateTimeZone.fromTZif "America/New_York" (versionOne z) of
+          Left why -> failure why
+          Right one ->
+            assertEqual
+              (offsetsAt one [1710054000, 2140000000, 4118083200])
+              ["-04:00", "-04:00", "-05:00"])
+    , integration "what is no TZif is said so" (do
+        z <- fixture "Asia/Taipei"
+        assertEqual
+          (List.map
+             (\b -> either (\why -> why) DateTimeZone.id (DateTimeZone.fromTZif "x" b))
+             [ Bytes.slice z 0 100
+             , Bytes.slice z 1 (Bytes.length z)
+             , Bytes.slice z 0 (Bytes.length z - 20)
+             , Bytes.slice z 0 (Bytes.length z - 3)
+             ])
+          [ "no second TZif header"
+          , "no TZif header"
+          , "TZif data ends early"
+          , "TZif footer no POSIX TZ rule"
+          ])
+    ]
