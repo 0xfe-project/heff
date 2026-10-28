@@ -1,18 +1,28 @@
 // The float functions the runtime carries itself, bundled after the rest
-// of it: sin, cos, tan, exp and log, fdlibm's (5.3, Sun's "Freely
-// Distributable Math Library"), as V8 has them for JavaScript's `Math` --
-// so that a program computes the same float on every platform, whatever
-// libm it would be linked with (zig's own on Linux and with musl, the
-// system's on macOS), and the same as the JavaScript backends.  One thing
-// is V8's, not fdlibm's: `exp(1)` is e, correctly rounded, where fdlibm's
-// is a unit in the last place off.  (sqrt is IEEE's, correctly rounded by
-// every libm; asin, acos, atan, atan2 and pow are still the libm's.)
+// of it: sin, cos, tan, exp and log.  On macOS they are the system's, its
+// libm's.  Elsewhere zig's compiler_rt would give its own in their place
+// (on Linux, and with musl), less accurate (its `exp 1.0` a unit in the
+// last place off); there they are fdlibm's (5.3, Sun's "Freely
+// Distributable Math Library"), as V8 has them for JavaScript's `Math`,
+// the same as the JavaScript backends.  One thing is V8's, not fdlibm's:
+// `exp(1)` is e, correctly rounded, where fdlibm's is a unit in the last
+// place off.  (sqrt is IEEE's, correctly rounded by every libm; asin,
+// acos, atan, atan2 and pow are the libm's.)
 //
-// Each function is written as fdlibm has it, its names `heff_`'s, its
-// words got at through a union, and floats never contracted (`a*b + c`
-// is not fused into one rounding: fdlibm's arithmetic is IEEE's, step by
-// step, as V8's is).  Its constants are within the functions, which makes
-// them a part's own where a program is split into parts.
+// Where they are fdlibm's, each is written as fdlibm has it, its names
+// `heff_`'s, its words got at through a union, and floats never
+// contracted (`a*b + c` is not fused into one rounding: fdlibm's
+// arithmetic is IEEE's, step by step, as V8's is).  Its constants are
+// within the functions, which makes them a part's own where a program is
+// split into parts.
+
+#ifdef __APPLE__
+#define heff_sin sin
+#define heff_cos cos
+#define heff_tan tan
+#define heff_exp exp
+#define heff_log log
+#else
 
 /*
  * ====================================================
@@ -1035,6 +1045,8 @@ HEFF_FN double heff_log(double x) {
     else return dk * ln2_hi - ((s * (f - R) - dk * ln2_lo) - f);
   }
 }
+
+#endif
 
 // (std.math's, of a boxed float)
 FLT1(heff_floatSin, heff_sin)
