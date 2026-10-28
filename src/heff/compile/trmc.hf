@@ -208,6 +208,272 @@ startAcc s ak e =
     _ -> pure e
   else pure e
 
+-- Products
+--------------------------------------------------------------------------------
+
+-- A function giving back a tag one field of which is built round what
+-- a call of itself gave in that field, the others given back as the call
+-- gave them -- a list rebuilt with what is threaded through it, `case
+-- go s cs of MkRan cs2 z -> MkRan (c :: cs2) z` -- has a copy fill that
+-- field instead: given the cell and the field, it gives back the tag
+-- with a hole there, and what its call of itself gives, it gives back as
+-- it is, a call last, so a loop --
+--
+--   go s l = case l of                     go$dps s l d = case l of
+--     Nil -> MkRan Nil s                     Nil -> let u = setField d 1 Nil
+--     c :: cs -> case go (s + c) cs of              in MkRan _ s
+--       MkRan cs2 z -> MkRan (c :: cs2) z    c :: cs ->
+--                                              let cell = c :: _
+--                                              let u = setField d 1 cell
+--                                              in go$dps (s + c) cs cell
+--
+-- and the function itself builds the first cell, and takes apart what
+-- the copy gives, the cell in that field.  What is built round the call
+-- is built before it, so only of values, naming nothing the call gave.
+
+-- | a call of itself taken apart, its fields given back as the call
+-- | gave them but one (`field`), built round what it gave there: the
+-- | call's arguments, the arm's names, the tag built
+type Prod =
+  { tag : String
+  , field : Int
+  , args : List IR.Expr
+  , vs : List String
+  , es : List IR.Expr
+  , ts : List IR.FieldTy
+  }
+
+isJustP : {a : Type} -> Maybe a -> Bool
+isJustP (Just _) = True
+isJustP Nothing = False
+
+nthOr : {a : Type} -> a -> Int -> List a -> a
+nthOr d k Nil = d
+nthOr d k (Cons x xs) = if k == 0 then x else nthOr d (k - 1) xs
+
+-- (the list, its element `k` replaced by `x`)
+replaceAt : {a : Type} -> Int -> a -> List a -> List a
+replaceAt k x ys =
+  List.zipWith
+    (\i y -> if i == k then x else y)
+    (List.range 0 (List.length ys - 1))
+    ys
+
+isTagE : IR.Expr -> Bool
+isTagE (ETag _ _ _) = True
+isTagE e = False
+
+isVarNamed : String -> IR.Expr -> Bool
+isVarNamed v (EVar w) = strEq v w
+isVarNamed v e = False
+
+-- (a value naming none of `vs`)
+valueFree : List String -> IR.Expr -> Bool
+valueFree vs e =
+  IR.isValue e && List.all (\x -> (IR.occurrences x e).count == 0) vs
+
+-- | a tag of values naming none of `vs` but its last field: the name
+-- | `v`, or another such tag
+chainTo : String -> List String -> IR.Expr -> Bool
+chainTo v vs (ETag t args _) =
+  List.all (valueFree vs) (initOf args)
+  && maybe False (\l -> isVarNamed v l || chainTo v vs l) (List.last args)
+chainTo v vs e = False
+
+-- | the field of the hole the last tag of such a chain has
+chainHole : IR.Expr -> Int
+chainHole (ETag t args _) =
+  maybe
+    0
+    (\l -> if isTagE l then chainHole l else List.length args - 1)
+    (List.last args)
+chainHole e = 0
+
+-- (a field given back as the call gave it: the name the arm bound it to)
+passes : Pair String IR.Expr -> Bool
+passes (MkPair v e) = not (strEq v "_") && isVarNamed v e
+
+-- (the one field not given back so, if it is built round what the call
+-- gave there)
+oneChain : List String -> List (Pair Int (Pair String IR.Expr)) -> Maybe Int
+oneChain vs (Cons (MkPair j (MkPair v e)) Nil) =
+  if not (strEq v "_") && chainTo v vs e then Just j else Nothing
+oneChain vs ps = Nothing
+
+prodAt : List String -> List IR.Expr -> Maybe Int
+prodAt vs es =
+  oneChain
+    vs
+    (List.keepIf
+       (\p -> not (passes (snd p)))
+       (List.zip (List.range 0 (List.length vs - 1)) (List.zip vs es)))
+
+prodArm : Self -> List IR.Expr -> IR.Arm -> Maybe Prod
+prodArm s args (MkArm t vs (ETag t2 es ts)) =
+  if strEq t t2 && List.length vs == List.length es
+  then maybe
+      Nothing
+      (\j ->
+         Just { tag = t, field = j, args = args, vs = vs, es = es, ts = ts })
+      (prodAt vs es)
+  else Nothing
+prodArm s args a = Nothing
+
+prodArms : Self -> List IR.Expr -> List IR.Arm -> Maybe Prod
+prodArms s args (Cons a Nil) = prodArm s args a
+prodArms s args arms = Nothing
+
+prodCall : Self -> IR.Expr -> List IR.Arm -> Maybe Prod
+prodCall s (ECall g args) arms =
+  if strEq g s.key && List.length args == s.arity then prodArms s args arms
+  else Nothing
+prodCall s c arms = Nothing
+
+-- | a way out taking apart a call of itself so
+prodOf : Self -> IR.Expr -> Maybe Prod
+prodOf s (EMatch c arms) = prodCall s c arms
+prodOf s e = Nothing
+
+-- | the ways out of `e`, such a match one of them, `f` at each
+prodTails : Self -> (IR.Expr -> S IR.Expr) -> IR.Expr -> S IR.Expr
+prodTails s f (ELet x a b) = do
+  b2 <- prodTails s f b
+  pure (ELet x a b2)
+prodTails s f (ESet xs a b) = do
+  b2 <- prodTails s f b
+  pure (ESet xs a b2)
+prodTails s f (EMatch c arms) =
+  if isJustP (prodOf s (EMatch c arms)) then f (EMatch c arms)
+  else do
+    arms2 <-
+      traverseS
+        (IR.traverseArmM (mo := instanceMonadS) (\_ b -> prodTails s f b))
+        arms
+    pure (EMatch c arms2)
+prodTails s f e = f e
+
+-- | ... listed
+prodWays : Self -> IR.Expr -> List IR.Expr
+prodWays s (ELet _ _ b) = prodWays s b
+prodWays s (ESet _ _ b) = prodWays s b
+prodWays s (EMatch c arms) =
+  if isJustP (prodOf s (EMatch c arms)) then [EMatch c arms]
+  else List.concatMap (\a -> prodWays s (IR.armBody a)) arms
+prodWays s e = [e]
+
+maybeList : {a : Type} -> Maybe a -> List a
+maybeList (Just x) = [x]
+maybeList Nothing = Nil
+
+-- (a way out the copy may give: abandoned, the tag built, or a call of
+-- itself taken apart as `q` is)
+wayFits : Self -> Prod -> IR.Expr -> Bool
+wayFits s q EAbandon = True
+wayFits s q (ETag t es _) = strEq t q.tag && List.length es == List.length q.es
+wayFits s q e =
+  maybe
+    False
+    (\(r : Prod) -> strEq r.tag q.tag && r.field == q.field)
+    (prodOf s e)
+
+-- | the calls of itself taken apart so, where every way out fits them
+-- | >>> List.map (\(q : Prod) -> q.field) (prodsOf { key = "f", arity = 1 } (EMatch (EVar "l") [MkArm "Nil" Nil (ETag "R" [ETag "Nil" Nil Nil, EVar "l"] [FtAny, FtAny]), MkArm "Cons" ["c", "cs"] (EMatch (ECall "f" [EVar "cs"]) [MkArm "R" ["r", "z"] (ETag "R" [ETag "Cons" [EVar "c", EVar "r"] [FtAny, FtAny], EVar "z"] [FtAny, FtAny])])]))
+-- | [0]
+prodsOf : Self -> IR.Expr -> List Prod
+prodsOf s b =
+  let ways = prodWays s b
+  in let prods = List.concatMap (\w -> maybeList (prodOf s w)) ways
+  in case prods of
+  Cons q _ -> if List.all (wayFits s q) ways then prods else Nil
+  Nil -> Nil
+
+-- | the chain `e` built a cell at a time, each with a hole last, put in
+-- | field `i` of `d`; then `k`, given the last cell and its hole's field
+cells : IR.Expr
+      -> IR.Expr
+      -> IR.Expr
+      -> (IR.Expr -> IR.Expr -> S IR.Expr)
+      -> S IR.Expr
+cells d i (ETag t args ts) k = do
+  c <- freshS "cell"
+  u <- freshS "u"
+  rest <-
+    cells
+      (EVar c)
+      (EInt (List.length args - 1))
+      (fromMaybe EAbandon (List.last args))
+      k
+  pure
+      (ELet
+         c
+         (ETag t (List.append (initOf args) [hole]) (holeTys ts))
+         (ELet u (EPrimCall setFieldPrim [d, i, EVar c]) rest))
+cells d i e k = k d i
+
+-- (a field bound to a name first, unless it is a value: the fields
+-- computed in their order, though one is put in a cell first)
+fieldBound : IR.Expr -> S (Pair (List (Pair String IR.Expr)) IR.Expr)
+fieldBound e =
+  if IR.isValue e then pure (MkPair Nil e)
+  else do
+    x <- freshS "f"
+    pure (MkPair [MkPair x e] (EVar x))
+
+letsAround : List (Pair String IR.Expr) -> IR.Expr -> IR.Expr
+letsAround Nil b = b
+letsAround (Cons (MkPair x e) rest) b = ELet x e (letsAround rest b)
+
+-- | a way out of the copy filling field `i` of `d`: a call of itself
+-- | taken apart goes round, the cells built round it put there; a tag
+-- | built puts its field `j` there, and is given with a hole in it
+prodFill : Self -> Dps -> IR.Expr -> IR.Expr -> Int -> IR.Expr -> S IR.Expr
+prodFill s p d i j (ETag t es ts) = do
+  bs <- traverseS fieldBound es
+  u <- freshS "u"
+  let es2 = List.map snd bs
+  pure
+      (letsAround
+         (List.concatMap fst bs)
+         (ELet
+            u
+            (EPrimCall setFieldPrim [d, i, nthOr EAbandon j es2])
+            (ETag t (replaceAt j hole es2) (replaceAt j FtAny ts))))
+prodFill s p d i j e = case prodOf s e of
+  Just q ->
+    cells
+      d
+      i
+      (nthOr EAbandon j q.es)
+      (\d2 i2 -> pure (ECall p.key (List.append q.args (dpsTail p d2 i2))))
+  Nothing -> pure e
+
+-- | a way out of the function itself taking apart a call of itself so:
+-- | the first cell built, the copy called to fill it, and what it gives
+-- | taken apart, the cell in that field
+prodStart : Self -> Dps -> Int -> IR.Expr -> S IR.Expr
+prodStart s p j e = case prodOf s e of
+  Just q -> case nthOr EAbandon j q.es of
+    ETag t args ts -> do
+      c <- freshS "cell"
+      rest <-
+        cells
+          (EVar c)
+          (EInt (List.length args - 1))
+          (fromMaybe EAbandon (List.last args))
+          (\d2 i2 ->
+             pure
+               (EMatch
+                  (ECall p.key (List.append q.args (dpsTail p d2 i2)))
+                  [ MkArm
+                    q.tag
+                    (replaceAt j "_" q.vs)
+                    (ETag q.tag (replaceAt j (EVar c) q.es) q.ts)
+                  ]))
+      pure
+          (ELet c (ETag t (List.append (initOf args) [hole]) (holeTys ts)) rest)
+    _ -> pure e
+  Nothing -> pure e
+
 -- Definitions
 --------------------------------------------------------------------------------
 
@@ -259,6 +525,59 @@ gathered s d xs b = do
     _ -> pure (IR.mkDef (d.key ^ "$acc") (d.name ^ "$acc") copy)
   pure [IR.mkDef d.key d.name (ELam xs b0), copyDef]
 
+-- (where the copy is given the field it fills: the one every cell is
+-- filled at, else its parameter `iv`)
+holeField : Dps -> String -> IR.Expr
+holeField p iv = case p.at of
+  Just k -> EInt k
+  Nothing -> EVar iv
+
+dpsParams : Dps -> String -> String -> List String
+dpsParams p dv iv = case p.at of
+  Just _ -> [dv]
+  Nothing -> [dv, iv]
+
+-- | `d` and the copy of it that fills field `j` of what it gives back,
+-- | `prods` its calls of itself taken apart
+producted : Self
+          -> IR.Def
+          -> List String
+          -> IR.Expr
+          -> List Prod
+          -> Int
+          -> S (List IR.Def)
+producted s d xs b prods j = do
+  let p : Dps =
+    { key = d.key ^ "$dps"
+    , at =
+        sameAt
+          (List.map (\(q : Prod) -> chainHole (nthOr EAbandon j q.es)) prods)
+    }
+  b0 <- prodTails s (prodStart s p j) b
+  copy <- \n -> IR.freshen n (ELam xs b)
+  dv <- freshS "d"
+  iv <- freshS "i"
+  copyDef <- case copy of
+    ELam ys cb -> do
+      cb' <- prodTails s (prodFill s p (EVar dv) (holeField p iv) j) cb
+      pure
+          (IR.mkDef
+             p.key
+             (d.name ^ "$dps")
+             (ELam (List.append ys (dpsParams p dv iv)) cb'))
+    _ -> pure (IR.mkDef p.key (d.name ^ "$dps") copy)
+  pure [IR.mkDef d.key d.name (ELam xs b0), copyDef]
+
+-- (... where it has such calls of itself)
+productedOr : Self
+            -> IR.Def
+            -> List String
+            -> IR.Expr
+            -> List Prod
+            -> S (List IR.Def)
+productedOr s d xs b (Cons q rest) = producted s d xs b (Cons q rest) q.field
+productedOr s d xs b Nil = pure [d]
+
 -- | the definitions, and where fresh names go on from
 type Trmced = { defs : List IR.Def, supply : Int }
 
@@ -268,7 +587,7 @@ defT d = case d.body of
     let s : Self = { key = d.key, arity = List.length xs }
     in if List.any (consEnds s) (IR.waysList b) then destined s d xs b
     else if List.any (appendEnds s) (IR.waysList b) then gathered s d xs b
-    else pure [d]
+    else productedOr s d xs b (prodsOf s b)
   _ -> pure [d]
 
 -- | the definitions, each that ends in a call of itself put in a tag or
