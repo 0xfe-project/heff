@@ -20,7 +20,7 @@
 --
 -- -- | what comes on `a`, one more, sent on `b`, for ever
 -- ponger : {e w : HFunctor}
---        -> {{cm : CML.cmlOps w <: e}}
+--        -> {{cm : CML.cml w <: e}}
 --        -> CML.Chan w Int
 --        -> CML.Chan w Int
 --        -> Co e Unit
@@ -30,7 +30,7 @@
 --   ponger a b
 --
 -- -- | main and one thread: 0 sent there, and 1 back
--- pinged : {e w : HFunctor} -> {{cm : CML.cmlOps w <: e}} -> Co e Int
+-- pinged : {e w : HFunctor} -> {{cm : CML.cml w <: e}} -> Co e Int
 -- pinged = do
 --   a <- CML.newChan
 --   b <- CML.newChan
@@ -45,12 +45,12 @@
 --            -> Co w (Maybe Int)
 -- pingedHere = do
 --   with _ := CML.threads do
---     pinged (w := w)
+--     pinged
 -- ```
 --
 -- Operation | What it does
 -- --- | ---
--- `spawn c` | `c`, of the scheduler's world `cml w <+> w`, is a thread of its own, its `with`s giving to the custodian this one's give to here; this one goes on
+-- `spawn c` | `c`, of the scheduler's world `cml w <+> Custodian.custodian <+> w`, is a thread of its own, its `with`s giving to the custodian this one's give to here; this one goes on
 -- `yield` | the next thread's turn; this one's again after those ready
 -- `newChan` | a channel, of what its type says
 -- `send ch x` | `x` on `ch`, once a thread takes it: waits for the receiver; a base event
@@ -191,10 +191,10 @@
 -- `choose`'s branches are not threads: they run in the choosing thread,
 -- in what is around the `choose`, and so in its world.
 --
--- cml has the custodian in its own effect: `cml w` is cml's operations,
--- `cmlOps w`, and the custodian, which covers the one outside -- the
--- scheduler's world `w` has none, `scheduled` running in `w <+>
--- custodian`.  A thread is a user of a custodian, not one of its
+-- A thread's world has a custodian of the scheduler's, `cml w <+>
+-- custodian <+> w`, which covers the one outside -- the scheduler's
+-- world `w` has none, `scheduled` running in `w <+> custodian`.  A
+-- thread is a user of a custodian, not one of its
 -- things: what it carries is which custodian its `with`s give to, the
 -- one theirs gave to where it was spawned, and no shutdown stops it.  A
 -- `with k := Custodian.custody do` (or `contained`) in a thread is
@@ -239,7 +239,6 @@
 
 module cml
   ( cml
-  , cmlOps
   , Chan
   , IVar
   , spawn
@@ -588,10 +587,12 @@ stepThen g (Choose s) = Choose (someThen (choosingThen g) s)
 stepThen g (MadeNack iv k) = MadeNack iv (\u -> g (k u))
 stepThen g (Settled n k) = Settled n (\u -> g (k u))
 
--- (cml's own operations: threads spawned and yielding, channels and
--- ivars made, and events synced on)
-cmlOps : HFunctor -> HFunctor
-cmlOps w =
+-- | For CML threads run in the world `w`: spawned and yielding,
+-- | channels and ivars made, and events synced on.  A thread's world is
+-- | `cml w <+> custodian <+> w`: the custodian there is the scheduler's,
+-- | which covers the one outside.
+cml : HFunctor -> HFunctor
+cml w =
   { f = CmlF w
   , hfmap = \m g p -> stepThen g p
   , hmap = \m n nt p -> case p of
@@ -605,14 +606,6 @@ cmlOps w =
       MadeNack iv k -> MadeNack iv k
       Settled n k -> Settled n k
   }
-
--- | For CML threads run in the world `w`: spawned and yielding,
--- | channels and ivars made, and events synced on; and the custodian
--- | the threads' `with`s give to, which covers the one outside -- each
--- | thread's own to say, a `with` of a custodian in it making it that
--- | one for the body, the thread waiting there as anywhere else.
-cml : HFunctor -> HFunctor
-cml w = cmlOps w <+> Custodian.custodian
 
 -- (a thread as `spawn` hands it over: of cml's world, its operations
 -- cml's own and the custodian's)
@@ -638,12 +631,12 @@ summedInto l r (InL p) = l p
 summedInto l r (InR q) = r q
 
 -- | `c`, a thread of its own; this one goes on.  `c` is a computation
--- | of the scheduler's world, `cml w <+> w`: no handler around the
+-- | of the scheduler's world, `cml w <+> Custodian.custodian <+> w`: no handler around the
 -- | spawn is around it, so what it needs -- a `recover`, a state, a
 -- | resource -- it opens itself, or is given as a value.
 spawn : {e w : HFunctor}
-      -> {{cm : cmlOps w <: e}}
-      -> Co (cml w <+> w) Unit
+      -> {{cm : cml w <: e}}
+      -> Co (cml w <+> Custodian.custodian <+> w) Unit
       -> Co e Unit
 spawn c =
   op
@@ -651,13 +644,18 @@ spawn c =
        (Spawn
           (\t inCml inWorld ->
              lift
-               (inj := summedInto (h := cml w) (k := w) (e := t) inCml inWorld)
+               (inj := summedInto
+                 (h := cml w <+> Custodian.custodian)
+                 (k := w)
+                 (e := t)
+                 inCml
+                 inWorld)
                c)
           (\u -> u)))
     val
 
 -- | The next thread's turn; this one's again after those ready.
-yield : {e w : HFunctor} -> {{cm : cmlOps w <: e}} -> Co e Unit
+yield : {e w : HFunctor} -> {{cm : cml w <: e}} -> Co e Unit
 yield = op (cm (Yield (\u -> u))) val
 
 -- Channels and ivars
@@ -666,14 +664,14 @@ yield = op (cm (Yield (\u -> u))) val
 -- | A channel of `a`s.
 newChan : {e w : HFunctor}
         -> {a : Type}
-        -> {{cm : cmlOps w <: e}}
+        -> {{cm : cml w <: e}}
         -> Co e (Chan w a)
 newChan = op (cm (NewChan (\r use -> use a (MkMakingChan (\ch -> ch))))) val
 
 -- | An ivar, holding nothing yet.
 newIVar : {e w : HFunctor}
         -> {a : Type}
-        -> {{cm : cmlOps w <: e}}
+        -> {{cm : cml w <: e}}
         -> Co e (IVar w a)
 newIVar = op (cm (NewIVar (\r use -> use a (MkMakingIVar (\iv -> iv))))) val
 
@@ -681,7 +679,7 @@ newIVar = op (cm (NewIVar (\r use -> use a (MkMakingIVar (\iv -> iv))))) val
 -- | once: a second put is abandoned.  Never waits.
 putIVar : {e w : HFunctor}
         -> {a : Type}
-        -> {{cm : cmlOps w <: e}}
+        -> {{cm : cml w <: e}}
         -> IVar w a
         -> a
         -> Co e Unit
@@ -695,7 +693,7 @@ putIVar iv v =
 -- | receiver.  A base event: in a `choose`, its branch's commit point.
 send : {e w : HFunctor}
      -> {a : Type}
-     -> {{cm : cmlOps w <: e}}
+     -> {{cm : cml w <: e}}
      -> Chan w a
      -> a
      -> Co e Unit
@@ -706,7 +704,7 @@ send ch v =
 -- | sender.  A base event.
 recv : {e w : HFunctor}
      -> {a : Type}
-     -> {{cm : cmlOps w <: e}}
+     -> {{cm : cml w <: e}}
      -> Chan w a
      -> Co e a
 recv ch =
@@ -715,7 +713,7 @@ recv ch =
 -- | What the ivar holds, waiting until it is written.  A base event.
 readIVar : {e w : HFunctor}
          -> {a : Type}
-         -> {{cm : cmlOps w <: e}}
+         -> {{cm : cml w <: e}}
          -> IVar w a
          -> Co e a
 readIVar iv =
@@ -723,7 +721,7 @@ readIVar iv =
 
 -- | A base event never ready: waits for ever, and in a `choose` is
 -- | never the one committed.
-never : {e w : HFunctor} -> {a : Type} -> {{cm : cmlOps w <: e}} -> Co e a
+never : {e w : HFunctor} -> {a : Type} -> {{cm : cml w <: e}} -> Co e a
 never = op (cm (Sync Nil)) val
 
 -- | One of the branches: each run, in order, up to its first base event
@@ -737,7 +735,7 @@ never = op (cm (Sync Nil)) val
 -- | told.  A `choose` in a branch is that branch's base events.
 choose : {e w : HFunctor}
        -> {a : Type}
-       -> {{cm : cmlOps w <: e}}
+       -> {{cm : cml w <: e}}
        -> List (Co e a)
        -> Co e a
 choose bs = op (cm (Choose (\r use -> use a (MkChoosing bs (\v -> v))))) val
@@ -759,7 +757,7 @@ data Nack (w : HFunctor) = MkNack (IVar w Unit)
 -- | thread goes on, `nack` is never ready.
 withNack : {e w : HFunctor}
          -> {a : Type}
-         -> {{cm : cmlOps w <: e}}
+         -> {{cm : cml w <: e}}
          -> (Nack w -> Co e a)
          -> Co e a
 withNack f = do
@@ -769,7 +767,7 @@ withNack f = do
 
 -- | Once the nack is ready: its `choose` left without its branch.  A
 -- | base event, as an ivar's read is.
-awaitNack : {e w : HFunctor} -> {{cm : cmlOps w <: e}} -> Nack w -> Co e Unit
+awaitNack : {e w : HFunctor} -> {{cm : cml w <: e}} -> Nack w -> Co e Unit
 awaitNack (MkNack iv) = readIVar iv
 
 -- The handler: a thread as a resumption
@@ -2335,7 +2333,7 @@ cmlAlg : {w : HFunctor}
        -> {a : Type}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
-       -> (cml w <+> w).f (Res w) a
+       -> (cml w <+> Custodian.custodian <+> w).f (Res w) a
        -> Res w a
 cmlAlg st (InL (InL p)) = RStep (stepThen (\x -> RDone x) p)
 cmlAlg st (InL (InR (Given (Under k s)))) =
@@ -2355,7 +2353,7 @@ cmlAlg st (InR q) =
 cmlHandler : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
-           -> Handler (cml w <+> w)
+           -> Handler (cml w <+> Custodian.custodian <+> w)
 cmlHandler st =
   { M = Res w
   , ret = \x -> RDone x
@@ -2364,7 +2362,7 @@ cmlHandler st =
   }
 
 -- (the scheduler's state, its spawned threads' first turns made: the
--- thread put in the scheduler's world, `cml w <+> w`, and handled, in
+-- thread put in the scheduler's world, `cml w <+> Custodian.custodian <+> w`, and handled, in
 -- its own turn)
 threaded : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
@@ -2382,7 +2380,10 @@ threaded st =
              (\u ->
                 handle
                   (cmlHandler s)
-                  (c (cml w <+> w) (inl (cml w) w) (inr (cml w) w))))
+                  (c
+                     (cml w <+> Custodian.custodian <+> w)
+                     (inl (cml w <+> Custodian.custodian) w)
+                     (inr (cml w <+> Custodian.custodian) w))))
   }
 
 -- (how many turns in a row a worker takes from its slot, before it puts
@@ -2734,7 +2735,7 @@ scheduledBy : {w : HFunctor}
             -> {a : Type}
             -> {{dm : Domain.domain <: w}}
             -> Maybe (Outside w)
-            -> Co (cml w <+> w) a
+            -> Co (cml w <+> Custodian.custodian <+> w) a
             -> Co (outer w) (Maybe a)
 scheduledBy outside c = do
   numbers <- Domain.newAtomic 0
@@ -2814,7 +2815,7 @@ scheduledBy outside c = do
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {{dm : Domain.domain <: w}}
-          -> Co (cml w <+> w) a
+          -> Co (cml w <+> Custodian.custodian <+> w) a
           -> Co (w <+> Custodian.custodian) (Maybe a)
 scheduled c = scheduledBy Nothing c
 
@@ -2833,7 +2834,7 @@ scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
                      -> {{dm : Domain.domain <: w}}
                      -> {{rx : Reactor.reactor <: w}}
-                     -> Co (cml w <+> w) a
+                     -> Co (cml w <+> Custodian.custodian <+> w) a
                      -> Co (w <+> Custodian.custodian) (Maybe a)
 scheduledWithReactor c =
   scheduledBy
@@ -2856,7 +2857,7 @@ scheduledWithReactor c =
 data Threads = OnDomains
 
 -- | `with _ := CML.threads do ss`: `ss` cml's main thread, in the world
--- | of the block around with cml's own (`cml w <+> w`, `ss` spawning,
+-- | of the block around with cml's own (`cml w <+> Custodian.custodian <+> w`, `ss` spawning,
 -- | sending, choosing), it and the threads it spawns run on domains, as
 -- | by `scheduled`; the `with` comes to `Just` the body's value, or
 -- | `Nothing` where every thread waits.  The `with` is done once the
@@ -2880,12 +2881,18 @@ threadsWithReactor = OnReactors
 -- | and the `with` comes to what main's answer is.
 instance instanceBinderThreads : Binder Threads
 instanceBinderThreads =
-  { Contents = \w s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
+  { Contents = \w s -> Unit
+  , World = \w -> cml w <+> Custodian.custodian <+> w
+  , Result = \r -> Maybe r
+  }
 
 -- | ... with a reactor.
 instance instanceBinderThreadsWithReactor : Binder ThreadsWithReactor
 instanceBinderThreadsWithReactor =
-  { Contents = \w s -> Unit, World = \w -> cml w <+> w, Result = \r -> Maybe r }
+  { Contents = \w s -> Unit
+  , World = \w -> cml w <+> Custodian.custodian <+> w
+  , Result = \r -> Maybe r
+  }
 
 -- | `scheduled`'s, or `scheduledWithReactor`'s, in a world `e` that has
 -- | a custodian of its own: the one outside the threads `e`'s, so that
@@ -2909,7 +2916,7 @@ instance instanceHolderThreads : {e : HFunctor}
                                  e
                                  Threads
                                  (\s -> Unit)
-                                 (\w -> cml w <+> w)
+                                 (\w -> cml w <+> Custodian.custodian <+> w)
                                  (\r -> Maybe r)
 instanceHolderThreads =
   { held = \c written body ->
@@ -2926,7 +2933,10 @@ instance instanceHolderThreadsWithReactor : {e : HFunctor}
                                             e
                                             ThreadsWithReactor
                                             (\s -> Unit)
-                                            (\w -> cml w <+> w)
+                                            (\w ->
+                                               cml w
+                                               <+> Custodian.custodian
+                                               <+> w)
                                             (\r -> Maybe r)
 instanceHolderThreadsWithReactor =
   { held = \c written body ->

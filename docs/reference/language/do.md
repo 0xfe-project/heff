@@ -282,10 +282,13 @@ body has that custodian current.
 
 A cml thread is a user of a custodian, not one of its things. What it
 carries is which custodian its `with`s give to: at first the one the
-`with`s gave to where it was spawned. No shutdown stops a thread. cml
-has the custodian in its own effect, `cml w`, and that one covers the
-one outside. The threads' world `w` has none of its own, and
-`CML.scheduled` runs in `w <+> custodian`.
+`with`s gave to where it was spawned. No shutdown stops a thread. A
+thread's world, `CML.cml w <+> custodian <+> w`, has a custodian of
+the scheduler's, and that one covers the one outside. The scheduler's
+world `w` has none of its own, and `CML.scheduled` runs in `w <+>
+custodian`. Thread code is written for any world `e`, asking for
+`{{cm : CML.cml w <: e}}` and `{{cu : custodian <: e}}`, as other
+code is; the concrete world appears only where `scheduled` runs it.
 
 So a `with k := Custodian.custody do` in a cml thread is cml's to
 answer. The body stays in the thread. It waits at a channel as
@@ -307,12 +310,15 @@ import exception
 import resource
 import std.net as Net
 
-serving : {w : HFunctor}
+serving : {e w : HFunctor}
         -> {s : Type}
-        -> {{nt : Net.net <: w}}
+        -> {{cm : CML.cml w <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
         -> With s Net.TcpListener
         -> CML.Chan w Int
-        -> Co (exception Net.NetError <+> (CML.cml w <+> w)) Unit
+        -> Co e Unit
 serving l ch = do
   with k := Custodian.contained do
     with Net.accept l as c do
@@ -380,7 +386,7 @@ spawned in `s` waited for at its end
   `BOC.boc w <+> w`, and none of the handlers around the `with` (a
   `try`, another `with`'s resource) is around it. What it needs, it
   opens itself or is given as a value. cml's threads are the same: a
-  `CML.spawn` takes a computation of `CML.cml w <+> w`.
+  `CML.spawn` takes a computation of `CML.cml w <+> Custodian.custodian <+> w`.
 - Its value is what the handler says: a file's `with` comes to what its
   body came to, a cown's to `()` (the behaviour runs later), cml's
   threads' to `Just` main's answer (`Nothing` where every thread
