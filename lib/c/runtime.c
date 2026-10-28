@@ -1188,6 +1188,17 @@ HEFF_KNOWN V heff_tag_at_n(V r, int id, int64_t n, V *f) {
   return r;
 }
 
+// (... the fields of `same` there already, each read from the cell at
+// its place and given back there: stored only in a new one)
+HEFF_KNOWN V heff_tag_re_n(V r, int id, int64_t n, uint64_t same, V *f) {
+  if (!IS_OBJ(r)) return heff_tag_n(id, n, f);
+  Tag *t = (Tag *)r;
+  t->h.tag = (uint16_t)id;
+  for (int64_t i = 0; i < n; i++)
+    if (!((same >> i) & 1)) t->f[i] = f[i];
+  return r;
+}
+
 HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
   if (!IS_OBJ(r)) return heff_tag_nf(id, n, flat, f);
   Tag *t = (Tag *)r;
@@ -1199,13 +1210,20 @@ HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
 // (what a tag's field waits as, a hole: no object, nothing to drop; and
 // field `i` of the cell `d`, made with a hole there that nothing has
 // seen yet, set to `v`: what a call of itself gives put where a tag waits
-// for it -- a destination; `d` consumed)
+// for it -- a destination; `d` consumed, `v` given back, counted)
 static inline V heff_hole(void) { return MK_INT(0); }
 
 static inline V heff_setField(V d, V i, V v) {
   ((Tag *)d)->f[INT_OF(i)] = v;
   heff_drop(d);
-  return NTAG(TAG_MkUnit);
+  return heff_dup(v);
+}
+
+// (... of a cell lent, a destination's: not given up, and the value set
+// given back lent, held by the cell -- no reference taken nor dropped)
+static inline V heff_setFieldPeek(V d, V i, V v) {
+  ((Tag *)d)->f[INT_OF(i)] = v;
+  return v;
 }
 
 // (a record of `n` fields, its labels `lbl`)

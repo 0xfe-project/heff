@@ -65,7 +65,15 @@ elemS x (Cons y ys) = strEq x y || elemS x ys
 -- | record of `n` fields -- built where it is bound, or read a field of
 -- | at its shape -- or a closure holding `n`, built where it is bound
 -- | (#34)
-data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
+-- | what a variable is known to be: a tag of `n` fields; a cell kept for
+-- | one, and the tag it was and the names its fields were read to, at
+-- | their places, where it was a tag of no flat field ("" and none, where
+-- | it is not known); a record of `n` fields; a closure holding `n`
+data Known
+  = KnownTag Int
+  | KnownCell Int String (List String)
+  | KnownRec Int
+  | KnownClo Int
 
 -- | a drop of a variable, as what it is known to be (if anything)
 data Drop = MkDrop String (Maybe Known)
@@ -125,8 +133,10 @@ data Exp b
   -- | a tag: the bits of its flat fields (#64, `Repr.flatBits`), its
   -- | fields (a flat one's bits, `RWord`)
   | RTag String Int (List (Exp b))
-  -- | ... built in the cell kept for it
-  | RTagIn (Exp b) String Int (List (Exp b))
+  -- | ... built in the cell kept for it, the bits of the fields there
+  -- | already (each the one read from the cell at its place, given back
+  -- | there): stored only where the cell is a new one
+  | RTagIn (Exp b) String Int Int (List (Exp b))
   -- | a record of its labels, the bits of its flat fields (#39,
   -- | `Repr.flatBits`), its fields (a flat one's bits, `RWord`)
   | RRec (List String) Int (List (Exp b))
@@ -1228,14 +1238,35 @@ tagVal r ce live t argv ts =
     (slotBits (Repr.tagSlots ts (List.length argv)))
     (storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv)
 
+-- (the bits of the fields there already, of a tag `t` built in the cell
+-- `ru`: each its own field, read from the cell at its place and given
+-- back there, as it was -- in a cell of a tag of no flat field)
+sameBits : CE -> Imperative.Val -> String -> List Value -> Int
+sameBits ce (SVar ru) t es = case OrdMap.lookup ce.known ru of
+  Just (KnownCell _ t0 vs) ->
+    if strEq t t0 && List.length vs == List.length es
+    then keepBits
+        (List.zipWith
+           (\v e -> case e of
+            RLocal x -> strEq v x
+            _ -> False)
+           vs
+           es)
+    else 0
+  _ -> 0
+sameBits ce ru t es = 0
+
 -- | ... in the cell `ru` kept for it
 reuseVal : RcK -> CE -> List String -> List Imperative.Val -> Value
 reuseVal r ce live (Cons ru (Cons (STag t argv ts) Nil)) =
-  RTagIn
+  let es = storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv
+  in let flat = slotBits (Repr.tagSlots ts (List.length argv))
+  in RTagIn
     (r.val ce (unionS (fvList argv) live) ru)
     t
-    (slotBits (Repr.tagSlots ts (List.length argv)))
-    (storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv)
+    flat
+    (if flat == 0 then sameBits ce ru t es else 0)
+    es
 reuseVal r ce live _ = RInt 0
 
 -- | a record built from `x`'s
@@ -2147,9 +2178,9 @@ knowing Nothing n ce = ce
 knowing (Just x) n ce = withKnown x (KnownTag n) ce
 
 -- (in an arm, the cell kept: known to be one for a tag of its size)
-knowCell : Maybe String -> Int -> CE -> CE
-knowCell Nothing n ce = ce
-knowCell (Just ru) n ce = withKnown ru (KnownCell n) ce
+knowCell : Maybe String -> String -> List String -> Int -> CE -> CE
+knowCell Nothing t vs n ce = ce
+knowCell (Just ru) t vs n ce = withKnown ru (KnownCell n t vs) ce
 
 -- (an arm, reading the fields it wants as `rd` says)
 armRead : RcK
@@ -2191,7 +2222,12 @@ armRead r ce taken lent t vs fb leaves rd (MkPair ru b2) =
              (withBorrowed
                 (if lent then List.append (minusS vs rd.counted) ce.borrowed
                  else ce.borrowed)
-                (knowCell ru (List.length vs) ce)))
+                (knowCell
+                   ru
+                   (if rd.flat then "" else t)
+                   (if rd.flat then Nil else vs)
+                   (List.length vs)
+                   ce)))
           b2))
     leaves
 
@@ -2782,6 +2818,57 @@ bindPeek r ce x a i rest after wb =
           rest
           after))
 
+-- Cells filled: `let x = setField d i v`, `d` lent to this code -- a
+-- destination (heff.compile.trmc), held by the cell before it -- has
+-- its field set and is not given up (`heff_setFieldPeek`), and `x`, the
+-- value set there, is lent too, held by `d` as long as `d` is: no
+-- reference taken for it, nor dropped.  So a destination goes round a
+-- loop lent, as heff.compile.borrow lends it on.
+
+-- | the cell, lent, of `let x = o`, a field of it set: the cell, the
+-- | field and the value
+fillOf : CE -> Imperative.Comp -> Maybe (Pair String (List Imperative.Val))
+fillOf ce (OPrim SetField (Cons (SVar d) rest)) =
+  if elemS d ce.borrowed then Just (MkPair d rest) else Nothing
+fillOf ce (OSimple (SPrim SetField (Cons (SVar d) rest))) =
+  if elemS d ce.borrowed then Just (MkPair d rest) else Nothing
+fillOf ce o = Nothing
+
+-- (`let x = setField d i v`, `d` lent: what is held and wanted neither
+-- by `i` and `v` nor after dropped first; then the field set, and `x`
+-- lent to what follows -- `wb` what that and what comes after want)
+bindFill : RcK
+         -> CE
+         -> String
+         -> String
+         -> List Imperative.Val
+         -> List Imperative.St
+         -> Maybe Imperative.Tl
+         -> List String
+         -> List Statement
+bindFill r ce x d iv rest after wb =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS (fvList iv) wb)))
+    (Cons
+       (CLet
+          x
+          (RPrim
+             SetFieldPeek
+             (Cons
+                (RLocal d)
+                (operandsF
+                   r
+                   (withPath (deadKept ce.owned (unionS (fvList iv) wb)) wb ce)
+                   wb
+                   iv))))
+       (r.stmts
+          (withPath
+             (deadKept ce.owned wb)
+             ce.after
+             (withBorrowed (Cons x ce.borrowed) ce))
+          rest
+          after))
+
 -- (a statement that sets `x`: a match, a condition)
 setting : RcK -> CE -> Imperative.St -> List Statement
 setting r ce (SCase v arms) = Cons (matchOf r ce False v (stArmsOf arms)) Nil
@@ -2815,6 +2902,21 @@ letOf r ce x o rest after Nothing =
     (takesFor ce o (restItems rest after))
     rest
     after
+
+-- (`let x = o` and what follows: a field of a cell lent set, or as
+-- `letOf` binds it)
+letFill : RcK
+        -> CE
+        -> String
+        -> Imperative.Comp
+        -> List Imperative.St
+        -> Maybe Imperative.Tl
+        -> Maybe (Pair String (List Imperative.Val))
+        -> List Statement
+letFill r ce x o rest after (Just (MkPair d iv)) =
+  bindFill r ce x d iv rest after (unionS (fvRest rest after) ce.after)
+letFill r ce x o rest after Nothing =
+  letOf r ce x o rest after (peekOf ce x o (restItems rest after))
 
 -- (the names declared one after another, and the statements after them)
 declRun : List String
@@ -2878,7 +2980,7 @@ stmtsF : RcK
 stmtsF r ce Nil (Just t) = r.tail ce t
 stmtsF r ce Nil Nothing = Nil
 stmtsF r ce (Cons (SLet x o) rest) after =
-  letOf r ce x o rest after (peekOf ce x o (restItems rest after))
+  letFill r ce x o rest after (fillOf ce o)
 stmtsF r ce (Cons (SDecl x) (Cons (SDecl y) more)) after =
   declsThen r ce (declRun [x, y] more) after
 stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
@@ -3238,7 +3340,7 @@ funPlain ce key xs b =
 tokenFun : CE -> String -> List String -> Imperative.Tl -> Int -> Def
 tokenFun ce key (Cons tok xs) b n =
   funPlain
-    (withKnown tok (KnownCell n) ce)
+    (withKnown tok (KnownCell n "" Nil) ce)
     key
     (Cons tok xs)
     (snd (reuseK.tl tok { n = n, tag = "" } b))
