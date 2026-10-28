@@ -210,15 +210,29 @@ empty = MkHashMap 0 Vacant
 bitAt : Int -> Int -> Int
 bitAt h s = shiftL 1 (and (shiftR h s) 31)
 
+-- (a node's two children, `a` first: an array made at once, no list
+-- made for it)
+twoChildren : {a : Type} -> a -> a -> Array a
+twoChildren a b = arraySet (arrayReplicate 2 a) 1 b
+
 -- (two nodes of hashes `h1` and `h2`, which differ, under one node at
 -- the level `s` bits down: further down while their bits there agree)
 joined : {k v : Type} -> Int -> Int -> Trie k v -> Int -> Trie k v -> Trie k v
 joined s h1 n1 h2 n2 =
-  if bitAt h1 s == bitAt h2 s
-  then Branch (bitAt h1 s) (arrayFromList [joined (s + 5) h1 n1 h2 n2])
-  else if bitAt h1 s < bitAt h2 s
-  then Branch (or (bitAt h1 s) (bitAt h2 s)) (arrayFromList [n1, n2])
-  else Branch (or (bitAt h1 s) (bitAt h2 s)) (arrayFromList [n2, n1])
+  let b1 = bitAt h1 s
+  in let b2 = bitAt h2 s
+  in if b1 == b2
+  then Branch b1 (arrayReplicate 1 (joined (s + 5) h1 n1 h2 n2))
+  else if b1 < b2
+  then Branch (or b1 b2) (twoChildren n1 n2)
+  else Branch (or b1 b2) (twoChildren n2 n1)
+
+-- (`x` put in among a node's children at `i`, their array given room
+-- first where it has none, its room doubled: a node filled a child at a
+-- time, where nothing else holds it, is grown in place but at each power
+-- of 2, not copied at each child)
+childAdded : {a : Type} -> Array a -> Int -> a -> Array a
+childAdded children i x = Array.insertAt (Array.reserve children 1) i x
 
 -- (pairs of one hash, as a node: none, one a leaf)
 collisionOf : {k v : Type} -> Int -> List (Pair k v) -> Trie k v
@@ -271,7 +285,7 @@ budded : {k v : Type}
 budded h s i key Nothing bm children = MkPair (Branch bm children) 0
 budded h s i key (Just v) bm children =
   MkPair
-    (Branch (or bm (bitAt h s)) (Array.insertAt children i (Leaf h key v)))
+    (Branch (or bm (bitAt h s)) (childAdded children i (Leaf h key v)))
     1
 
 -- (what a walk gives back: the node it was given, changed; what it found
@@ -298,7 +312,7 @@ insertAt eq f h s key value (Branch bm children) holed =
   then MkWalked
       (Branch
          (or bm (bitAt h s))
-         (Array.insertAt children (-1 - j) (Leaf h key value)))
+         (childAdded children (-1 - j) (Leaf h key value)))
       1
       holed
   else (let child = arrayIndex children j
@@ -388,21 +402,28 @@ lookup m key = lookupAt equal (hash key) 0 (trieOf m)
     in if i < 0 then Nothing
     else lookupAt eq h (s + 5) (arrayIndex children i)
 
--- (the one child of a node: a leaf or keys of one hash, which may stand
--- for the node, at any level; or a node, which may not, its bits being
--- of its own level)
-lone : {k v : Type} -> Trie k v -> Trie k v -> Trie k v
-lone (Branch bm children) node = node
-lone child node = child
+-- (the one child left of a node, `other`, beside the one at `j` the walk
+-- emptied: a leaf or keys of one hash, which may stand for the node, at
+-- any level, the children's array let go as it is; or a node, which may
+-- not, its bits being of its own level)
+lone : {k v : Type}
+     -> Trie k v
+     -> Int
+     -> Int
+     -> Array (Trie k v)
+     -> Trie k v
+lone (Branch b c) bm j children = Branch bm (Array.removeAt children j)
+lone other bm j children = other
 
--- (a node of fewer children: none, nothing; one, it if it may stand
--- for the node)
-shrunk : {k v : Type} -> Int -> Array (Trie k v) -> Trie k v
-shrunk 0 children = Vacant
-shrunk bm children =
-  if arrayLength children == 1
-  then lone (arrayIndex children 0) (Branch bm children)
-  else Branch bm children
+-- (a node of fewer children, the one at `j` emptied by the walk: none,
+-- nothing; one, it if it may stand for the node -- not taken out of
+-- the array first, which would be made over only to be let go)
+shrunk : {k v : Type} -> Int -> Int -> Array (Trie k v) -> Trie k v
+shrunk 0 j children = Vacant
+shrunk bm j children =
+  if arrayLength children == 2
+  then lone (arrayIndex children (1 - j)) bm j children
+  else Branch bm (Array.removeAt children j)
 
 -- (whether a node is none: a child the walk emptied)
 vacant : {k v : Type} -> Trie k v -> Bool
@@ -454,7 +475,7 @@ remove (MkHashMap n t) key =
               MkWalked changed taken rest ->
                 if vacant changed
                 then MkWalked
-                    (shrunk (xor bm (bitAt h s)) (Array.removeAt rest j))
+                    (shrunk (xor bm (bitAt h s)) j rest)
                     taken
                     holed
                 else MkWalked
@@ -549,7 +570,7 @@ alter (MkHashMap n t) key f =
               MkWalked changed d rest ->
                 if vacant changed
                 then MkWalked
-                    (shrunk (xor bm (bitAt h s)) (Array.removeAt rest j))
+                    (shrunk (xor bm (bitAt h s)) j rest)
                     d
                     holed
                 else MkWalked (Branch bm (arraySet rest j changed)) d holed))
@@ -724,7 +745,7 @@ updateBy (MkHashMap n t) query value f =
     then MkWalked
         (Branch
            (or bm (bitAt h s))
-           (Array.insertAt children (-1 - j) (Leaf h (keyed query) value)))
+           (childAdded children (-1 - j) (Leaf h (keyed query) value)))
         1
         holed
     else (let child = arrayIndex children j
