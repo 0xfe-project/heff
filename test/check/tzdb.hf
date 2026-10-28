@@ -1,0 +1,117 @@
+-- std.tzdb: zones read from a directory of TZif files (the fixtures
+-- kept beside this file in zoneinfo/), what is said where one cannot be,
+-- and the system's own tz database and zone, where it has them.
+
+module test.check.tzdb
+
+import check
+import co
+import exception
+import std.datetimezone as DateTimeZone
+import std.filesystem
+import std.instant as Instant
+import std.offset as Offset
+import std.path as Path
+import std.process
+import std.tzdb as TZDB
+
+-- (the zone of the id in the directory, or why there is none)
+tried : {e : HFunctor}
+      -> {{disk : filesystem <: e}}
+      -> String
+      -> String
+      -> Co e (Either TZDB.ZoneError DateTimeZone.DateTimeZone)
+tried dir name = attempt TZDB.ZoneError (TZDB.zoneIn dir name)
+
+-- (the zone of the id in the system's tz database, or why there is
+-- none)
+triedSystem : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> String
+            -> Co e (Either TZDB.ZoneError DateTimeZone.DateTimeZone)
+triedSystem name = attempt TZDB.ZoneError (TZDB.zone name)
+
+-- (the zone of the id in the directory, or why there is none, as it is
+-- written)
+said : {e : HFunctor}
+     -> {{disk : filesystem <: e}}
+     -> String
+     -> String
+     -> Co e String
+said dir name = do
+  r <- tried dir name
+  pure (either show DateTimeZone.id r)
+
+-- (the system's zone, or why there is none, as it is written)
+systemSaid : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{sys : process <: e}}
+           -> Co e String
+systemSaid = do
+  r <- attempt TZDB.ZoneError TZDB.system
+  pure (either show DateTimeZone.id r)
+
+-- (the zone's offsets at the seconds since the epoch, as they are
+-- written)
+offsetsAt : DateTimeZone.DateTimeZone -> List Int -> List String
+offsetsAt z =
+  List.map
+    (\s -> show (DateTimeZone.offsetAt z (Instant.fromUnixNanoseconds (s * 1000000000))))
+
+-- (the fixtures' directory)
+fixtures : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Co e String
+fixtures = do
+  root <- getEnv "HEFF_TEST_ROOT"
+  case root of
+    Just dir -> pure (dir ^ "/test/check/zoneinfo")
+    Nothing -> failure "HEFF_TEST_ROOT is not set: `heff test` sets it"
+
+-- (whether the zone of the id is had, and its offsets at the seconds
+-- are these)
+offsetsHold : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> Either TZDB.ZoneError DateTimeZone.DateTimeZone
+            -> List Int
+            -> List String
+            -> Co e Unit
+offsetsHold (Left err) seconds expected = failure (show err)
+offsetsHold (Right z) seconds expected =
+  assertEqual (offsetsAt z seconds) expected
+
+-- | zones by their ids
+reading : Test
+reading =
+  group
+    "tzdb"
+    [ integration "a zone of a directory, by its id" (do
+        dir <- fixtures
+        taipei <- tried dir "Asia/Taipei"
+        offsetsHold taipei [0, 4118083200] ["+08:00", "+08:00"])
+    , integration "what is no zone is said so" (do
+        dir <- fixtures
+        none <- said dir "Asia/Taipe"
+        assert
+          none
+          (startsWith "Asia/Taipe: " none
+           && endsWith "ENOENT: No such file or directory" none)
+        out <- said dir "../datetimezone.hf"
+        assertEqual out "../datetimezone.hf: no zone's id"
+        nowhere <- said (dir ^ "/none") "UTC"
+        assertEqual
+          nowhere
+          ("UTC: no tz database at " ^ dir ^ "/none (Windows keeps none)"))
+    , integration "the system's tz database" (do
+        there <- isDirectory (Path.parse TZDB.directory)
+        if not there then skip "the system has no tz database" else pure ()
+        ny <- triedSystem "America/New_York"
+        offsetsHold
+          ny
+          [1710053999, 1710054000, 4118083200]
+          ["-05:00", "-04:00", "-04:00"])
+    , integration "the system's zone" (do
+        z <- systemSaid
+        assert z (not (strEq z "")))
+    ]

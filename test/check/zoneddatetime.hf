@@ -1,0 +1,137 @@
+-- std.zoneddatetime on New York and London as the tz database has them,
+-- the TZif files kept beside this file in zoneinfo/: a date-time the
+-- clocks skipped over in spring, and one they went back over in autumn,
+-- resolved each way the program may say, in 2024 and, by the footer's
+-- rule, in 2100.
+
+module test.check.zoneddatetime
+
+import check
+import co
+import exception
+import std.datetimezone as DateTimeZone
+import std.duration as Duration
+import std.filesystem
+import std.instant as Instant
+import std.localdatetime as LocalDateTime
+import std.path as Path
+import std.process
+import std.zoneddatetime as ZonedDateTime
+
+-- (the zone of a fixture, by its id, else the test fails)
+fixtureZone : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
+            -> String
+            -> Co e DateTimeZone.DateTimeZone
+fixtureZone name = do
+  root <- getEnv "HEFF_TEST_ROOT"
+  case root of
+    Just dir -> do
+      bytes <- readBytes (Path.parse (dir ^ "/test/check/zoneinfo/" ^ name))
+      either failure pure (DateTimeZone.fromTZif name bytes)
+    Nothing -> failure "HEFF_TEST_ROOT is not set: `heff test` sets it"
+
+-- (the date-time in the zone by each resolver, as it is written, `none`
+-- where there is none)
+resolvedBy : DateTimeZone.DateTimeZone -> String -> List ZonedDateTime.Resolver -> List String
+resolvedBy z s =
+  List.map
+    (\r ->
+       maybe
+         "no date-time"
+         (\t -> maybe "none" show (ZonedDateTime.resolve r z t))
+         (LocalDateTime.parse s))
+
+-- (a resolver of the skipped, failing the ambiguous)
+skipping : ZonedDateTime.SkippedTime -> ZonedDateTime.Resolver
+skipping k = { skipped = k, ambiguous = Fail }
+
+-- (a resolver of the ambiguous, failing the skipped)
+repeating : ZonedDateTime.AmbiguousTime -> ZonedDateTime.Resolver
+repeating k = { skipped = Fail, ambiguous = k }
+
+-- | the gaps and overlaps of New York and London, resolved
+resolving : Test
+resolving =
+  group
+    "zoneddatetime"
+    [ integration "New York, spring 2024: 02:30 skipped" (do
+        z <- fixtureZone "America/New_York"
+        assertEqual
+          (resolvedBy
+             z
+             "2024-03-10T02:30:00"
+             [ skipping Earlier
+             , skipping Later
+             , skipping ShiftForward
+             , skipping Fail
+             , ZonedDateTime.lenient
+             , ZonedDateTime.strict
+             ])
+          [ "2024-03-10T01:59:59.999999999-05:00[America/New_York]"
+          , "2024-03-10T03:00:00-04:00[America/New_York]"
+          , "2024-03-10T03:30:00-04:00[America/New_York]"
+          , "none"
+          , "2024-03-10T03:30:00-04:00[America/New_York]"
+          , "none"
+          ])
+    , integration "New York, autumn 2024: 01:30 twice" (do
+        z <- fixtureZone "America/New_York"
+        assertEqual
+          (resolvedBy
+             z
+             "2024-11-03T01:30:00"
+             [ repeating Earlier
+             , repeating Later
+             , repeating Fail
+             , ZonedDateTime.lenient
+             , ZonedDateTime.strict
+             ])
+          [ "2024-11-03T01:30:00-04:00[America/New_York]"
+          , "2024-11-03T01:30:00-05:00[America/New_York]"
+          , "none"
+          , "2024-11-03T01:30:00-04:00[America/New_York]"
+          , "none"
+          ])
+    , integration "New York, 2100, by the footer's rule" (do
+        z <- fixtureZone "America/New_York"
+        assertEqual
+          (resolvedBy z "2100-03-14T02:30:00" [skipping ShiftForward, skipping Fail])
+          ["2100-03-14T03:30:00-04:00[America/New_York]", "none"]
+        assertEqual
+          (resolvedBy z "2100-11-07T01:30:00" [repeating Later, ZonedDateTime.strict])
+          ["2100-11-07T01:30:00-05:00[America/New_York]", "none"]
+        assertEqual
+          (resolvedBy z "2100-07-01T12:00:00" [ZonedDateTime.strict])
+          ["2100-07-01T12:00:00-04:00[America/New_York]"])
+    , integration "London, 2024: an hour skipped, an hour twice" (do
+        z <- fixtureZone "Europe/London"
+        assertEqual
+          (resolvedBy
+             z
+             "2024-03-31T01:15:00"
+             [skipping Earlier, skipping Later, skipping ShiftForward])
+          [ "2024-03-31T00:59:59.999999999Z[Europe/London]"
+          , "2024-03-31T02:00:00+01:00[Europe/London]"
+          , "2024-03-31T02:15:00+01:00[Europe/London]"
+          ]
+        assertEqual
+          (resolvedBy z "2024-10-27T01:15:00" [repeating Earlier, repeating Later])
+          [ "2024-10-27T01:15:00+01:00[Europe/London]"
+          , "2024-10-27T01:15:00Z[Europe/London]"
+          ])
+    , integration "an instant in a zone, and a duration across a change" (do
+        z <- fixtureZone "America/New_York"
+        let before = ZonedDateTime.at (Instant.fromUnixNanoseconds 1710050400000000000) z
+        assertEqual
+          (List.map show [before, ZonedDateTime.plus before (Duration.hours 1)])
+          [ "2024-03-10T01:00:00-05:00[America/New_York]"
+          , "2024-03-10T03:00:00-04:00[America/New_York]"
+          ]
+        assertEqual
+          (show (ZonedDateTime.instant (ZonedDateTime.plus before (Duration.hours 1))))
+          "2024-03-10T07:00:00Z")
+    ]
