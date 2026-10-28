@@ -1,0 +1,181 @@
+-- A world made of globals alone -- effects summed by `<+>`, `stdio <+>
+-- time <+> process`, what `main`'s type says -- is a global of its own,
+-- each sum in it too: computed once, as a definition's value is, and so
+-- immortal, counted by no thread (the runtime makes a definition's value
+-- so once it is computed).  Built where it is written, in a
+-- function, it is a record of closures each thread counts atomically as
+-- an operation crosses it, and to the simplifier it is a record written
+-- out, known only while it is small: a world of a few effects more is
+-- given whole to what it runs, its operations handed on through each
+-- sum, layer by layer.  A global is known whatever its size, and a copy
+-- of what it runs made for it: an operation put straight in its place.
+--
+-- Building a sum computes nothing and cannot fail (`<+>` makes a record
+-- of functions), so that is all it moves: no other application, and no
+-- world with a variable in it -- a copy made for this global gives those
+-- it, and the simplifier knows a sum of globals given it as it is.
+
+module heff.compile.worlds
+
+import heff.compile.ir as IR
+
+-- What is a world of globals
+--------------------------------------------------------------------------------
+
+-- | the key of the sum of effects
+sumKey : String
+sumKey = "co.<+>"
+
+-- (two, if it is two)
+twoOf : List IR.Expr -> Maybe (Pair IR.Expr IR.Expr)
+twoOf (Cons a (Cons b Nil)) = Just (MkPair a b)
+twoOf _ = Nothing
+
+-- (... and one, given another: `(<+> a) b`, as it may be applied)
+oneThen : List IR.Expr -> List IR.Expr -> Maybe (Pair IR.Expr IR.Expr)
+oneThen (Cons a Nil) (Cons b Nil) = Just (MkPair a b)
+oneThen _ _ = Nothing
+
+sumHead : IR.Expr -> Bool
+sumHead (EGlobal p) = strEq p sumKey
+sumHead _ = False
+
+-- (the sum's sides, given at once or one after the other)
+appSides : IR.Expr -> List IR.Expr -> Maybe (Pair IR.Expr IR.Expr)
+appSides (EApp f xs) ys = if sumHead f then oneThen xs ys else Nothing
+appSides f xs = if sumHead f then twoOf xs else Nothing
+
+-- | its two sides, if it is a sum
+-- | >>> sidesOf (EApp (EGlobal "co.<+>") [EGlobal "a", EGlobal "b"])
+-- | Just (MkPair (EGlobal "a") (EGlobal "b"))
+-- | >>> sidesOf (EApp (EGlobal "f") [EGlobal "a", EGlobal "b"])
+-- | Nothing
+sidesOf : IR.Expr -> Maybe (Pair IR.Expr IR.Expr)
+sidesOf (EApp f xs) = appSides f xs
+sidesOf _ = Nothing
+
+-- | whether it is a global, or a sum of such
+ofGlobals : IR.Expr -> Bool
+ofGlobals (EGlobal _) = True
+ofGlobals e = case sidesOf e of
+  Just (MkPair a b) -> ofGlobals a && ofGlobals b
+  Nothing -> False
+
+-- | a sum of globals alone
+-- | >>> isWorld (EApp (EGlobal "co.<+>") [EApp (EGlobal "co.<+>") [EGlobal "a", EGlobal "b"], EGlobal "c"])
+-- | True
+-- | >>> isWorld (EApp (EGlobal "co.<+>") [EVar "e", EGlobal "c"])
+-- | False
+isWorld : IR.Expr -> Bool
+isWorld e = case sidesOf e of
+  Just (MkPair a b) -> ofGlobals a && ofGlobals b
+  Nothing -> False
+
+-- | what tells two worlds apart: its globals, as summed
+worldText : IR.Expr -> String
+worldText (EGlobal g) = g
+worldText e = case sidesOf e of
+  Just (MkPair a b) -> "(" ^ worldText a ^ " " ^ worldText b ^ ")"
+  Nothing -> "?"
+
+-- (the worlds in it, outermost, onto `acc`)
+worldsIn : IR.Expr -> List IR.Expr -> List IR.Expr
+worldsIn e acc =
+  if isWorld e then Cons e acc
+  else IR.foldParts (\_ p a -> worldsIn p a) e acc
+
+-- Each a global
+--------------------------------------------------------------------------------
+
+-- | the globals made so far (the last first), each world's by its text
+type Floated = { keys : List (Pair String String), defs : List IR.Def }
+
+keyOf : List (Pair String String) -> String -> Maybe String
+keyOf Nil t = Nothing
+keyOf (Cons (MkPair u k) rest) t = if strEq u t then Just k else keyOf rest t
+
+-- (the sum of `a` and `b`, a global of `owner`'s, its text `t`)
+withSum : String
+        -> String
+        -> IR.Expr
+        -> IR.Expr
+        -> Floated
+        -> Pair IR.Expr Floated
+withSum owner t a b fl =
+  MkPair
+    (EGlobal (owner ^ "$world" ^ debug (List.length fl.defs)))
+    { keys =
+        Cons (MkPair t (owner ^ "$world" ^ debug (List.length fl.defs))) fl.keys
+    , defs =
+        Cons
+          (IR.mkDef
+             (owner ^ "$world" ^ debug (List.length fl.defs))
+             (owner ^ "$world")
+             (EApp (EGlobal sumKey) [a, b]))
+          fl.defs
+    }
+
+-- (... its right side as `go` makes it a global, its left made one)
+bothThen : String
+         -> String
+         -> IR.Expr
+         -> Pair IR.Expr Floated
+         -> Pair IR.Expr Floated
+bothThen owner t a2 (MkPair b2 fl) = withSum owner t a2 b2 fl
+
+sideThen : (Floated -> IR.Expr -> Pair IR.Expr Floated)
+         -> String
+         -> String
+         -> IR.Expr
+         -> Pair IR.Expr Floated
+         -> Pair IR.Expr Floated
+sideThen go owner t b (MkPair a2 fl) = bothThen owner t a2 (go fl b)
+
+-- | a world (or a global) as a global: its sides first, a sum made once
+floatOne : String -> Floated -> IR.Expr -> Pair IR.Expr Floated
+floatOne owner fl e = case sidesOf e of
+  Nothing -> MkPair e fl
+  Just (MkPair a b) -> case keyOf fl.keys (worldText e) of
+    Just k -> MkPair (EGlobal k) fl
+    Nothing ->
+      sideThen
+        (\fl2 x -> floatOne owner fl2 x)
+        owner
+        (worldText e)
+        b
+        (floatOne owner fl a : Pair IR.Expr Floated)
+
+floatAll : String -> Floated -> List IR.Expr -> Floated
+floatAll owner fl Nil = fl
+floatAll owner fl (Cons e rest) =
+  floatAll owner (snd (floatOne owner fl e)) rest
+
+-- (each world in it its global)
+replaced : List (Pair String String) -> IR.Expr -> IR.Expr
+replaced keys e =
+  if isWorld e
+  then case keyOf keys (worldText e) of
+    Just k -> EGlobal k
+    Nothing -> e
+  else IR.mapParts (\_ p -> replaced keys p) e
+
+-- (the definition, its worlds those globals, after them)
+withWorlds : IR.Def -> Floated -> List IR.Def
+withWorlds d fl =
+  IR.appendI
+    (List.reverse fl.defs)
+    (Cons (IR.mkDef d.key d.name (replaced fl.keys d.body)) Nil)
+
+-- | a definition, each world of globals in it a global of its own, given
+-- | before it (its sides before it)
+-- | >>> List.map (\(d : IR.Def) -> d.body) (worldsDef (IR.mkDef "m.main" "main" (ELam ["hd"] (EApp (EGlobal "m.program") [EApp (EGlobal "co.<+>") [EApp (EGlobal "co.<+>") [EGlobal "a", EGlobal "b"], EGlobal "c"], EVar "hd"]))))
+-- | Cons (EApp (EGlobal "co.<+>") (Cons (EGlobal "a") (Cons (EGlobal "b") Nil))) (Cons (EApp (EGlobal "co.<+>") (Cons (EGlobal "m.main$world0") (Cons (EGlobal "c") Nil))) (Cons (ELam (Cons "hd" Nil) (EApp (EGlobal "m.program") (Cons (EGlobal "m.main$world1") (Cons (EVar "hd") Nil)))) Nil))
+-- | >>> List.length (worldsDef (IR.mkDef "m.f" "f" (ELam ["e"] (EApp (EGlobal "co.<+>") [EVar "e", EGlobal "c"]))))
+-- | 1
+worldsDef : IR.Def -> List IR.Def
+worldsDef d =
+  withWorlds d (floatAll d.key { keys = Nil, defs = Nil } (worldsIn d.body Nil))
+
+-- | every definition's
+worldsProgram : List IR.Def -> List IR.Def
+worldsProgram defs = List.concatMap worldsDef defs
