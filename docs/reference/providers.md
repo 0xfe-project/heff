@@ -169,6 +169,49 @@ static V heff_provider_threads(V p, V k) {
 }
 ```
 
+## Libraries and frameworks
+
+A module whose C uses a library that is not the runtime's says so with a
+definition of type `FFI.Links`. Every program that imports the module is
+built with it, by `heff build`, `heff run` and `heff test`:
+
+```haskell
+import ffi as FFI
+
+unibilium : FFI.Links
+unibilium = { pkgConfig = ["unibilium"] }
+```
+
+| Field | What `zig cc` is given |
+|---|---|
+| `pkgConfig` | `pkg-config --cflags` and `--libs` of these packages |
+| `libs` | `-lNAME` for each name |
+| `frameworks` | `-framework NAME` for each name, on macOS; nothing elsewhere |
+
+Each field defaults to `[]`. The provider, or the module's description,
+then includes the library's own header and calls its functions directly:
+the C compiler checks each call against the header, and the library is
+linked, so no `dlopen` or `dlsym` table is needed.
+
+```haskell
+cocoa : FFI.Links
+cocoa = { libs = ["objc"], frameworks = ["AppKit", "CoreGraphics"] }
+```
+
+- The fields hold names, not flags: a name starting with `-` is an
+  error.
+- A flag several modules ask for is given once.
+- When neither pkg-config nor the C compiler knows where a library is,
+  the program's `build.hf` says where to look, with `includeDirs` and
+  `libDirs` (see [Projects](projects.md#programs)).
+- Programs are built for the machine they are built on, so pkg-config
+  gives that machine's flags. A provider that uses a framework on macOS
+  and something else elsewhere keeps the macOS part under
+  `#ifdef __APPLE__`.
+- `heff compile --backend=c FILE OUT` writes the flags beside the C, a
+  flag per line: `OUT.link` for one file, `OUT/heff.link` for a
+  directory.
+
 ## Host types
 
 A thing of the host the program holds, such as an open file, a socket
