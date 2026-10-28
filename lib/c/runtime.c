@@ -2179,10 +2179,22 @@ static inline V heff_keep(V x) {
 // (both words: tested at once, their low bits)
 #define BOTH_INT(a, b) HEFF_LIKELY(IS_INT((a) & (b)))
 
+// (a word made of two: its low bit set, as the C compiler is told, so
+// that an operation on it next tests it no more -- `(x + y) % m` tests
+// `x` and `y` once)
+static inline __attribute__((always_inline)) V heff_word_made(int64_t r) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_assume)
+  __builtin_assume((r & 1) == 1);
+#endif
+#endif
+  return (V)r;
+}
+
 INT_BIG(V, heff_intAdd, num_add(&x, y.neg, &y))
 HEFF_FAST V heff_intAdd(V a, V b) {
   int64_t r;
-  if (BOTH_INT(a, b) && !__builtin_add_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  if (BOTH_INT(a, b) && !__builtin_add_overflow((int64_t)a, (int64_t)b - 1, &r)) return heff_word_made(r);
   return heff_intAdd_big(a, b);
 }
 
@@ -2190,7 +2202,7 @@ HEFF_FAST V heff_intAdd(V a, V b) {
 INT_BIG(V, heff_intSub, num_add(&x, !y.neg && y.n > 0, &y))
 HEFF_FAST V heff_intSub(V a, V b) {
   int64_t r;
-  if (BOTH_INT(a, b) && !__builtin_sub_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  if (BOTH_INT(a, b) && !__builtin_sub_overflow((int64_t)a, (int64_t)b - 1, &r)) return heff_word_made(r);
   return heff_intSub_big(a, b);
 }
 
