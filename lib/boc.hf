@@ -67,6 +67,7 @@
 -- `newCown v` | a cown holding `v`
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
 -- `with a := c do ...` | the same, its body statements, `a` what `c` holds (more cowns, a binding each)
+-- `with a := c where p do ...` | the same, its body run once `p` holds of what the cowns hold: until then, the behaviour waits for one `p` reads to be written
 -- `with r := BOC.await act do ...` | `act`, of the world, run outside every behaviour; the body a behaviour once it has come to `r`; this one goes on
 -- `with a := c` / `r := BOC.await act do ...` | the same, the body a behaviour on `c` once `act` has come to `r`
 -- `scheduled failed c` | `c` and its behaviours run, on domains, every behaviour waited for; `failed why` where one fails
@@ -80,7 +81,14 @@
 -- each cown bound to a name (`with x := from` and `y := to` under it),
 -- its statements the body, the names what they hold, set to change it:
 -- only the cowns whose names it sets are written back, and the `with`
--- comes to `()`.  The body is a closed computation of the scheduler's
+-- comes to `()`.  A `with` of cowns with a condition, `with a := c
+-- where p do ...`, is a behaviour that, once it has its cowns, checks
+-- `p` of what they hold: where it does not hold, the behaviour lets go
+-- of them, untouched, and waits until a behaviour writes a cown whose
+-- name `p` reads; then it is queued again on all of them, behind that
+-- one, and checks `p` again (the paper's `whenever`).  One still
+-- waiting once every other behaviour is done is dropped, its body never
+-- run.  The body is a closed computation of the scheduler's
 -- world, `boc w <+> w`, run on whichever domain takes it, later: none of
 -- the handlers around the `when` (or the `with`) is around it -- a
 -- `recover`, a state, a resource of a `with` -- so what it needs it
@@ -239,6 +247,9 @@ module boc
   , instanceHolderCown
   , instanceHolderCowns
   , instanceHolderCownsMore
+  , instanceWaiterCown
+  , instanceWaiterCowns
+  , instanceWaiterCownsMore
   , Await
   , await
   , instanceBinderAwait
@@ -363,11 +374,18 @@ data Link (w : HFunctor)
 -- (a request: compared only as the cell it is, never rebuilt)
 type Request (w : HFunctor) = Domain.Atomic (Link w)
 
+-- (a behaviour let go of, its condition not holding: spawned again,
+-- given the scheduler as the domain spawning it holds it)
+type Again (w : HFunctor) = Sched w -> Runner w -> Co w Unit
+
 -- (a cown, as its queue: its number, which orders the cowns of a
--- behaviour; the last request for it; and the request it keeps as the
--- last while no behaviour waits for it)
+-- behaviour; the last request for it; the request it keeps as the
+-- last while no behaviour waits for it; and the behaviours waiting for
+-- it to be written, their conditions reading it -- held, as what it
+-- holds is, only by the behaviour that has the cown)
 data Handle (w : HFunctor)
-  = MkHandle Int (Domain.Atomic (Request w)) (Request w)
+  = MkHandle Int (Domain.Atomic (Request w)) (Request w) (Domain.Atomic
+                                                            (List (Again w)))
 
 -- | A cown holding an `a`, of behaviours run in the world `w`.
 data Cown (w : HFunctor) a = MkCown (Handle w) (Domain.Atomic a)
@@ -379,7 +397,10 @@ cellOf : {w : HFunctor} -> {a : Type} -> Cown w a -> Domain.Atomic a
 cellOf (MkCown h at) = at
 
 numberOf : {w : HFunctor} -> Handle w -> Int
-numberOf (MkHandle n last none) = n
+numberOf (MkHandle n last none waiting) = n
+
+waitingOf : {w : HFunctor} -> Handle w -> Domain.Atomic (List (Again w))
+waitingOf (MkHandle n last none waiting) = waiting
 
 -- | What a behaviour can be on: a cown, or a tuple of them (`(a, b, c)`,
 -- | nesting to the left); the world their behaviours run in, what they
@@ -464,10 +485,23 @@ type Body (f : (Type -> Type) -> Type -> Type) (w : HFunctor) t =
   -> (w <: e)
   -> Co e t
 
+-- (what a behaviour waits for: its condition, of what its cowns hold;
+-- the cowns it reads, waited on where it does not hold; and those its
+-- body writes, whose behaviours waiting are spawned again after it)
+type Waiting (w : HFunctor) t =
+  { holds : t -> Bool, reads : List (Handle w), writes : List (Handle w) }
+
+-- (no condition, and no cown written)
+unconditioned : {w : HFunctor} -> {t : Type} -> Waiting w t
+unconditioned = { holds = \v -> True, reads = Nil, writes = Nil }
+
 -- (a behaviour asked for: its cowns' queues, how what they hold is read
--- and written, its body -- a `b` -- and what comes after the asking)
+-- and written, what it waits for, its body -- a `b` -- and what comes
+-- after the asking)
 data Behaving (w : HFunctor) (b : Type -> Type) x t
-  = MkBehaving (List (Handle w)) (Reading w t) (Writing w t) (t -> b t) x
+  = MkBehaving (List (Handle w)) (Reading w t) (Writing w t) (Waiting w t) (t
+                                                                            -> b
+                                                                              t) x
 
 makingThen : {w : HFunctor}
            -> {x y a : Type}
@@ -482,7 +516,8 @@ behavingThen : {w : HFunctor}
              -> (x -> y)
              -> Behaving w b x t
              -> Behaving w b y t
-behavingThen g (MkBehaving hs rd wr body x) = MkBehaving hs rd wr body (g x)
+behavingThen g (MkBehaving hs rd wr wt body x) =
+  MkBehaving hs rd wr wt body (g x)
 
 -- (an act of the world awaited: the act, what comes once it has come
 -- to its value -- a behaviour's body, a `b` -- and what comes after the
@@ -547,16 +582,34 @@ writtenFirst : List Bool -> Bool
 writtenFirst (b :: rest) = b
 writtenFirst Nil = False
 
--- (a behaviour on `cs`, writing back the cowns `written` says)
-behaviour : {c : Type}
-          -> {e : HFunctor}
-          -> c
-          -> {{cw : Cowns c}}
-          -> {{bc : boc cw.World <: e}}
-          -> List Bool
-          -> (cw.Contents -> Co (boc cw.World <+> cw.World) cw.Contents)
-          -> Co e Unit
-behaviour cs written body =
+-- (the cowns a `Bool` each says, in order: one past the `Bool`s too,
+-- as `Cowns`' `write` takes them)
+flagged : {w : HFunctor} -> List (Handle w) -> List Bool -> List (Handle w)
+flagged (h :: hs) (False :: fs) = flagged hs fs
+flagged (h :: hs) (True :: fs) = h :: flagged hs fs
+flagged hs Nil = hs
+flagged Nil fs = Nil
+
+-- (the cowns a `Bool` a name says, to wait on or to wake: all of them
+-- where a name holds more than one, a tuple of cowns, and the `Bool`s
+-- are not one a cown)
+named : {w : HFunctor} -> List (Handle w) -> List Bool -> List (Handle w)
+named hs fs = if List.length fs == List.length hs then flagged hs fs else hs
+
+-- (a behaviour on `cs`, its body run once `ok` holds of what they hold,
+-- waiting meanwhile on the cowns `read` says, and writing back the
+-- cowns `written` says)
+behaviourWhere : {c : Type}
+               -> {e : HFunctor}
+               -> c
+               -> {{cw : Cowns c}}
+               -> {{bc : boc cw.World <: e}}
+               -> List Bool
+               -> List Bool
+               -> (cw.Contents -> Bool)
+               -> (cw.Contents -> Co (boc cw.World <+> cw.World) cw.Contents)
+               -> Co e Unit
+behaviourWhere cs written read ok body =
   op
     (bc
        (When
@@ -567,9 +620,25 @@ behaviour cs written body =
                   (cw.handles cs)
                   (\dm -> cw.read dm cs)
                   (\dm v -> cw.write dm cs written v)
+                  { holds = ok
+                  , reads = named (cw.handles cs) read
+                  , writes = named (cw.handles cs) written
+                  }
                   (\v -> closed (body v))
                   MkUnit))))
     val
+
+-- (a behaviour on `cs`, writing back the cowns `written` says)
+behaviour : {c : Type}
+          -> {e : HFunctor}
+          -> c
+          -> {{cw : Cowns c}}
+          -> {{bc : boc cw.World <: e}}
+          -> List Bool
+          -> (cw.Contents -> Co (boc cw.World <+> cw.World) cw.Contents)
+          -> Co e Unit
+behaviour cs written body =
+  behaviourWhere cs (cw := cw) written Nil (\v -> True) body
 
 -- | A behaviour on the cowns `cs`, one or a tuple of them, spawned;
 -- | this one goes on.  Its turn comes once every behaviour spawned
@@ -678,6 +747,74 @@ instanceHolderCownsMore =
           (\v -> bind (body (s := Unit) v) (\p -> pure (snd p)))
   }
 
+-- | A behaviour on a cown held by a `with` with a condition, `with a :=
+-- | c where p do ...`: once it has the cown, `p` checked of what it
+-- | holds; where it does not hold, the cown let go of, untouched, and
+-- | the behaviour waits until a behaviour writes it, then is spawned
+-- | again, behind that one (the paper's `whenever`).
+instance instanceWaiterCown : {e w : HFunctor}
+                            -> {a : Type}
+                            -> {{bc : boc w <: e}}
+                            -> Waiter
+                              e
+                              (Cown w a)
+                              (\s -> a)
+                              (\x -> boc w <+> w)
+                              (\r -> Unit)
+instanceWaiterCown =
+  { heldWhere = \c written read p body ->
+        behaviourWhere
+          c
+          written
+          read
+          (\v -> p (s := Unit) v)
+          (\v -> bind (body (s := Unit) v) (\q -> pure (snd q)))
+  }
+
+-- | ... on two cowns: let go of both, and waiting on those `p` reads.
+instance instanceWaiterCowns : {e w : HFunctor}
+                             -> {a b : Type}
+                             -> {{cw : Cowns (Cown w a, Cown w b)}}
+                             -> {{bc : boc cw.World <: e}}
+                             -> Waiter
+                               e
+                               (Cown w a, Cown w b)
+                               (\s -> cw.Contents)
+                               (\x -> boc cw.World <+> cw.World)
+                               (\r -> Unit)
+instanceWaiterCowns =
+  { heldWhere = \c written read p body ->
+        behaviourWhere
+          c
+          (cw := cw)
+          written
+          read
+          (\v -> p (s := Unit) v)
+          (\v -> bind (body (s := Unit) v) (\q -> pure (snd q)))
+  }
+
+-- | ... on more.
+instance instanceWaiterCownsMore : {e w : HFunctor}
+                                 -> {a d f : Type}
+                                 -> {{cw : Cowns (Cown w a, (d, f))}}
+                                 -> {{bc : boc cw.World <: e}}
+                                 -> Waiter
+                                   e
+                                   (Cown w a, (d, f))
+                                   (\s -> cw.Contents)
+                                   (\x -> boc cw.World <+> cw.World)
+                                   (\r -> Unit)
+instanceWaiterCownsMore =
+  { heldWhere = \c written read p body ->
+        behaviourWhere
+          c
+          (cw := cw)
+          written
+          read
+          (\v -> p (s := Unit) v)
+          (\v -> bind (body (s := Unit) v) (\q -> pure (snd q)))
+  }
+
 -- Awaiting the world
 --------------------------------------------------------------------------------
 
@@ -718,6 +855,7 @@ alone body =
                   Nil
                   (\dm -> pure MkUnit)
                   (\dm u -> pure MkUnit)
+                  unconditioned
                   (\u -> closed body)
                   MkUnit))))
     val
@@ -986,7 +1124,7 @@ queued : {w : HFunctor}
        -> List (Held w)
        -> Co w Unit
 queued st runner b Nil = pure ()
-queued st runner b (MkPair (MkHandle n last none) r :: rest) = do
+queued st runner b (MkPair (MkHandle n last none waiting) r :: rest) = do
   prev <- swapped last r
   link <- linkOnceCome prev
   case link of
@@ -1013,7 +1151,7 @@ released : {w : HFunctor}
          -> Runner w
          -> Held w
          -> Co w Unit
-released st runner (MkPair (MkHandle n last none) r) = do
+released st runner (MkPair (MkHandle n last none waiting) r) = do
   link <- Domain.get r
   case link of
     Behind b -> resolved st runner b
@@ -1058,11 +1196,69 @@ unreportedAs st why = do
   _ <- Domain.cas st.unreported (Nothing : Maybe String) (Just why)
   pure ()
 
+-- (each spawned again, in order)
+spawnedAgain : {w : HFunctor}
+             -> Sched w
+             -> Runner w
+             -> List (Again w)
+             -> Co w Unit
+spawnedAgain st runner Nil = pure ()
+spawnedAgain st runner (again :: rest) = do
+  again st runner
+  spawnedAgain st runner rest
+
+-- (`once` waiting on each cown)
+waitingOn : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> List (Handle w)
+          -> Again w
+          -> Co w Unit
+waitingOn Nil once = pure ()
+waitingOn (h :: hs) once = do
+  others <- Domain.get (waitingOf h)
+  Domain.set (waitingOf h) (once :: others)
+  waitingOn hs once
+
+-- (the behaviours waiting on the cowns written spawned again, each
+-- behind the one writing, which still has the cowns: in the order they
+-- came to wait)
+woken : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> Sched w
+      -> Runner w
+      -> List (Handle w)
+      -> Co w Unit
+woken st runner Nil = pure ()
+woken st runner (h :: hs) = do
+  waiting <- Domain.get (waitingOf h)
+  Domain.set (waitingOf h) Nil
+  spawnedAgain st runner (List.reverse waiting)
+  woken st runner hs
+
+-- (a behaviour whose condition does not hold, which still has its
+-- cowns: waiting on those its condition reads, to be spawned again,
+-- `again`, once the first of them is written -- once, whichever)
+waited : {w : HFunctor}
+       -> {{dm : Domain.domain <: w}}
+       -> List (Handle w)
+       -> Again w
+       -> Co w Unit
+waited hs again = do
+  armed <- Domain.newAtomic (True : Bool)
+  let once : Again w = \here on -> do
+    first <- Domain.cas armed True False
+    if first then again here on else pure ()
+  waitingOn hs once
+
 -- (a behaviour spawned on its cowns' queues, `rd` and `wr` reading and
--- writing what they hold, `body` its work, given the scheduler as the
--- domain running it holds it: what they hold is written after the
--- body, by its answer; a body that fails leaves them as they were, and
--- its failure is given to `failed` before they are let go)
+-- writing what they hold, `wt` what it waits for, `body` its work,
+-- given the scheduler as the domain running it holds it: what they hold
+-- is written after the body, by its answer, and the behaviours waiting
+-- on the cowns written spawned again; a body that fails leaves them as
+-- they were, and its failure is given to `failed` before they are let
+-- go.  Where its condition does not hold of what they hold, the
+-- behaviour lets go of them untouched and waits on those it reads, to
+-- be spawned again)
 spawnedOn : {w : HFunctor}
           -> {t : Type}
           -> {{dm : Domain.domain <: w}}
@@ -1071,9 +1267,10 @@ spawnedOn : {w : HFunctor}
           -> List (Handle w)
           -> Reading w t
           -> Writing w t
+          -> Waiting w t
           -> (t -> Sched w -> Runner w -> Co w t)
           -> Co w Unit
-spawnedOn st runner hs rd wr body = do
+spawnedOn st runner hs rd wr wt body = do
   let ordered = List.sortOn (\h -> numberOf h) hs
   if not (distinct (List.map numberOf ordered)) then abandon
   else do
@@ -1082,12 +1279,24 @@ spawnedOn st runner hs rd wr body = do
     count <- Domain.newAtomic (List.length held + 1)
     let turn : Sched w -> Runner w -> Co w Unit = \here on -> do
       v <- rd dm
-      -- (the body applied when the computation tried runs, not where
-      -- it is built: a body that fails as it is applied fails there,
-      -- caught)
-      outcome <- Domain.tried (bind (later (\u -> body v here on)) (\c -> c))
+      -- (the condition and the body applied when the computation
+      -- tried runs, not where it is built: one that fails as it is
+      -- applied fails there, caught)
+      outcome <-
+        Domain.tried
+          (bind
+             (later
+                (\u ->
+                   if wt.holds v
+                   then bind (body v here on) (\a -> pure (Just a))
+                   else pure (Nothing : Maybe t)))
+             (\c -> c))
       case outcome of
-        Right after -> wr dm after
+        Right (Just after) -> do
+          wr dm after
+          woken here on wt.writes
+        Right Nothing ->
+          waited wt.reads (\st2 on2 -> spawnedOn st2 on2 hs rd wr wt body)
         Left why -> do
           reported <-
             Domain.tried (bind (later (\u -> here.failed why)) (\c -> c))
@@ -1112,8 +1321,9 @@ madeCown st (MkMaking v k) = do
   n <- Domain.fetchAdd st.numbers 1
   none <- Domain.newAtomic (NoRequest : Link w)
   last <- Domain.newAtomic none
+  waiting <- Domain.newAtomic Nil
   cell <- Domain.newAtomic v
-  pure (k (MkCown (MkHandle n last none) cell))
+  pure (k (MkCown (MkHandle n last none waiting) cell))
 
 -- (`act` awaited, from `runner`, and `k` given its value once it has
 -- come to it, on that runner, and the scheduler as it holds it.  Where
@@ -1144,6 +1354,7 @@ awaited st runner act k = case st.outside of
         Nil
         (\dm -> pure MkUnit)
         (\dm u -> pure MkUnit)
+        unconditioned
         (\u here on -> awaited here on act k)
 
 -- (the handler's monad, a computation given the domain it runs on, as
@@ -1186,7 +1397,7 @@ bocAlg st opened runner (InL (When s)) = do
   charged st runner
   cust <- Custodian.current
   s (Co w x) (\t bh -> case bh of
-    MkBehaving hs rd wr body k ->
+    MkBehaving hs rd wr wt body k ->
       bind
         (spawnedOn
            st
@@ -1194,6 +1405,7 @@ bocAlg st opened runner (InL (When s)) = do
            hs
            rd
            wr
+           wt
            (\v here on -> custodiedAt cust (opened here (body v) on)))
         (\u -> pure k))
 bocAlg st opened runner (InL (Awaits s)) = do

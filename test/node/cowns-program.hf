@@ -5,7 +5,9 @@
 -- two cowns a behaviour; behaviours on one cown in the order they were
 -- spawned; a behaviour spawned in a behaviour's body, on its cown and
 -- another; a behaviour that fails among others on its cown; one
--- spawned on a free cown in a body that goes on long after.  Each is
+-- spawned on a free cown in a body that goes on long after; behaviours
+-- waiting (`with ... where`) until their condition holds, and one whose
+-- condition never does.  Each is
 -- run by a `scheduled` of its own, and what its cowns
 -- hold at the end is read out by a last behaviour on them, into a cell
 -- read once `scheduled` is done.
@@ -167,6 +169,94 @@ nested = do
   BOC.when a (spawning a b out)
   pure out
 
+-- (behaviour `i` of `n` on the cown of the turn and the numbers come:
+-- waiting until the turn is its own, then its number put on the list
+-- and the turn the next's; the last says the list)
+turned : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> {{dmw : Domain.domain <: w}}
+       -> BOC.Cown w (Int, List Int)
+       -> Domain.Atomic (List Int)
+       -> Int
+       -> Int
+       -> Co e Unit
+turned c out n i = do
+  with t := c
+    where fst t == i
+  do
+    t := (i + 1, i :: snd t)
+    if i == n then Domain.set out (List.reverse (snd t)) else pure ()
+
+-- (behaviours `i` down to 1, spawned in that order)
+turnsFrom : {e w : HFunctor}
+          -> {{bc : BOC.boc w <: e}}
+          -> {{dmw : Domain.domain <: w}}
+          -> BOC.Cown w (Int, List Int)
+          -> Domain.Atomic (List Int)
+          -> Int
+          -> Int
+          -> Co e Unit
+turnsFrom c out n 0 = pure ()
+turnsFrom c out n i = do
+  turned c out n i
+  turnsFrom c out n (i - 1)
+
+-- | five behaviours on one cown, spawned the last first, each waiting
+-- | (`where`) for its turn: their numbers in the order of the turns
+inTurn : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> {{dm : Domain.domain <: e}}
+       -> {{dmw : Domain.domain <: w}}
+       -> Co e (Domain.Atomic (List Int))
+inTurn = do
+  c <- BOC.newCown (1, Nil)
+  out <- Domain.newAtomic Nil
+  turnsFrom c out 5 5
+  pure out
+
+-- | a behaviour on two cowns waiting until the first holds more than
+-- | 0, its condition reading it alone: 1 added to the second meanwhile,
+-- | then 2 set in the first; it adds the first to the second, and says
+-- | what they hold then
+waitingOnOne : {e w : HFunctor}
+             -> {{bc : BOC.boc w <: e}}
+             -> {{dm : Domain.domain <: e}}
+             -> {{dmw : Domain.domain <: w}}
+             -> Co e (Domain.Atomic (Int, Int))
+waitingOnOne = do
+  x <- BOC.newCown 0
+  y <- BOC.newCown 0
+  out <- Domain.newAtomic (0, 0)
+  with a := x
+       b := y
+    where a > 0
+  do
+    b := b + a
+    Domain.set out (a, b)
+  with b := y do
+    b := b + 1
+  with a := x do
+    a := 2
+  pure out
+
+-- | a behaviour whose condition never holds: let go of each time the
+-- | cown is written, and dropped once every other behaviour is done --
+-- | its body never run, and `scheduled` ends
+neverHeld : {e w : HFunctor}
+          -> {{bc : BOC.boc w <: e}}
+          -> {{dm : Domain.domain <: e}}
+          -> {{dmw : Domain.domain <: w}}
+          -> Co e (Domain.Atomic Bool)
+neverHeld = do
+  c <- BOC.newCown 0
+  ran <- Domain.newAtomic False
+  with n := c
+    where n < 0
+  do
+    Domain.set ran True
+  adding c 3
+  pure ran
+
 -- (`why` pushed onto what `whys` holds, by a `cas` retried)
 reported : {e : HFunctor}
          -> {{dm : Domain.domain <: e}}
@@ -267,8 +357,7 @@ said : {e : HFunctor}
      -> Co e (List String)
 said = do
   whys <- Domain.newAtomic (Nil : List String)
-  failedOut <-
-    BOC.scheduled (reported whys) (failing (bc := _) (dm := _) whys)
+  failedOut <- BOC.scheduled (reported whys) (failing (bc := _) (dm := _) whys)
   (f, failedBefore) <- Domain.get failedOut
   failures <- Domain.get whys
   unreported <- Domain.newAtomic (Nil : List String)
@@ -279,17 +368,20 @@ said = do
          (failing (bc := _) (dm := _) unreported))
   nOut <- BOC.scheduled (\why -> abandon) (counted (bc := _) (dm := _))
   n <- Domain.get nOut
-  heldOut <-
-    BOC.scheduled (\why -> abandon) (accounts (bc := _) (dm := _))
+  heldOut <- BOC.scheduled (\why -> abandon) (accounts (bc := _) (dm := _))
   (p, q, r, s) <- Domain.get heldOut
-  xsOut <-
-    BOC.scheduled (\why -> abandon) (ordered (bc := _) (dm := _))
+  xsOut <- BOC.scheduled (\why -> abandon) (ordered (bc := _) (dm := _))
   xs <- Domain.get xsOut
-  pairOut <-
-    BOC.scheduled (\why -> abandon) (nested (bc := _) (dm := _))
+  pairOut <- BOC.scheduled (\why -> abandon) (nested (bc := _) (dm := _))
   (x, y) <- Domain.get pairOut
   seenOut <- BOC.scheduled (\why -> abandon) (kept (bc := _) (dm := _))
   seen <- Domain.get seenOut
+  turnsOut <- BOC.scheduled (\why -> abandon) (inTurn (bc := _) (dm := _))
+  turns <- Domain.get turnsOut
+  oneOut <- BOC.scheduled (\why -> abandon) (waitingOnOne (bc := _) (dm := _))
+  (oa, ob) <- Domain.get oneOut
+  neverOut <- BOC.scheduled (\why -> abandon) (neverHeld (bc := _) (dm := _))
+  never <- Domain.get neverOut
   cores <- Domain.cores
   pure
       [ "added by 1000: " ^ debug n
@@ -312,4 +404,8 @@ said = do
       ^ (if cores == 1 || seen < longBound
          then ", before its end where another domain is"
          else ", only after its end")
+      , "waiting for their turns: " ^ unwords (List.map debug turns)
+      , "waiting on one of two: " ^ debug oa ^ " " ^ debug ob
+      , "a condition never holding: "
+      ^ (if never then "its body ran" else "its body never ran")
       ]
