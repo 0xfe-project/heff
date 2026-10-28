@@ -278,12 +278,49 @@ on the domain that made them, at its next operation.
 
 What starts to run later keeps the custodian current where it was
 started, as Racket's threads do. A domain spawned in a custodian's
-body has that custodian current, and so does a cml thread spawned
-there, in each of its turns, while the other threads keep theirs. A
-`with` of a custodian in a cml thread runs its body alone, as cml runs
-every operation of the world that holds a computation, so the thread
-does not wait at a channel in it. To serve a connection in a custodian
-of its own, spawn the thread that serves it inside the `with`.
+body has that custodian current.
+
+A cml thread is a user of a custodian, not one of its things. What it
+carries is which custodian its `with`s give to: at first the one the
+`with`s gave to where it was spawned. No shutdown stops a thread. cml
+has the custodian in its own effect, `cml w`, and that one covers the
+one outside. The threads' world `w` has none of its own, and
+`CML.scheduled` runs in `w <+> custodian`.
+
+So a `with k := Custodian.custody do` in a cml thread is cml's to
+answer. The body stays in the thread. It waits at a channel as
+anywhere else, and the other threads run meanwhile. For the extent of
+the body, the thread's `with`s give to `k`, and after it they give to
+the one before. That goes with the thread's continuation wherever its
+turns are taken, so another thread's `with`s never give to `k`, and a
+throw that leaves the body leaves `k` too. cml passes the custodian's
+other operations on to the one outside, with `k` current for them: a
+thing given to it, a custodian made, a release kept. One thread can
+accept connections and serve each in a `contained` custodian of its
+own:
+
+```haskell
+import bytes as Bytes
+import cml as CML
+import custodian as Custodian
+import exception
+import resource
+import std.net as Net
+
+serving : {w : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: w}}
+        -> With s Net.TcpListener
+        -> CML.Chan w Int
+        -> Co (exception Net.NetError <+> (CML.cml w <+> w)) Unit
+serving l ch = do
+  with k := Custodian.contained do
+    with Net.accept l as c do
+      n <- CML.recv ch
+      _ <- Net.write c (Bytes.fromString (debug n))
+      pure ()
+  serving l ch
+```
 
 What a custodian is given is higher-order. It is a computation of the
 world it was given in, with the handlers between there and the

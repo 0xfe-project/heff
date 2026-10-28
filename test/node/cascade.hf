@@ -19,6 +19,14 @@
 --            its failures, the other not, taking turns: the first's
 --            thing that fails to end takes its custodian down alone; the
 --            other's, the root's still, ends the program
+--   connections
+--            a server in a cml thread, a custodian of its own for each
+--            connection, one that contains its failures, the body
+--            waiting on a channel for main's word while main runs: the
+--            second's thing, held by a domain past its `with`, fails to
+--            end, its custodian alone shut down -- its connection
+--            closed, the server's write on it failing -- the others
+--            served
 
 module test.node.cascade
 
@@ -30,6 +38,7 @@ import exception
 import std.domain as Domain
 import std.io
 import std.net as Net
+import std.reactor as Reactor
 import resource
 import test.node.flaky as Flaky
 
@@ -72,10 +81,13 @@ keeper t go = do
   g <- Domain.get go
   if g then pure () else keeper t go
 
--- (the world, and the server's within it, hearing its throws)
+-- (the world, cml's threads' and the program's, theirs with the
+-- custodian; and the server's within it, hearing its throws)
+base : HFunctor
+base = stdio <+> Net.net <+> Domain.domain <+> Flaky.flaky
+
 world : HFunctor
-world =
-  stdio <+> Net.net <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian
+world = base <+> Custodian.custodian
 
 guarded : HFunctor
 guarded = exception Net.NetError <+> (exception String <+> world)
@@ -169,7 +181,6 @@ rooted = do
 thingAfter : {w : HFunctor}
            -> {{io : stdio <: w}}
            -> {{fl : Flaky.flaky <: w}}
-           -> {{cu : Custodian.custodian <: w}}
            -> String
            -> CML.Chan w Unit
            -> CML.Chan w Unit
@@ -190,7 +201,6 @@ thingAfter name go done = do
 inTurns : {w : HFunctor}
         -> {{io : stdio <: w}}
         -> {{fl : Flaky.flaky <: w}}
-        -> {{cu : Custodian.custodian <: w}}
         -> Co (CML.cml w <+> w) Unit
 inTurns = do
   go1 <- CML.newChan
@@ -206,5 +216,143 @@ inTurns = do
 
 threads : Co world Unit
 threads = do
-  r <- CML.scheduled (inTurns (w := world))
+  r <- CML.scheduled (w := base) (inTurns (w := base))
   print "not reached"
+
+-- (the `i`th connection, its server's part, in a cml thread: in a
+-- custodian of its own, which contains its failures, the connection
+-- accepted, then main's word waited for on `word` -- the body staying
+-- in the thread, the other threads running -- and the connection's
+-- thing held by a domain past its `with`; then main told, on `done`)
+servedAfter : {w : HFunctor}
+            -> {s : Type}
+            -> {{dm : Domain.domain <: w}}
+            -> {{nt : Net.net <: w}}
+            -> {{fl : Flaky.flaky <: w}}
+            -> With s Net.TcpListener
+            -> Domain.Atomic (List String)
+            -> Domain.Atomic (List String)
+            -> CML.Chan w Int
+            -> CML.Chan w Unit
+            -> Int
+            -> Co (CML.cml w <+> w) Unit
+servedAfter l log stops word done i = do
+  r <-
+    attempt
+      String
+      (attempt
+         Net.NetError (do
+           with k := Custodian.contained do
+             _ <-
+               Custodian.manage
+                 k
+                 (logged stops ("custodian " ^ debug i ^ " shut down"))
+             with Net.accept l as c do
+               n <- CML.recv word
+               go <- Domain.newAtomic False
+               with sc := Domain.scope do
+                 with Flaky.withThing (n == 2) as t do
+                   _ <- Domain.spawn sc (keeper t go)
+                   pure ()
+                 Domain.set go True
+               wr <- Net.write c (Bytes.fromString ("served " ^ debug n))
+               case wr of
+                 Left err ->
+                   logged log ("connection " ^ debug n ^ ": " ^ err.name)
+                 Right u -> logged log ("connection " ^ debug n ^ " written")))
+  case r of
+    Left why -> logged log ("thrown: " ^ why)
+    Right (Left err) -> logged log ("thrown: " ^ err.name)
+    Right (Right u) -> pure ()
+  CML.send done ()
+
+-- (the server: the connections, one after another)
+serving : {w : HFunctor}
+        -> {s : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> {{nt : Net.net <: w}}
+        -> {{fl : Flaky.flaky <: w}}
+        -> With s Net.TcpListener
+        -> Domain.Atomic (List String)
+        -> Domain.Atomic (List String)
+        -> CML.Chan w Int
+        -> CML.Chan w Unit
+        -> Int
+        -> Co (CML.cml w <+> w) Unit
+serving l log stops word done i =
+  if i > 3 then pure ()
+  else do
+    servedAfter l log stops word done i
+    serving l log stops word done (i + 1)
+
+-- (main's part of the `i`th connection: connected, the word given, what
+-- comes read, and the server's part waited for)
+asked : {w : HFunctor}
+      -> {{dm : Domain.domain <: w}}
+      -> {{nt : Net.net <: w}}
+      -> Int
+      -> Domain.Atomic (List String)
+      -> CML.Chan w Int
+      -> CML.Chan w Unit
+      -> Int
+      -> Co (CML.cml w <+> w) Unit
+asked port log word done i = do
+  r <-
+    attempt
+      Net.NetError (do
+        with Net.withConnection (here port) as cl do
+          CML.send word i
+          got <- drained cl Bytes.empty
+          CML.recv (w := w) done
+          logged log ("client " ^ debug i ^ " read: " ^ got))
+  case r of
+    Left err -> logged log ("client " ^ debug i ^ ": " ^ err.name)
+    Right u -> pure ()
+
+-- (the server spawned, and main asking it three times)
+connected : {w : HFunctor}
+          -> {s : Type}
+          -> {{dm : Domain.domain <: w}}
+          -> {{nt : Net.net <: w}}
+          -> {{fl : Flaky.flaky <: w}}
+          -> With s Net.TcpListener
+          -> Int
+          -> Domain.Atomic (List String)
+          -> Domain.Atomic (List String)
+          -> Co (CML.cml w <+> w) Unit
+connected l port log stops = do
+  word <- CML.newChan
+  done <- CML.newChan
+  CML.spawn (serving l log stops word done 1)
+  asked port log word done 1
+  asked port log word done 2
+  asked port log word done 3
+
+-- (the threads' world, a reactor's for the waits)
+reacting : HFunctor
+reacting = base <+> Reactor.reactor
+
+connections : Co (reacting <+> Custodian.custodian) Unit
+connections = do
+  log <- Domain.newAtomic (Nil : List String)
+  stops <- Domain.newAtomic (Nil : List String)
+  r <-
+    Net.withListener (here 0) 16 (\l -> do
+      a <- Net.local l
+      case a of
+        Left err -> print ("no port: " ^ err.name)
+        Right at -> do
+          m <-
+            CML.scheduledWithReactor
+              (w := reacting)
+              (connected (w := reacting) l at.port log stops)
+          case m of
+            Just u -> pure ()
+            Nothing -> print "every thread waiting")
+  case r of
+    Left err -> print ("not listening: " ^ err.name)
+    Right u -> pure ()
+  ls <- Domain.get log
+  printed ls
+  ss <- Domain.get stops
+  printed ss
