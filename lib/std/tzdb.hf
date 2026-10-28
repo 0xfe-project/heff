@@ -1,0 +1,236 @@
+-- The tz database the system keeps: its zones read from their files, as
+-- NodaTime's `DateTimeZoneProviders.Tzdb` gives them, and the zone the
+-- system is set to.  A zone is named by its id in the IANA tz database,
+-- `Asia/Taipei`, `America/New_York`, `UTC`, the path of its TZif file
+-- under the system's zoneinfo directory, `/usr/share/zoneinfo` on macOS
+-- (a link to the system's own copy) and on Linux; the file is read by
+-- std.filesystem, and std.datetimezone's `fromTZif` reads its bytes, in
+-- the program, so the data is the system's, updated with it, and no
+-- libc time-zone function is called.  Windows keeps no tz database:
+-- there a zone is not found, and the error says so.
+--
+-- What could not be read is thrown as a `ZoneError`, over the
+-- `exception` effect.  Import it by a name, `import std.tzdb as TZDB`,
+-- as its names are short.
+--
+-- ```haskell
+-- import co
+-- import exception
+-- import std.filesystem
+-- import std.instant as Instant
+-- import std.tzdb as TZDB
+-- import std.zoneddatetime as ZonedDateTime
+--
+-- -- | the instant as the clocks of Taipei tell it
+-- inTaipei : {e : HFunctor}
+--          -> {{disk : filesystem <: e}}
+--          -> {{ex : exception TZDB.ZoneError <: e}}
+--          -> Instant.Instant
+--          -> Co e String
+-- inTaipei t = do
+--   taipei <- TZDB.zone "Asia/Taipei"
+--   pure (show (ZonedDateTime.at t taipei))
+-- ```
+
+module std.tzdb
+  ( ZoneError
+  , directory
+  , zoneIn
+  , zone
+  , system
+  , instanceShowZoneError
+  )
+
+import co
+import exception
+import std.datetimezone as DateTimeZone
+import std.filesystem
+import std.path as Path
+import std.process
+
+-- | Why a zone could not be had: the id it was asked by (for the
+-- | system's own, what `TZ` says, or `localtime`), and why.
+type ZoneError = { id : String, message : String }
+
+-- | As a system's tools say it: the id, and why.
+-- | >>> show ({ id = "Asia/Taipe", message = "/usr/share/zoneinfo/Asia/Taipe: ENOENT: No such file or directory" } : ZoneError)
+-- | "Asia/Taipe: /usr/share/zoneinfo/Asia/Taipe: ENOENT: No such file or directory"
+instance instanceShowZoneError : Show ZoneError
+instanceShowZoneError = { show = \err -> err.id ^ ": " ^ err.message }
+
+-- | Where the system keeps the tz database, its zones' TZif files:
+-- | `/usr/share/zoneinfo`.
+directory : String
+directory = "/usr/share/zoneinfo"
+
+-- (whether the byte may be in a zone's id: a letter, a digit, `_`, `-`,
+-- `+`, `.`)
+isIdByte : Int -> Bool
+isIdByte c =
+  65 <= c && c <= 90
+  || 97 <= c && c <= 122
+  || 48 <= c && c <= 57
+  || c == 95
+  || c == 45
+  || c == 43
+  || c == 46
+
+-- (whether the segment of an id is one: not empty, not `.` or `..`)
+isIdSegment : String -> Bool
+isIdSegment s =
+  not (strEq s "" || strEq s "." || strEq s "..")
+  && foldBytes (\ok c -> ok && isIdByte c) True s
+
+-- (whether it is a zone's id, a path under the directory and nowhere
+-- else: segments of letters, digits, `_`, `-`, `+` and `.`, by `/`)
+-- | >>> List.map isZoneId ["Asia/Taipei", "Etc/GMT+8", "America/Port-au-Prince", "UTC", "", "/etc/passwd", "../passwd", "Asia//Taipei", "Asia/Taipei/"]
+-- | [True, True, True, True, False, False, False, False, False]
+isZoneId : String -> Bool
+isZoneId s = List.all isIdSegment (split "/" s)
+
+-- (the zone of the bytes read, or why not)
+zoneRead : {e : HFunctor}
+         -> {{ex : exception ZoneError <: e}}
+         -> String
+         -> Either FileError Bytes
+         -> Co e DateTimeZone.DateTimeZone
+zoneRead name (Left err) = throw ({ id = name, message = show err } : ZoneError)
+zoneRead name (Right bytes) =
+  either
+    (\why -> throw ({ id = name, message = why } : ZoneError))
+    pure
+    (DateTimeZone.fromTZif name bytes)
+
+-- (the zone of the TZif file at the path, its id `name`)
+zoneOfFile : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{ex : exception ZoneError <: e}}
+           -> String
+           -> String
+           -> Co e DateTimeZone.DateTimeZone
+zoneOfFile name path = do
+  read <- attempt FileError (readBytes (Path.parse path))
+  zoneRead name read
+
+-- | The zone of the id, `Asia/Taipei`, as the TZif files under the
+-- | directory `dir` have it.  A `ZoneError` where the id is none (a path
+-- | out of the directory, `../x`, or empty), there is no directory, or
+-- | the file cannot be read or is no TZif.
+zoneIn : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> {{ex : exception ZoneError <: e}}
+       -> String
+       -> String
+       -> Co e DateTimeZone.DateTimeZone
+zoneIn dir name =
+  if not (isZoneId name)
+  then throw ({ id = name, message = "no zone's id" } : ZoneError)
+  else do
+    there <- isDirectory (Path.parse dir)
+    if not there
+    then throw
+        ({ id = name
+         , message = "no tz database at " ^ dir ^ " (Windows keeps none)"
+         } :
+           ZoneError)
+    else zoneOfFile name (dir ^ "/" ^ name)
+
+-- | The zone of the id, `Asia/Taipei`, as the system's tz database has
+-- | it, at `directory`.  A `ZoneError` where the id is none, there is no
+-- | tz database there (as on Windows), or its file cannot be read or is
+-- | no TZif.
+zone : {e : HFunctor}
+     -> {{disk : filesystem <: e}}
+     -> {{ex : exception ZoneError <: e}}
+     -> String
+     -> Co e DateTimeZone.DateTimeZone
+zone name = zoneIn directory name
+
+-- (the id of a zone's file at the path: what is after its last
+-- `zoneinfo`, if it has one)
+-- | >>> List.map idOfPath ["/var/db/timezone/zoneinfo/Asia/Taipei", "../usr/share/zoneinfo/Europe/London", "/etc/localtime"]
+-- | [Just "Asia/Taipei", Just "Europe/London", Nothing]
+idOfPath : String -> Maybe String
+idOfPath path = idAfter (split "/" path) Nothing
+  where
+  -- (the segments after the last `zoneinfo` of them, `found` so far)
+  idAfter : List String -> Maybe String -> Maybe String
+  idAfter Nil found = found
+  idAfter (Cons s rest) found =
+    idAfter
+      rest
+      (if strEq s "zoneinfo" && isZoneId (joinWith "/" rest)
+       then Just (joinWith "/" rest)
+       else found)
+
+-- (the zone `TZ` says, its `:` gone: UTC if it is empty; the file at an
+-- absolute path; a zone of the tz database by its id; else a POSIX rule)
+zoneOfTZ : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> {{ex : exception ZoneError <: e}}
+         -> String
+         -> Co e DateTimeZone.DateTimeZone
+zoneOfTZ s = do
+  named <-
+    if isZoneId s then isFile (Path.parse (directory ^ "/" ^ s))
+    else pure False
+  if strEq s "" then pure DateTimeZone.utc
+  else if startsWith "/" s then zoneOfFile (fromMaybe s (idOfPath s)) s
+  else if named then zone s
+  else maybe
+      (throw
+         ({ id = s
+          , message =
+              "TZ names no zone of the tz database at "
+              ^ directory
+              ^ ", and is no POSIX TZ rule"
+          } :
+            ZoneError))
+      pure
+      (DateTimeZone.fromPosix s)
+
+-- (the id of `/etc/localtime` by where it links: in the tz database, its
+-- id there; else `localtime`)
+localtimeId : Either FileError Path.Path -> String
+localtimeId (Right p) = fromMaybe "localtime" (idOfPath (Path.render p))
+localtimeId (Left _) = "localtime"
+
+-- (the zone the system is set to without `TZ`: `/etc/localtime`, UTC
+-- where there is none)
+localtime : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> {{ex : exception ZoneError <: e}}
+          -> Co e DateTimeZone.DateTimeZone
+localtime = do
+  there <- isFile (Path.parse "/etc/localtime")
+  if not there then pure DateTimeZone.utc
+  else do
+    link <- attempt FileError (readLink (Path.parse "/etc/localtime"))
+    zoneOfFile (localtimeId link) "/etc/localtime"
+
+-- (the zone the system is set to, by what `TZ` is)
+systemBy : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> {{ex : exception ZoneError <: e}}
+         -> Maybe String
+         -> Co e DateTimeZone.DateTimeZone
+systemBy (Just s) =
+  zoneOfTZ (if startsWith ":" s then strSlice s 1 (strLength s) else s)
+systemBy Nothing = localtime
+
+-- | The zone the system is set to, as the tz code reads it: the
+-- | environment's `TZ` if it is set -- empty, UTC; a path, `/...`, the
+-- | TZif file there; an id of the tz database, `Asia/Taipei`, its zone;
+-- | else a POSIX rule, `EST5EDT,M3.2.0,M11.1.0`, a `:` before any of them
+-- | passed over -- and else `/etc/localtime`, its id where it links in
+-- | the tz database (`localtime` if not), and UTC where there is none.
+-- | A `ZoneError` where `TZ` names no zone, or a file cannot be read or
+-- | is no TZif.
+system : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> {{env : process <: e}}
+       -> {{ex : exception ZoneError <: e}}
+       -> Co e DateTimeZone.DateTimeZone
+system = do
+  tz <- getEnv "TZ"
+  systemBy tz
