@@ -192,7 +192,10 @@
 -- custodian <+> w`, which covers the one outside.  The scheduler's world
 -- `w` need not name one: `scheduled` connects its custodian to the
 -- runtime's custodians, through the domains' (`Domain.rooted`), so a
--- `main` that starts cml names none.  A
+-- `main` that starts cml names none.  The scheduler itself runs in `w`
+-- alone: only a thread's operation of the world is run so connected,
+-- each by itself, and the scheduler's own operations -- a handoff's
+-- dozen or two -- cross no handler for it.  A
 -- thread is a user of a custodian, not one of its
 -- things: what it carries is which custodian its `with`s give to, the
 -- one theirs gave to where it was spawned, and no shutdown stops it.  A
@@ -282,7 +285,7 @@ import std.reactor as Reactor
 data Slot (w : HFunctor)
   = MkSlot Int (Domain.Atomic
                   (Maybe
-                     (Maybe (Slot w) -> Co (w <+> Custodian.custodian) Unit)))
+                     (Maybe (Slot w) -> Co w Unit)))
 
 -- (where a thread is readied from: a worker, as its slot; or none, a
 -- computation run alone or `scheduled` starting main)
@@ -290,13 +293,13 @@ type Runner (w : HFunctor) = Maybe (Slot w)
 
 -- (a thread's turn, readied: the thread run from where it stopped,
 -- given the worker that takes it)
-type Turn (w : HFunctor) = Runner w -> Co (w <+> Custodian.custodian) Unit
+type Turn (w : HFunctor) = Runner w -> Co w Unit
 
 -- (an empty slot, of the `i`th worker)
 slotMade : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Int
-         -> Co (w <+> Custodian.custodian) (Slot w)
+         -> Co w (Slot w)
 slotMade i = do
   held <- Domain.newAtomic (Nothing : Maybe (Turn w))
   pure (MkSlot i held)
@@ -309,7 +312,7 @@ slotNumber (MkSlot i held) = i
 isHolding : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Slot w
-          -> Co (w <+> Custodian.custodian) Bool
+          -> Co w Bool
 isHolding (MkSlot i held) = do
   t <- Domain.get held
   pure (case t of
@@ -323,7 +326,7 @@ keptIn : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Slot w
        -> Turn w
-       -> Co (w <+> Custodian.custodian) Bool
+       -> Co w Bool
 keptIn (MkSlot i held) t = do
   s <- Domain.get held
   case s of
@@ -337,7 +340,7 @@ keptIn (MkSlot i held) t = do
 takenFrom : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Slot w
-          -> Co (w <+> Custodian.custodian) (Maybe (Turn w))
+          -> Co w (Maybe (Turn w))
 takenFrom (MkSlot i held) = do
   s <- Domain.get held
   case s of
@@ -359,12 +362,12 @@ data Offer = MkOffer (Domain.Atomic Bool)
 -- readies its thread once a receiver has taken it, given where the
 -- receiver runs)
 data Sender (w : HFunctor) a
-  = MkSender Offer a (Runner w -> Co (w <+> Custodian.custodian) Unit)
+  = MkSender Offer a (Runner w -> Co w Unit)
 
 -- (a receiver waiting at a channel or an ivar: its offer, and what
 -- readies its thread, given the value and where the one giving it runs)
 data Receiver (w : HFunctor) a
-  = MkReceiver Offer (a -> Runner w -> Co (w <+> Custodian.custodian) Unit)
+  = MkReceiver Offer (a -> Runner w -> Co w Unit)
 
 -- (those waiting at a channel or an ivar, the longest first: a deque,
 -- an offer put at its back, the partner taken from among the first few
@@ -827,31 +830,24 @@ data Stepped (w : HFunctor)
 -- (a worker's group of the reactor: what each operation of the world
 -- started in it comes to is the step of the thread that did it, to be
 -- taken once it is done)
-type Group (w : HFunctor) =
-  Reactor.Group (Co (w <+> Custodian.custodian) (Stepped w))
+type Group (w : HFunctor) = Reactor.Group (Co w (Stepped w))
 
 -- (the reactor's operations, its evidence given: where the scheduler
 -- waits on the world through it)
 type Outside (w : HFunctor) =
-  { open : Co (w <+> Custodian.custodian) (Group w)
-  , within : Group w -> Co (w <+> Custodian.custodian) (Group w)
+  { open : Co w (Group w)
+  , within : Group w -> Co w (Group w)
   , start :
         Group w
-        -> Co
-          (w <+> Custodian.custodian)
-          (Co (w <+> Custodian.custodian) (Stepped w))
-        -> Co
-          (w <+> Custodian.custodian)
-          (Maybe (Co (w <+> Custodian.custodian) (Stepped w)))
+        -> Co w (Co w (Stepped w))
+        -> Co w (Maybe (Co w (Stepped w)))
   , finished :
         Group w
         -> Bool
-        -> Co
-          (w <+> Custodian.custodian)
-          (List (Co (w <+> Custodian.custodian) (Stepped w)))
-  , pending : Group w -> Co (w <+> Custodian.custodian) Int
-  , close : Group w -> Co (w <+> Custodian.custodian) Unit
-  , wake : Group w -> Co (w <+> Custodian.custodian) Unit
+        -> Co w (List (Co w (Stepped w)))
+  , pending : Group w -> Co w Int
+  , close : Group w -> Co w Unit
+  , wake : Group w -> Co w Unit
   }
 
 -- (a worker's waits on the world: its group, opened by the worker on
@@ -861,7 +857,7 @@ type Outside (w : HFunctor) =
 type Waits (w : HFunctor) =
   { group : Domain.Atomic (Maybe (Group w))
   , polling : Domain.Atomic Bool
-  , inbox : Domain.Atomic (List (Co (w <+> Custodian.custodian) Unit))
+  , inbox : Domain.Atomic (List (Co w Unit))
   }
 
 -- (a choice whose branches have operations of the world pending: the
@@ -948,7 +944,7 @@ groupOn : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
         -> Runner w
-        -> Co (w <+> Custodian.custodian) (Maybe (Pair (Outside w) (Group w)))
+        -> Co w (Maybe (Pair (Outside w) (Group w)))
 groupOn st Nothing = pure Nothing
 groupOn st (Just slot) = case waitsOf st slot of
   Nothing -> pure Nothing
@@ -965,7 +961,7 @@ wokenPolling : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
              -> Outside w
              -> List (Waits w)
-             -> Co (w <+> Custodian.custodian) Unit
+             -> Co w Unit
 wokenPolling o Nil = pure ()
 wokenPolling o (ws :: rest) = do
   p <- Domain.get ws.polling
@@ -980,7 +976,7 @@ wokenAllPolling : {w : HFunctor}
                 -> {{dm : Domain.domain <: w}}
                 -> Outside w
                 -> List (Waits w)
-                -> Co (w <+> Custodian.custodian) Unit
+                -> Co w Unit
 wokenAllPolling o Nil = pure ()
 wokenAllPolling o (ws :: rest) = do
   p <- Domain.get ws.polling
@@ -996,7 +992,7 @@ queued : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
        -> Turn w
-       -> Co (w <+> Custodian.custodian) Unit
+       -> Co w Unit
 queued st t = do
   q <- Domain.get st.ready
   Domain.set st.ready (MkPair (fst q) (t :: snd q))
@@ -1013,7 +1009,7 @@ readied : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
         -> Turn w
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 readied st t = do
   Domain.lock st.mutex
   queued st t
@@ -1027,7 +1023,7 @@ readiedOn : {w : HFunctor}
           -> Sched w
           -> Runner w
           -> Turn w
-          -> Co (w <+> Custodian.custodian) Unit
+          -> Co w Unit
 readiedOn st Nothing t = readied st t
 readiedOn st (Just slot) t = do
   kept <- keptIn slot t
@@ -1040,7 +1036,7 @@ unkept : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> Sched w
        -> Runner w
-       -> Co (w <+> Custodian.custodian) Unit
+       -> Co w Unit
 unkept st Nothing = pure ()
 unkept st (Just slot) = do
   holding <- isHolding slot
@@ -1058,8 +1054,8 @@ postedTo : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
          -> Slot w
-         -> Co (w <+> Custodian.custodian) Unit
-         -> Co (w <+> Custodian.custodian) Unit
+         -> Co w Unit
+         -> Co w Unit
 postedTo st slot act = case waitsOf st slot of
   Nothing -> act
   Just (MkPair o ws) -> do
@@ -1077,7 +1073,7 @@ postedTo st slot act = case waitsOf st slot of
 counted : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 counted st = do
   _ <- Domain.fetchAdd st.live 1
   pure ()
@@ -1086,7 +1082,7 @@ counted st = do
 finishedWith : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
              -> Sched w
-             -> Co (w <+> Custodian.custodian) Unit
+             -> Co w Unit
 finishedWith st = do
   Domain.lock st.mutex
   Domain.set st.done True
@@ -1099,7 +1095,7 @@ finishedWith st = do
 uncounted : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
-          -> Co (w <+> Custodian.custodian) Unit
+          -> Co w Unit
 uncounted st = do
   n <- Domain.fetchAdd st.live (0 - 1)
   if n == 1 then finishedWith st else pure ()
@@ -1111,7 +1107,7 @@ readyAgain : {w : HFunctor}
            -> Sched w
            -> Runner w
            -> Turn w
-           -> Co (w <+> Custodian.custodian) Unit
+           -> Co w Unit
 readyAgain st runner t = do
   counted st
   readiedOn st runner t
@@ -1127,7 +1123,7 @@ drawn : {w : HFunctor}
       -> {{dm : Domain.domain <: w}}
       -> Sched w
       -> Int
-      -> Co (w <+> Custodian.custodian) Int
+      -> Co w Int
 drawn st n = do
   last <- Domain.get st.draws
   let next : Int = (last * 48271) % 2147483647
@@ -1147,7 +1143,7 @@ madeChan : {w : HFunctor}
          -> {a : Type}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
-         -> Co (w <+> Custodian.custodian) (Chan w a)
+         -> Co w (Chan w a)
 madeChan st = do
   n <- Domain.fetchAdd st.numbers 1
   mu <- Domain.newMutex
@@ -1160,7 +1156,7 @@ madeIVar : {w : HFunctor}
          -> {a : Type}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
-         -> Co (w <+> Custodian.custodian) (IVar w a)
+         -> Co w (IVar w a)
 madeIVar st = do
   n <- Domain.fetchAdd st.numbers 1
   mu <- Domain.newMutex
@@ -1177,7 +1173,7 @@ wokenAll : {w : HFunctor}
          -> Runner w
          -> List (Receiver w a)
          -> a
-         -> Co (w <+> Custodian.custodian) Unit
+         -> Co w Unit
 wokenAll runner Nil v = pure ()
 wokenAll runner (MkReceiver (MkOffer claimed) wake :: rest) v = do
   ok <- Domain.cas claimed False True
@@ -1191,7 +1187,7 @@ written : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Runner w
         -> Putting w x a
-        -> Co (w <+> Custodian.custodian) x
+        -> Co w x
 written runner (MkPutting (MkIVar n mu value readers) v k) = do
   Domain.lock mu
   held <- Domain.get value
@@ -1212,7 +1208,7 @@ registered : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
            -> Waiting w
-           -> Co (w <+> Custodian.custodian) Unit
+           -> Co w Unit
 registered st x = do
   xs <- Domain.get st.waiting
   ok <- Domain.cas st.waiting xs (x :: xs)
@@ -1226,7 +1222,7 @@ settled : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
         -> Int
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 settled st n = do
   xs <- Domain.get st.waiting
   if List.any (\x -> waitingNumber x == n) xs
@@ -1241,7 +1237,7 @@ toldNack : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Runner w
          -> IVar w Unit
-         -> Co (w <+> Custodian.custodian) Unit
+         -> Co w Unit
 toldNack runner (MkIVar n mu value readers) = do
   Domain.lock mu
   held <- Domain.get value
@@ -1258,7 +1254,7 @@ toldAll : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Runner w
         -> List (IVar w Unit)
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 toldAll runner Nil = pure ()
 toldAll runner (nack :: rest) = do
   toldNack runner nack
@@ -1271,7 +1267,7 @@ toldAll runner (nack :: rest) = do
 toldDropped : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> List (Waiting w)
-            -> Co (w <+> Custodian.custodian) Unit
+            -> Co w Unit
 toldDropped Nil = pure ()
 toldDropped (MkWaiting n off nacks :: rest) = do
   _ <- claimedOffer off
@@ -1341,7 +1337,7 @@ claimedAmong : {w : HFunctor}
              -> Sched w
              -> (x -> Offer)
              -> List x
-             -> Co (w <+> Custodian.custodian) (Pair (Maybe x) (List x))
+             -> Co w (Pair (Maybe x) (List x))
 claimedAmong st offerOf Nil = pure (MkPair Nothing Nil)
 claimedAmong st offerOf (x :: Nil) = do
   ok <- claimedOffer (offerOf x)
@@ -1365,7 +1361,7 @@ claimedWaiter : {w : HFunctor}
               -> Sched w
               -> (x -> Offer)
               -> Deque.Deque x
-              -> Co (w <+> Custodian.custodian) (Pair (Maybe x) (Deque.Deque x))
+              -> Co w (Pair (Maybe x) (Deque.Deque x))
 claimedWaiter st offerOf d = do
   front <- unclaimedFront offerOf window d
   case fst front of
@@ -1384,18 +1380,18 @@ canCommit : {w : HFunctor}
           -> {x : Type}
           -> {{dm : Domain.domain <: w}}
           -> Base w x
-          -> Co (w <+> Custodian.custodian) Bool
+          -> Co w Bool
 canCommit (AlwaysBase k) = pure True
 canCommit (SendBase s) =
-  s (Co (w <+> Custodian.custodian) Bool) (\a sd -> case sd of
+  s (Co w Bool) (\a sd -> case sd of
     MkSendOn (MkChan n mu senders receivers) v k ->
       prunedFront receiverOffer receivers)
 canCommit (RecvBase s) =
-  s (Co (w <+> Custodian.custodian) Bool) (\a rc -> case rc of
+  s (Co w Bool) (\a rc -> case rc of
     MkRecvOn (MkChan n mu senders receivers) k ->
       prunedFront senderOffer senders)
 canCommit (ReadBase s) =
-  s (Co (w <+> Custodian.custodian) Bool) (\a rd -> case rd of
+  s (Co w Bool) (\a rd -> case rd of
     MkReadOn (MkIVar n mu value readers) k -> do
       held <- Domain.get value
       pure (case held of
@@ -1407,7 +1403,7 @@ readyNow : {w : HFunctor}
          -> {x : Type}
          -> {{dm : Domain.domain <: w}}
          -> List (Base w x)
-         -> Co (w <+> Custodian.custodian) (List (Base w x))
+         -> Co w (List (Base w x))
 readyNow Nil = pure Nil
 readyNow (b :: bs) = do
   can <- canCommit b
@@ -1424,7 +1420,7 @@ committedSend : {w : HFunctor}
               -> Sched w
               -> Runner w
               -> SendOn w x a
-              -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+              -> Co w (Maybe (Unit -> x))
 committedSend st runner (MkSendOn (MkChan n mu senders receivers) v k) = do
   rs <- Domain.get receivers
   r <- claimedWaiter st receiverOffer rs
@@ -1445,7 +1441,7 @@ committedRecv : {w : HFunctor}
               -> Sched w
               -> Runner w
               -> RecvOn w x a
-              -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+              -> Co w (Maybe (Unit -> x))
 committedRecv st runner (MkRecvOn (MkChan n mu senders receivers) k) = do
   ss <- Domain.get senders
   r <- claimedWaiter st senderOffer ss
@@ -1462,7 +1458,7 @@ committedRead : {w : HFunctor}
               -> {x a : Type}
               -> {{dm : Domain.domain <: w}}
               -> ReadOn w x a
-              -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+              -> Co w (Maybe (Unit -> x))
 committedRead (MkReadOn (MkIVar n mu value readers) k) = do
   held <- Domain.get value
   pure (case held of
@@ -1479,19 +1475,19 @@ committed : {w : HFunctor}
           -> Sched w
           -> Runner w
           -> Base w x
-          -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+          -> Co w (Maybe (Unit -> x))
 committed st runner (AlwaysBase k) = pure (Just k)
 committed st runner (SendBase s) =
   s
-    (Co (w <+> Custodian.custodian) (Maybe (Unit -> x)))
+    (Co w (Maybe (Unit -> x)))
     (\a sd -> committedSend st runner sd)
 committed st runner (RecvBase s) =
   s
-    (Co (w <+> Custodian.custodian) (Maybe (Unit -> x)))
+    (Co w (Maybe (Unit -> x)))
     (\a rc -> committedRecv st runner rc)
 committed st runner (ReadBase s) =
   s
-    (Co (w <+> Custodian.custodian) (Maybe (Unit -> x)))
+    (Co w (Maybe (Unit -> x)))
     (\a rd -> committedRead rd)
 
 -- (one of the base events that can be committed now, drawn at random
@@ -1505,7 +1501,7 @@ committedAmong : {w : HFunctor}
                -> Sched w
                -> Runner w
                -> List (Base w x)
-               -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+               -> Co w (Maybe (Unit -> x))
 committedAmong st runner Nil = pure Nothing
 committedAmong st runner (b :: Nil) = committed st runner b
 committedAmong st runner bs = do
@@ -1528,7 +1524,7 @@ committedOne : {w : HFunctor}
              -> Sched w
              -> Runner w
              -> List (Base w x)
-             -> Co (w <+> Custodian.custodian) (Maybe (Unit -> x))
+             -> Co w (Maybe (Unit -> x))
 committedOne st runner bs = do
   ready <- readyNow bs
   case ready of
@@ -1545,14 +1541,14 @@ committedOne st runner bs = do
 -- for the worker that takes the turn)
 offered : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
-        -> (Runner w -> Turn w -> Co (w <+> Custodian.custodian) Unit)
+        -> (Runner w -> Turn w -> Co w Unit)
         -> ((Unit -> Res w Unit) -> Turn w)
         -> Offer
         -> Base w (Res w Unit)
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 offered again turnOf off (AlwaysBase k) = pure ()
 offered again turnOf off (SendBase s) =
-  s (Co (w <+> Custodian.custodian) Unit) (\a sd -> case sd of
+  s (Co w Unit) (\a sd -> case sd of
     MkSendOn (MkChan n mu senders receivers) v k -> do
       ss <- Domain.get senders
       Domain.set
@@ -1561,7 +1557,7 @@ offered again turnOf off (SendBase s) =
              ss
              (MkSender off v (\on -> again on (turnOf k)))))
 offered again turnOf off (RecvBase s) =
-  s (Co (w <+> Custodian.custodian) Unit) (\a rc -> case rc of
+  s (Co w Unit) (\a rc -> case rc of
     MkRecvOn (MkChan n mu senders receivers) k -> do
       rs <- Domain.get receivers
       Domain.set
@@ -1572,7 +1568,7 @@ offered again turnOf off (RecvBase s) =
                 off
                 (\v on -> again on (turnOf (\u -> k v))))))
 offered again turnOf off (ReadBase s) =
-  s (Co (w <+> Custodian.custodian) Unit) (\a rd -> case rd of
+  s (Co w Unit) (\a rd -> case rd of
     MkReadOn (MkIVar n mu value readers) k -> do
       rs <- Domain.get readers
       Domain.set
@@ -1585,11 +1581,11 @@ offered again turnOf off (ReadBase s) =
 
 offeredAll : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
-           -> (Runner w -> Turn w -> Co (w <+> Custodian.custodian) Unit)
+           -> (Runner w -> Turn w -> Co w Unit)
            -> ((Unit -> Res w Unit) -> Turn w)
            -> Offer
            -> List (Base w (Res w Unit))
-           -> Co (w <+> Custodian.custodian) Unit
+           -> Co w Unit
 offeredAll again turnOf off Nil = pure ()
 offeredAll again turnOf off (b :: bs) = do
   offered again turnOf off b
@@ -1690,7 +1686,7 @@ waitedWith : {w : HFunctor}
            -> Sched w
            -> Offer
            -> List (IVar w Unit)
-           -> Co (w <+> Custodian.custodian) Unit
+           -> Co w Unit
 waitedWith st off Nil = pure ()
 waitedWith st off (nack :: rest) =
   registered st (MkWaiting (ivarNumber nack) off (nack :: rest))
@@ -1719,7 +1715,7 @@ choiceFor : {w : HFunctor}
           -> Group w
           -> Slot w
           -> Maybe (Choice w)
-          -> Co (w <+> Custodian.custodian) (Choice w)
+          -> Co w (Choice w)
 choiceFor o g slot (Just c) = pure c
 choiceFor o g slot Nothing = do
   sub <- o.within g
@@ -1741,7 +1737,7 @@ deliveredBranch : {w : HFunctor}
                 -> List Int
                 -> (Res w a -> Res w Unit)
                 -> Res w a
-                -> Co (w <+> Custodian.custodian) (Stepped w)
+                -> Co w (Stepped w)
 deliveredBranch o turnOf c around up next = do
   ok <- claimedOffer c.offer
   if ok
@@ -1761,7 +1757,7 @@ failedAfter : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> IVar w Unit
             -> String
-            -> Co (w <+> Custodian.custodian) (Branches w)
+            -> Co w (Branches w)
 failedAfter nack why = do
   toldNack Nothing nack
   Domain.fail why
@@ -1780,10 +1776,10 @@ branched : {w : HFunctor}
          -> Runner w
          -> List (Some (Branch w))
          -> Branches w
-         -> Co (w <+> Custodian.custodian) (Branches w)
+         -> Co w (Branches w)
 branched st turnOf runner Nil acc = pure acc
 branched st turnOf runner (sb :: rest) acc =
-  sb (Co (w <+> Custodian.custodian) (Branches w)) (\a br -> case br of
+  sb (Co w (Branches w)) (\a br -> case br of
     MkBranch r up around -> case r of
       RDone x ->
         branched
@@ -1799,17 +1795,14 @@ branched st turnOf runner (sb :: rest) acc =
         on <- groupOn st runner
         case (on, runner) of
           (Just (MkPair o g), Just slot) -> do
-            c <-
-              (choiceFor o g slot acc.outside :
-                 Co (w <+> Custodian.custodian) (Choice w))
+            c <- (choiceFor o g slot acc.outside : Co w (Choice w))
             now <- Domain.newAtomic (Nothing : Maybe (Res w a))
             waited <- Domain.newAtomic False
             r <-
               o.start
                 (choiceGroup c)
-                (bind m (\(next : Res w a) -> do
-                 pended <-
-                   (Domain.get waited : Co (w <+> Custodian.custodian) Bool)
+                (bind (Domain.rooted m) (\(next : Res w a) -> do
+                 pended <- (Domain.get waited : Co w Bool)
                  if pended then pure () else Domain.set now (Just next)
                  pure (deliveredBranch o turnOf c around up next)))
             case r of
@@ -1833,7 +1826,7 @@ branched st turnOf runner (sb :: rest) acc =
                     rest
                     { acc | outside = Just c, pending = True }
           _ -> do
-            next <- m
+            next <- Domain.rooted m
             branched
                 st
                 turnOf
@@ -1864,7 +1857,7 @@ branched st turnOf runner (sb :: rest) acc =
             ((\t use -> use a (MkBranch (k MkUnit) up around)) :: rest)
             acc
         NewChan s ->
-          s (Co (w <+> Custodian.custodian) (Branches w)) (\c mk -> case mk of
+          s (Co w (Branches w)) (\c mk -> case mk of
             MkMakingChan k -> do
               ch <- madeChan st
               branched
@@ -1874,7 +1867,7 @@ branched st turnOf runner (sb :: rest) acc =
                   ((\t use -> use a (MkBranch (k ch) up around)) :: rest)
                   acc)
         NewIVar s ->
-          s (Co (w <+> Custodian.custodian) (Branches w)) (\c mk -> case mk of
+          s (Co w (Branches w)) (\c mk -> case mk of
             MkMakingIVar k -> do
               iv <- madeIVar st
               branched
@@ -1884,7 +1877,7 @@ branched st turnOf runner (sb :: rest) acc =
                   ((\t use -> use a (MkBranch (k iv) up around)) :: rest)
                   acc)
         PutIVar s ->
-          s (Co (w <+> Custodian.custodian) (Branches w)) (\c pt -> do
+          s (Co w (Branches w)) (\c pt -> do
             k <- written runner pt
             branched
                 st
@@ -1926,7 +1919,7 @@ branched st turnOf runner (sb :: rest) acc =
                 List.map (\b -> MkPair around (baseThen up b)) bs ++ acc.bases
             }
         Choose s ->
-          s (Co (w <+> Custodian.custodian) (Branches w)) (\c ch -> case ch of
+          s (Co w (Branches w)) (\c ch -> case ch of
             MkChoosing bs k ->
               branched
                 st
@@ -1974,7 +1967,7 @@ synced : {w : HFunctor}
        -> Maybe (Choice w)
        -> List (IVar w Unit)
        -> List (Base w (Res w Unit))
-       -> Co (w <+> Custodian.custodian) (Stepped w)
+       -> Co w (Stepped w)
 synced st turnOf runner chosen nacks bs = do
   let locks = locksOf bs
   lockedAll locks
@@ -2018,7 +2011,7 @@ yielded : {w : HFunctor}
         -> Sched w
         -> Runner w
         -> Turn w
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 yielded st Nothing t = readied st t
 yielded st (Just slot) t = do
   Domain.lock st.mutex
@@ -2036,7 +2029,7 @@ pendingChoice : {w : HFunctor}
               -> {{dm : Domain.domain <: w}}
               -> Sched w
               -> Branches w
-              -> Co (w <+> Custodian.custodian) (Maybe (Choice w))
+              -> Co w (Maybe (Choice w))
 pendingChoice st br = case (br.outside, st.outside) of
   (Just c, Just o) ->
     if br.pending
@@ -2056,7 +2049,7 @@ stepped : {w : HFunctor}
         -> ((Unit -> Res w Unit) -> Turn w)
         -> Runner w
         -> Res w Unit
-        -> Co (w <+> Custodian.custodian) (Stepped w)
+        -> Co w (Stepped w)
 stepped st turnOf runner (RDone u) = do
   uncounted st
   pure Stopped
@@ -2065,11 +2058,14 @@ stepped st turnOf runner (RAct m) = do
   on <- groupOn st runner
   case on of
     Just (MkPair o g) -> do
-      r <- o.start g (bind m (\next -> pure (pure (Resumed next turnOf))))
+      r <-
+        o.start
+          g
+          (bind (Domain.rooted m) (\next -> pure (pure (Resumed next turnOf))))
       case r of
         Just act -> act
         Nothing -> pure Stopped
-    Nothing -> bind m (\r -> pure (GoesOn r))
+    Nothing -> bind (Domain.rooted m) (\r -> pure (GoesOn r))
 stepped st turnOf runner (RNext g) = pure (GoesOn (g MkUnit))
 stepped st turnOf runner (RStep (Spawn c k)) = do
   readyAgain st runner (st.thread c)
@@ -2079,19 +2075,19 @@ stepped st turnOf runner (RStep (Yield k)) = do
   yielded st runner (turnOf k)
   pure Stopped
 stepped st turnOf runner (RStep (NewChan s)) =
-  s (Co (w <+> Custodian.custodian) (Stepped w)) (\a mk -> case mk of
+  s (Co w (Stepped w)) (\a mk -> case mk of
     MkMakingChan k -> bind (madeChan st) (\ch -> pure (GoesOn (k ch))))
 stepped st turnOf runner (RStep (NewIVar s)) =
-  s (Co (w <+> Custodian.custodian) (Stepped w)) (\a mk -> case mk of
+  s (Co w (Stepped w)) (\a mk -> case mk of
     MkMakingIVar k -> bind (madeIVar st) (\iv -> pure (GoesOn (k iv))))
 stepped st turnOf runner (RStep (PutIVar s)) =
   s
-    (Co (w <+> Custodian.custodian) (Stepped w))
+    (Co w (Stepped w))
     (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
 stepped st turnOf runner (RStep (Sync bs)) =
   synced st turnOf runner Nothing Nil bs
 stepped st turnOf runner (RStep (Choose s)) =
-  s (Co (w <+> Custodian.custodian) (Stepped w)) (\a ch -> case ch of
+  s (Co w (Stepped w)) (\a ch -> case ch of
     MkChoosing bs k -> do
       br <-
         (branched
@@ -2103,7 +2099,7 @@ stepped st turnOf runner (RStep (Choose s)) =
               bs)
            ({ bases = Nil, nacks = Nil, outside = Nothing, pending = False } :
               Branches w) :
-           Co (w <+> Custodian.custodian) (Branches w))
+           Co w (Branches w))
       chosen <- pendingChoice st br
       synced st turnOf runner chosen (branchesNacks br) (committable br))
 stepped st turnOf runner (RStep (MadeNack nack k)) = do
@@ -2131,7 +2127,7 @@ othersReady : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> Sched w
             -> Runner w
-            -> Co (w <+> Custodian.custodian) Bool
+            -> Co w Bool
 othersReady st Nothing = pure False
 othersReady st (Just slot) = do
   holding <- isHolding slot
@@ -2154,7 +2150,7 @@ ranOn : {w : HFunctor}
       -> Runner w
       -> Int
       -> Res w Unit
-      -> Co (w <+> Custodian.custodian) Unit
+      -> Co w Unit
 ranOn st turnOf runner fuel r = do
   s <- stepped st turnOf runner r
   case s of
@@ -2175,7 +2171,7 @@ threadFailed : {w : HFunctor}
              -> Sched w
              -> Bool
              -> String
-             -> Co (w <+> Custodian.custodian) Unit
+             -> Co w Unit
 threadFailed st main why = do
   _ <- Domain.cas st.failure (Nothing : Maybe String) (Just why)
   uncounted st
@@ -2193,7 +2189,7 @@ run : {w : HFunctor}
     -> Bool
     -> Runner w
     -> Res w Unit
-    -> Co (w <+> Custodian.custodian) Unit
+    -> Co w Unit
 run st False runner r =
   ranOn st (\k on -> run st False on (k MkUnit)) runner fuelPerRun r
 run st True runner r = do
@@ -2212,6 +2208,14 @@ run st True runner r = do
   case out of
     Right u -> pure ()
     Left why -> threadFailed st True why
+
+-- (a computation of the scheduler's world, run in that of a thread's
+-- operation of the world, which has the custodian's too)
+scheduling : {w : HFunctor}
+           -> {a : Type}
+           -> Co w a
+           -> Co (w <+> Custodian.custodian) a
+scheduling c = lift (inj := \p -> InL p) c
 
 -- (a branch of a choice run alone, of whatever type: what is left of
 -- it to run up to its commit point, and `up` making what follows that)
@@ -2240,7 +2244,7 @@ readyAlone st (sb :: rest) =
       RStep p -> case p of
         Spawn c k -> do
           cust <- Custodian.current
-          readyAgain st Nothing (st.thread (threadAt cust c))
+          scheduling (readyAgain st Nothing (st.thread (threadAt cust c)))
           readyAlone
               st
               ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
@@ -2251,20 +2255,20 @@ readyAlone st (sb :: rest) =
         NewChan s ->
           s (Co (w <+> Custodian.custodian) (Maybe x)) (\c mk -> case mk of
             MkMakingChan k -> do
-              ch <- madeChan st
+              ch <- scheduling (madeChan st)
               readyAlone
                   st
                   ((\t use -> use a (MkAloneBranch (k ch) up)) :: rest))
         NewIVar s ->
           s (Co (w <+> Custodian.custodian) (Maybe x)) (\c mk -> case mk of
             MkMakingIVar k -> do
-              iv <- madeIVar st
+              iv <- scheduling (madeIVar st)
               readyAlone
                   st
                   ((\t use -> use a (MkAloneBranch (k iv) up)) :: rest))
         PutIVar s ->
           s (Co (w <+> Custodian.custodian) (Maybe x)) (\c pt -> do
-            k <- written Nothing pt
+            k <- scheduling (written Nothing pt)
             readyAlone st ((\t use -> use a (MkAloneBranch k up)) :: rest))
         MadeNack nack k ->
           readyAlone
@@ -2302,19 +2306,19 @@ alone st (RAct m) = bind m (\r -> alone st r)
 alone st (RNext g) = alone st (g MkUnit)
 alone st (RStep (Spawn c k)) = do
   cust <- Custodian.current
-  readyAgain st Nothing (st.thread (threadAt cust c))
+  scheduling (readyAgain st Nothing (st.thread (threadAt cust c)))
   alone st (k MkUnit)
 alone st (RStep (Yield k)) = alone st (k MkUnit)
 alone st (RStep (NewChan s)) =
   s (Co (w <+> Custodian.custodian) a) (\t mk -> case mk of
-    MkMakingChan k -> bind (madeChan st) (\ch -> alone st (k ch)))
+    MkMakingChan k -> bind (scheduling (madeChan st)) (\ch -> alone st (k ch)))
 alone st (RStep (NewIVar s)) =
   s (Co (w <+> Custodian.custodian) a) (\t mk -> case mk of
-    MkMakingIVar k -> bind (madeIVar st) (\iv -> alone st (k iv)))
+    MkMakingIVar k -> bind (scheduling (madeIVar st)) (\iv -> alone st (k iv)))
 alone st (RStep (PutIVar s)) =
   s
     (Co (w <+> Custodian.custodian) a)
-    (\t p -> bind (written Nothing p) (\k -> alone st k))
+    (\t p -> bind (scheduling (written Nothing p)) (\k -> alone st k))
 alone st (RStep (Sync bs)) = abandon
 alone st (RStep (MadeNack nack k)) = alone st (k MkUnit)
 alone st (RStep (Settled n k)) = alone st (k MkUnit)
@@ -2409,7 +2413,7 @@ ran : {w : HFunctor}
     -> Slot w
     -> Turn w
     -> Int
-    -> Co (w <+> Custodian.custodian) Unit
+    -> Co w Unit
 ran st slot turn n = do
   turn (Just slot)
   next <- takenFrom slot
@@ -2430,7 +2434,7 @@ ran st slot turn n = do
 dequeued : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
-         -> Co (w <+> Custodian.custodian) (Maybe (Turn w))
+         -> Co w (Maybe (Turn w))
 dequeued st = do
   q <- Domain.get st.ready
   case q of
@@ -2446,7 +2450,7 @@ dequeued st = do
 stolen : {w : HFunctor}
        -> {{dm : Domain.domain <: w}}
        -> List (Slot w)
-       -> Co (w <+> Custodian.custodian) (Maybe (Turn w))
+       -> Co w (Maybe (Turn w))
 stolen Nil = pure Nothing
 stolen (slot :: slots) = do
   holding <- isHolding slot
@@ -2472,7 +2476,7 @@ inboxDone : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
           -> Slot w
-          -> Co (w <+> Custodian.custodian) Unit
+          -> Co w Unit
 inboxDone st slot = case waitsOf st slot of
   Nothing -> pure ()
   Just (MkPair o ws) -> do
@@ -2482,7 +2486,7 @@ inboxDone st slot = case waitsOf st slot of
       _ -> do
         Domain.lock st.mutex
         acts <- Domain.get ws.inbox
-        Domain.set ws.inbox (Nil : List (Co (w <+> Custodian.custodian) Unit))
+        Domain.set ws.inbox (Nil : List (Co w Unit))
         Domain.unlock st.mutex
         doneAll (List.reverse acts)
 
@@ -2492,8 +2496,8 @@ deliveredAll : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
              -> Sched w
              -> Slot w
-             -> List (Co (w <+> Custodian.custodian) (Stepped w))
-             -> Co (w <+> Custodian.custodian) Unit
+             -> List (Co w (Stepped w))
+             -> Co w Unit
 deliveredAll st slot Nil = pure ()
 deliveredAll st slot (act :: acts) = do
   s <- act
@@ -2511,7 +2515,7 @@ serviced : {w : HFunctor}
          -> Sched w
          -> Slot w
          -> Bool
-         -> Co (w <+> Custodian.custodian) Unit
+         -> Co w Unit
 serviced st slot wait = do
   inboxDone st slot
   on <- groupOn st (Just slot)
@@ -2536,7 +2540,7 @@ waitedFor : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
           -> Slot w
-          -> Co (w <+> Custodian.custodian) Unit
+          -> Co w Unit
 waitedFor st slot = case waitsOf st slot of
   Just (MkPair o ws) -> do
     g <- Domain.get ws.group
@@ -2582,7 +2586,7 @@ taken : {w : HFunctor}
       -> Sched w
       -> Slot w
       -> Bool
-      -> Co (w <+> Custodian.custodian) (Maybe (Turn w))
+      -> Co w (Maybe (Turn w))
 taken st slot looked = do
   stop <- Domain.get st.stopping
   if stop then pure Nothing
@@ -2612,7 +2616,7 @@ worker : {w : HFunctor}
        -> Sched w
        -> Slot w
        -> Int
-       -> Co (w <+> Custodian.custodian) Unit
+       -> Co w Unit
 worker st slot rounds = do
   own <- case st.outside of
     Just o ->
@@ -2643,7 +2647,7 @@ guarded : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
         -> Slot w
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 guarded st slot = do
   out <- Domain.tried (bind (later (\u -> worker st slot 0)) (\c -> c))
   case out of
@@ -2659,7 +2663,7 @@ workerOn : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
          -> Slot w
-         -> Co (w <+> Custodian.custodian) Unit
+         -> Co w Unit
 workerOn st slot = case waitsOf st slot of
   Nothing -> guarded st slot
   Just (MkPair o ws) -> do
@@ -2674,8 +2678,8 @@ workerOn st slot = case waitsOf st slot of
 workers : {e w : HFunctor}
         -> {s : Type}
         -> {{dm : Domain.domain <: w}}
-        -> {{sp : Domain.scoped (w <+> Custodian.custodian) <: e}}
-        -> Domain.Scope s (w <+> Custodian.custodian)
+        -> {{sp : Domain.scoped w <: e}}
+        -> Domain.Scope s w
         -> Sched w
         -> List (Slot w)
         -> Co e Unit
@@ -2689,7 +2693,7 @@ slotsMade : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Int
           -> Int
-          -> Co (w <+> Custodian.custodian) (List (Slot w))
+          -> Co w (List (Slot w))
 slotsMade i n =
   if n <= 0 then pure Nil
   else do
@@ -2701,13 +2705,13 @@ slotsMade i n =
 waitsMade : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Int
-          -> Co (w <+> Custodian.custodian) (List (Waits w))
+          -> Co w (List (Waits w))
 waitsMade n =
   if n <= 0 then pure Nil
   else do
     group <- Domain.newAtomic (Nothing : Maybe (Group w))
     polling <- Domain.newAtomic False
-    inbox <- Domain.newAtomic (Nil : List (Co (w <+> Custodian.custodian) Unit))
+    inbox <- Domain.newAtomic (Nil : List (Co w Unit))
     rest <- waitsMade (n - 1)
     pure ({ group = group, polling = polling, inbox = inbox } :: rest)
 
@@ -2715,7 +2719,7 @@ waitsMade n =
 idleUntilDone : {w : HFunctor}
               -> {{dm : Domain.domain <: w}}
               -> Sched w
-              -> Co (w <+> Custodian.custodian) Unit
+              -> Co w Unit
 idleUntilDone st = do
   d <- Domain.get st.done
   if d then pure ()
@@ -2727,7 +2731,7 @@ idleUntilDone st = do
 stopped : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
-        -> Co (w <+> Custodian.custodian) Unit
+        -> Co w Unit
 stopped st = do
   Domain.lock st.mutex
   idleUntilDone st
@@ -2747,7 +2751,7 @@ scheduledBy : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> Maybe (Outside w)
             -> Co (cml w <+> Custodian.custodian <+> w) a
-            -> Co (w <+> Custodian.custodian) (Maybe a)
+            -> Co w (Maybe a)
 scheduledBy outside c = do
   numbers <- Domain.newAtomic 0
   draws <- Domain.newAtomic 1
@@ -2795,17 +2799,18 @@ scheduledBy outside c = do
          thenRes
            (handle (cmlHandler st) c)
            (\x ->
-              RAct (do
-                Domain.set answer (Just x)
-                finishedWith st
-                pure (RDone MkUnit))))
+              RAct
+                (scheduling (do
+                 Domain.set answer (Just x)
+                 finishedWith st
+                 pure (RDone MkUnit)))))
   readyAgain st Nothing (\on -> run st True on main)
   with sc := Domain.scope do
     workers sc st slots
     lift
         (inj := inr
-          (Domain.scoped (w <+> Custodian.custodian))
-          (w <+> Custodian.custodian))
+          (Domain.scoped w)
+          w)
         (stopped st)
   dropped <- Domain.get waiting
   toldDropped dropped
@@ -2832,7 +2837,7 @@ scheduled : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Co (cml w <+> Custodian.custodian <+> w) a
           -> Co w (Maybe a)
-scheduled c = Domain.rooted (scheduledBy Nothing c)
+scheduled c = scheduledBy Nothing c
 
 -- | `scheduled`, each domain waiting on the world through a reactor of
 -- | its own (std.reactor's, the C backend's): a thread's operation of
@@ -2852,18 +2857,17 @@ scheduledWithReactor : {w : HFunctor}
                      -> Co (cml w <+> Custodian.custodian <+> w) a
                      -> Co w (Maybe a)
 scheduledWithReactor c =
-  Domain.rooted
-    (scheduledBy
-       (Just
-          { open = Reactor.open
-          , within = \g -> Reactor.openWithin g
-          , start = \g m -> Reactor.start g m
-          , finished = \g wait -> Reactor.finished g wait
-          , pending = \g -> Reactor.pending g
-          , close = \g -> Reactor.close g
-          , wake = \g -> Reactor.wake g
-          })
-       c)
+  scheduledBy
+    (Just
+       { open = Reactor.open
+       , within = \g -> Reactor.openWithin g
+       , start = \g m -> Reactor.start g m
+       , finished = \g wait -> Reactor.finished g wait
+       , pending = \g -> Reactor.pending g
+       , close = \g -> Reactor.close g
+       , wake = \g -> Reactor.wake g
+       })
+    c
 
 -- A scheduler's scope
 --------------------------------------------------------------------------------
