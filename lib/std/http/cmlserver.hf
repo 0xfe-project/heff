@@ -21,6 +21,7 @@
 -- import std.net as Net
 -- import std.reactor as Reactor
 -- import std.signal as Signal
+-- import std.time as Time
 -- import custodian as Custodian
 -- import resource
 --
@@ -32,6 +33,7 @@
 -- served : {w : HFunctor}
 --        -> {s : Type}
 --        -> {{nt : Net.net <: w}}
+--        -> {{clock : Time.time <: w}}
 --        -> {{sg : Signal.signals <: w}}
 --        -> With s Net.TcpListener
 --        -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
@@ -43,7 +45,7 @@
 --
 -- -- | on port 8080, the threads run on the program's world itself, each
 -- -- | waiting on the world through its domain's reactor
--- main : Co (Net.net <+> Reactor.reactor <+> Domain.domain <+> Signal.signals) Unit
+-- main : Co (Net.net <+> Time.time <+> Reactor.reactor <+> Domain.domain <+> Signal.signals) Unit
 -- main = do
 --   r <-
 --     Net.withListener
@@ -67,7 +69,11 @@
 -- catches it itself -- and the others are served on.  A connection whose
 -- client sends nothing for `idle` milliseconds -- 30 seconds unless
 -- another is given, by name, `CmlServer.serve (idle := 5000) Empty
--- l handle`; 0 for no limit -- is closed, its thread done.  Where a
+-- l handle`; 0 for no limit -- is closed, its thread done; so is one
+-- that sends a request's head a little at a time and has not sent it
+-- all within `headerWithin` milliseconds -- 30 seconds unless another
+-- is given, by name -- of the connection's start, or of the response
+-- before it.  Where a
 -- connection cannot be accepted (the program out of descriptors,
 -- `EMFILE`; the listener closed, `EBADF`) the server stops: `serve`
 -- comes back, the connections being served going on, the listener left
@@ -85,6 +91,7 @@ import exception
 import std.http as HTTP
 import std.http.server as Server
 import std.net as Net
+import std.time as Time
 import resource
 
 -- (a connection served, then closed: the handler's throws heard here,
@@ -94,6 +101,8 @@ servedOn : {w : HFunctor}
          -> {s : Type}
          -> {err : Type}
          -> {{nt : Net.net <: w}}
+         -> {{clock : Time.time <: w}}
+         -> Int
          -> Int
          -> (Server.Request
              -> Co
@@ -101,12 +110,13 @@ servedOn : {w : HFunctor}
                HTTP.Response)
          -> With s Net.TcpStream
          -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
-servedOn idle handle c = do
+servedOn idle within handle c = do
   _ <-
     attempt
       err
       (Server.serveConnection
          (idle := idle)
+         (headerWithin := within)
          (\r -> False)
          handle
          c)
@@ -119,7 +129,9 @@ acceptor : {w : HFunctor}
          -> {s : Type}
          -> {err : Type}
          -> {{nt : Net.net <: w}}
+         -> {{clock : Time.time <: w}}
          -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
+         -> Int
          -> Int
          -> With s Net.TcpListener
          -> (Server.Request
@@ -127,13 +139,13 @@ acceptor : {w : HFunctor}
                (exception err <+> (CML.cml w <+> Custodian.custodian <+> w))
                HTTP.Response)
          -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
-acceptor stop idle l handle = do
+acceptor stop idle within l handle = do
   r <- Net.accepted l
   case r of
     Left why -> stop
     Right c -> do
-      CML.spawn (servedOn idle handle c)
-      acceptor stop idle l handle
+      CML.spawn (servedOn idle within handle c)
+      acceptor stop idle within l handle
 
 -- (the listener's connections accepted by a thread of their own, until
 -- it stops: then this comes back)
@@ -142,6 +154,8 @@ acceptedUntilStopped : {e w : HFunctor}
                      -> {err : Type}
                      -> {{cm : CML.cml w <: e}}
                      -> {{nt : Net.net <: w}}
+                     -> {{clock : Time.time <: w}}
+                     -> Int
                      -> Int
                      -> With s Net.TcpListener
                      -> (Server.Request
@@ -150,9 +164,9 @@ acceptedUntilStopped : {e w : HFunctor}
                             <+> (CML.cml w <+> Custodian.custodian <+> w))
                            HTTP.Response)
                      -> Co e Unit
-acceptedUntilStopped idle l handle = do
+acceptedUntilStopped idle within l handle = do
   stopped <- CML.newIVar
-  CML.spawn (acceptor (CML.putIVar stopped ()) idle l handle)
+  CML.spawn (acceptor (CML.putIVar stopped ()) idle within l handle)
   CML.readIVar stopped
 
 -- | The listener's connections served at once, each by a cml thread of
@@ -160,7 +174,9 @@ acceptedUntilStopped idle l handle = do
 -- | them in a loop, and closed as it is served.  Until one fails to be
 -- | accepted: the listener left as it is, the connections being served
 -- | going on.  A connection whose client sends nothing for `idle`
--- | milliseconds is closed, its thread done.  The handler runs in its
+-- | milliseconds is closed, its thread done; one whose request's head
+-- | is not all read within `headerWithin` milliseconds of its start, or
+-- | of the response before it, too.  The handler runs in its
 -- | connection's thread, in the scheduler's world, and may throw an
 -- | `err` (`Empty` for one that throws nothing): that connection is
 -- | closed at once, unanswered, and what was thrown let go of; the
@@ -169,12 +185,14 @@ acceptedUntilStopped idle l handle = do
 serve : {w : HFunctor}
       -> {s : Type}
       -> {idle : Int := 30000}
+      -> {headerWithin : Int := 30000}
       -> (err : Type)
       -> {{nt : Net.net <: w}}
+      -> {{clock : Time.time <: w}}
       -> With s Net.TcpListener
       -> (Server.Request
           -> Co
             (exception err <+> (CML.cml w <+> Custodian.custodian <+> w))
             HTTP.Response)
       -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
-serve err l handle = acceptedUntilStopped idle l handle
+serve err l handle = acceptedUntilStopped idle headerWithin l handle

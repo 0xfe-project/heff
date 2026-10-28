@@ -15,10 +15,12 @@
 --
 -- ```haskell
 -- import co
+-- import custodian as Custodian
 -- import exception
 -- import std.http as HTTP
 -- import std.http.server as Server
 -- import std.net as Net
+-- import std.time as Time
 --
 -- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 -- hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
@@ -27,7 +29,9 @@
 -- -- | or the port not listened on: then that is thrown
 -- helloAt : {e : HFunctor}
 --         -> {{nt : Net.net <: e}}
+--         -> {{clock : Time.time <: e}}
 --         -> {{fail : exception Net.NetError <: e}}
+--         -> {{cu : Custodian.custodian <: e}}
 --         -> Int
 --         -> Co e Unit
 -- helloAt port = do
@@ -50,7 +54,13 @@
 -- read before its connection is closed.  A response is written within the
 -- same limit.  So a client that holds a connection and is silent holds
 -- it no longer than that, by a scheduler that waits on the world through
--- std.reactor or by none.
+-- std.reactor or by none.  A client that is not silent, but sends a
+-- request's head a little at a time, is held to a limit of its own: the
+-- whole head is read within `headerWithin` milliseconds -- 30 seconds
+-- unless another is given, by name; 0 for no limit -- of the
+-- connection's start, or of the response before it, or the connection
+-- is closed, unanswered, as one silent too long is.  So a server's
+-- world has std.time's clock, `time`, beside std.net's `net`.
 
 module std.http.server
   ( Request
@@ -73,8 +83,10 @@ import bytes as Bytes
 import co
 import custodian as Custodian
 import exception
+import std.duration as Duration
 import std.http as HTTP
 import std.net as Net
+import std.time as Time
 import uint8 as UInt8
 import resource
 
@@ -121,6 +133,12 @@ bodyMost = 67108864
 -- (how much is read at a time)
 readSize : Int
 readSize = 65536
+
+-- (how much is read at a time of a head not read all at once: so a
+-- client sending its head a little at a time is waited for with a small
+-- buffer, not `readSize`)
+headPiece : Int
+headPiece = 4096
 
 -- (how much of what a client still sends, after a request refused, is
 -- read and let go of before its connection is closed)
@@ -246,32 +264,70 @@ moreBytes again ended buf (Right b) =
 -- (a head read: the bytes read, and where its blank line starts)
 data Head = HeadAt Bytes Int | HeadTooLong | HeadEnded
 
+-- (the monotonic clock, in milliseconds)
+millisecondsNow : {e : HFunctor} -> {{clock : Time.time <: e}} -> Co e Int
+millisecondsNow =
+  bind Time.monotonic (\d -> pure (Duration.totalNanoseconds d / 1000000))
+
+-- (when a head begun now is to be read by, on the monotonic clock, given
+-- `within` milliseconds for it: none where that is 0)
+headBy : {e : HFunctor}
+       -> {{clock : Time.time <: e}}
+       -> Int
+       -> Co e (Maybe Int)
+headBy 0 = pure Nothing
+headBy within = bind millisecondsNow (\now -> pure (Just (now + within)))
+
+-- (the shorter of two time limits, 0 none)
+shorter : Int -> Int -> Int
+shorter 0 left = left
+shorter idle left = if idle < left then idle else left
+
+-- (more of a head read, `size` bytes at most, within `idle`
+-- milliseconds, and by `by` on the monotonic clock where there is a
+-- `by`: where that has passed, none, as where the connection ends)
+headRead : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> {{clock : Time.time <: e}}
+         -> Int
+         -> Maybe Int
+         -> With s Net.TcpStream
+         -> Int
+         -> Co e (Either Net.NetError Bytes)
+headRead idle Nothing c size = Net.read (timeout := idle) c size
+headRead idle (Just by) c size =
+  bind
+    millisecondsNow
+    (\now ->
+       if now >= by then pure (Right Bytes.empty)
+       else Net.read (timeout := shorter idle (by - now)) c size)
+
 -- (bytes read until `buf` has a head, looked for from `from` on, each
--- read within `idle` milliseconds; where one is not, the connection's
--- end)
+-- read within `idle` milliseconds, and all by `by`; where one is not,
+-- the connection's end)
 readHead : {e : HFunctor}
          -> {s : Type}
          -> {{nt : Net.net <: e}}
+         -> {{clock : Time.time <: e}}
          -> Int
+         -> Maybe Int
          -> With s Net.TcpStream
          -> Bytes
          -> Int
          -> Co e Head
-readHead idle c buf from =
+readHead idle by c buf from =
   let i = headEnd buf from
   in if i >= 0 then pure (HeadAt buf i)
   else if Bytes.length buf > headMost then pure HeadTooLong
-  else bind
-      (Net.read (timeout := idle) c readSize)
-      (moreBytes
-         (\b ->
-            readHead
-              idle
-              c
-              b
-              (if Bytes.length buf > 3 then Bytes.length buf - 3 else 0))
-         HeadEnded
-         buf)
+  else let next : Int = if Bytes.length buf > 3 then Bytes.length buf - 3 else 0
+       in bind
+         (headRead
+            idle
+            by
+            c
+            (if Bytes.length buf == 0 then readSize else headPiece))
+         (moreBytes (\b -> readHead idle by c b next) HeadEnded buf)
 
 -- (a read's bytes, after the parts before, `got` bytes in all: `again`
 -- of them; where the connection ended, or failed, none)
@@ -319,14 +375,21 @@ bodied r n (Just b) =
 -- | it (`Asked`), or the status it is answered with (`Refused`); else,
 -- | not all read yet, `Left`: its head, where that is read -- the
 -- | request, its body to come -- and how many bytes in all it wants at
--- | least.
+-- | least.  The head's end, its blank line, is looked for from `from`
+-- | on, by name (0, the start, unless another is given): a reader that
+-- | has looked through what came before, or knows where it is, says so.
 -- | >>> either (\(p : (Maybe Request, Int)) -> debug (snd p)) (\g -> "got") (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nab"])
 -- | "40"
 -- | >>> either (\(p : (Maybe Request, Int)) -> "more") (\g -> "whole") (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET"])
 -- | "whole"
-requestIn : Net.Address -> Bytes -> Either (Maybe Request, Int) Got
+-- | >>> either (\(p : (Maybe Request, Int)) -> "more") (\g -> "whole") (requestIn (from := 14) { host = "::1", port = 1 } b["GET / HTTP/1.1\r\n\r\n"])
+-- | "whole"
+requestIn : {from : Int := 0}
+          -> Net.Address
+          -> Bytes
+          -> Either (Maybe Request, Int) Got
 requestIn peer buf =
-  let i = headEnd buf 0
+  let i = headEnd buf from
   in if i < 0
   then (if Bytes.length buf > headMost then Right (Refused 431)
         else Left (Nothing, Bytes.length buf + 1))
@@ -386,16 +449,21 @@ headed idle c peer HeadTooLong = pure (Refused 431)
 headed idle c peer HeadEnded = pure Ended
 
 -- (the next request of the connection, `buf` read of it already, each
--- read within `idle` milliseconds)
+-- read within `idle` milliseconds, and its head within `within` of now)
 readRequest : {e : HFunctor}
             -> {s : Type}
             -> {{nt : Net.net <: e}}
+            -> {{clock : Time.time <: e}}
+            -> Int
             -> Int
             -> With s Net.TcpStream
             -> Net.Address
             -> Bytes
             -> Co e Got
-readRequest idle c peer buf = bind (readHead idle c buf 0) (headed idle c peer)
+readRequest idle within c peer buf = do
+  by <- headBy within
+  head <- readHead idle by c buf 0
+  headed idle c peer head
 
 -- Writing a response
 --------------------------------------------------------------------------------
@@ -595,19 +663,21 @@ goOn again (Done stop) = pure stop
 closedWith : {e : HFunctor}
            -> {s : Type}
            -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
+           -> Int
            -> Int
            -> (Request -> Bool)
            -> (Request -> Co e HTTP.Response)
            -> With s Net.TcpStream
            -> Either Net.NetError Net.Address
            -> Co e Bool
-closedWith idle last handle c (Left err) = pure False
-closedWith idle last handle c (Right peer) = serveFrom Bytes.empty
+closedWith idle within last handle c (Left err) = pure False
+closedWith idle within last handle c (Right peer) = serveFrom Bytes.empty
   where
   -- (the connection's requests answered, `buf` read of them already)
   serveFrom : Bytes -> Co e Bool
   serveFrom buf = do
-    got <- readRequest idle c peer buf
+    got <- readRequest idle within c peer buf
     after <- answered idle c last handle got
     goOn serveFrom after
 
@@ -616,17 +686,22 @@ closedWith idle last handle c (Right peer) = serveFrom Bytes.empty
 -- | the request is the last the server answers: whether `last` said so.
 -- | The connection is closed by the `with` holding it, `Net.accept`'s
 -- | or `Net.withConnection`'s, when its body ends.  Where the client
--- | sends nothing for `idle` milliseconds, it ends there (0: no limit).
+-- | sends nothing for `idle` milliseconds, it ends there (0: no limit);
+-- | where a request's head is not all read within `headerWithin`
+-- | milliseconds of the connection's start, or of the response before
+-- | it, too (0: no limit).
 serveConnection : {e : HFunctor}
                 -> {s : Type}
                 -> {idle : Int := 30000}
+                -> {headerWithin : Int := 30000}
                 -> {{nt : Net.net <: e}}
+                -> {{clock : Time.time <: e}}
                 -> (Request -> Bool)
                 -> (Request -> Co e HTTP.Response)
                 -> With s Net.TcpStream
                 -> Co e Bool
 serveConnection last handle c =
-  bind (Net.peer c) (closedWith idle last handle c)
+  bind (Net.peer c) (closedWith idle headerWithin last handle c)
 
 -- (the next connection, `again`; or the server done, `last` said so)
 nextOr : {e : HFunctor} -> (Unit -> Co e Unit) -> Bool -> Co e Unit
@@ -643,7 +718,9 @@ nextOr again False = again MkUnit
 serveUntil : {e : HFunctor}
            -> {s : Type}
            -> {idle : Int := 30000}
+           -> {headerWithin : Int := 30000}
            -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
            -> {{ex : exception Net.NetError <: e}}
            -> {{cu : Custodian.custodian <: e}}
            -> (Request -> Bool)
@@ -652,15 +729,30 @@ serveUntil : {e : HFunctor}
            -> Co e Unit
 serveUntil last l handle =
   bind
-    (Net.accept l (serveConnection (idle := idle) last handle))
-    (nextOr (\u -> serveUntil (idle := idle) last l handle))
+    (Net.accept
+       l
+       (serveConnection
+          (idle := idle)
+          (headerWithin := headerWithin)
+          last
+          handle))
+    (nextOr
+       (\u ->
+          serveUntil
+            (idle := idle)
+            (headerWithin := headerWithin)
+            last
+            l
+            handle))
 
 -- | The listener's connections served, until one fails to be accepted:
 -- | why thrown, the listener left as it is (`serveUntil`).
 serve : {e : HFunctor}
       -> {s : Type}
       -> {idle : Int := 30000}
+      -> {headerWithin : Int := 30000}
       -> {{nt : Net.net <: e}}
+      -> {{clock : Time.time <: e}}
       -> {{ex : exception Net.NetError <: e}}
       -> {{cu : Custodian.custodian <: e}}
       -> With s Net.TcpListener
@@ -668,5 +760,11 @@ serve : {e : HFunctor}
       -> Co e Unit
 serve l handle =
   bind
-    (Net.accept l (serveConnection (idle := idle) (\r -> False) handle))
-    (\stop -> serve (idle := idle) l handle)
+    (Net.accept
+       l
+       (serveConnection
+          (idle := idle)
+          (headerWithin := headerWithin)
+          (\r -> False)
+          handle))
+    (\stop -> serve (idle := idle) (headerWithin := headerWithin) l handle)
