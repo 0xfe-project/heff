@@ -1,10 +1,9 @@
--- Threads truly at once, by std.thread (its C
--- provider building the runtime for threads).  `spread n` gives the rest of the program to each
--- of n threads, shared by them, its index its answer; `gather x` joins
--- them, each thread's value, in order, in thread 0, every other thread
--- ending there.  `parMap w f xs` is `f` of each of `xs`, by `w` threads
--- taking the next as they end one: their answers any type, handed back.
--- And `Parallel`, each side a thread (`inThreads`).
+-- Threads truly at once, by std.thread, on std.domain's domains (whose
+-- C provider builds the runtime for threads).  `spread n c` runs `c i`
+-- on each of n domains, `i` its index, their answers in order.
+-- `parMap w f xs` is `f` of each of `xs`, by `w` domains taking the next
+-- as they end one: their answers any type, handed back.  And
+-- `Parallel`, each side a domain (`inThreads`).
 
 module test.node.threads
 
@@ -13,6 +12,7 @@ import co
 import int64 as Int64
 import parallel
 import std.io
+import std.domain as Domain
 import std.process
 import std.thread
 import uint64 as UInt64
@@ -148,36 +148,34 @@ fibPar d n =
 showInts : List Int -> String
 showInts xs = unwords (List.map debug xs)
 
+-- (a spread inside a domain of a spread's: its answers summed)
+innerSum : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Int -> Co e Int
+innerSum j = do
+  inner <- spread 3 (\k -> pure (j * 10 + k))
+  pure (List.sum inner)
+
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
-        -> {{th : threads <: e}}
+        -> {{dm : Domain.domain <: e}}
         -> Co e Unit
 program = do
   print "said before the spread, once"
-  i <- spread 4
-  sq <- gather (i * i)
+  sq <- spread 4 (\i -> pure (i * i))
   print ("squares: " ^ showInts sq)
-  j <- spread 2
-  k <- spread 3
-  inner <- gather (j * 10 + k)
-  outer <- gather (List.sum inner)
+  outer <- spread 2 (\j -> innerSum j)
   print ("nested: " ^ showInts outer)
-  m <- spread 3
-  own <- gather (List.sum (List.map (\x -> x * m) (List.range 1 5)))
+  own <- spread 3 (\m -> pure (List.sum (List.map (\x -> x * m) (List.range 1 5))))
   print ("each its own: " ^ showInts own)
-  n <- spread 4
-  shared <- gather (List.sum squares + n)
+  shared <- spread 4 (\n -> pure (List.sum squares + n))
   print ("a definition, shared: " ^ showInts shared)
   mine <-
     pure
       ({ m = 2.5, k = 9223372036854775807, u = 18446744073709551615, tag = "own" }
        : Mass)
   us <- pure (widesFrom 3)
-  f <- spread 3
-  flat <- gather (massOf mine us + f)
+  flat <- spread 3 (\f -> pure (massOf mine us + f))
   print ("flat fields, frozen and shared: " ^ showInts flat)
-  t <- spread 3
-  ws <- gather (spun t)
+  ws <- spread 3 (\t -> pure (spun t))
   print ("workers: " ^ showInts ws)
   ps <- parMap 4 (primesIn 100000) (List.range 0 (100000 / 4096))
   print ("primes below 100000, by 4: " ^ debug (List.sum ps))
@@ -186,45 +184,42 @@ program = do
   r <- handle (inThreads Int Int e) (fibPar (e := e) 3 20)
   print ("fib 20, each Parallel a thread: " ^ debug r)
 
-main : Co (stdio <+> process <+> threads) Unit
-main = program (io := _) (th := _)
+main : Co (stdio <+> process <+> Domain.domain) Unit
+main = program (io := _) (dm := _)
 
--- (a thread that abandons: the program abandons, as it would one thread
--- doing it all, when the threads are joined)
+-- (a domain of a spread's that abandons: the program abandons, as it
+-- would one domain doing it all, when the domains are joined)
 abandoning : {e : HFunctor}
            -> {{io : stdio <: e}}
-           -> {{th : threads <: e}}
+           -> {{dm : Domain.domain <: e}}
            -> Co e Unit
 abandoning = do
-  i <- spread 3
-  x <- later (\u -> if i == 2 then abandon else i)
-  xs <- gather x
+  xs <- spread 3 (\i -> later (\u -> if i == 2 then abandon else i))
   print ("not said: " ^ showInts xs)
 
-failing : Co (stdio <+> process <+> threads) Unit
-failing = abandoning (io := _) (th := _)
+failing : Co (stdio <+> process <+> Domain.domain) Unit
+failing = abandoning (io := _) (dm := _)
 
 -- (deeper than any stack: no tail call)
 sumTo : Int -> Int
 sumTo n = if n == 0 then 0 else n + sumTo (n - 1)
 
--- (a thread whose stack overflows: caught there, and the program ends
--- so, as it would one thread doing it all, when the threads are joined)
+-- (a domain whose stack overflows: caught there, and the program ends
+-- so, as it would one domain doing it all, when the domains are joined)
 overflowingIn : {e : HFunctor}
               -> {{io : stdio <: e}}
-              -> {{th : threads <: e}}
+              -> {{dm : Domain.domain <: e}}
               -> Co e Unit
 overflowingIn = do
   print "said before the spread"
-  i <- spread 3
-  x <- later (\u -> if i == 2 then sumTo 1000000000000 else i)
-  xs <- gather x
+  xs <-
+    spread 3 (\i -> later (\u -> if i == 2 then sumTo 1000000000000 else i))
   print ("not said: " ^ showInts xs)
 
-overflowing : Co (stdio <+> process <+> threads) Unit
-overflowing = overflowingIn (io := _) (th := _)
+overflowing : Co (stdio <+> process <+> Domain.domain) Unit
+overflowing = overflowingIn (io := _) (dm := _)
 
--- (any value, there and back: strings and lists mapped, gathered, and
+-- (any value, there and back: strings and lists mapped and spread, and
 -- each side of a `Parallel` of two types; a value of the caller's, not a
 -- definition, shared by each task that holds it; a thunk of the
 -- caller's, shared, forced by threads at once)
@@ -240,7 +235,7 @@ showList xs = "[" ^ joinWith "," (List.map debug xs) ^ "]"
 
 generics : {e : HFunctor}
          -> {{io : stdio <: e}}
-         -> {{th : threads <: e}}
+         -> {{dm : Domain.domain <: e}}
          -> Co e Unit
 generics = do
   shouted <- parMap 3 (\s -> s ^ "!") ["a", "bb", "ccc", "dddd", "eeeee"]
@@ -262,16 +257,15 @@ generics = do
   print ("views of the caller's string: " ^ unwords (List.map (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 3) cut))
   own <- parMap 3 (\k -> strSlice (joinWith "" (List.replicate 100 (debug k))) 2 90) [0, 1, 2]
   print ("views of each's own: " ^ unwords (List.map (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 2) own))
-  i <- spread 3
-  names <- gather (joinWith "" (List.replicate i "ab"))
-  print ("gathered: " ^ joinWith "," names)
+  names <- spread 3 (\i -> pure (joinWith "" (List.replicate i "ab")))
+  print ("spread: " ^ joinWith "," names)
   both <- handle (inThreads String (List Int) e) (mixed (e := e))
   print ("a Parallel of two types: " ^ fst both ^ "; " ^ showList (snd both))
   c <- cores
   print (if c >= 1 then "cores: at least one" else "cores: none")
 
-generic : Co (stdio <+> process <+> threads) Unit
-generic = generics (io := _) (th := _)
+generic : Co (stdio <+> process <+> Domain.domain) Unit
+generic = generics (io := _) (dm := _)
 
 -- (tasks that abandon: the others take no more, and the caller
 -- abandons, as it would have, one thread doing all -- the first that
@@ -285,15 +279,15 @@ failAt i =
 
 poolFailing : {e : HFunctor}
             -> {{io : stdio <: e}}
-            -> {{th : threads <: e}}
+            -> {{dm : Domain.domain <: e}}
             -> Co e Unit
 poolFailing = do
   print "said before the pool"
   xs <- parMap 4 failAt (List.range 0 7)
   print ("not said: " ^ showInts xs)
 
-failingTask : Co (stdio <+> process <+> threads) Unit
-failingTask = poolFailing (io := _) (th := _)
+failingTask : Co (stdio <+> process <+> Domain.domain) Unit
+failingTask = poolFailing (io := _) (dm := _)
 
 -- (`cpu WORK N W`: WORK -- primes, queens or fib -- of N, by W threads)
 tasks : String -> Int -> Pair Int (Int -> Int)
@@ -304,7 +298,7 @@ tasks w n =
 
 cpuRun : {e : HFunctor}
        -> {{io : stdio <: e}}
-       -> {{th : threads <: e}}
+       -> {{dm : Domain.domain <: e}}
        -> String
        -> Int
        -> Int
@@ -315,17 +309,17 @@ cpuRun w n ws = do
 
 cpuArgs : {e : HFunctor}
         -> {{io : stdio <: e}}
-        -> {{th : threads <: e}}
+        -> {{dm : Domain.domain <: e}}
         -> List String
         -> Co e Unit
 cpuArgs (w :: n :: ws :: _) =
   cpuRun w (fromMaybe 0 (parseInt n)) (fromMaybe 1 (parseInt ws))
 cpuArgs _ = print "cpu primes|queens|fib N W"
 
-cpu : Co (stdio <+> process <+> threads) Unit
+cpu : Co (stdio <+> process <+> Domain.domain) Unit
 cpu = do
   argv <- args (ev := _)
-  cpuArgs (io := _) (th := _) argv
+  cpuArgs (io := _) (dm := _) argv
 
 -- (`handOver R W`: R rounds, each W lists of 100,000 made by the tasks'
 -- threads and given back by the caller, which sums them -- made in one
@@ -336,7 +330,7 @@ madeThere i = List.range i (i + 99999)
 
 handRounds : {e : HFunctor}
            -> {{io : stdio <: e}}
-           -> {{th : threads <: e}}
+           -> {{dm : Domain.domain <: e}}
            -> Int
            -> Int
            -> Int
@@ -349,7 +343,7 @@ handRounds r w acc =
 
 handArgs : {e : HFunctor}
          -> {{io : stdio <: e}}
-         -> {{th : threads <: e}}
+         -> {{dm : Domain.domain <: e}}
          -> List String
          -> Co e Unit
 handArgs (r :: w :: _) = do
@@ -357,10 +351,10 @@ handArgs (r :: w :: _) = do
   print ("handed over: " ^ debug s)
 handArgs _ = print "handOver ROUNDS W"
 
-handOver : Co (stdio <+> process <+> threads) Unit
+handOver : Co (stdio <+> process <+> Domain.domain) Unit
 handOver = do
   argv <- args (ev := _)
-  handArgs (io := _) (th := _) argv
+  handArgs (io := _) (dm := _) argv
 
 -- (`unshared`: a tree, a list and two arrays shared with the pool's
 -- threads, each reading all of them; held by the caller alone again once
@@ -406,7 +400,7 @@ renamed a i =
 
 unsharedRun : {e : HFunctor}
             -> {{io : stdio <: e}}
-            -> {{th : threads <: e}}
+            -> {{dm : Domain.domain <: e}}
             -> Co e Unit
 unsharedRun = do
   t <- pure (grown 12 1)
@@ -426,5 +420,5 @@ unsharedRun = do
   print ("array: " ^ debug (arraySum (tripled a 0) 0 0))
   print ("names: " ^ debug (namesLength (renamed names 0) 0 0))
 
-unshared : Co (stdio <+> process <+> threads) Unit
-unshared = unsharedRun (io := _) (th := _)
+unshared : Co (stdio <+> process <+> Domain.domain) Unit
+unshared = unsharedRun (io := _) (dm := _)

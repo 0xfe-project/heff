@@ -21,7 +21,7 @@ library declares them.
 
 - `lib/std/`'s effects are the system's, with C providers: `std.io`,
   `std.filesystem`, `std.process`, `std.progress`, `std.http`,
-  `std.net`, `std.thread`, `std.reactor`, `std.signal`, `std.terminal`.
+  `std.net`, `std.reactor`, `std.signal`, `std.terminal`.
 - `std.reference` and `std.time` have both a C and a JavaScript
   provider.
 - `lib/browser/`'s are the browser's, JavaScript only: `browser.dom`,
@@ -98,11 +98,11 @@ tag's with `heff_tget_v`, never directly.
 ```haskell
 import ffi as FFI
 
-threadsInC : FFI.Described
-threadsInC =
+filesInC : FFI.Described
+filesInC =
   FFI.describe
-    []
-    [FFI.operation "Cores" (FFI.fun "th_cores" [] (FFI.gives FFI.int64))]
+    ["<stdio.h>"]
+    [FFI.operation "Remove" (FFI.fun "remove" [FFI.string] FFI.doneOrErrno)]
 ```
 
 An operation that is one C call need not be written in the provider: a

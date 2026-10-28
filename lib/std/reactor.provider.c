@@ -19,7 +19,7 @@
 // An `End` and a `Finished` are each a function given what to do with
 // what they hold, their types erased: `rx_open` takes it -- an end's
 // value and its function `k`, a finished's function `k` -- so that the
-// provider has each apart, as std.thread's provider takes a work.
+// provider has each apart, as std.domain's provider takes a `Some`.
 
 // (what an end or a finished holds, where `rx_open` puts it)
 static HEFF_TLS V rx_held[2];

@@ -182,8 +182,9 @@ Other calls take stack:
 
 - A C program has a 1 GiB stack: recursion millions deep. When it runs
   out, the program says `heff: stack overflow` and exits with 2. A
-  thread of std.thread has a 256 MiB stack; when it runs out, the
-  thread fails, and the program fails so when the thread is joined.
+  domain of std.domain (std.thread's are domains) has a 256 MiB stack;
+  when it runs out, the domain fails, and the program fails so when
+  it is joined.
   `-DHEFF_MAIN_STACK=BYTES` when building its C sets another size.
 - A JavaScript program runs on the stack of what loads it, room for
   about ten thousand calls. Deeper, it throws a `RangeError`.
