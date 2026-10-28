@@ -29,19 +29,11 @@ map : {a b : Type} -> (a -> b) -> List a -> List b
 map f [] = []
 map f (y :: ys) = f y :: map f ys
 
--- | each line printed: a computation that needs the standard streams,
--- | in any world `e` that has them
-printAll : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
-printAll [] = pure MkUnit
-printAll (l :: ls) = do
-  print l
-  printAll ls
-
 main : Co stdio Unit
-main =
-  printAll
-    (io := here stdio)
-    (map (\n -> "Hello, " ^ n ^ "!") ["heff", "world"])
+main = do
+  let ls : List String = ["heff", "world"]
+  for x in ls do
+    print $ "Hello, " ^ x ^ "!"
 ```
 
 `heff run hello.hf` prints the two greetings; `heff test hello.hf`
