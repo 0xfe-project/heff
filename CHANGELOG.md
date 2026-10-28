@@ -126,6 +126,7 @@
 
 ### Compiler and tools
 
+- `M.x`, where the module imported as `M` defines `x` but its claim does not list it, says `` `x` is defined in `m` but not exported`` (E0353), not that `M` is read as a tag.
 - A metavariable applied past its arity, as `?m t` of a `?m : Type -> Type` under a binder `t`, has the type it comes to applied to all its arguments where it is pruned, or stands in another's solution: such a program (`first fixed made t`, `x : Of made -> Int`) aborted the compiler with `heff:abandon`, and now elaborates, or says what it cannot infer.
 - `heff dev` builds and runs, and no longer serves pages: `heff dev-pages`, `--port` and `--proxy` are gone, and heff links no network or HTTP client.
 - `heff dev-pages` serves up to 16 connections at once, each a computation of its own in a group of std.reactor's, no threads (it was green threads), so heff stays a program of one thread.
