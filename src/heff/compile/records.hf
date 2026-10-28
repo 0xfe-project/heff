@@ -1,0 +1,169 @@
+-- A record built in a function out of statics alone -- globals, lambdas
+-- that mention no variable of the function's, constants, and tags of
+-- such -- is a global of its own: built once, as a definition's value
+-- is, and so immortal, counted by no thread (the runtime makes a
+-- definition's value so once it is computed).  Built where it is
+-- written, it is allocated each time it is reached, and where it is
+-- handed on to what many threads run, each of them counts it
+-- atomically as it passes it on.
+--
+-- The simplifier makes such records: the program's handler, `ret`,
+-- `bind` and `malg` (the runtime's monad, its algebra performing), is
+-- known where the program is and inlined into what it runs; where that
+-- is given to a function not known there -- a body a library function
+-- takes, its continuation -- the handler is written out again, a record
+-- of three lambdas, at each call.  So with a functor's `fmap` in each
+-- operation, a sum's `hfmap` and `hmap`.  This runs after the simplifier
+-- and the passes after it, where they are made, for both backends.
+--
+-- One alike in two places, but for the numbers of the names it binds
+-- (copies of one record, as the simplifier makes them), is one global: a
+-- handler inlined in many copies is built once.  Only a record with a
+-- lambda or a global in it (a record of numbers is the C backend's to
+-- take apart, heff.compile.fields), and only in a function: a value's
+-- own records are built once already.  No lazy value's box (`MkLazy`):
+-- it keeps what it comes to, its own.
+
+module heff.compile.records
+
+import heff.compile.ir as IR
+import heff.compile.irtext as IRText
+import heff.compile.lift as Lift
+import std.ordmap as OrdMap
+
+-- What is static
+--------------------------------------------------------------------------------
+
+-- | what a record of statics may hold: a global, a lambda mentioning no
+-- | variable, a constant, a tag of such (not a lazy value's box)
+-- | >>> staticPart (ELam ["x"] (EApp (EGlobal "m.f") [EVar "x"]))
+-- | True
+-- | >>> staticPart (ELam ["x"] (EApp (EVar "k") [EVar "x"]))
+-- | False
+staticPart : IR.Expr -> Bool
+staticPart (EGlobal _) = True
+staticPart (ELam xs b) = List.null (Lift.freeVars xs b)
+staticPart (ETag t args _) =
+  not (strEq t "MkLazy") && List.all (\a -> staticPart a) args
+staticPart (EInt _) = True
+staticPart (EFloat _) = True
+staticPart (EStr _) = True
+staticPart (EBytes _) = True
+staticPart (EFixed _ _) = True
+staticPart (EFloat32 _) = True
+staticPart _ = False
+
+-- (a lambda, or a global, in it: what is worth a global)
+heldPart : IR.Expr -> Bool
+heldPart (EGlobal _) = True
+heldPart (ELam _ _) = True
+heldPart (ETag _ args _) = List.any (\a -> heldPart a) args
+heldPart _ = False
+
+-- | a record of statics, a lambda or a global among them
+-- | >>> ofStatics [MkPair "ret" (ELam ["x", "k"] (EApp (EVar "k") [EVar "x"])), MkPair "n" (EInt 1)]
+-- | True
+-- | >>> ofStatics [MkPair "n" (EInt 1)]
+-- | False
+ofStatics : List (Pair String IR.Expr) -> Bool
+ofStatics fs =
+  List.all (\p -> staticPart (snd p)) fs && List.any (\p -> heldPart (snd p)) fs
+
+-- Each a global
+--------------------------------------------------------------------------------
+
+-- | the globals made so far, each by its text (the names it binds named
+-- | afresh); those made of the definition gone through (the last first),
+-- | and how many
+type St = { keys : OrdMap.OrdMap String String, out : List IR.Def, k : Int }
+
+-- | computations making globals
+type S a = St -> Pair a St
+
+bindTake : {a b : Type} -> (a -> S b) -> Pair a St -> Pair b St
+bindTake f (MkPair x s) = f x s
+
+-- `do` is this
+bind : {a b : Type} -> S a -> (a -> S b) -> S b
+bind m f = \s -> bindTake f (m s)
+
+pure : {a : Type} -> a -> S a
+pure x = \s -> MkPair x s
+
+instance instanceMonadS : Monad S
+instanceMonadS = { pure = pure, bind = bind }
+
+-- (what tells two records apart: the record, the names it binds named
+-- from 0)
+textOf : IR.Expr -> String
+textOf e = IRText.encodeExpr (fst (IR.freshen 0 e))
+
+-- (the record a global of `owner`'s, the `k`th, its text `t`)
+madeAs : String -> String -> IR.Expr -> St -> Pair IR.Expr St
+madeAs owner t e s =
+  MkPair
+    (EGlobal (owner ^ "$rec" ^ debug s.k))
+    { keys = OrdMap.insert s.keys t (owner ^ "$rec" ^ debug s.k)
+    , out =
+        Cons (IR.mkDef (owner ^ "$rec" ^ debug s.k) (owner ^ "$rec") e) s.out
+    , k = s.k + 1
+    }
+
+-- | the record as a global: one made already of one alike, else one of
+-- | `owner`'s
+globalOf : String -> IR.Expr -> S IR.Expr
+globalOf owner e = \s -> case OrdMap.lookup s.keys (textOf e) of
+  Just g -> MkPair (EGlobal g) s
+  Nothing -> madeAs owner (textOf e) e s
+
+-- (a node, its parts gone through already: a record of statics in a
+-- function a global)
+nodeOf : String -> Bool -> IR.Expr -> S IR.Expr
+nodeOf owner True (ERecord fs ts) =
+  if ofStatics fs then globalOf owner (ERecord fs ts) else pure (ERecord fs ts)
+nodeOf owner inFun e = pure e
+
+-- (a node's parts, by `go`: a lambda's body in a function)
+partsOf : (Bool -> IR.Expr -> S IR.Expr) -> Bool -> IR.Expr -> S IR.Expr
+partsOf go inFun (ELam xs b) = bind (go True b) (\b2 -> pure (ELam xs b2))
+partsOf go inFun e =
+  IR.traversePartsM (mo := instanceMonadS) (\_ p -> go inFun p) e
+
+-- | an expression of `owner`'s, each record of statics in a function in
+-- | it a global, inner ones first
+go : String -> Bool -> IR.Expr -> S IR.Expr
+go owner inFun e =
+  bind (partsOf (\b p -> go owner b p) inFun e) (nodeOf owner inFun)
+
+-- (the definition, its records globals given before it; the globals made)
+withRecords : IR.Def -> Pair IR.Expr St -> Pair (List IR.Def) St
+withRecords d (MkPair b s) =
+  MkPair
+    (IR.appendI (List.reverse s.out) (Cons (IR.mkDef d.key d.name b) Nil))
+    s
+
+defOf : St -> IR.Def -> Pair (List IR.Def) St
+defOf s d =
+  withRecords d (go d.key False d.body { keys = s.keys, out = Nil, k = 0 })
+
+-- (... in front of those gone through already)
+defsOnto : Pair (List (List IR.Def)) St
+         -> IR.Def
+         -> Pair (List (List IR.Def)) St
+defsOnto (MkPair acc s) d = case defOf s d of
+  MkPair ds s2 -> MkPair (Cons ds acc) s2
+
+-- | the program, each record of statics in a function a global, given
+-- | before the first definition it is in
+-- | >>> List.map (\(d : IR.Def) -> d.key) (recordsProgram [IR.mkDef "m.f" "f" (ELam ["c"] (EApp (EVar "c") [ERecord [MkPair "ret" (ELam ["x"] (EVar "x"))] [FtOther]])), IR.mkDef "m.g" "g" (ELam ["c"] (EApp (EVar "c") [ERecord [MkPair "ret" (ELam ["x"] (EVar "x"))] [FtOther]]))])
+-- | ["m.f$rec0", "m.f", "m.g"]
+-- | >>> List.length (recordsProgram [IR.mkDef "m.v" "v" (ERecord [MkPair "ret" (ELam ["x"] (EVar "x"))] [FtOther])])
+-- | 1
+-- | >>> List.length (recordsProgram [IR.mkDef "m.f" "f" (ELam ["c"] (ERecord [MkPair "ret" (ELam ["x"] (EVar "c"))] [FtOther]))])
+-- | 1
+recordsProgram : List IR.Def -> List IR.Def
+recordsProgram defs = case List.foldl
+    defsOnto
+    (MkPair Nil { keys = OrdMap.empty, out = Nil, k = 0 })
+    defs of
+  MkPair acc s -> List.concatMap (\ds -> ds) (List.reverse acc)
