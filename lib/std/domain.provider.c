@@ -395,7 +395,25 @@ static void dm_condition_let_go(void *x) {
 #define DM_MUTEX(v) ((pthread_mutex_t *)heff_foreign_ptr(v))
 #define DM_CONDITION(v) ((pthread_cond_t *)heff_foreign_ptr(v))
 
+// (a mutex held briefly by another domain is waited for spinning, a
+// little, before the system is asked to put this one to sleep: on a
+// system whose mutexes never spin, every lock contended would be a
+// sleep and a wake, costing more than most holds)
+#define DM_LOCK_SPINS 100
+
+static void dm_relax(void) {
+#if defined(__aarch64__)
+  __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+  __asm__ __volatile__("pause");
+#endif
+}
+
 static void dm_lock(pthread_mutex_t *m) {
+  for (int i = 0; i < DM_LOCK_SPINS; i++) {
+    if (pthread_mutex_trylock(m) == 0) return;
+    dm_relax();
+  }
   int r = pthread_mutex_lock(m);
   if (r == EDEADLK) heff_fail("domain: a deadlock: a mutex locked by the domain holding it");
   if (r != 0) heff_fail("domain: a mutex not locked");
