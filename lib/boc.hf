@@ -362,10 +362,10 @@ type Outside (w : HFunctor) =
 -- counted too; whether the domains are to stop; and the workers, for
 -- those waiting in the reactor to be woken; and how many behaviours a
 -- domain runs in a row from its slot, its batch, before it puts the
--- next among those ready.  Of the behaviours `b`:
--- each worker holds a copy of its own, made on its domain, and a
--- behaviour is run with the copy of the worker running it, so that no
--- record of it is counted by every domain at once)
+-- next among those ready; `b` the behaviours.  It is kept forever
+-- (`Domain.forever`), with the workers' cells, so that no domain
+-- counts it, nor what it holds, as every domain reads them all through
+-- the run)
 type Scheduler (w : HFunctor) (b : Type) =
   { numbers : Domain.Atomic Int
   , live : Domain.Atomic Int
@@ -1896,41 +1896,6 @@ servingIn st o worker = do
   Domain.unlock st.mutex
   o.close g
 
--- (the reactor's operations, in a record of this domain's own)
-outsideHere : {w : HFunctor} -> Outside w -> Outside w
-outsideHere o =
-  { open = o.open
-  , start = o.start
-  , startIn = o.startIn
-  , finished = o.finished
-  , pending = o.pending
-  , close = o.close
-  , wake = o.wake
-  }
-
--- (the scheduler's state in a record of this domain's own, holding
--- what the shared one holds: counted by this domain, not by all of
--- them at once, as it is handed from one of its computations to the
--- next)
-heldHere : {w : HFunctor} -> Sched w -> Sched w
-heldHere st =
-  { numbers = st.numbers
-  , live = st.live
-  , failed = st.failed
-  , unreported = st.unreported
-  , ready = st.ready
-  , done = st.done
-  , outside = maybe Nothing (\o -> Just (outsideHere o)) st.outside
-  , mutex = st.mutex
-  , work = st.work
-  , waiting = st.waiting
-  , idle = st.idle
-  , polling = st.polling
-  , stopping = st.stopping
-  , workers = st.workers
-  , batch = st.batch
-  }
-
 -- (a worker, on its domain.  Where the scheduler waits on the world
 -- through the reactor, a failure of the worker's own -- not of a body,
 -- nor of an act, which its group finishes as `actFailed` -- fails the
@@ -1954,29 +1919,13 @@ workingAs st worker = case st.outside of
         unreportedAs st why
         Domain.put st.done MkUnit
 
--- (a worker's cells, in a record of its domain's own)
-workerHere : {w : HFunctor} -> {b : Type} -> Worker w b -> Worker w b
-workerHere worker =
-  { slot = worker.slot
-  , fuel = worker.fuel
-  , starting = worker.starting
-  , group = worker.group
-  , polling = worker.polling
-  , turns = worker.turns
-  , ended = worker.ended
-  }
-
--- (a worker, on its domain, with the scheduler's state, and its own
--- cells, in records of its own)
+-- (a worker, on its domain)
 workerOn : {w : HFunctor}
          -> {{dm : Domain.domain <: w}}
          -> Sched w
          -> Worker w (Behaviour w)
          -> Co w Unit
-workerOn shared worker = do
-  st <- later (\u -> heldHere shared)
-  mine <- later (\u -> workerHere worker)
-  workingAs st mine
+workerOn st worker = workingAs st worker
 
 -- (`n` workers, none on a domain yet)
 workersMade : {w : HFunctor}
@@ -2092,7 +2041,7 @@ scheduledBy outside batch failed c = do
   stopping <- Domain.newAtomic False
   n <- Domain.cores
   ws <- workersMade n
-  let st : Sched w =
+  let made : Sched w =
     { numbers = numbers
     , live = live
     , failed = failed
@@ -2109,6 +2058,7 @@ scheduledBy outside batch failed c = do
     , workers = ws
     , batch = batch
     }
+  st <- Domain.forever made
   x <-
     with sc := Domain.scope do
       workers sc st ws
