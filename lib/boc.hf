@@ -314,8 +314,8 @@ data Starting (w : HFunctor)
 -- it, the last first; whether it waits in the reactor, to be woken
 -- there; and how many behaviours it has run since it last looked at
 -- its group's acts finished.  Cells only that worker touches, but its
--- group and whether it waits, which others read under the scheduler's
--- mutex to wake it)
+-- group, which others read to wake it, and whether it waits, which the
+-- one that wakes it takes back, so that no other wakes it again)
 type Worker (w : HFunctor) (b : Type) =
   { slot : Domain.Atomic (Maybe b)
   , fuel : Domain.Atomic Int
@@ -1042,21 +1042,29 @@ instanceHolderCownsAwait =
 fuelLimit : Int
 fuelLimit = 256
 
--- (a worker waiting in the reactor woken, the first found, the mutex
--- held: for a behaviour put among those ready where no domain waits on
--- the condition)
+-- (a worker waiting in the reactor woken, the first found that no
+-- other has woken: taken out of those waiting there, so the next
+-- behaviour put among those ready wakes another; the mutex not held,
+-- so no domain waits for it while the wake goes to the system.  For a
+-- behaviour put among those ready where no domain waits on the
+-- condition)
 wokenPolling : {w : HFunctor}
              -> {{dm : Domain.domain <: w}}
+             -> Sched w
              -> Outside w
              -> List (Worker w (Behaviour w))
              -> Co w Unit
-wokenPolling o Nil = pure ()
-wokenPolling o (worker :: rest) = do
-  p <- Domain.get worker.polling
-  g <- Domain.get worker.group
-  case g of
-    Just grp -> if p then o.wake grp else wokenPolling o rest
-    Nothing -> wokenPolling o rest
+wokenPolling st o Nil = pure ()
+wokenPolling st o (worker :: rest) = do
+  mine <- Domain.cas worker.polling True False
+  if mine
+  then do
+    _ <- Domain.fetchAdd st.polling (0 - 1)
+    g <- Domain.get worker.group
+    case g of
+      Just grp -> o.wake grp
+      Nothing -> pure ()
+  else wokenPolling st o rest
 
 -- (every worker waiting in the reactor woken, the mutex held: the
 -- domains to stop)
@@ -1076,8 +1084,11 @@ wokenAllPolling o (worker :: rest) = do
 
 -- (`b` put among those ready, for any domain to take: where the
 -- scheduler waits on the world through the reactor, at the back of
--- the queue, a domain waiting on the condition woken, or else one
--- waiting in the reactor)
+-- the queue, a domain waiting on the condition woken, or else, once
+-- the mutex is let go of, one waiting in the reactor.  A domain about
+-- to wait there counts itself among those waiting, under the mutex,
+-- before it looks at the queue a last time; so one counted after `b`
+-- was put finds `b`, and one counted before is seen here)
 readied : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
@@ -1090,11 +1101,14 @@ readied st b = case st.outside of
     q <- Domain.get st.waiting
     Domain.set st.waiting (MkPair (fst q) (b :: snd q))
     idle <- Domain.get st.idle
-    if idle > 0 then Domain.signal st.work
+    if idle > 0
+    then do
+      Domain.signal st.work
+      Domain.unlock st.mutex
     else do
+      Domain.unlock st.mutex
       p <- Domain.get st.polling
-      if p > 0 then wokenPolling o st.workers else pure ()
-    Domain.unlock st.mutex
+      if p > 0 then wokenPolling st o st.workers else pure ()
 
 -- (the first behaviour of the queue, the mutex held, if one is)
 dequeued : {w : HFunctor}
@@ -1744,11 +1758,13 @@ taken st o worker g = do
               _ <- Domain.fetchAdd st.polling 1
               Domain.unlock st.mutex
               done <- o.finished g True
+              stillCounted <- Domain.cas worker.polling True False
+              if stillCounted
+              then do
+                _ <- Domain.fetchAdd st.polling (0 - 1)
+                pure ()
+              else pure ()
               resumedAll st done
-              Domain.lock st.mutex
-              Domain.set worker.polling False
-              _ <- Domain.fetchAdd st.polling (0 - 1)
-              Domain.unlock st.mutex
               taken st o worker g
             else do
               left <- o.finished g False
