@@ -605,6 +605,17 @@ static V heff_provider_domain(V p, V k) {
     x = heff_answer(g, v);
     break;
   }
+  // (a value kept for as long as the program runs: immortal, with all
+  // it holds, counted by no domain from now on)
+  case TAG_Forever: {
+    V kp = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V v = heff_tget_v(kp, 0), g = heff_dup(heff_field(kp, 1));
+    heff_drop(kp);
+    heff_freeze(v);
+    x = heff_answer(g, v);
+    break;
+  }
   // (an operation of the custodian's, from `rooted`: the custodian's
   // provider's, the custodian current the one `rooted` says)
   case TAG_CustodyOp: {
