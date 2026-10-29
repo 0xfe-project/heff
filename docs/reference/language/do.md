@@ -507,6 +507,51 @@ is `e`'s `stdio`, through the `io` in scope, with nothing written. A
 world `\w -> stdio <+> w` makes a `with` whose holder sends what its
 body prints elsewhere, to a file or a buffer.
 
+### with, where a condition holds
+
+```haskell
+import boc as BOC
+
+-- | `n` taken from the stock once it has `n`: until then, the behaviour
+-- | lets go of the cown and waits for another to write it
+taken : {e w : HFunctor}
+      -> {{bc : BOC.boc w <: e}}
+      -> BOC.Cown w Int
+      -> Int
+      -> Co e Unit
+taken stock n = do
+  with s := stock
+    where s >= n
+  do
+    s := s - n
+```
+
+`with x := M where p do` is a `with` of bindings with a condition:
+`where p` on a line of its own under the bindings, indented, and `do`
+on the next, under `with`. What the names are bound to is taken, as
+without it, and `p` is checked of them. Where `p` holds, the body runs.
+Where it does not, everything is let go of, untouched, and taken again
+later, `p` checked again, until it holds.
+
+- `p` is an expression of the names, a `Bool`: no action in it, no
+  `(<- c)`. It may name other values of the block around, which do not
+  change while it waits; only the names can.
+- The handler is told which names `p` reads, as it is told which the
+  body sets: a change to one of those is what can make `p` hold, so it
+  is those it waits on.
+- How it waits, and what "later" is, is the handler's. boc's cowns:
+  the behaviour lets go of its cowns and waits until a behaviour writes
+  one its condition reads, then is queued again on all of them, behind
+  that one (the paper's `whenever`). A behaviour still waiting once
+  every other is done is dropped, its body never run: nothing is left
+  to write its cowns. One that waits may wait long: those queued
+  before it again go first each time.
+- Only a handler that can let go and take again has the clause. Beside
+  its `Holder`, it is an instance of co's `Waiter`, whose `heldWhere` is
+  given what `held` is, which names `p` reads (a `Bool` each) and `p`.
+  A `with ... where` of a handler without one, a file or a scope of
+  domains, is a type error (E0341).
+
 ### A scope of domains
 
 ```haskell
