@@ -557,3 +557,73 @@ gluesOf g handWritten leaves = case eithers
     (List.map (glueOf g handWritten) leaves) of
   Left why -> Left why
   Right ms -> Right (justs ms)
+
+-- What a module's C is built and linked with
+--------------------------------------------------------------------------------
+
+-- | what a module says its C needs beyond the runtime, as the `ffi`
+-- | module has it (`Links`): pkg-config's packages, libraries, and macOS
+-- | frameworks, each by its name
+type Links =
+  { pkgConfig : List String, libs : List String, frameworks : List String }
+
+-- (a field of strings; none, where it is left out)
+namesOf : Interp.Val -> String -> Maybe (List String)
+namesOf v x = case fieldOf v x of
+  Nothing -> Just Nil
+  Just l -> andThen (listOf l) (eachOf strOf)
+
+-- | a `Links` value read
+readLinks : Interp.Val -> Maybe Links
+readLinks v = case namesOf v "pkgConfig" of
+  Nothing -> Nothing
+  Just ps -> case namesOf v "libs" of
+    Nothing -> Nothing
+    Just ls -> case namesOf v "frameworks" of
+      Nothing -> Nothing
+      Just fs -> Just { pkgConfig = ps, libs = ls, frameworks = fs }
+
+-- (a name given to the C compiler as it is: one that would be read as
+-- an option, or is none, is no name)
+badName : String -> Bool
+badName n = strEq n "" || startsWith "-" n || contains " " n
+
+linksBad : Links -> Maybe String
+linksBad l = case List.keepIf
+    badName
+    (appendF l.pkgConfig (appendF l.libs l.frameworks)) of
+  Cons n _ ->
+    Just ("`" ^ n ^ "` is not a name of a package, library or framework")
+  Nil -> Nothing
+
+-- | what the program's modules say their C needs, each definition of
+-- | type `Links`, in the order of the program; or what is wrong with one
+linksIn : Globals.Globals -> Either String (List Links)
+linksIn g = case List.map
+    fst
+    (List.keepIf
+       (\(p : Pair String Globals.Entry) ->
+          isGlobalTy "ffi.Links" (snd p).tySyntax)
+       (Globals.globalsList g)) of
+  Nil -> Right Nil
+  keys ->
+    eithers
+      (List.map
+         (\(p : Pair String Interp.EvalResult) -> case snd p of
+          RSucceeded v -> case readLinks v of
+            Just l -> case linksBad l of
+              Just why -> Left (Effect.moduleOfKey (fst p) ^ ": " ^ why)
+              Nothing -> Right l
+            Nothing ->
+              Left
+                (Effect.moduleOfKey (fst p)
+                 ^ ": `"
+                 ^ Effect.nameOfKey (fst p)
+                 ^ "` is not a description heff can read")
+          _ ->
+            Left
+              (Effect.moduleOfKey (fst p)
+               ^ ": `"
+               ^ Effect.nameOfKey (fst p)
+               ^ "` could not be evaluated"))
+         (Interp.evalReached g keys))

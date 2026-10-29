@@ -52,14 +52,19 @@
 static HEFF_TLS V dm_held;
 
 static V dm_open_fn(V self, V *a) {
+  (void)self;
   dm_held = a[0];
-  heff_drop(self);
   return NTAG(TAG_MkUnit);
 }
 
+// (`dm_open_fn` as a function of the program's: one for good, never
+// counted, as a lambda capturing nothing is -- not one made for each
+// operation)
+static Clo dm_open_clo = {{0x80000000u, K_CLO, 0}, dm_open_fn, 1, 0};
+
 // (what `s` holds; `s` consumed)
 static V dm_open(V s) {
-  heff_drop(heff_answer(s, heff_clo(dm_open_fn, 1, 0, NULL)));
+  heff_drop(heff_answer(s, (V)&dm_open_clo));
   return dm_held;
 }
 
@@ -416,6 +421,9 @@ static V heff_custodian_at(V p, V k, V here);
 
 static V heff_provider_domain(V p, V k) {
   V x;
+  // (an operation holding computations or none, as the effect sorts
+  // them: the operation itself, inside)
+  { V q = heff_dup(heff_field(p, 0)); heff_drop(p); p = q; }
   switch (heff_tag_of(p)) {
   case TAG_Spawn: {
     V sp = dm_open(heff_dup(heff_field(p, 0)));

@@ -632,8 +632,211 @@ touch = do
           (said r ^ "made: " ^ debug made ^ ", kept: " ^ debug kept)
           "status 1\ntouch: missing/file: ENOENT: No such file or directory\nmade: \"\", kept: \"as it was\""
 
+-- | an effect of one operation, a C function's, `module name`: the
+-- | function described with its header, `header`, and what the module's
+-- | C needs, `links` (ffi's `Links`, as written)
+cBound : String
+       -> String
+       -> String
+       -> String
+       -> String
+       -> List String
+       -> String
+cBound name header fun args result links =
+  joinWith
+    "\n"
+    [ "module " ^ name
+    , ""
+    , "import co"
+    , "import ffi as FFI"
+    , ""
+    , "data BoundF (m : Type -> Type) x = Call " ^ args ^ " (" ^ result ^ " -> x)"
+    , ""
+    , "bound : HFunctor"
+    , "bound ="
+    , "  { f = BoundF"
+    , "  , hfmap = \\m g p -> case p of"
+    , "      Call " ^ (if strEq args "" then "" else "a ") ^ "k -> Call " ^ (if strEq args "" then "" else "a ") ^ "(\\r -> g (k r))"
+    , "  , hmap = \\m n nt p -> case p of"
+    , "      Call " ^ (if strEq args "" then "" else "a ") ^ "k -> Call " ^ (if strEq args "" then "" else "a ") ^ "k"
+    , "  }"
+    , ""
+    , "boundInC : FFI.Described"
+    , "boundInC = FFI.describe [\"" ^ header ^ "\"] [FFI.operation \"Call\" " ^ fun ^ "]"
+    , ""
+    , "boundLinks : FFI.Links"
+    , "boundLinks = " ^ joinWith "\n" links
+    , ""
+    , "call : {e : HFunctor} -> {{b : bound <: e}} -> " ^ (if strEq args "" then "" else args ^ " -> ") ^ "Co e " ^ result
+    , "call " ^ (if strEq args "" then "" else "a ") ^ "= op (b (Call " ^ (if strEq args "" then "" else "a ") ^ "(\\r -> r))) val"
+    , ""
+    ]
+
+-- | a program, `module name`, that prints what `body` makes of the
+-- | module `bound`'s `call`
+boundMain : String -> String -> String -> String
+boundMain name bound body =
+  joinWith
+    "\n"
+    [ "module " ^ name
+    , ""
+    , "import co"
+    , "import std.io"
+    , "import " ^ bound ^ " as Bound"
+    , ""
+    , "main : Co (Bound.bound <+> stdio) Unit"
+    , "main = do"
+    , "  r <- Bound.call" ^ body
+    , ""
+    ]
+
+-- (a program's build.hf, the C compiler told where else to look)
+linkedBuild : String
+linkedBuild =
+  joinWith
+    "\n"
+    [ "import manifest"
+    , ""
+    , "build : Build"
+    , "build ="
+    , "  { backend = C"
+    , "  , run = \"main\""
+    , "  , includeDirs = [\"vendor/include\"]"
+    , "  , libDirs = [\"vendor/lib\"]"
+    , "  }"
+    , ""
+    ]
+
+-- (the library `twice`, a static one, built here by zig: its header in
+-- vendor/include, the library in vendor/lib; else the test fails)
+twiceBuilt : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
+           -> Co e Unit
+twiceBuilt = do
+  makeDirectory "vendor/include"
+  makeDirectory "vendor/lib"
+  writeFile "vendor/include/twice.h" "#include <stdint.h>\nint64_t twice_of(int64_t n);\n"
+  writeFile "vendor/twice.c" "#include \"twice.h\"\nint64_t twice_of(int64_t n) { return 2 * n; }\n"
+  o <-
+    run
+      { command = "zig"
+      , args = ["cc", "-O2", "-c", "-Ivendor/include", "vendor/twice.c", "-o", "vendor/twice.o"]
+      , timeout = 120000
+      }
+  a <-
+    if succeeded o
+    then run
+        { command = "zig"
+        , args = ["ar", "rcs", "vendor/lib/libtwice.a", "vendor/twice.o"]
+        , timeout = 60000
+        }
+    else pure o
+  if succeeded a then pure () else failure ("the library: " ^ said a)
+
+-- | a program built with a library that is not the runtime's: its
+-- | module says what its C needs (ffi's `Links`) -- a static library
+-- | built here, its header included from a directory of the build.hf's,
+-- | linked from another; on macOS a framework, CoreFoundation's clock --
+-- | and, where there is pkg-config, `heff run` of one whose module names
+-- | the library by its package, found by pkg-config
+linked : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> Co e Unit
+linked = do
+  heff <- given "HEFF"
+  os <- platform
+  here <- workingDir
+  twiceBuilt
+  makeDirectory "src"
+  makeDirectory "app/twice"
+  writeFile
+      "package.hf"
+      "import manifest\n\npackage : Package\npackage = { module = \"linked\", heff = \"0.5.0\" }\n"
+  writeFile
+      "src/twice.hf"
+      (cBound
+         "twice"
+         "<twice.h>"
+         "(FFI.fun \"twice_of\" [FFI.int64] (FFI.gives FFI.int64))"
+         "Int"
+         "Int"
+         ["{ libs = [\"twice\"] }"])
+  writeFile "app/twice/build.hf" linkedBuild
+  writeFile
+      "app/twice/main.hf"
+      (boundMain "app.twice.main" "twice" " 21\n  print (\"twice 21: \" ^ debug r)")
+  if strEq os "darwin"
+  then do
+    makeDirectory "app/clock"
+    writeFile
+        "src/clock.hf"
+        (cBound
+           "clock"
+           "<CoreFoundation/CoreFoundation.h>"
+           "(FFI.fun \"CFAbsoluteTimeGetCurrent\" [] (FFI.gives FFI.double))"
+           ""
+           "Float64"
+           ["{ frameworks = [\"CoreFoundation\"] }"])
+    writeFile
+        "app/clock/build.hf"
+        "import manifest\n\nbuild : Build\nbuild = { backend = C, run = \"main\" }\n"
+    writeFile
+        "app/clock/main.hf"
+        (boundMain
+           "app.clock.main"
+           "clock"
+           "\n  print (if r > 8.0e8 then \"since 2001: yes\" else \"since 2001: no\")")
+  else pure ()
+  built <- run { command = heff, args = ["build"], timeout = 600000 }
+  if succeeded built then pure () else failure ("heff build: " ^ said built)
+  r <- run { command = ".heff/bin/twice", timeout = 60000 }
+  assertEqual (said r) "status 0\ntwice 21: 42\n"
+  if strEq os "darwin"
+  then do
+    c <- run { command = ".heff/bin/clock", timeout = 60000 }
+    assertEqual (said c) "status 0\nsince 2001: yes\n"
+  else pure ()
+  pc <- run { command = "pkg-config", args = ["--version"], timeout = 60000 }
+  if succeeded pc
+  then do
+    makeDirectory "pc"
+    writeFile
+        "vendor/twice.pc"
+        ("prefix="
+         ^ show here
+         ^ "/vendor\nName: twice\nDescription: twice\nVersion: 1.0.0\n"
+         ^ "Cflags: -I${prefix}/include\nLibs: -L${prefix}/lib -ltwice\n")
+    writeFile
+        "src/viapc.hf"
+        (cBound
+           "viapc"
+           "<twice.h>"
+           "(FFI.fun \"twice_of\" [FFI.int64] (FFI.gives FFI.int64))"
+           "Int"
+           "Int"
+           ["{ pkgConfig = [\"twice\"] }"])
+    writeFile
+        "pc/main.hf"
+        (boundMain "pc.main" "viapc" " 4\n  print (\"twice 4: \" ^ debug r)")
+    v <-
+      run
+        { command = heff
+        , args = ["run", "pc/main.hf"]
+        , env = [MkPair "PKG_CONFIG_PATH" (show here ^ "/vendor")]
+        , timeout = 600000
+        }
+    assertEqual (said v) "status 0\ntwice 4: 8\n"
+  else pure ()
+
 -- | the example apps, on a pretend page, the notes' page and server, the
--- | first program, the todos, fs_tree and touch
+-- | first program, the todos, fs_tree and touch, and a program linked
+-- | with a library
 apps : Test
 apps =
   group
@@ -644,4 +847,5 @@ apps =
     , withinTime 600000 (integration "todos" todos)
     , withinTime 600000 (integration "fs_tree" fsTree)
     , withinTime 600000 (integration "touch" touch)
+    , withinTime 600000 (integration "linked" linked)
     ]

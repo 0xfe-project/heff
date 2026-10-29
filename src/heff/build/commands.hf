@@ -726,6 +726,17 @@ zigOf : String -> String
 zigOf outPath =
   if endsWith "/" outPath then outPath ^ "heff.zig" else zigBeside outPath
 
+-- (where the flags `zig cc` is given for what the program's modules say
+-- their C needs are kept, a flag a line: `DIR/heff.link`, or `F.link`
+-- beside a program of one file)
+linkOf : String -> String
+linkOf outPath =
+  if endsWith "/" outPath then outPath ^ "heff.link"
+  else (if endsWith ".c" outPath
+        then strSlice outPath 0 (strLength outPath - 2)
+        else outPath)
+    ^ ".link"
+
 -- (a C program of one file written, its runtime's Zig beside it; then
 -- `done`)
 writeOutC : {e : HFunctor}
@@ -1412,6 +1423,86 @@ readRuntimeC = do
   custody <- readRuntimeFile "custody.c"
   pure { c = c, zig = zig, fuel = fuel, custody = custody }
 
+-- (pkg-config's flags of the packages, `what` `--cflags` or `--libs`:
+-- its words; or what it said, where it could not give them)
+pkgConfigFlags : {e : HFunctor}
+               -> {{sys : process <: e}}
+               -> String
+               -> List String
+               -> Co e (Either String (List String))
+pkgConfigFlags what Nil = pure (Right Nil)
+pkgConfigFlags what names = do
+  r <- run { command = "pkg-config", args = Cons what names }
+  pure
+      (if succeeded r then Right (words r.out)
+       else Left
+           ("`pkg-config "
+            ^ what
+            ^ " "
+            ^ joinWith " " names
+            ^ "` could not say how: "
+            ^ trim r.err))
+
+-- (a framework's flags, on the platform `os`: macOS's alone has them)
+frameworkFlags : String -> String -> List String
+frameworkFlags "darwin" f = ["-framework", f]
+frameworkFlags os f = Nil
+
+-- | the flags `zig cc` is given for what the program's modules say their
+-- | C needs, built on the platform `os` (Node.js's name): pkg-config's
+-- | for its packages, then `-lNAME` of each library, then each framework
+-- | -- macOS's only; elsewhere none -- each once; or why they cannot be
+-- | said
+linkFlags : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> String
+          -> List Glue.Links
+          -> Co e (Either String (List String))
+linkFlags os ls = do
+  pkgs <- pure (nubStrM (List.concatMap (\(l : Glue.Links) -> l.pkgConfig) ls))
+  cflags <- pkgConfigFlags "--cflags" pkgs
+  libs <- pkgConfigFlags "--libs" pkgs
+  pure (case cflags of
+    Left why -> Left why
+    Right cs -> case libs of
+      Left why -> Left why
+      Right lfs ->
+        Right
+          (List.append
+             (nubStrM (List.append cs lfs))
+             (List.append
+                (List.map
+                   (\lib -> "-l" ^ lib)
+                   (nubStrM
+                      (List.concatMap (\(l : Glue.Links) -> l.libs) ls)))
+                (List.concatMap
+                   (frameworkFlags os)
+                   (nubStrM
+                      (List.concatMap
+                         (\(l : Glue.Links) -> l.frameworks)
+                         ls))))))
+
+-- (the flags written where the build reads them, `linkOf outPath`, a
+-- flag a line -- none, the file gone -- then `done`)
+linkWritten : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> String
+            -> List String
+            -> Co e Unit
+            -> Co e Unit
+linkWritten outPath Nil done = do
+  _ <- Files.remove (linkOf outPath)
+  done
+linkWritten outPath flags done = do
+  was <- Files.readFile (linkOf outPath)
+  ok <- writeChanged (linkOf outPath) (joinWith "\n" flags ^ "\n") was
+  if ok then done
+  else do
+    printErr ("cannot write " ^ linkOf outPath)
+    exit 1
+
 compileLastC : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
@@ -1464,17 +1555,28 @@ compileLastC bi sources file name outPath failed done cs = case Driver.lastCheck
         Left why -> do
           printErr ("heff: " ^ file ^ ": " ^ why)
           failed ("heff: " ^ file ^ ": " ^ why)
-        Right glues ->
-          compileFoundC
-            bi
-            file
-            name
-            outPath
-            rt
-            failed
-            done
-            c
-            (List.append found (List.map EmitC.glueProvider glues))
+        Right glues -> case Glue.linksIn c.top.globals of
+          Left why -> do
+            printErr ("heff: " ^ file ^ ": " ^ why)
+            failed ("heff: " ^ file ^ ": " ^ why)
+          Right links -> do
+            os <- platform
+            flags <- linkFlags os links
+            case flags of
+              Left why -> do
+                printErr ("heff: " ^ file ^ ": " ^ why)
+                failed ("heff: " ^ file ^ ": " ^ why)
+              Right fs ->
+                compileFoundC
+                  bi
+                  file
+                  name
+                  outPath
+                  rt
+                  failed
+                  (linkWritten outPath fs done)
+                  c
+                  (List.append found (List.map EmitC.glueProvider glues))
 
 -- | compile the computation `name` of FILE, loaded (`l`), to C -- one
 -- | file, or, OUT a directory (`dir/`), a file a module -- then go on
@@ -1570,7 +1672,9 @@ cCmd fuel name outPath file =
         ^ zigOf outPath
         ^ " -femit-bin=runtime.o` and `zig cc -O2 "
         ^ (if endsWith "/" outPath then outPath ^ "*.c" else outPath)
-        ^ " runtime.o -o PROGRAM -lm`"))
+        ^ " runtime.o -o PROGRAM -lm`, with the flags in "
+        ^ linkOf outPath
+        ^ " where its modules' C needs more"))
 
 -- | `heff dump-c FILE OUT`: one C file that shows each of FILE's
 -- | definitions, as the tests hold it to the interpreter's values
@@ -1799,17 +1903,19 @@ zigObjects z mode (Cons f rest) made = do
   else pure (Left r)
 
 -- (the C files and the objects linked by `zig cc`, given these flags,
--- into `out`; or, where an object was not built, how zig ran for it)
+-- and after them what the modules' C needs, `links`, into `out`; or,
+-- where an object was not built, how zig ran for it)
 zigLinked : {e : HFunctor}
           -> {{prog : Progress.progress <: e}}
           -> Progress.Task
           -> List String
           -> List String
+          -> List String
           -> String
           -> Either Ran (List String)
           -> Co e Ran
-zigLinked z flags files out (Left r) = pure r
-zigLinked z flags files out (Right os) =
+zigLinked z flags links files out (Left r) = pure r
+zigLinked z flags links files out (Right os) =
   Progress.runUnder
     z
     "zig"
@@ -1817,7 +1923,11 @@ zigLinked z flags files out (Right os) =
        "cc"
        (List.append
           flags
-          (Cons "-w" (List.append files (List.append os ["-o", out, "-lm"])))))
+          (Cons
+             "-w"
+             (List.append
+                files
+                (List.append os (List.append links ["-o", out, "-lm"]))))))
 
 -- (the C files of `dir`, a file a module, by `zig cc` given these flags
 -- (its level, and what else the program is built with) -- which builds
@@ -1844,7 +1954,15 @@ zigBuildFlagsOr failed who st flags p dir out next = do
   zigs <- pure (endingIn st dir ".zig" (fromMaybe Nil names))
   z <- Progress.start p "zig cc" (List.length files + List.length zigs + 1)
   objects <- zigObjects z (zigMode flags) zigs Nil
-  r <- zigLinked z flags files out objects
+  links <- Files.readFile (HostPath.join st dir "heff.link")
+  r <-
+    zigLinked
+      z
+      flags
+      (List.keepIf (\l -> not (strEq l "")) (lines (fromMaybe "" links)))
+      files
+      out
+      objects
   Progress.end z
   if succeeded r then next
   else do
@@ -1887,8 +2005,18 @@ zigBuild : {e : HFunctor}
 zigBuild who st opt p dir out next =
   zigBuildOr (\why -> exit 1) who st opt p dir out next
 
--- (`.heff/build/X/` by `zig cc` at the target's level, the program X,
--- `.heff/build/X/X`: a task under the program's, `p`)
+-- (the flags of where the build.hf `a` says the C compiler also looks:
+-- `-I` each of its include directories, `-L` each of its library
+-- directories, from the project's root)
+dirFlags : Path.Style -> Target -> Project.Build -> List String
+dirFlags st t a =
+  List.append
+    (List.map (\d -> "-I" ^ inProject st t d) a.includeDirs)
+    (List.map (\d -> "-L" ^ inProject st t d) a.libDirs)
+
+-- (`.heff/build/X/` by `zig cc` at the target's level, and where the
+-- build.hf `a` says to look, the program X, `.heff/build/X/X`: a task
+-- under the program's, `p`)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
@@ -1898,10 +2026,19 @@ zigCc : {e : HFunctor}
       -> Target
       -> Progress.Task
       -> String
+      -> Project.Build
       -> Co e Unit
       -> Co e Unit
-zigCc st t p x next =
-  zigBuild "heff build" st t.opt p (partsDir st t x) (builtAt st t x x) next
+zigCc st t p x a next =
+  zigBuildFlagsOr
+    (\why -> exit 1)
+    "heff build"
+    st
+    (Cons t.opt (dirFlags st t a))
+    p
+    (partsDir st t x)
+    (builtAt st t x x)
+    next
 
 -- (where `heff run` builds FILE: `.heff/run/F/`, F its path, its
 -- separators underscores)
@@ -1984,7 +2121,7 @@ buildApp st t bp x a next =
         (Just a.run)
         (partsDir st t x ^ "/")
         (appFile st t x "main.hf")
-        (ended c (zigCc st t p x (ended p next)))
+        (ended c (zigCc st t p x a (ended p next)))
   else if t.pages
   then do
     p <- Progress.start bp x 1

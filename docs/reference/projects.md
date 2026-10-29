@@ -105,6 +105,12 @@ defining `build`, of type `Build`:
 | `run` | the definition run, usually `main` |
 | `ships` | files and directories of the project that `heff install` puts beside the program; default `[]` |
 | `fuel` | `True` to build it with fuel: every loop ticked, so that std.fuel's `limited` stops a loop with no operation in it, at a cost to every loop (see [Fuel](commands.md#fuel)); default `False` |
+| `includeDirs` | directories where the C compiler also looks for headers, from the project's root when relative; default `[]` |
+| `libDirs` | directories where the C compiler also looks for libraries, from the project's root when relative; default `[]` |
+
+`includeDirs` and `libDirs` matter only where a module the program
+imports links a library that pkg-config does not know (see
+[Libraries and frameworks](providers.md#libraries-and-frameworks)).
 
 `heff build` builds every program into `.heff/bin/`. `heff install`
 builds them to run fastest, into `~/.heff/bin/`, with what they ship.
