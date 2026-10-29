@@ -143,6 +143,28 @@ static V heff_provider_reactor(V p, V k) {
     heff_reactor_wake_group(g);
     return heff_tail(k, 1, &x);
   }
+  // (what gives up a group within another, from any domain, with what
+  // it is then finished as)
+  case TAG_MakeGiving: {
+    int64_t g = INT_OF(heff_field(p, 0));
+    rx_open(heff_dup(heff_field(p, 1)), 1);
+    V gave = rx_held[0];
+    V f = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    V x = heff_answer(f, heff_reactor_giving(g, gave));
+    return heff_tail(k, 1, &x);
+  }
+  // (its group closed, here, where it is this domain's)
+  case TAG_CloseGiving: {
+    HeffGiving *gv = heff_foreign_ptr(heff_field(p, 0));
+    int64_t g = gv->group;
+    V x = heff_dup(heff_field(p, 1));
+    // (closed before the thing may be let go of here, so that its end,
+    // then, finds it closed)
+    heff_reactor_close(g);
+    heff_drop(p);
+    return heff_tail(k, 1, &x);
+  }
   case TAG_Close: {
     int64_t g = INT_OF(heff_field(p, 0));
     V x = heff_dup(heff_field(p, 1));

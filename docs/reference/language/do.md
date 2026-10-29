@@ -342,7 +342,11 @@ A boc behaviour is a user of a custodian too. It takes the custodian
 current where it is spawned, and its body runs with that one current:
 the things its `with`s hold are in its custody, and the behaviours it
 spawns take it as well. An act awaited by `BOC.await`, and the
-behaviour after it, take the one current at the `await`. A behaviour
+behaviour after it, take the one current at the `await`, and the act is
+one of its things: shut down while the act still waits, the custodian
+gives the act up, and the behaviour after it is never spawned.
+`BOC.awaitFirst a b` races two acts so, in a custodian of their own
+that the first to come to its value shuts down. A behaviour
 runs to its end without waiting, so a `with` of a custodian in its body
 is the body's own, for its extent. The custodian is the one of the
 scheduler's world, so `BOC.scheduled` asks for `custodian <: w`, and a

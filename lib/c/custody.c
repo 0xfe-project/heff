@@ -82,7 +82,8 @@ static void heff_due_drained(void);
 
 HEFF_FN HeffDueQ *heff_due_queue(void) {
   if (!heff_due_here) {
-    heff_thread_ending = heff_due_drained;
+    if (__atomic_load_n(&heff_thread_ending, __ATOMIC_ACQUIRE) != heff_due_drained)
+      __atomic_store_n(&heff_thread_ending, heff_due_drained, __ATOMIC_RELEASE);
     HeffDueQ *q = heff_alloc(sizeof *q);
     memset(q, 0, sizeof *q);
 #ifdef HEFF_THREADS

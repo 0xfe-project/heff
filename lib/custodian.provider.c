@@ -9,8 +9,11 @@
 // (the runtime's part told what this provider does with a thing let go
 // of, as the first custodian is made)
 static void heff_custody_ready(void) {
-  heff_foreign_disowned = heff_custody_disowned;
-  heff_foreign_failed = heff_custody_thing_failed;
+  // (set once: a custodian is made on any domain, and the others read
+  // these as they let go of foreign values)
+  if (__atomic_load_n(&heff_foreign_disowned, __ATOMIC_ACQUIRE) == heff_custody_disowned) return;
+  __atomic_store_n(&heff_foreign_failed, heff_custody_thing_failed, __ATOMIC_RELEASE);
+  __atomic_store_n(&heff_foreign_disowned, heff_custody_disowned, __ATOMIC_RELEASE);
 }
 
 static void heff_custody_let_go(void *p) {
