@@ -127,6 +127,7 @@
 - A program using threads built as parts (`heff build`, `heff compile DIR/`) no longer crashes: every C file now sees threads mode, not only the one with `main`.
 - The continuations a recursive copy is handed by its own group are tags, not closures, where every one that may reach a call is known and goes nowhere else: their free variables the fields, a call of one a call of a function choosing its body by the tag (defunctionalization, within the group alone), a call of itself last a loop. tree_explore 4.4 s to 3.3 s.
 - A rune and its width read at the same byte, as `runeAt s i` reads them, are decoded once, by a primitive giving both; an ASCII byte is read where it is, not by a call. In C, str_runes 17.8 G to 9.8 G instructions, graphemes 25.3 G to 23.3 G; in JavaScript, str_runes 7.2 s to 6.0 s. `fromRunes` counts its bytes without encoding each rune twice.
+- C: a provider may lend the process's first thread to a toolkit that must have it (AppKit's, UIKit's run loop), `heff_first_thread(run, stop, u)`, and ask `heff_is_first_thread()` (#142): `run(u)` runs there while the program goes on on its own thread; at the program's end, however it ends, `stop(u)` is called and `run` waited for, or, with no `stop`, the program exits without it. A program that lends nothing ends as before.
 
 ### Compiler and tools
 

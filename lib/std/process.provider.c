@@ -1562,7 +1562,7 @@ static V heff_provider_process(V p, V k) {
     int code = (int)INT_OF(heff_field(p, 0));
     fflush(stdout);
     fflush(stderr);
-    exit(code);
+    heff_exit(code);
   }
   case TAG_Run: {
     V inv = heff_dup(heff_field(p, 0));
@@ -1747,7 +1747,7 @@ static V heff_provider_process(V p, V k) {
       // (no exec on Windows: the command is run, and its exit code this
       // program's)
       HANDLE h = heff_spawn(as, GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
-      if (h) exit((int)heff_wait(h));
+      if (h) heff_exit((int)heff_wait(h));
 #else
       // (the program's process becomes the command's: in this
       // thread's directory, as it would be between a fork and an exec)
@@ -1757,7 +1757,7 @@ static V heff_provider_process(V p, V k) {
     // (why, as a `ProcessError` says it)
     int e = errno ? errno : ENOENT;
     fprintf(stderr, "%s: %s: %s\n", c ? c : "the command", heff_errno_name(e), strerror(e));
-    exit(1);
+    heff_exit(1);
   }
   default:
     heff_fail("not an operation of process");
