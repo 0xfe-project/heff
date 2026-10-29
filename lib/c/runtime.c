@@ -4326,24 +4326,29 @@ HEFF_FN Str *heff_bytes_new(int64_t len) {
   return s;
 }
 
+// (each that only reads its bytes with a `_lent` form, as a string's
+// has: "Lent strings", above)
+HEFF_FAST V heff_bytesLength_lent(V a, int give) { return heff_strLength_lent(a, give); }
 HEFF_FN V heff_bytesLength(V a) { return heff_strLength(a); }
 
 // (the byte at `i`; out of them, abandoned, as `bytes`'s `index` never
 // asks)
-HEFF_FN V heff_bytesAt(V a, V i) {
+HEFF_FAST V heff_bytesAt_lent(V a, V i, int give) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
   if (!IS_INT(i) || k < 0 || k >= x->len) return heff_abandon();
   V r = MK_INT(x->p[k]);
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return r;
 }
+HEFF_FN V heff_bytesAt(V a, V i) { return heff_bytesAt_lent(a, i, 1); }
 
-HEFF_FN V heff_bytesSlice(V a, V i, V j) {
-  V s = heff_strSlice(a, i, j);
+HEFF_FN V heff_bytesSlice_lent(V a, V i, V j, int give) {
+  V s = heff_strSlice_lent(a, i, j, give);
   OBJ(s)->kind = K_BYT;
   return s;
 }
+HEFF_FN V heff_bytesSlice(V a, V i, V j) { return heff_bytesSlice_lent(a, i, j, 1); }
 
 HEFF_FN V heff_bytesAppend(V a, V b) { return heff_buf_append(a, b, K_BYT); }
 
@@ -4363,6 +4368,7 @@ HEFF_FN V heff_bytesConcat(V l) {
   return (V)s;
 }
 
+HEFF_FAST V heff_bytesEq_lent(V a, V b, int give) { return heff_strEq_lent(a, b, give); }
 HEFF_FN V heff_bytesEq(V a, V b) { return heff_strEq(a, b); }
 
 HEFF_FN V heff_bytesFromList(V l) {
@@ -4436,14 +4442,15 @@ HEFF_FN uint64_t heff_bits_of_int(V v, int64_t n, int64_t flags) {
 }
 
 // (`heff.elab.clauses` checks that it is there before it is read)
-HEFF_FN V heff_bytesIntAt(V a, V o, V n, V f) {
+HEFF_FAST V heff_bytesIntAt_lent(V a, V o, V n, V f, int give) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), bits = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
   V r = heff_bits_int(x->p, at, bits, INT_OF(f));
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return r;
 }
+HEFF_FN V heff_bytesIntAt(V a, V o, V n, V f) { return heff_bytesIntAt_lent(a, o, n, f, 1); }
 
 // (the integer `v`, its low `n` bits (a multiple of 8, up to 64), as
 // bytes)
@@ -4458,14 +4465,15 @@ HEFF_FN V heff_bytesOfInt(V n, V f, V v) {
 }
 
 // (whether the bytes `b` are those of `a` at `o`)
-HEFF_FN V heff_bytesHasAt(V a, V o, V b) {
+HEFF_FAST V heff_bytesHasAt_lent(V a, V o, V b, int give) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t at = INT_OF(o);
   int r = IS_INT(o) && at >= 0 && at <= x->len - y->len && (y->len == 0 || memcmp(x->p + at, y->p, (size_t)y->len) == 0);
-  heff_drop(a);
-  heff_drop(b);
+  HEFF_GIVEN(give, 0, a);
+  HEFF_GIVEN(give, 2, b);
   return heff_bool(r);
 }
+HEFF_FN V heff_bytesHasAt(V a, V o, V b) { return heff_bytesHasAt_lent(a, o, b, 5); }
 
 // Bits
 // ---------------------------------------------------------------------
