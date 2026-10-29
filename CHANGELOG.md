@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+Released 2026-10-29.
 
 ### Language
 
@@ -143,7 +145,6 @@
 - A C program can be linked with a library or framework that is not the runtime's (#141). A module whose C needs one says so with a definition of type `FFI.Links` (`{ pkgConfig = ["unibilium"] }`, `{ libs = ["objc"], frameworks = ["AppKit"] }`), and every program that imports it is built with pkg-config's flags, `-lNAME` and, on macOS, `-framework NAME`, by `heff build`, `heff run` and `heff test`; a provider includes the library's header and calls it, with no `dlopen`. A program's `build.hf` can add `includeDirs` and `libDirs`.
 - `heff compile --backend=c` without `--name` runs `main`, as `--backend=page` now does too, not each definition shown nor the first computation that fits; a file without the definition is refused, naming it. OUT in a directory that is not there is refused, `heff compile: DIR: no such directory`, for every backend, and a file `compile`, `promote` or `fmt` cannot write is said, not an exit 1 with no word. The tests' C program of each definition is `heff dump-c FILE OUT`.
 
-### Docs
 ### Docs
 
 - New language reference pages for lazy values and for theories.
