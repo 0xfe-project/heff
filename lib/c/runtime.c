@@ -2239,6 +2239,21 @@ HEFF_FAST V heff_intMod(V a, V b) {
   return heff_intMod_big(a, b);
 }
 
+// (each given also a mask of the operands given it, the others lent, as
+// a comparison is: two words' operation takes nothing, and only where
+// one is big is what is lent counted, for `NAME_big` to consume)
+#define INT_LENT(name)                                                  \
+  HEFF_FAST V name##_lent(V a, V b, int give) {                         \
+    if (BOTH_INT(a, b)) return name(a, b);                              \
+    return name##_big(give & 1 ? a : heff_dup(a),                       \
+                      give & 2 ? b : heff_dup(b));                      \
+  }
+INT_LENT(heff_intAdd)
+INT_LENT(heff_intSub)
+INT_LENT(heff_intMul)
+INT_LENT(heff_intDiv)
+INT_LENT(heff_intMod)
+
 // A comparison, as C's condition (`heff_intLt_c`, what the emitter
 // tests where its Bool is only looked at) and as its Bool, each also
 // given a mask of the operands given it, the others lent (`_lent`, as a
