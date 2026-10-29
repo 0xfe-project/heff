@@ -5284,7 +5284,8 @@ HEFF_FN void heff_fail_again(const char *why) {
 HEFF_VAR(void (*heff_thread_ending)(void));
 
 HEFF_FN void heff_thread_end(void) {
-  if (heff_thread_ending) heff_thread_ending();
+  void (*ending)(void) = __atomic_load_n(&heff_thread_ending, __ATOMIC_ACQUIRE);
+  if (ending) ending();
 #if SMALL_MAX == 0
   for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
     void *p = heff_free_list[c];
@@ -5463,10 +5464,12 @@ struct HeffSource {
 
 // (a group: its number, unique among every thread's; how many waits are
 // pending in it -- in a root, those of the groups within it too -- the
-// root it is within, or 0 where it is one; and, in a root, what a step
-// of a computation started in it that fails is finished as, given why,
-// or 0: the failure is the program's)
-typedef struct { int64_t id, pending, root; V failed; } HeffGroup;
+// root it is within, or 0 where it is one; in a root, what a step of a
+// computation started in it that fails is finished as, given why, or 0:
+// the failure is the program's; and, in a group within one, what gives
+// it up from any thread, where something does, or 0)
+typedef struct HeffGiving HeffGiving;
+typedef struct { int64_t id, pending, root; V failed; HeffGiving *giving; } HeffGroup;
 typedef struct { int64_t group; V v; } HeffFinished;
 
 HEFF_VAR(HEFF_TLS int64_t heff_group);
@@ -5895,9 +5898,9 @@ HEFF_FN void heff_waker_remove(int64_t g) {
 #endif
 }
 
-// | The thread whose group `g` is woken, from any thread: its reactor's
-// | next turn, or the one it is waiting in, comes back, and so does
-// | `heff_reactor_finished`, with none finished where none is.
+// | The thread whose group `g`, a root, is woken, from any thread: its
+// | reactor's next turn, or the one it is waiting in, comes back, and so
+// | does `heff_reactor_finished`, with none finished where none is.
 HEFF_FN void heff_reactor_wake_group(int64_t g) {
 #ifndef _WIN32
   pthread_mutex_lock(&heff_wakers_mu);
@@ -5930,8 +5933,10 @@ HEFF_FN int64_t heff_group_made(int64_t root) {
   heff_groups_open[heff_ngroups].pending = 0;
   heff_groups_open[heff_ngroups].root = root;
   heff_groups_open[heff_ngroups].failed = 0;
+  heff_groups_open[heff_ngroups].giving = 0;
   heff_ngroups++;
-  heff_waker_add(g);
+  // (a root alone is woken: one within it is waited on with it)
+  if (!root) heff_waker_add(g);
   return g;
 }
 
@@ -6106,8 +6111,11 @@ HEFF_FN void heff_reactor_turn(int wait) {
 // | Group `g`'s finished, since it was last asked, in the order they
 // | were: where `wait`, waiting for one at least while any of it is
 // | pending; none where none is.
+HEFF_FN void heff_giving_taken(void);
+
 HEFF_FN V heff_reactor_finished(int64_t g, int wait) {
   for (;;) {
+    heff_giving_taken();
     int some = 0;
     for (size_t i = 0; i < heff_nfinished && !some; i++) some = heff_finished[i].group == g;
     HeffGroup *gr = heff_group_of(g);
@@ -6147,7 +6155,10 @@ HEFF_FN int heff_group_in(int64_t id, int64_t g) {
   return gr && gr->root == g;
 }
 
+HEFF_FN void heff_giving_closed(int64_t g);
+
 HEFF_FN void heff_reactor_close(int64_t g) {
+  heff_giving_closed(g);
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
     next = w->next;
     if (!heff_group_in(w->group, g)) continue;
@@ -6164,12 +6175,163 @@ HEFF_FN void heff_reactor_close(int64_t g) {
   }
   heff_nfinished = kept;
   for (size_t i = 0; i < heff_ngroups;) {
-    int64_t id = heff_groups_open[i].id;
-    if (id == g || heff_groups_open[i].root == g) {
+    int64_t id = heff_groups_open[i].id, root = heff_groups_open[i].root;
+    if (id == g || root == g) {
       if (heff_groups_open[i].failed) heff_drop(heff_groups_open[i].failed);
       heff_groups_open[i] = heff_groups_open[--heff_ngroups];
-      heff_waker_remove(id);
+      // (a root's waker taken out; and, with the thread's last group,
+      // its pipe closed)
+      if (!root || heff_ngroups == 0) heff_waker_remove(id);
     } else i++;
+  }
+}
+
+// Giving a group up from any thread
+// ---------------------------------------------------------------------
+//
+// A group within another is given up from any thread by what gives it
+// up (`heff_reactor_giving`): a foreign value -- a thing a custodian can
+// have in its custody -- made with a value of the group's, `gave`.
+// Ended, by a custodian's shutdown or as its last reference is dropped,
+// it asks the thread whose group it is to give the group up, and wakes
+// that thread.  The thread does at its next look at its finished
+// (`heff_giving_taken`, at a point where no wait of its is being
+// stepped): where any of the group is pending, the group is closed, what
+// is pending in it let go of, undone, and `gave` is among its root's
+// finished instead, so that what counts the computations started knows
+// that one is done; where none is -- what was started came to its
+// value, or failed, already -- the group is closed alone.  A group
+// closed, by any means, is given up no more.  The asking is under a lock
+// of its own: the group is its thread's, the thing anyone's.
+
+struct HeffGiving {
+  int64_t group, root;
+  int state;                     // (0 open; 1 asked to be given up, among
+                                 //  those asked once the lock is had; 2
+                                 //  taken by its thread; 3 closed: from 0,
+                                 //  by a `cas`, else under the lock)
+  int refs;                      // (the thing's, and the group's while it
+                                 //  is open: counted atomically)
+  V gave;
+  HeffGiving *next;              // (among those asked)
+};
+
+#ifdef HEFF_PART
+extern HeffGiving *heff_giving_asked;
+extern int64_t heff_giving_n;
+extern pthread_mutex_t heff_giving_mu;
+#else
+HeffGiving *heff_giving_asked;
+int64_t heff_giving_n;
+pthread_mutex_t heff_giving_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+// (one of its holders let go of it: freed by the last)
+HEFF_FN void heff_giving_unref(HeffGiving *gv) {
+  if (__atomic_sub_fetch(&gv->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+  V gave = gv->gave;
+  free(gv);
+  heff_drop(gave);
+}
+
+// (it taken out of those asked; the lock held)
+HEFF_FN void heff_giving_unasked(HeffGiving *gv) {
+  for (HeffGiving **at = &heff_giving_asked; *at; at = &(*at)->next)
+    if (*at == gv) {
+      *at = gv->next;
+      __atomic_sub_fetch(&heff_giving_n, 1, __ATOMIC_RELEASE);
+      return;
+    }
+}
+
+// (its end, from any thread: its group asked to be given up, and its
+// thread woken, where it is open)
+static const char *heff_giving_end(void *p) {
+  HeffGiving *gv = p;
+  int open = 0, asked = 0;
+  if (!__atomic_compare_exchange_n(&gv->state, &open, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return NULL;
+  pthread_mutex_lock(&heff_giving_mu);
+  // (not closed meanwhile, by its thread)
+  if (__atomic_load_n(&gv->state, __ATOMIC_ACQUIRE) == 1) {
+    gv->next = heff_giving_asked;
+    heff_giving_asked = gv;
+    __atomic_add_fetch(&heff_giving_n, 1, __ATOMIC_RELEASE);
+    asked = 1;
+  }
+  pthread_mutex_unlock(&heff_giving_mu);
+  if (asked) heff_reactor_wake_group(gv->root);
+  return NULL;
+}
+
+static void heff_giving_let_go(void *p) { heff_giving_unref(p); }
+
+// | What gives up group `g`, a group within another of this thread's,
+// | from any thread: `gave`, its value where it is given up while any
+// | of it is pending, finished in its root.  `gave` consumed.
+HEFF_FN V heff_reactor_giving(int64_t g, V gave) {
+  HeffGroup *gr = heff_group_of(g);
+  if (!gr || !gr->root) heff_fail("a group given up that is not one within another");
+  if (gr->giving) heff_fail("a group given up by two things");
+  HeffGiving *gv = heff_alloc(sizeof *gv);
+  gv->group = g;
+  gv->root = gr->root;
+  gv->state = 0;
+  gv->refs = 2;
+  gv->gave = heff_share(gave);
+  gv->next = NULL;
+  gr->giving = gv;
+  return heff_foreign_ending(gv, heff_giving_let_go, heff_giving_end);
+}
+
+// (the groups `g` closes -- it, and those within it -- given up no
+// more, let go of by them: before what is pending in them is, as what
+// that lets go of may hold what gives one up)
+HEFF_FN void heff_giving_closed(int64_t g) {
+  for (size_t i = 0; i < heff_ngroups; i++) {
+    HeffGroup *gr = &heff_groups_open[i];
+    if (!gr->giving || (gr->id != g && gr->root != g)) continue;
+    HeffGiving *gv = gr->giving;
+    gr->giving = 0;
+    int open = 0;
+    if (!__atomic_compare_exchange_n(&gv->state, &open, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      pthread_mutex_lock(&heff_giving_mu);
+      if (__atomic_load_n(&gv->state, __ATOMIC_ACQUIRE) == 1) heff_giving_unasked(gv);
+      __atomic_store_n(&gv->state, 3, __ATOMIC_RELEASE);
+      pthread_mutex_unlock(&heff_giving_mu);
+    }
+    heff_giving_unref(gv);
+  }
+}
+
+// | The groups of this thread's asked to be given up, given up: each
+// | closed, and, where any of it was pending, what it gave finished in
+// | its root.
+HEFF_FN void heff_giving_taken(void) {
+  if (__atomic_load_n(&heff_giving_n, __ATOMIC_ACQUIRE) == 0) return;
+  HeffGiving *mine = NULL;
+  pthread_mutex_lock(&heff_giving_mu);
+  for (HeffGiving **at = &heff_giving_asked; *at;) {
+    HeffGiving *gv = *at;
+    HeffGroup *gr = heff_group_of(gv->group);
+    if (gr && gr->giving == gv) {
+      *at = gv->next;
+      __atomic_sub_fetch(&heff_giving_n, 1, __ATOMIC_RELEASE);
+      __atomic_store_n(&gv->state, 2, __ATOMIC_RELEASE);
+      gv->next = mine;
+      mine = gv;
+    } else at = &gv->next;
+  }
+  pthread_mutex_unlock(&heff_giving_mu);
+  while (mine) {
+    HeffGiving *gv = mine;
+    mine = gv->next;
+    HeffGroup *gr = heff_group_of(gv->group);
+    if (!gr) continue;
+    int64_t root = gr->root;
+    V gave = gr->pending > 0 ? heff_dup(gv->gave) : 0;
+    heff_reactor_close(gv->group);
+    if (gave) heff_finished_put(root, gave);
   }
 }
 

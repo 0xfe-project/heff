@@ -70,6 +70,7 @@
 -- `with a := c where p do ...` | the same, its body run once `p` holds of what the cowns hold: until then, the behaviour waits for one `p` reads to be written
 -- `with r := BOC.await act do ...` | `act`, of the world, run outside every behaviour; the body a behaviour once it has come to `r`; this one goes on
 -- `with a := c` / `r := BOC.await act do ...` | the same, the body a behaviour on `c` once `act` has come to `r`
+-- `with r := BOC.awaitFirst a b do ...` | `a` and `b` raced: the body once the first has come to its value, `r` `Left` or `Right` it, the other given up
 -- `scheduled failed c` | `c` and its behaviours run, on domains, every behaviour waited for; `failed why` where one fails
 -- `scheduledWithReactor failed c` | the same, each domain running acts awaited in a reactor of its own, every act waited for too
 -- `scheduled (batch := n) failed c` | either, each domain running at most `n` behaviours in a row before the others ready get their turn (64 when not given)
@@ -103,14 +104,35 @@
 -- `scheduled` gives main's answer once every behaviour is done.  The
 -- same cown twice in one `when` is abandoned when the `when` runs.
 --
+-- So a behaviour runs before every behaviour spawned after it on a cown
+-- they share, wherever in the source it is.  A report meant to say what
+-- the cowns hold once a server is done, written as a `with` of them as
+-- the server starts, runs first, before any request, and says what they
+-- held then: it reads as "at the end" and is not.  What is to come after
+-- the server is spawned once the server is done, in the body of the
+-- `with` that runs then -- after the act that waits for the server's end
+-- (`r := BOC.await (Signal.wait [Terminate])`), say -- where it comes
+-- after every behaviour spawned before it on those cowns.
+--
 -- A behaviour is a user of a custodian, not one of its things, as a
 -- cml thread is: it takes the custodian current where it is spawned --
 -- `k` in a `with k := Custodian.custody do` (or `contained`), else the
 -- one current where `scheduled` runs -- and its body runs with that
 -- one current, so the things its `with`s hold are in its custody, and
 -- the behaviours it spawns take it too.  An act awaited, and the
--- behaviour after it, take the one current at the `await`.  No
--- shutdown stops a behaviour.  A `with` of a custodian in a body is
+-- behaviour after it, take the one current at the `await`, and the act
+-- is one of its things, as what a `with` holds is: under
+-- `scheduledWithReactor`, where that custodian is shut down while the
+-- act waits, the act is given up -- its wait taken out of the reactor,
+-- what comes after it let go of -- and the behaviour after it is never
+-- spawned.  So a server's `/stop` that shuts down the custody its acts
+-- were awaited in -- `with k := Custodian.custody do` around them --
+-- lets go of the act waiting for a signal, and the run ends.  One that
+-- has come to its value is not given up: its behaviour is spawned.
+-- There is no handle to give up one act: an act given a custody of its
+-- own, shut down, is that.  `awaitFirst a b` does it for two: it awaits
+-- both in a custody of its own, and the first to come to its value
+-- shuts it down.  No shutdown stops a behaviour.  A `with` of a custodian in a body is
 -- the body's, for its extent, since a behaviour runs to its end without
 -- waiting.  The custodian is the one of the scheduler's world:
 -- `scheduled` asks for `custodian <: w`, and a `main` that runs it
@@ -252,6 +274,7 @@ module boc
   , instanceWaiterCownsMore
   , Await
   , await
+  , awaitFirst
   , instanceBinderAwait
   , instanceBinderCownsAwait
   , instanceHolderAwait
@@ -275,6 +298,12 @@ import std.reactor as Reactor
 -- what is to run once the act has come to its value)
 type Group (w : HFunctor) = Reactor.Group (Co w Unit)
 
+-- (an act awaited, to be started: the custodian current at its await,
+-- where it is not the root's, and the act, come to what is to run once
+-- it has come to its value)
+data Starting (w : HFunctor)
+  = MkStarting (Maybe Custodian.Custodian) (Co w (Co w Unit))
+
 -- (a worker, as the computations of the scheduler's on it see it: its
 -- slot, for the behaviour -- a `b` -- it is to run next, where one is;
 -- how many operations the body it runs may still do before the slot
@@ -290,17 +319,24 @@ type Group (w : HFunctor) = Reactor.Group (Co w Unit)
 type Worker (w : HFunctor) (b : Type) =
   { slot : Domain.Atomic (Maybe b)
   , fuel : Domain.Atomic Int
-  , starting : Domain.Atomic (List (Co w (Co w Unit)))
+  , starting : Domain.Atomic (List (Starting w))
   , group : Domain.Atomic (Maybe (Group w))
   , polling : Domain.Atomic Bool
   , turns : Domain.Atomic Int
   }
 
 -- (the reactor's operations, its evidence given: where the scheduler
--- waits on the world through it)
+-- waits on the world through it.  `startIn` starts an act in a custody,
+-- one of its things: in a group of its own within the worker's, which
+-- the custody's shutdown gives up)
 type Outside (w : HFunctor) =
   { open : (String -> Co w Unit) -> Co w (Group w)
   , start : Group w -> Co w (Co w Unit) -> Co w (Maybe (Co w Unit))
+  , startIn :
+        Custodian.Custodian
+        -> Group w
+        -> Co w (Co w Unit)
+        -> Co w (Maybe (Co w Unit))
   , finished : Group w -> Bool -> Co w (List (Co w Unit))
   , pending : Group w -> Co w Int
   , close : Group w -> Co w Unit
@@ -402,14 +438,32 @@ numberOf (MkHandle n last none waiting) = n
 waitingOf : {w : HFunctor} -> Handle w -> Domain.Atomic (List (Again w))
 waitingOf (MkHandle n last none waiting) = waiting
 
+-- (a `Bool` of a `with`'s names, the first's, or `True` where none is)
+firstFlag : List Bool -> Bool
+firstFlag (b :: rest) = b
+firstFlag Nil = True
+
+-- (a pair's `Bool`s a cown, `l` and `r` cowns on its sides, from a
+-- `Bool` a name: the last name the whole pair's, else the first the
+-- left side's and the rest, by `rest`, the right side's)
+spreadPair : Int -> Int -> (List Bool -> List Bool) -> List Bool -> List Bool
+spreadPair l r rest (b :: Nil) = List.replicate (l + r) b
+spreadPair l r rest (b :: bs) = List.replicate l b ++ rest bs
+spreadPair l r rest Nil = List.replicate (l + r) True
+
 -- | What a behaviour can be on: a cown, or a tuple of them (`(a, b, c)`,
 -- | nesting to the left); the world their behaviours run in, what they
 -- | hold, how many cowns, their queues, and how what they hold is read
 -- | and written -- written where its `Bool` says, one a cown, in order.
+-- | `spread` makes those `Bool`s from a `with`'s, one a name: its names
+-- | bound along the pairs to the right (`with a := c0`, `b := (c1,
+-- | c2)` and `c := c3` binds `(c0, ((c1, c2), c3))`), the last to what
+-- | is left, each name's `Bool` for every cown it holds.
 theory Cowns (c : Type) where
   World : HFunctor
   Contents : Type
   width : Int
+  spread : List Bool -> List Bool
   handles : c -> List (Handle World)
   read : (Domain.domain <: World) -> c -> Co World Contents
   write : (Domain.domain <: World)
@@ -424,6 +478,7 @@ instanceCownsCown =
   { World = w
   , Contents = a
   , width = 1
+  , spread = \fs -> [firstFlag fs]
   , handles = \c -> [handleOf c]
   , read = \dm c -> Domain.get (dm := dm) (cellOf c)
   , write = \dm c ws v -> case ws of
@@ -441,6 +496,7 @@ instanceCownsPair =
   { World = l.World
   , Contents = (l.Contents, r.Contents)
   , width = l.width + r.width
+  , spread = spreadPair l.width r.width r.spread
   , handles = \p -> l.handles (fst p) ++ r.handles (snd p)
   , read = \dm p ->
         bind
@@ -577,11 +633,6 @@ newCown : {e w : HFunctor}
         -> Co e (Cown w a)
 newCown v = op (bc (NewCown (\r use -> use a (MkMaking v (\c -> c))))) val
 
--- (whether the first name of a `with` is set by its body)
-writtenFirst : List Bool -> Bool
-writtenFirst (b :: rest) = b
-writtenFirst Nil = False
-
 -- (the cowns a `Bool` each says, in order: one past the `Bool`s too,
 -- as `Cowns`' `write` takes them)
 flagged : {w : HFunctor} -> List (Handle w) -> List Bool -> List (Handle w)
@@ -590,15 +641,10 @@ flagged (h :: hs) (True :: fs) = h :: flagged hs fs
 flagged hs Nil = hs
 flagged Nil fs = Nil
 
--- (the cowns a `Bool` a name says, to wait on or to wake: all of them
--- where a name holds more than one, a tuple of cowns, and the `Bool`s
--- are not one a cown)
-named : {w : HFunctor} -> List (Handle w) -> List Bool -> List (Handle w)
-named hs fs = if List.length fs == List.length hs then flagged hs fs else hs
-
 -- (a behaviour on `cs`, its body run once `ok` holds of what they hold,
--- waiting meanwhile on the cowns `read` says, and writing back the
--- cowns `written` says)
+-- waiting meanwhile on the cowns of the names `read` says, and writing
+-- back those of the names `written` says: a `Bool` a name of a `with`,
+-- spread over its cowns)
 behaviourWhere : {c : Type}
                -> {e : HFunctor}
                -> c
@@ -619,10 +665,10 @@ behaviourWhere cs written read ok body =
                (MkBehaving
                   (cw.handles cs)
                   (\dm -> cw.read dm cs)
-                  (\dm v -> cw.write dm cs written v)
+                  (\dm v -> cw.write dm cs (cw.spread written) v)
                   { holds = ok
-                  , reads = named (cw.handles cs) read
-                  , writes = named (cw.handles cs) written
+                  , reads = flagged (cw.handles cs) (cw.spread read)
+                  , writes = flagged (cw.handles cs) (cw.spread written)
                   }
                   (\v -> closed (body v))
                   MkUnit))))
@@ -655,7 +701,7 @@ when : {c : Type}
      -> {{bc : boc cw.World <: e}}
      -> (cw.Contents -> Co (boc cw.World <+> cw.World) cw.Contents)
      -> Co e Unit
-when cs body = behaviour cs (List.replicate cw.width True) body
+when cs body = behaviour cs [True] body
 
 -- | A `with` of a cown: a behaviour on it, spawned (`with a := c do
 -- | ...`: `a` what it holds); this one goes on, and the `with` comes to
@@ -818,27 +864,6 @@ instanceWaiterCownsMore =
 -- Awaiting the world
 --------------------------------------------------------------------------------
 
--- | An act of the world `w` awaited by a `with`, `r := BOC.await act`:
--- | it comes to an `a`, outside every behaviour, and the `with`'s body
--- | is a behaviour once it has.
-data Await (w : HFunctor) a = MkAwait (Co w a)
-
--- | `act` awaited by a `with`: `with r := BOC.await act do ...`.
-await : {w : HFunctor} -> {a : Type} -> Co w a -> Await w a
-await act = MkAwait act
-
--- (the act awaited, and `k` given its value once it has come to it)
-awaitedThen : {e w : HFunctor}
-            -> {a : Type}
-            -> {{bc : boc w <: e}}
-            -> Await w a
-            -> (a -> Co (boc w <+> w) Unit)
-            -> Co e Unit
-awaitedThen (MkAwait act) k =
-  op
-    (bc (Awaits (\r use -> use a (MkAwaiting act (\v -> closed (k v)) MkUnit))))
-    val
-
 -- (a behaviour on no cown, spawned: `body` its work)
 alone : {e w : HFunctor}
       -> {{bc : boc w <: e}}
@@ -859,6 +884,88 @@ alone body =
                   (\u -> closed body)
                   MkUnit))))
     val
+
+-- | What a `with` awaits, `r := BOC.await act` or `r := BOC.awaitFirst
+-- | a b`: it comes to an `a`, outside every behaviour, and the `with`'s
+-- | body is a behaviour once it has.  (An act of the world `w`; or a
+-- | race, which, in a behaviour of its own, awaits its acts, given what
+-- | comes after the first.)
+data Await (w : HFunctor) a
+  = MkAwait (Co w a)
+  | Raced ((a -> Co (boc w <+> w) Unit) -> Co (boc w <+> w) Unit)
+
+-- | `act` awaited by a `with`: `with r := BOC.await act do ...`.
+await : {w : HFunctor} -> {a : Type} -> Co w a -> Await w a
+await act = MkAwait act
+
+-- (the act awaited, and `k` given its value once it has come to it)
+awaitedThen : {e w : HFunctor}
+            -> {a : Type}
+            -> {{bc : boc w <: e}}
+            -> Await w a
+            -> (a -> Co (boc w <+> w) Unit)
+            -> Co e Unit
+awaitedThen (MkAwait act) k =
+  op
+    (bc (Awaits (\r use -> use a (MkAwaiting act (\v -> closed (k v)) MkUnit))))
+    val
+awaitedThen (Raced race) k = alone (race k)
+
+-- (an act of a race, come to its value: where it is the first to, the
+-- race's custody shut down, giving up the other, and `Just` the value;
+-- else `Nothing`)
+firstOf : {w : HFunctor}
+        -> {a : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> {{cu : Custodian.custodian <: w}}
+        -> Domain.Atomic Int
+        -> Custodian.Custodian
+        -> Co w a
+        -> Co w (Maybe a)
+firstOf once race act = do
+  v <- act
+  n <- Domain.fetchAdd once 1
+  if n == 0
+  then do
+    _ <- Custodian.shutdown race
+    pure (Just v)
+  else pure Nothing
+
+-- (`k` given the value, where there is one)
+givenJust : {e : HFunctor}
+          -> {a : Type}
+          -> (a -> Co e Unit)
+          -> Maybe a
+          -> Co e Unit
+givenJust k (Just v) = k v
+givenJust k Nothing = pure ()
+
+-- | `a` and `b` awaited by a `with`, raced: `with r := BOC.awaitFirst a
+-- | b do ...`, `r` `Left` what `a` came to or `Right` what `b` did,
+-- | whichever came to its value first.  Both are awaited in a custody of
+-- | their own, under the one current; the first to come to its value
+-- | shuts it down, which gives up the other, and the body is a behaviour
+-- | on that one's value alone.  A time limit is a race with a sleep.
+-- | Under `scheduled`, which runs each act where it is awaited, `a` is
+-- | run, then `b`, and `a` comes first.
+awaitFirst : {w : HFunctor}
+           -> {a b : Type}
+           -> {{dm : Domain.domain <: w}}
+           -> {{cu : Custodian.custodian <: w}}
+           -> Co w a
+           -> Co w b
+           -> Await w (Either a b)
+awaitFirst l r =
+  Raced (\k -> do
+    race <- Custodian.make
+    once <- Domain.newAtomic 0
+    Custodian.custodied race (do
+      awaitedThen
+          (MkAwait (firstOf once race (bind l (\x -> pure (Left x)))))
+          (givenJust k)
+      awaitedThen
+          (MkAwait (firstOf once race (bind r (\y -> pure (Right y)))))
+          (givenJust k)))
 
 -- | A `with` of an act awaited, `with r := BOC.await act do ...`: `r`
 -- | what the act comes to; the `with` comes to nothing at once.
@@ -922,7 +1029,7 @@ instanceHolderCownsAwait =
           (\v ->
              behaviour
                (fst p)
-               (List.replicate cw.width (writtenFirst written))
+               [firstFlag written]
                (\t ->
                   bind (body (s := Unit) (t, v)) (\q -> pure (fst (snd q)))))
   }
@@ -1337,16 +1444,19 @@ awaited : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
         -> Runner w
+        -> Maybe Custodian.Custodian
         -> Co w a
         -> (a -> Sched w -> Runner w -> Co w Unit)
         -> Co w Unit
-awaited st runner act k = case st.outside of
+awaited st runner cust act k = case st.outside of
   Nothing -> bind act (\v -> k v st runner)
   Just o -> case runner of
     Just worker -> do
       _ <- Domain.fetchAdd st.live 1
       acts <- Domain.get worker.starting
-      Domain.set worker.starting (bind act (\v -> pure (k v st runner)) :: acts)
+      Domain.set
+          worker.starting
+          (MkStarting cust (bind act (\v -> pure (k v st runner))) :: acts)
     Nothing ->
       spawnedOn
         st
@@ -1355,7 +1465,7 @@ awaited st runner act k = case st.outside of
         (\dm -> pure MkUnit)
         (\dm u -> pure MkUnit)
         unconditioned
-        (\u here on -> awaited here on act k)
+        (\u here on -> awaited here on cust act k)
 
 -- (the handler's monad, a computation given the domain it runs on, as
 -- a functor)
@@ -1417,6 +1527,7 @@ bocAlg st opened runner (InL (Awaits s)) = do
         (awaited
            st
            runner
+           cust
            (custodiedAt cust act)
            (\v here on -> custodiedAt cust (opened here (k v) on)))
         (\u -> pure next))
@@ -1489,6 +1600,15 @@ resumedAll st (k :: ks) = do
   resumed st k
   resumedAll st ks
 
+-- (an act started in the group: in a custody, as one of its things)
+startedIn : {w : HFunctor}
+          -> Outside w
+          -> Group w
+          -> Starting w
+          -> Co w (Maybe (Co w Unit))
+startedIn o g (MkStarting Nothing act) = o.start g act
+startedIn o g (MkStarting (Just c) act) = o.startIn c g act
+
 -- (the acts given, started in the group in their order: each come to
 -- its value at once resumed there)
 startedEach : {w : HFunctor}
@@ -1496,11 +1616,11 @@ startedEach : {w : HFunctor}
             -> Sched w
             -> Outside w
             -> Group w
-            -> List (Co w (Co w Unit))
+            -> List (Starting w)
             -> Co w Unit
 startedEach st o g Nil = pure ()
 startedEach st o g (act :: acts) = do
-  r <- o.start g act
+  r <- startedIn o g act
   case r of
     Just k -> resumed st k
     Nothing -> pure ()
@@ -1533,7 +1653,7 @@ afterTurn st worker = case st.outside of
         case acts of
           Nil -> pure ()
           _ -> do
-            Domain.set worker.starting (Nil : List (Co w (Co w Unit)))
+            Domain.set worker.starting (Nil : List (Starting w))
             startedEach st o g (List.reverse acts)
         t <- Domain.get worker.turns
         if t + 1 < pollEvery then Domain.set worker.turns (t + 1)
@@ -1700,6 +1820,7 @@ outsideHere : {w : HFunctor} -> Outside w -> Outside w
 outsideHere o =
   { open = o.open
   , start = o.start
+  , startIn = o.startIn
   , finished = o.finished
   , pending = o.pending
   , close = o.close
@@ -1785,7 +1906,7 @@ workersMade n =
   else do
     slot <- Domain.newAtomic (Nothing : Maybe (Behaviour w))
     fuel <- Domain.newAtomic fuelLimit
-    starting <- Domain.newAtomic (Nil : List (Co w (Co w Unit)))
+    starting <- Domain.newAtomic (Nil : List (Starting w))
     group <- Domain.newAtomic (Nothing : Maybe (Group w))
     polling <- Domain.newAtomic False
     turns <- Domain.newAtomic 0
@@ -1937,6 +2058,26 @@ scheduled : {w : HFunctor}
           -> Co w a
 scheduled failed c = scheduledBy Nothing (max 1 batch) failed c
 
+-- (an act started in a group of its own within `g`, which the custody
+-- `k` has among its things: shut down while the act waits, the group is
+-- given up, the act's continuation let go of, and `pure ()` comes in
+-- its place, for the act to be counted done; come to its value, the
+-- group closed before what comes after it runs)
+startedInCustody : {w : HFunctor}
+                 -> {{cu : Custodian.custodian <: w}}
+                 -> {{rx : Reactor.reactor <: w}}
+                 -> Custodian.Custodian
+                 -> Group w
+                 -> Co w (Co w Unit)
+                 -> Co w (Maybe (Co w Unit))
+startedInCustody k g act = do
+  inner <- Reactor.openWithin g
+  gv <- Reactor.giving inner (pure ())
+  Custodian.custodied k (Custodian.owned gv)
+  Reactor.start
+      inner
+      (bind act (\next -> pure (bind (Reactor.closeGiving gv) (\u -> next))))
+
 -- | `scheduled`, each domain waiting on the world through a reactor of
 -- | its own (std.reactor's, the C backend's): an act awaited (`await`)
 -- | is run outside every behaviour, started in the reactor of the
@@ -1945,7 +2086,8 @@ scheduled failed c = scheduledBy Nothing (max 1 batch) failed c
 -- | has come to its value.  A domain with no behaviour to run and acts
 -- | pending waits in its reactor, until one has come to its value, or a
 -- | behaviour is ready.  Every behaviour, and every act awaited, is
--- | waited for.  An act that fails -- abandons, or fails in the runtime
+-- | waited for, but an act given up: one whose custodian is shut down
+-- | while it waits, its `with`'s body never run.  An act that fails -- abandons, or fails in the runtime
 -- | -- is as a body that fails: `failed` given why, its `with`'s body
 -- | not run, the others going on.  `batch` as `scheduled`'s.
 scheduledWithReactor : {w : HFunctor}
@@ -1962,6 +2104,7 @@ scheduledWithReactor failed c =
     (Just
        { open = \f -> Reactor.open (failed := Just f)
        , start = \g m -> Reactor.start g m
+       , startIn = \k g m -> startedInCustody k g m
        , finished = \g wait -> Reactor.finished g wait
        , pending = \g -> Reactor.pending g
        , close = \g -> Reactor.close g

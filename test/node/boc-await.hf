@@ -13,6 +13,7 @@ import std.domain as Domain
 import std.duration as Duration
 import std.io
 import std.reactor as Reactor
+import std.signal as Signal
 import std.time
 
 -- (`v`, after `ms` milliseconds' sleep)
@@ -129,6 +130,52 @@ failing ran count = do
     pure ()
   chained count 3
 
+-- (acts awaited in a custody, shut down once a sleep of 50 ms is
+-- done: a sleep of 5 s and a wait for SIGHUP, given up, their bodies
+-- never run -- `ran` counts them -- and the run ends then)
+givenUp : {e w : HFunctor}
+        -> {{bc : BOC.boc w <: e}}
+        -> {{clock : time <: w}}
+        -> {{sg : Signal.signals <: w}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> {{cuw : Custodian.custodian <: w}}
+        -> {{dm : Domain.domain <: e}}
+        -> {{dmw : Domain.domain <: w}}
+        -> Domain.Atomic Int
+        -> Co e Unit
+givenUp ran = do
+  with k := Custodian.custody do
+    with u := BOC.await (after 5000 ()) do
+      _ <- Domain.fetchAdd ran 1
+      pure ()
+    with s := BOC.await (Signal.wait [Hangup]) do
+      _ <- Domain.fetchAdd ran 1
+      pure ()
+    with u := BOC.await (after 50 ()) do
+      _ <- Custodian.shutdown k
+      pure ()
+
+-- (two races, a sleep of 50 ms against one of 5 s, each way round: what
+-- each came to, on the cown, the run ending once the first are done)
+raced : {e w : HFunctor}
+      -> {{bc : BOC.boc w <: e}}
+      -> {{clock : time <: w}}
+      -> {{cuw : Custodian.custodian <: w}}
+      -> {{dm : Domain.domain <: e}}
+      -> {{dmw : Domain.domain <: w}}
+      -> Domain.Atomic (List String)
+      -> Co e Unit
+raced seen = do
+  log <- BOC.newCown Nil
+  with l := log
+       r := BOC.awaitFirst (after 50 "quick") (after 5000 "slow") do
+    l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
+    Domain.set seen l
+  with l := log
+       r := BOC.awaitFirst (after 5000 "slow") (after 100 "quick") do
+    l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
+    Domain.set seen l
+
 -- (under `scheduledWithReactor`: the sleeps at once, their behaviours
 -- on the cown in the order they woke, the chain done before the run
 -- ended; under `scheduled`, each sleep in turn; acts that fail, the
@@ -177,6 +224,42 @@ program = do
           ^ debug c)
        r)
 
+-- (acts given up as their custody is shut down, and acts raced, under
+-- `scheduledWithReactor`: each run in about the time of its quickest)
+givingUp : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{clock : time <: e}}
+         -> {{sg : Signal.signals <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> {{dm : Domain.domain <: e}}
+         -> {{cu : Custodian.custodian <: e}}
+         -> Co e Unit
+givingUp = do
+  ran <- Domain.newAtomic 0
+  (ms, u) <-
+    timed
+      (BOC.scheduledWithReactor
+         (\why -> printErr ("failed: " ^ why))
+         (givenUp (bc := _) (clock := _) (cu := _) (dm := _) ran))
+  n <- Domain.get ran
+  print
+    ("given up: bodies run "
+     ^ debug n
+     ^ (if ms < 1000 then ", in time" else ", took " ^ debug ms ^ " ms"))
+  seen <- Domain.newAtomic Nil
+  (ms2, u2) <-
+    timed
+      (BOC.scheduledWithReactor
+         (\why -> printErr ("failed: " ^ why))
+         (raced (bc := _) (clock := _) (dm := _) seen))
+  l <- Domain.get seen
+  print
+    ("raced: "
+     ^ joinWith ", " l
+     ^ (if ms2 < 1000 then ", in time" else ", took " ^ debug ms2 ^ " ms"))
+
 -- | the program, on the system's threads
-main : Co (stdio <+> time <+> Reactor.reactor <+> Domain.domain <+> Custodian.custodian) Unit
-main = program (io := _) (clock := _) (rx := _) (dm := _) (cu := _)
+main : Co (stdio <+> time <+> Signal.signals <+> Reactor.reactor <+> Domain.domain <+> Custodian.custodian) Unit
+main = do
+  program (io := _) (clock := _) (rx := _) (dm := _) (cu := _)
+  givingUp (io := _) (clock := _) (sg := _) (rx := _) (dm := _) (cu := _)
