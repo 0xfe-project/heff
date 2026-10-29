@@ -212,6 +212,59 @@ cocoa = { libs = ["objc"], frameworks = ["AppKit", "CoreGraphics"] }
   flag per line: `OUT.link` for one file, `OUT/heff.link` for a
   directory.
 
+## The first thread
+
+A C program runs on a thread of its own, with a large stack; the
+process's first thread only waits for it to end. Some toolkits must
+have the first thread: AppKit's and UIKit's run loops, and every window
+call, belong there. A provider lends it to one:
+
+```c
+int heff_first_thread(void (*run)(void *), void (*stop)(void *), void *u);
+int heff_is_first_thread(void);
+```
+
+`heff_first_thread` queues `run(u)` to run on the first thread, and
+says:
+
+| Result | Meaning |
+|---|---|
+| `0` | queued: `run(u)` runs as soon as the first thread is free |
+| `1` | a job is lent already, queued or running: one at a time |
+| `2` | the program is ending: nothing is run |
+
+`run` may return, and the first thread waits again for another job or
+the program's end; or it may never return, and the thread is the
+toolkit's from then on. `heff_is_first_thread()` says whether the
+caller is on the first thread.
+
+- No heff code runs on the first thread. The program asks the toolkit
+  for something by the toolkit's own way to its thread, such as
+  `dispatch_sync_f(dispatch_get_main_queue(), ...)` on macOS; the
+  toolkit tells the program something through the provider, such as a
+  queue and a condition variable, or a byte on a pipe the reactor waits
+  on.
+- When the program ends while a job runs there, however it ends (its
+  `main` returning, `exit n`, a failure no one caught):
+  - with `stop`, the ending thread calls `stop(u)`, which must make
+    `run` return, and waits; the first thread then ends the process
+    with the program's status, its output flushed and its `atexit`
+    handlers run there. Nothing times the wait out: winding the toolkit
+    up is the provider's job. `stop` for AppKit sends `[NSApp stop:nil]`
+    to the main queue and posts an event, by which the loop notices it;
+    for a bare `CFRunLoopRun`, a function sent to the main queue
+    (`dispatch_async_f`) that calls `CFRunLoopStop(CFRunLoopGetCurrent())`.
+    `run` may return on its own just as `stop` is called, so `stop` must
+    not wait for the loop.
+  - with `stop` `NULL`, the program's end does not wait for the first
+    thread: the ending thread flushes the output and exits with the
+    program's status.
+- A job queued but not begun when the program ends is not run.
+- A stack overflow ends the program at once, without `stop`.
+- A program that lends nothing ends exactly as before.
+- Linux toolkits (GTK) and Win32's message loop do not need the first
+  thread; their providers do not lend it.
+
 ## Host types
 
 A thing of the host the program holds, such as an open file, a socket

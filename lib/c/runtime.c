@@ -444,6 +444,121 @@ static inline int heff_alone(Obj *o) { return o->rc == 1; }
 
 static inline int heff_unique(V v) { return heff_alone(OBJ(v)); }
 
+// The first thread, lent (#142).  The program runs on a thread of its
+// own, its stack large and watched; the process's first thread only
+// waits for its end.  A toolkit that must have that thread for its own
+// (AppKit's run loop, UIKit's) is given it by a provider:
+// `heff_first_thread(run, stop, u)` asks for `run(u)` there -- 0 where
+// it is queued, 1 where a job is lent already (queued or running: one
+// at a time), 2 where the program is ending.  The first thread runs it
+// as soon as it is free; where `run` returns, the thread waits again,
+// for the program's end or another job; where it never does, the
+// thread is the toolkit's from then on.  No heff code runs there: what
+// the program asks of the toolkit goes by the toolkit's own way to its
+// thread (macOS's main queue), what the toolkit tells the program by
+// the provider's (a queue and a condition, or a byte on a pipe the
+// reactor waits on).  `heff_is_first_thread()`, from `main` on, says
+// whether the caller is on it.
+//
+// The program's end while a job runs there (`heff_end`: its thread
+// returning, or a failure or `exit n` on any thread -- not a stack's
+// overflow, which ends it at once): with no `stop`, the ending thread
+// ends the process itself, its output flushed -- the first thread need
+// not come back; with `stop`, it calls `stop(u)`, which is to make
+// `run` return, and waits, and the first thread, `run` returned, ends
+// the process by the program's status, as it does where nothing is
+// lent.  Nothing times a `stop` out: winding the toolkit up is the
+// provider's, and a toolkit cut short mid-run is what `stop` is there
+// to spare.  (`run` may return on its own as `stop` is called: `stop`
+// only asks, never waits.)  A job queued, not begun, when the program
+// ends is not run.
+// The program ends once: a thread ending it after another waits, and
+// the thread ending it, ending it again (an `atexit` handler's
+// failure), ends it at once, as `exit` does.
+typedef struct {
+  void (*run)(void *);
+  void (*stop)(void *);
+  void *u;
+  int lent;     // a job queued or running
+  int running;  // begun on the first thread
+  int ended;    // 0; 1, the first thread ends the process; 2, another
+  int waits;    // whether the ending thread waits for the first
+  int status;
+  pthread_t first, ender;
+  int known;    // whether `first` is set
+} HeffFirst;
+#ifdef HEFF_PART
+extern HeffFirst heff_first;
+extern pthread_mutex_t heff_first_mu;
+extern pthread_cond_t heff_first_cv;
+#else
+HeffFirst heff_first;
+pthread_mutex_t heff_first_mu = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t heff_first_cv = PTHREAD_COND_INITIALIZER;
+#endif
+
+HEFF_FN int heff_is_first_thread(void) {
+  return heff_first.known && pthread_equal(pthread_self(), heff_first.first);
+}
+
+HEFF_FN int heff_first_thread(void (*run)(void *), void (*stop)(void *), void *u) {
+  pthread_mutex_lock(&heff_first_mu);
+  int r = heff_first.ended ? 2 : heff_first.lent ? 1 : 0;
+  if (r == 0) {
+    heff_first.run = run;
+    heff_first.stop = stop;
+    heff_first.u = u;
+    heff_first.lent = 1;
+    pthread_cond_broadcast(&heff_first_cv);
+  }
+  pthread_mutex_unlock(&heff_first_mu);
+  return r;
+}
+
+// (the program's end, by `status`, begun on this thread: `returned`,
+// the program's thread returning, which leaves the end to the first
+// thread where nothing runs there, and returns; every other end this
+// thread's, as before anything was lent)
+HEFF_FN void heff_end(int status, int returned) {
+  pthread_t self = pthread_self();
+  pthread_mutex_lock(&heff_first_mu);
+  if (heff_first.ended) {
+    if (pthread_equal(heff_first.ender, self)) {
+      pthread_mutex_unlock(&heff_first_mu);
+      exit(status);
+    }
+    for (;;) pthread_cond_wait(&heff_first_cv, &heff_first_mu);
+  }
+  heff_first.ender = self;
+  heff_first.status = status;
+  if (heff_first.running && heff_first.stop && !heff_is_first_thread()) {
+    void (*stop)(void *) = heff_first.stop;
+    void *u = heff_first.u;
+    heff_first.ended = 1;
+    heff_first.waits = 1;
+    pthread_mutex_unlock(&heff_first_mu);
+    stop(u);
+    pthread_mutex_lock(&heff_first_mu);
+    for (;;) pthread_cond_wait(&heff_first_cv, &heff_first_mu);
+  }
+  if (returned && !heff_first.running) {
+    heff_first.ended = 1;
+    pthread_cond_broadcast(&heff_first_cv);
+    pthread_mutex_unlock(&heff_first_mu);
+    return;
+  }
+  heff_first.ended = 2;
+  pthread_mutex_unlock(&heff_first_mu);
+  fflush(stdout);
+  exit(status);
+}
+
+// (the program ended by `status`, from any thread of it)
+HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
+  heff_end(status, 0);
+  exit(status);
+}
+
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
 // said; otherwise it ends the program.  Jumped to by `_longjmp`, which
@@ -464,14 +579,14 @@ HEFF_FN void heff_fail(const char *why) {
   if (heff_catch) { heff_caught = why; HEFF_LONGJMP(*heff_catch); }
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
-  exit(1);
+  heff_exit(1);
 }
 
 HEFF_FN V heff_abandon(void) {
   if (heff_catch) { heff_caught = "heff:abandon"; HEFF_LONGJMP(*heff_catch); }
   fflush(stdout);
   fprintf(stderr, "heff:abandon\n");
-  exit(1);
+  heff_exit(1);
 }
 
 HEFF_FN V heff_nomatch(V s);
@@ -4825,7 +4940,7 @@ HEFF_VAR(void (*heff_foreign_failed)(V owner, const char *why));
 HEFF_FN void heff_root_failed(const char *why) {
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
-  exit(1);
+  heff_exit(1);
 }
 
 // (a foreign value let go of: taken out of its custodian's custody,
@@ -5156,7 +5271,7 @@ HEFF_FN void heff_fail_again(const char *why) {
   if (!heff_catch && strcmp(why, HEFF_OVERFLOW) == 0) {
     fflush(stdout);
     fputs("heff: " HEFF_OVERFLOW "\n", stderr);
-    exit(HEFF_OVERFLOW_STATUS);
+    heff_exit(HEFF_OVERFLOW_STATUS);
   }
   heff_fail(why);
 }
@@ -6537,11 +6652,48 @@ static void *heff_thread(void *u) {
 }
 #endif
 
+// (the program's thread: the program, then its end -- the first
+// thread's to make, where nothing lent runs there)
+static void *heff_program(void *u) {
+  heff_thread(u);
+  heff_end(heff_status, 1);
+  return NULL;
+}
+
+// (the first thread's part: each job lent to it run, until the
+// program's end is its own to make -- then the program's status)
+static int heff_first_serve(void) {
+  pthread_mutex_lock(&heff_first_mu);
+  for (;;) {
+    if (heff_first.ended == 1 && !heff_first.running) break;
+    if (!heff_first.ended && heff_first.lent && !heff_first.running) {
+      void (*run)(void *) = heff_first.run;
+      void *u = heff_first.u;
+      heff_first.running = 1;
+      pthread_mutex_unlock(&heff_first_mu);
+      run(u);
+      pthread_mutex_lock(&heff_first_mu);
+      heff_first.running = 0;
+      heff_first.lent = 0;
+      continue;
+    }
+    pthread_cond_wait(&heff_first_cv, &heff_first_mu);
+  }
+  int status = heff_first.status;
+  pthread_mutex_unlock(&heff_first_mu);
+  return status;
+}
+
+static void heff_first_begin(void) {
+  heff_first.first = pthread_self();
+  heff_first.known = 1;
+}
+
 #ifdef _WIN32
 // (the program's thread on Windows: its large stack reserved, not
 // committed, and its bytes in and out as they are, not as text)
 static DWORD WINAPI heff_win_thread(LPVOID u) {
-  heff_thread(u);
+  heff_program(u);
   return 0;
 }
 
@@ -6552,11 +6704,13 @@ int main(int argc, char **argv) {
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stderr), _O_BINARY);
   SetConsoleOutputCP(CP_UTF8);
+  heff_first_begin();
   HANDLE t = CreateThread(NULL, (SIZE_T)HEFF_MAIN_STACK, heff_win_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
   if (!t) heff_fail("cannot start");
-  WaitForSingleObject(t, INFINITE);
+  int status = heff_first_serve();
+  if (!heff_first.waits) WaitForSingleObject(t, INFINITE);
   fflush(stdout);
-  return heff_status;
+  return status;
 }
 #else
 int main(int argc, char **argv) {
@@ -6569,11 +6723,13 @@ int main(int argc, char **argv) {
   pthread_attr_setguardsize(&attr, HEFF_GUARD);
 #endif
   heff_watch_faults();
+  heff_first_begin();
   pthread_t t;
-  if (pthread_create(&t, &attr, heff_thread, NULL) != 0) heff_fail("cannot start");
-  pthread_join(t, NULL);
+  if (pthread_create(&t, &attr, heff_program, NULL) != 0) heff_fail("cannot start");
+  int status = heff_first_serve();
+  if (!heff_first.waits) pthread_join(t, NULL);
   fflush(stdout);
-  return heff_status;
+  return status;
 }
 #endif
 #endif
