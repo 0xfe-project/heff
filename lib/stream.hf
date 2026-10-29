@@ -1,0 +1,184 @@
+-- Values given one at a time: a computation yields them (`yield`), and
+-- `source` makes it a `Source`, pulled a value at a time.  It runs up to
+-- its first `yield` and stops there, and goes on to the next only as the
+-- rest is pulled, so a source of a million values pulled three times
+-- makes three.  Use it by a name, `import stream as Stream`, as it has a
+-- `map`, a `take` and a `zip`.
+--
+-- ```haskell
+-- import co
+-- import stream as Stream
+-- import std.io
+--
+-- -- | the integers from `i` to `n`, each said as it is made
+-- counting : {e : HFunctor}
+--          -> {{io : stdio <: e}}
+--          -> {{ys : Stream.yielding Int <: e}}
+--          -> Int
+--          -> Int
+--          -> Co e Unit
+-- counting i n =
+--   if i > n then pure MkUnit
+--   else do
+--     print ("made " ^ showInt i)
+--     Stream.yield i
+--     counting (i + 1) n
+--
+-- -- | the first three of a million, tenfold, summed: three made
+-- summed : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Int
+-- summed = do
+--   r <- Stream.fold
+--          (Stream.take 3 (Stream.map (\x -> x * 10) (Stream.source (counting 1 1000000))))
+--          0
+--          (\acc x -> pure (acc + x))
+--   pure (fst r)
+-- ```
+--
+-- What a source is pulled by is a value, a `Step`: the end, or a value
+-- and the rest.  So two are pulled side by side (`zip`), and one is
+-- left unfinished (`take`) and pulled on later, where a fold, which
+-- gives each value on, goes through one to its end.
+--
+-- An operation of the rest of the world that holds a computation of
+-- its own (`catch`, a `with`) runs it whole: what that computation
+-- yields is not given on.
+
+module stream
+  ( YieldF(..)
+  , yielding
+  , yield
+  , Step(..)
+  , Source
+  , source
+  , fold
+  , map
+  , take
+  , zip
+  , each
+  )
+
+import co
+
+-- | The operation: a value given, the rest (`x`) after it.
+data YieldF o (m : Type -> Type) x = Yield o x
+
+-- | For values given one at a time, each to whoever pulls.
+yielding : (o : Type) -> HFunctor
+yielding o =
+  { f = YieldF o
+  , hfmap = \m g p -> case p of
+      Yield v x -> Yield v (g x)
+  , hmap = \m n nt p -> case p of
+      Yield v x -> Yield v x
+  }
+
+-- | A value given.
+yield : {o : Type} -> {e : HFunctor} -> {{ev : yielding o <: e}} -> o -> Co e Unit
+yield v = op (ev (Yield v MkUnit)) val
+
+-- | What a pull finds: the end, with what the source came to; or a
+-- | value, and the rest to pull.
+data Step (e : HFunctor) o r = Done r | Next o (Co e (Step e o r))
+
+-- | Values to pull, in the world `e`, and what they end with, an `r`.
+type Source (e : HFunctor) o r = Co e (Step e o r)
+
+-- (a source, then `k` with what it came to)
+andThen : {e : HFunctor}
+        -> {o a b : Type}
+        -> Source e o a
+        -> (a -> Source e o b)
+        -> Source e o b
+andThen m k = bind m (\s -> case s of
+  Done x -> k x
+  Next v rest -> val (Next v (andThen rest k)))
+
+-- (sources as a functor of what they come to)
+sourceFunctor : (e : HFunctor) -> (o : Type) -> RawFunctor
+sourceFunctor e o =
+  { f = \x -> Source e o x
+  , fmap = \g m -> andThen m (\x -> val (Done (g x)))
+  }
+
+-- (a source run to its end, what it gives not given on)
+drained : {e : HFunctor} -> {o r : Type} -> Source e o r -> Co e r
+drained m = bind m (\s -> case s of
+  Done x -> val x
+  Next v rest -> drained rest)
+
+-- (the handler: each `yield` stops there, the rest left to the puller)
+pulled : (o : Type) -> (e : HFunctor) -> Handler ((yielding o) <+> e)
+pulled o e =
+  { M = \x -> Source e o x
+  , ret = \x -> val (Done x)
+  , bind = \m k -> andThen m k
+  , malg = \p -> case p of
+      InL t -> case t of
+        Yield v x -> val (Next v (val (Done x)))
+      InR q ->
+        op
+          (e.hmap (sourceFunctor e o) (coFunctor e) (\m -> drained m) q)
+          (\x -> val (Done x))
+  }
+
+-- | `c`, its values to pull: it runs up to its first `yield`, and on to
+-- | the next as the rest is pulled.
+source : {o : Type}
+       -> {e : HFunctor}
+       -> {r : Type}
+       -> Co ((yielding o) <+> e) r
+       -> Source e o r
+source c = handle (pulled o e) c
+
+-- | Each value of `src` given to `step`, from `acc`: what they come to,
+-- | and what `src` came to.
+fold : {e : HFunctor}
+     -> {o r a : Type}
+     -> Source e o r
+     -> a
+     -> (a -> o -> Co e a)
+     -> Co e (Pair a r)
+fold src acc step = bind src (\s -> case s of
+  Done x -> val (MkPair acc x)
+  Next v rest -> bind (step acc v) (\next -> fold rest next step))
+
+-- | Each value of `src`, mapped by `f`.
+map : {e : HFunctor} -> {a b r : Type} -> (a -> b) -> Source e a r -> Source e b r
+map f src = bind src (\s -> case s of
+  Done x -> val (Done x)
+  Next v rest -> val (Next (f v) (map f rest)))
+
+-- | The first `n` values of `src`, and the rest of it, to pull on.
+take : {e : HFunctor}
+     -> {o r : Type}
+     -> Int
+     -> Source e o r
+     -> Source e o (Source e o r)
+take n src =
+  if n <= 0 then val (Done src)
+  else bind src (\s -> case s of
+    Done x -> val (Done (val (Done x)))
+    Next v rest -> val (Next v (take (n - 1) rest)))
+
+-- | A value of each, a pair at a time, until either ends.
+zip : {e : HFunctor}
+    -> {a b r q : Type}
+    -> Source e a r
+    -> Source e b q
+    -> Source e (Pair a b) Unit
+zip xs ys = bind xs (\s -> case s of
+  Done x -> val (Done MkUnit)
+  Next a xrest -> bind ys (\t -> case t of
+    Done y -> val (Done MkUnit)
+    Next b yrest -> val (Next (MkPair a b) (zip xrest yrest))))
+
+-- | Each value of `src` yielded again, in a computation that yields:
+-- | what `src` came to.
+each : {e : HFunctor}
+     -> {o r : Type}
+     -> {{ev : yielding o <: e}}
+     -> Source e o r
+     -> Co e r
+each src = bind src (\s -> case s of
+  Done x -> val x
+  Next v rest -> bind (yield v) (\u -> each rest))

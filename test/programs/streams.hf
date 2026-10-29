@@ -1,0 +1,115 @@
+-- Sources pulled a value at a time (lib/stream.hf): what each makes and
+-- each pull takes is written down in a state, in the order it happens,
+-- so that a pull is seen to run the source up to its next `yield` and
+-- no further -- a source of a million values pulled three times makes
+-- three -- and two are seen pulled side by side.
+
+module test.programs.streams
+
+import co
+import state
+import stream as Stream
+
+-- the world: a log, the last thing first
+W : HFunctor
+W = state (List String)
+
+said : {e : HFunctor} -> {{st : state (List String) <: e}} -> String -> Co e Unit
+said s = bind get (\l -> put (s :: l))
+
+-- | the integers from `i` to `n`, each logged as it is made
+counting : {e : HFunctor}
+         -> {{st : state (List String) <: e}}
+         -> {{ys : Stream.yielding Int <: e}}
+         -> String
+         -> Int
+         -> Int
+         -> Co e Int
+counting name i n =
+  if i > n then pure n
+  else do
+    said (name ^ " made " ^ showInt i)
+    Stream.yield i
+    counting name (i + 1) n
+
+made : {e : HFunctor}
+     -> {{st : state (List String) <: e}}
+     -> String
+     -> Int
+     -> Stream.Source e Int Int
+made name n = Stream.source (counting name 1 n)
+
+-- (pure: the log, in order, beside what the computation came to)
+logged : {a : Type} -> Co W a -> Pair a (List String)
+logged c =
+  let r =
+    handle
+      { M = \x -> List String -> Pair x (List String)
+      , ret = \x l -> MkPair x l
+      , bind = \m k l -> case m l of
+          MkPair x l2 -> k x l2
+      , malg = \p l -> case p of
+          Get k -> MkPair (k l) l
+          Put l2 x -> MkPair x l2
+      }
+      c
+      Nil
+  in MkPair (fst r) (List.reverse (snd r))
+
+-- | each value logged as it is taken
+taking : Int -> Int -> Co W Int
+taking acc x = bind (said ("took " ^ showInt x)) (\u -> pure (acc + x))
+
+-- | three of a million, tenfold, summed: three made, each before it is
+-- | taken
+firstThree : Pair Int (List String)
+firstThree =
+  logged
+    (bind
+       (Stream.fold
+          (Stream.take 3 (Stream.map (\x -> x * 10) (made "a" 1000000)))
+          0
+          taking)
+       (\r -> pure (fst r)))
+
+-- | all of a source, and what it came to
+whole : Pair (Pair Int Int) (List String)
+whole = logged (Stream.fold (made "a" 4) 0 taking)
+
+-- | the rest `take` leaves, pulled on later
+restAfter : Pair (Pair Int Int) (List String)
+restAfter =
+  logged
+    (bind (Stream.fold (Stream.take 2 (made "a" 5)) 0 taking) (\r ->
+    Stream.fold (snd r) 100 taking))
+
+-- | two side by side, until the shorter ends
+zipped : Pair (Pair (List (Pair Int Int)) Unit) (List String)
+zipped =
+  logged
+    (Stream.fold
+       (Stream.zip (made "a" 3) (made "b" 5))
+       Nil
+       (\ps p -> pure (p :: ps)))
+
+-- | a source yielded again by another, which doubles each value
+doubled : {e : HFunctor}
+        -> {{st : state (List String) <: e}}
+        -> {{ys : Stream.yielding Int <: e}}
+        -> Stream.Source e Int Int
+        -> Co e Int
+doubled src = do
+  said "doubling"
+  Stream.each (Stream.map (\x -> x * 2) src)
+
+again : Pair (Pair Int Int) (List String)
+again =
+  logged
+    (Stream.fold
+       (Stream.source (doubled (made "a" 3)))
+       0
+       taking)
+
+-- (one watch for them all: a watch computes the file's definitions anew)
+-- >>> (MkPair (MkPair firstThree whole) (MkPair restAfter (MkPair zipped again)) : Pair (Pair (Pair Int (List String)) (Pair (Pair Int Int) (List String))) (Pair (Pair (Pair Int Int) (List String)) (Pair (Pair (Pair (List (Pair Int Int)) Unit) (List String)) (Pair (Pair Int Int) (List String)))))
+-- MkPair (MkPair (MkPair 60 ["a made 1", "took 10", "a made 2", "took 20", "a made 3", "took 30"]) (MkPair (MkPair 10 4) ["a made 1", "took 1", "a made 2", "took 2", "a made 3", "took 3", "a made 4", "took 4"])) (MkPair (MkPair (MkPair 112 5) ["a made 1", "took 1", "a made 2", "took 2", "a made 3", "took 3", "a made 4", "took 4", "a made 5", "took 5"]) (MkPair (MkPair (MkPair [MkPair 3 3, MkPair 2 2, MkPair 1 1] MkUnit) ["a made 1", "b made 1", "a made 2", "b made 2", "a made 3", "b made 3"]) (MkPair (MkPair 12 3) ["doubling", "a made 1", "took 2", "a made 2", "took 4", "a made 3", "took 6"])))
