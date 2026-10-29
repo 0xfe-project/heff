@@ -312,10 +312,14 @@ data Starting (w : HFunctor)
 -- comes to what is to run once it has come to its value; the acts
 -- awaited by the behaviour it runs, to be started in the group after
 -- it, the last first; whether it waits in the reactor, to be woken
--- there; and how many behaviours it has run since it last looked at
--- its group's acts finished.  Cells only that worker touches, but its
--- group, which others read to wake it, and whether it waits, which the
--- one that wakes it takes back, so that no other wakes it again)
+-- there; how many behaviours it has run since it last looked at its
+-- group's acts finished; and how many behaviours and acts have ended on
+-- there; how many behaviours it has run since it last looked at its
+-- group's acts finished; and how many behaviours and acts have ended on
+-- it that the scheduler's `live` still counts.  Cells only that worker
+-- touches, but its group, which others read to wake it, and whether it
+-- waits, which the one that wakes it takes back, so that no other wakes
+-- it again)
 type Worker (w : HFunctor) (b : Type) =
   { slot : Domain.Atomic (Maybe b)
   , fuel : Domain.Atomic Int
@@ -323,6 +327,7 @@ type Worker (w : HFunctor) (b : Type) =
   , group : Domain.Atomic (Maybe (Group w))
   , polling : Domain.Atomic Bool
   , turns : Domain.Atomic Int
+  , ended : Domain.Atomic Int
   }
 
 -- (the reactor's operations, its evidence given: where the scheduler
@@ -1294,12 +1299,67 @@ releasedAll st runner (r :: rs) = do
   released st runner r
   releasedAll st runner rs
 
--- (a behaviour done, or main: where none is left, said once, for
--- `scheduled`)
+-- (`n` behaviours or acts done, or main: where none is left, said
+-- once, for `scheduled`)
+finishedBy : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Int
+           -> Co w Unit
+finishedBy st n = do
+  was <- Domain.fetchAdd st.live (0 - n)
+  if was == n then Domain.put st.done MkUnit else pure ()
+
+-- (main done)
 finished : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
-finished st = do
-  n <- Domain.fetchAdd st.live (0 - 1)
-  if n == 1 then Domain.put st.done MkUnit else pure ()
+finished st = finishedBy st 1
+
+-- (a behaviour or an act done, on `runner`: on a worker, counted there,
+-- `live` told only once the worker has nothing to run -- so `live`
+-- never counts fewer than are not done, and the domains do not all
+-- change it at once for every behaviour)
+finishedOn : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Sched w
+           -> Runner w
+           -> Co w Unit
+finishedOn st Nothing = finished st
+finishedOn st (Just worker) = do
+  _ <- Domain.fetchAdd worker.ended 1
+  pure ()
+
+-- (a behaviour or an act begun, on `runner`: on a worker where one has
+-- ended that `live` still counts, counted as that one, `live` not
+-- changed)
+begunOn : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Runner w
+        -> Co w Unit
+begunOn st Nothing = do
+  _ <- Domain.fetchAdd st.live 1
+  pure ()
+begunOn st (Just worker) = do
+  e <- Domain.get worker.ended
+  if e > 0 then Domain.set worker.ended (e - 1)
+  else do
+    _ <- Domain.fetchAdd st.live 1
+    pure ()
+
+-- (those ended on the worker taken off `live`: before it looks for a
+-- behaviour beyond its slot, or waits)
+toldEnded : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
+          -> Worker w (Behaviour w)
+          -> Co w Unit
+toldEnded st worker = do
+  e <- Domain.get worker.ended
+  if e > 0
+  then do
+    Domain.set worker.ended 0
+    finishedBy st e
+  else pure ()
 
 -- (no number twice, of numbers in order)
 distinct : List Int -> Bool
@@ -1395,7 +1455,7 @@ spawnedOn st runner hs rd wr wt body = do
   let ordered = List.sortOn (\h -> numberOf h) hs
   if not (distinct (List.map numberOf ordered)) then abandon
   else do
-    _ <- Domain.fetchAdd st.live 1
+    begunOn st runner
     held <- requestedAll ordered
     count <- Domain.newAtomic (List.length held + 1)
     let turn : Sched w -> Runner w -> Co w Unit = \here on -> do
@@ -1425,7 +1485,7 @@ spawnedOn st runner hs rd wr wt body = do
             Right u -> pure ()
             Left again -> unreportedAs here again
       releasedAll here on held
-      finished here
+      finishedOn here on
     let b : Behaviour w = MkBehaviour count turn
     queued st runner b held
     markedCome held
@@ -1466,7 +1526,7 @@ awaited st runner cust act k = case st.outside of
   Nothing -> bind act (\v -> k v st runner)
   Just o -> case runner of
     Just worker -> do
-      _ <- Domain.fetchAdd st.live 1
+      begunOn st runner
       acts <- Domain.get worker.starting
       Domain.set
           worker.starting
@@ -1598,21 +1658,23 @@ bocHandler st = bocHandlerBy st (\here b -> opening here b)
 resumed : {w : HFunctor}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
+        -> Worker w (Behaviour w)
         -> Co w Unit
         -> Co w Unit
-resumed st k = do
+resumed st worker k = do
   k
-  finished st
+  finishedOn st (Just worker)
 
 resumedAll : {w : HFunctor}
            -> {{dm : Domain.domain <: w}}
            -> Sched w
+           -> Worker w (Behaviour w)
            -> List (Co w Unit)
            -> Co w Unit
-resumedAll st Nil = pure ()
-resumedAll st (k :: ks) = do
-  resumed st k
-  resumedAll st ks
+resumedAll st worker Nil = pure ()
+resumedAll st worker (k :: ks) = do
+  resumed st worker k
+  resumedAll st worker ks
 
 -- (an act started in the group: in a custody, as one of its things)
 startedIn : {w : HFunctor}
@@ -1628,17 +1690,18 @@ startedIn o g (MkStarting (Just c) act) = o.startIn c g act
 startedEach : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> Sched w
+            -> Worker w (Behaviour w)
             -> Outside w
             -> Group w
             -> List (Starting w)
             -> Co w Unit
-startedEach st o g Nil = pure ()
-startedEach st o g (act :: acts) = do
+startedEach st worker o g Nil = pure ()
+startedEach st worker o g (act :: acts) = do
   r <- startedIn o g act
   case r of
-    Just k -> resumed st k
+    Just k -> resumed st worker k
     Nothing -> pure ()
-  startedEach st o g acts
+  startedEach st worker o g acts
 
 -- (how many behaviours a worker runs between two looks at its group's
 -- acts finished, not waiting: a look polls every act pending there, so
@@ -1668,13 +1731,13 @@ afterTurn st worker = case st.outside of
           Nil -> pure ()
           _ -> do
             Domain.set worker.starting (Nil : List (Starting w))
-            startedEach st o g (List.reverse acts)
+            startedEach st worker o g (List.reverse acts)
         t <- Domain.get worker.turns
         if t + 1 < pollEvery then Domain.set worker.turns (t + 1)
         else do
           Domain.set worker.turns 0
           done <- o.finished g False
-          resumedAll st done
+          resumedAll st worker done
       Nothing -> pure ()
 
 -- (the behaviour run on the worker, its body given the fuel in full,
@@ -1707,6 +1770,7 @@ working : {w : HFunctor}
         -> Worker w (Behaviour w)
         -> Co w Unit
 working st worker = do
+  toldEnded st worker
   next <- Domain.take st.ready
   case next of
     Just b -> do
@@ -1738,6 +1802,7 @@ taken st o worker g = do
       Domain.set worker.slot (Nothing : Maybe (Behaviour w))
       pure (Just b)
     Nothing -> do
+      toldEnded st worker
       Domain.lock st.mutex
       stop <- Domain.get st.stopping
       if stop
@@ -1764,7 +1829,7 @@ taken st o worker g = do
                 _ <- Domain.fetchAdd st.polling (0 - 1)
                 pure ()
               else pure ()
-              resumedAll st done
+              resumedAll st worker done
               taken st o worker g
             else do
               left <- o.finished g False
@@ -1776,7 +1841,7 @@ taken st o worker g = do
                   Domain.unlock st.mutex
                 _ -> do
                   Domain.unlock st.mutex
-                  resumedAll st left
+                  resumedAll st worker left
               taken st o worker g
 
 -- (a domain running behaviours, where the scheduler waits on the world
@@ -1898,6 +1963,7 @@ workerHere worker =
   , group = worker.group
   , polling = worker.polling
   , turns = worker.turns
+  , ended = worker.ended
   }
 
 -- (a worker, on its domain, with the scheduler's state, and its own
@@ -1926,6 +1992,7 @@ workersMade n =
     group <- Domain.newAtomic (Nothing : Maybe (Group w))
     polling <- Domain.newAtomic False
     turns <- Domain.newAtomic 0
+    ended <- Domain.newAtomic 0
     rest <- workersMade (n - 1)
     pure
         ({ slot = slot
@@ -1934,6 +2001,7 @@ workersMade n =
          , group = group
          , polling = polling
          , turns = turns
+         , ended = ended
          }
          :: rest)
 
