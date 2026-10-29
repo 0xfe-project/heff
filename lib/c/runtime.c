@@ -1188,6 +1188,17 @@ HEFF_KNOWN V heff_tag_at_n(V r, int id, int64_t n, V *f) {
   return r;
 }
 
+// (... the fields of `same` there already, each read from the cell at
+// its place and given back there: stored only in a new one)
+HEFF_KNOWN V heff_tag_re_n(V r, int id, int64_t n, uint64_t same, V *f) {
+  if (!IS_OBJ(r)) return heff_tag_n(id, n, f);
+  Tag *t = (Tag *)r;
+  t->h.tag = (uint16_t)id;
+  for (int64_t i = 0; i < n; i++)
+    if (!((same >> i) & 1)) t->f[i] = f[i];
+  return r;
+}
+
 HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
   if (!IS_OBJ(r)) return heff_tag_nf(id, n, flat, f);
   Tag *t = (Tag *)r;
@@ -1199,13 +1210,20 @@ HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
 // (what a tag's field waits as, a hole: no object, nothing to drop; and
 // field `i` of the cell `d`, made with a hole there that nothing has
 // seen yet, set to `v`: what a call of itself gives put where a tag waits
-// for it -- a destination; `d` consumed)
+// for it -- a destination; `d` consumed, `v` given back, counted)
 static inline V heff_hole(void) { return MK_INT(0); }
 
 static inline V heff_setField(V d, V i, V v) {
   ((Tag *)d)->f[INT_OF(i)] = v;
   heff_drop(d);
-  return NTAG(TAG_MkUnit);
+  return heff_dup(v);
+}
+
+// (... of a cell lent, a destination's: not given up, and the value set
+// given back lent, held by the cell -- no reference taken nor dropped)
+static inline V heff_setFieldPeek(V d, V i, V v) {
+  ((Tag *)d)->f[INT_OF(i)] = v;
+  return v;
 }
 
 // (a record of `n` fields, its labels `lbl`)
@@ -2161,10 +2179,22 @@ static inline V heff_keep(V x) {
 // (both words: tested at once, their low bits)
 #define BOTH_INT(a, b) HEFF_LIKELY(IS_INT((a) & (b)))
 
+// (a word made of two: its low bit set, as the C compiler is told, so
+// that an operation on it next tests it no more -- `(x + y) % m` tests
+// `x` and `y` once)
+static inline __attribute__((always_inline)) V heff_word_made(int64_t r) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_assume)
+  __builtin_assume((r & 1) == 1);
+#endif
+#endif
+  return (V)r;
+}
+
 INT_BIG(V, heff_intAdd, num_add(&x, y.neg, &y))
 HEFF_FAST V heff_intAdd(V a, V b) {
   int64_t r;
-  if (BOTH_INT(a, b) && !__builtin_add_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  if (BOTH_INT(a, b) && !__builtin_add_overflow((int64_t)a, (int64_t)b - 1, &r)) return heff_word_made(r);
   return heff_intAdd_big(a, b);
 }
 
@@ -2172,7 +2202,7 @@ HEFF_FAST V heff_intAdd(V a, V b) {
 INT_BIG(V, heff_intSub, num_add(&x, !y.neg && y.n > 0, &y))
 HEFF_FAST V heff_intSub(V a, V b) {
   int64_t r;
-  if (BOTH_INT(a, b) && !__builtin_sub_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  if (BOTH_INT(a, b) && !__builtin_sub_overflow((int64_t)a, (int64_t)b - 1, &r)) return heff_word_made(r);
   return heff_intSub_big(a, b);
 }
 

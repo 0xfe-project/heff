@@ -65,7 +65,15 @@ elemS x (Cons y ys) = strEq x y || elemS x ys
 -- | record of `n` fields -- built where it is bound, or read a field of
 -- | at its shape -- or a closure holding `n`, built where it is bound
 -- | (#34)
-data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
+-- | what a variable is known to be: a tag of `n` fields; a cell kept for
+-- | one, and the tag it was and the names its fields were read to, at
+-- | their places, where it was a tag of no flat field ("" and none, where
+-- | it is not known); a record of `n` fields; a closure holding `n`
+data Known
+  = KnownTag Int
+  | KnownCell Int String (List String)
+  | KnownRec Int
+  | KnownClo Int
 
 -- | a drop of a variable, as what it is known to be (if anything)
 data Drop = MkDrop String (Maybe Known)
@@ -125,8 +133,10 @@ data Exp b
   -- | a tag: the bits of its flat fields (#64, `Repr.flatBits`), its
   -- | fields (a flat one's bits, `RWord`)
   | RTag String Int (List (Exp b))
-  -- | ... built in the cell kept for it
-  | RTagIn (Exp b) String Int (List (Exp b))
+  -- | ... built in the cell kept for it, the bits of the fields there
+  -- | already (each the one read from the cell at its place, given back
+  -- | there): stored only where the cell is a new one
+  | RTagIn (Exp b) String Int Int (List (Exp b))
   -- | a record of its labels, the bits of its flat fields (#39,
   -- | `Repr.flatBits`), its fields (a flat one's bits, `RWord`)
   | RRec (List String) Int (List (Exp b))
@@ -1228,16 +1238,6 @@ tagVal r ce live t argv ts =
     (slotBits (Repr.tagSlots ts (List.length argv)))
     (storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv)
 
--- | ... in the cell `ru` kept for it
-reuseVal : RcK -> CE -> List String -> List Imperative.Val -> Value
-reuseVal r ce live (Cons ru (Cons (STag t argv ts) Nil)) =
-  RTagIn
-    (r.val ce (unionS (fvList argv) live) ru)
-    t
-    (slotBits (Repr.tagSlots ts (List.length argv)))
-    (storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv)
-reuseVal r ce live _ = RInt 0
-
 -- | a record built from `x`'s
 updateVal : RcK
           -> CE
@@ -1295,6 +1295,52 @@ recordVal r ce live fs ts Nothing =
        live
        (List.map (slotAt ts) (List.range 0 (List.length fs - 1)))
        (List.map snd fs))
+
+-- (the bits of the fields there already, of a tag `t` built in the cell
+-- `ru`: each its own field, read from the cell at its place and given
+-- back there, as it was -- in a cell of a tag of no flat field)
+sameBits : CE -> Imperative.Val -> String -> List Value -> Int
+sameBits ce (SVar ru) t es = case OrdMap.lookup ce.known ru of
+  Just (KnownCell _ t0 vs) ->
+    if strEq t t0 && List.length vs == List.length es
+    then keepBits
+        (List.zipWith
+           (\v e -> case e of
+            RLocal x -> strEq v x
+            _ -> False)
+           vs
+           es)
+    else 0
+  _ -> 0
+sameBits ce ru t es = 0
+
+-- (a record built of the shape of `x`, which it reads before (see
+-- "Records rebuilt"): in its cell, where this code holds it and gives it
+-- up here; else as any record is)
+rebuiltFrom : CE
+            -> List String
+            -> String
+            -> List (Pair String Imperative.Val)
+            -> Maybe String
+rebuiltFrom ce live x fs =
+  if elemS x ce.owned && not (elemS x live) && not (elemS x ce.borrowed)
+  then Just x
+  else updatedIn ce live (List.map fst fs) fs
+
+-- | ... in the cell `ru` kept for it
+reuseVal : RcK -> CE -> List String -> List Imperative.Val -> Value
+reuseVal r ce live (Cons (SVar x) (Cons (SRec fs ts) Nil)) =
+  recordVal r ce live fs ts (rebuiltFrom ce live x fs)
+reuseVal r ce live (Cons ru (Cons (STag t argv ts) Nil)) =
+  let es = storedAs r ce live (Repr.tagSlots ts (List.length argv)) argv
+  in let flat = slotBits (Repr.tagSlots ts (List.length argv))
+  in RTagIn
+    (r.val ce (unionS (fvList argv) live) ru)
+    t
+    flat
+    (if flat == 0 then sameBits ce ru t es else 0)
+    es
+reuseVal r ce live _ = RInt 0
 
 -- (the repr an array's element comes as: a variable as it is kept, a
 -- primitive done unboxed as it gives, a number's literal as its number)
@@ -2147,9 +2193,9 @@ knowing Nothing n ce = ce
 knowing (Just x) n ce = withKnown x (KnownTag n) ce
 
 -- (in an arm, the cell kept: known to be one for a tag of its size)
-knowCell : Maybe String -> Int -> CE -> CE
-knowCell Nothing n ce = ce
-knowCell (Just ru) n ce = withKnown ru (KnownCell n) ce
+knowCell : Maybe String -> String -> List String -> Int -> CE -> CE
+knowCell Nothing t vs n ce = ce
+knowCell (Just ru) t vs n ce = withKnown ru (KnownCell n t vs) ce
 
 -- (an arm, reading the fields it wants as `rd` says)
 armRead : RcK
@@ -2191,7 +2237,12 @@ armRead r ce taken lent t vs fb leaves rd (MkPair ru b2) =
              (withBorrowed
                 (if lent then List.append (minusS vs rd.counted) ce.borrowed
                  else ce.borrowed)
-                (knowCell ru (List.length vs) ce)))
+                (knowCell
+                   ru
+                   (if rd.flat then "" else t)
+                   (if rd.flat then Nil else vs)
+                   (List.length vs)
+                   ce)))
           b2))
     leaves
 
@@ -2304,6 +2355,7 @@ stArmsOf arms =
 reusedOf : List Imperative.Val -> Maybe Known
 reusedOf (Cons _ (Cons (STag _ argv _) Nil)) =
   Just (KnownTag (List.length argv))
+reusedOf (Cons _ (Cons (SRec fs _) Nil)) = Just (KnownRec (List.length fs))
 reusedOf _ = Nothing
 
 builtOf : Imperative.Comp -> Maybe Known
@@ -2435,7 +2487,8 @@ varIs x (SVar y) = strEq x y
 varIs x _ = False
 
 -- (whether `x`, in the worklist, is only read fields of, none of them
--- `l`, and outside any lambda)
+-- `l`, and outside any lambda -- or rebuilt in, its fields stored anew
+-- (see "Records rebuilt"))
 othersW : String -> String -> List Item -> Bool
 othersW x l Nil = True
 othersW x l (Cons (IVal (SVar y)) rest) = not (strEq x y) && othersW x l rest
@@ -2447,6 +2500,8 @@ othersW x l (Cons (IVal (SLam _ (MkBlock t))) rest) =
 othersW x l (Cons (IVal (STag _ argv _)) rest) =
   othersW x l (pushVals argv rest)
 othersW x l (Cons (IVal (SRec fs _)) rest) =
+  othersW x l (pushVals (List.map snd fs) rest)
+othersW x l (Cons (IVal (SPrim Reuse (Cons (SVar y) (Cons (SRec fs _) Nil)))) rest) =
   othersW x l (pushVals (List.map snd fs) rest)
 othersW x l (Cons (IVal (SPrim _ argv)) rest) = othersW x l (pushVals argv rest)
 othersW x l (Cons (IVal _) rest) = othersW x l rest
@@ -2782,6 +2837,57 @@ bindPeek r ce x a i rest after wb =
           rest
           after))
 
+-- Cells filled: `let x = setField d i v`, `d` lent to this code -- a
+-- destination (heff.compile.trmc), held by the cell before it -- has
+-- its field set and is not given up (`heff_setFieldPeek`), and `x`, the
+-- value set there, is lent too, held by `d` as long as `d` is: no
+-- reference taken for it, nor dropped.  So a destination goes round a
+-- loop lent, as heff.compile.borrow lends it on.
+
+-- | the cell, lent, of `let x = o`, a field of it set: the cell, the
+-- | field and the value
+fillOf : CE -> Imperative.Comp -> Maybe (Pair String (List Imperative.Val))
+fillOf ce (OPrim SetField (Cons (SVar d) rest)) =
+  if elemS d ce.borrowed then Just (MkPair d rest) else Nothing
+fillOf ce (OSimple (SPrim SetField (Cons (SVar d) rest))) =
+  if elemS d ce.borrowed then Just (MkPair d rest) else Nothing
+fillOf ce o = Nothing
+
+-- (`let x = setField d i v`, `d` lent: what is held and wanted neither
+-- by `i` and `v` nor after dropped first; then the field set, and `x`
+-- lent to what follows -- `wb` what that and what comes after want)
+bindFill : RcK
+         -> CE
+         -> String
+         -> String
+         -> List Imperative.Val
+         -> List Imperative.St
+         -> Maybe Imperative.Tl
+         -> List String
+         -> List Statement
+bindFill r ce x d iv rest after wb =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS (fvList iv) wb)))
+    (Cons
+       (CLet
+          x
+          (RPrim
+             SetFieldPeek
+             (Cons
+                (RLocal d)
+                (operandsF
+                   r
+                   (withPath (deadKept ce.owned (unionS (fvList iv) wb)) wb ce)
+                   wb
+                   iv))))
+       (r.stmts
+          (withPath
+             (deadKept ce.owned wb)
+             ce.after
+             (withBorrowed (Cons x ce.borrowed) ce))
+          rest
+          after))
+
 -- (a statement that sets `x`: a match, a condition)
 setting : RcK -> CE -> Imperative.St -> List Statement
 setting r ce (SCase v arms) = Cons (matchOf r ce False v (stArmsOf arms)) Nil
@@ -2815,6 +2921,21 @@ letOf r ce x o rest after Nothing =
     (takesFor ce o (restItems rest after))
     rest
     after
+
+-- (`let x = o` and what follows: a field of a cell lent set, or as
+-- `letOf` binds it)
+letFill : RcK
+        -> CE
+        -> String
+        -> Imperative.Comp
+        -> List Imperative.St
+        -> Maybe Imperative.Tl
+        -> Maybe (Pair String (List Imperative.Val))
+        -> List Statement
+letFill r ce x o rest after (Just (MkPair d iv)) =
+  bindFill r ce x d iv rest after (unionS (fvRest rest after) ce.after)
+letFill r ce x o rest after Nothing =
+  letOf r ce x o rest after (peekOf ce x o (restItems rest after))
 
 -- (the names declared one after another, and the statements after them)
 declRun : List String
@@ -2878,7 +2999,7 @@ stmtsF : RcK
 stmtsF r ce Nil (Just t) = r.tail ce t
 stmtsF r ce Nil Nothing = Nil
 stmtsF r ce (Cons (SLet x o) rest) after =
-  letOf r ce x o rest after (peekOf ce x o (restItems rest after))
+  letFill r ce x o rest after (fillOf ce o)
 stmtsF r ce (Cons (SDecl x) (Cons (SDecl y) more)) after =
   declsThen r ce (declRun [x, y] more) after
 stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
@@ -3238,7 +3359,7 @@ funPlain ce key xs b =
 tokenFun : CE -> String -> List String -> Imperative.Tl -> Int -> Def
 tokenFun ce key (Cons tok xs) b n =
   funPlain
-    (withKnown tok (KnownCell n) ce)
+    (withKnown tok (KnownCell n "" Nil) ce)
     key
     (Cons tok xs)
     (snd (reuseK.tl tok { n = n, tag = "" } b))
@@ -3256,11 +3377,173 @@ valRc ce key t =
     (rcK.tail (withPath Nil Nil (withFrame Nothing 0 (knowingShapes t ce))) t)
     ce.reprs
 
+-- Records rebuilt (#149): a record built of the shape of one read before
+-- it on the way there, `{ fired = s.fired + 1, firedSum = .. }`, none of
+-- its fields kept from it (which is an update, "Records updated"), is
+-- built in that one's cell where this code holds it and gives it up
+-- there (`rebuiltFrom`), as a tag is in the cell of one taken apart: it
+-- is marked, before the references are counted, as built in the cell of
+-- the record read (`$reuse`), so that the record is held up to there.
+-- What a branch reads stays in it; a record rebuilt in a branch is gone
+-- after it.  A lambda's body is a way of its own.
+
+-- | the records read so far on the way, by name, with their shapes
+type Seen = List (Pair String (List String))
+
+-- (the records a value reads fields of at a known shape, onto `acc`: not
+-- in a lambda)
+shapesOfV : Seen -> Imperative.Val -> Seen
+shapesOfV acc (SProj (SVar x) _ sh _) =
+  if List.null sh then acc else Cons (MkPair x sh) acc
+shapesOfV acc (SProj v _ _ _) = shapesOfV acc v
+shapesOfV acc (STag _ args _) = List.foldl shapesOfV acc args
+shapesOfV acc (SRec fs _) = List.foldl shapesOfV acc (List.map snd fs)
+shapesOfV acc (SPrim _ args) = List.foldl shapesOfV acc args
+shapesOfV acc v = acc
+
+shapesOfOp : Seen -> Imperative.Comp -> Seen
+shapesOfOp acc (OSimple v) = shapesOfV acc v
+shapesOfOp acc (OCall _ args) = List.foldl shapesOfV acc args
+shapesOfOp acc (OApply f args) = List.foldl shapesOfV acc (Cons f args)
+shapesOfOp acc (OPrim _ args) = List.foldl shapesOfV acc args
+shapesOfOp acc o = acc
+
+isJustR : Maybe String -> Bool
+isJustR (Just _) = True
+isJustR Nothing = False
+
+-- (a record of the fields `fs`: built in the cell of one read of its
+-- shape, that one no longer seen; or as it is, where a field is kept
+-- from one, or none is seen)
+rebuiltRec : Seen
+           -> List (Pair String Imperative.Val)
+           -> List IR.FieldTy
+           -> Pair Seen Imperative.Val
+rebuiltRec seen fs ts =
+  if List.length fs > 62
+     || List.any (\f -> isJustR (keptFrom (List.map fst fs) f)) fs
+  then MkPair seen (SRec fs ts)
+  else case List.find (\p -> sameS (snd p) (List.map fst fs)) seen of
+    Just p ->
+      MkPair
+        (List.keepIf (\q -> not (strEq (fst q) (fst p))) seen)
+        (SPrim reusePrim [SVar (fst p), SRec fs ts])
+    Nothing -> MkPair seen (SRec fs ts)
+
+-- | the walk, knotted: a value, a statement, a way out (from nothing seen)
+type RebuiltK =
+  { val : Seen -> Imperative.Val -> Pair Seen Imperative.Val
+  , st : Seen -> Imperative.St -> Pair Seen Imperative.St
+  , tl : Imperative.Tl -> Imperative.Tl
+  }
+
+consSeen : {a : Type} -> a -> Pair Seen (List a) -> Pair Seen (List a)
+consSeen x (MkPair s xs) = MkPair s (Cons x xs)
+
+rebuiltVs : RebuiltK
+          -> Seen
+          -> List Imperative.Val
+          -> Pair Seen (List Imperative.Val)
+rebuiltVs k seen Nil = MkPair seen Nil
+rebuiltVs k seen (Cons v vs) = case k.val seen v of
+  MkPair s2 v2 -> consSeen v2 (rebuiltVs k s2 vs)
+
+rebuiltV : RebuiltK -> Seen -> Imperative.Val -> Pair Seen Imperative.Val
+rebuiltV k seen (SLam xs (MkBlock t)) = MkPair seen (SLam xs (MkBlock (k.tl t)))
+rebuiltV k seen (STag t args ts) = case rebuiltVs k seen args of
+  MkPair s2 as2 -> MkPair s2 (STag t as2 ts)
+rebuiltV k seen (SRec fs ts) = case rebuiltVs k seen (List.map snd fs) of
+  MkPair s2 vs2 ->
+    rebuiltRec s2 (List.zipWith (\f v -> MkPair (fst f) v) fs vs2) ts
+rebuiltV k seen (SPrim p args) = case rebuiltVs k seen args of
+  MkPair s2 as2 -> MkPair s2 (SPrim p as2)
+rebuiltV k seen v = MkPair seen v
+
+rebuiltOp : RebuiltK
+          -> Seen
+          -> Imperative.Comp
+          -> Pair Seen Imperative.Comp
+rebuiltOp k seen (OSimple v) = case k.val seen v of
+  MkPair s2 v2 -> MkPair s2 (OSimple v2)
+rebuiltOp k seen (OCall g args) = case rebuiltVs k seen args of
+  MkPair s2 as2 -> MkPair s2 (OCall g as2)
+rebuiltOp k seen (OApply f args) = case rebuiltVs k seen (Cons f args) of
+  MkPair s2 (Cons f2 as2) -> MkPair s2 (OApply f2 as2)
+  MkPair s2 Nil -> MkPair s2 (OApply f args)
+rebuiltOp k seen (OPrim p args) = case rebuiltVs k seen args of
+  MkPair s2 as2 -> MkPair s2 (OPrim p as2)
+rebuiltOp k seen o = MkPair seen o
+
+-- (what is computed, what it reads seen first)
+rebuiltIn : RebuiltK -> Seen -> Imperative.Comp -> Pair Seen Imperative.Comp
+rebuiltIn k seen o = rebuiltOp k (shapesOfOp seen o) o
+
+rebuiltSts : RebuiltK
+           -> Seen
+           -> List Imperative.St
+           -> Pair Seen (List Imperative.St)
+rebuiltSts k seen Nil = MkPair seen Nil
+rebuiltSts k seen (Cons st rest) = case k.st seen st of
+  MkPair s2 st2 -> consSeen st2 (rebuiltSts k s2 rest)
+
+-- (those seen before branches still seen after them: rebuilt in none)
+seenAfter : Seen -> List Seen -> Seen
+seenAfter seen outs =
+  List.keepIf
+    (\p -> List.all (\o -> List.any (\q -> strEq (fst q) (fst p)) o) outs)
+    seen
+
+rebuiltSt : RebuiltK -> Seen -> Imperative.St -> Pair Seen Imperative.St
+rebuiltSt k seen (SLet x o) = case rebuiltIn k seen o of
+  MkPair s2 o2 -> MkPair s2 (SLet x o2)
+rebuiltSt k seen (SOnce x o) = case rebuiltIn k seen o of
+  MkPair s2 o2 -> MkPair s2 (SOnce x o2)
+rebuiltSt k seen (SSet x o) = case rebuiltIn k seen o of
+  MkPair s2 o2 -> MkPair s2 (SSet x o2)
+rebuiltSt k seen (SIf c ts fs) = case rebuiltSts k seen ts of
+  MkPair s1 ts2 -> case rebuiltSts k seen fs of
+    MkPair s2 fs2 -> MkPair (seenAfter seen [s1, s2]) (SIf c ts2 fs2)
+rebuiltSt k seen (SCase v arms) =
+  let outs =
+    List.map
+      (\a -> case a of
+       MkArm t vs ss -> case rebuiltSts k seen ss of
+         MkPair s2 ss2 -> MkPair s2 (MkArm t vs ss2))
+      arms
+  in MkPair (seenAfter seen (List.map fst outs)) (SCase v (List.map snd outs))
+rebuiltSt k seen st = MkPair seen st
+
+rebuiltTl : RebuiltK -> Seen -> Imperative.Tl -> Imperative.Tl
+rebuiltTl k seen (TSeq ss t) = case rebuiltSts k seen ss of
+  MkPair s2 ss2 -> TSeq ss2 (rebuiltTl k s2 t)
+rebuiltTl k seen (TReturn o) = TReturn (snd (rebuiltIn k seen o))
+rebuiltTl k seen (TLoop vs) = TLoop (snd (rebuiltVs k seen vs))
+rebuiltTl k seen (TIf c t e) = TIf c (rebuiltTl k seen t) (rebuiltTl k seen e)
+rebuiltTl k seen (TCase v arms) =
+  TCase
+    v
+    (List.map
+       (\a -> case a of
+        MkArm t vs b -> MkArm t vs (rebuiltTl k seen b))
+       arms)
+
+rebuiltK : RebuiltK
+rebuiltK =
+  { val = \seen v -> rebuiltV rebuiltK seen v
+  , st = \seen st -> rebuiltSt rebuiltK seen st
+  , tl = \t -> rebuiltTl rebuiltK Nil t
+  }
+
+-- | a body, each record built of the shape of one read before it marked
+-- | as built in that one's cell
+rebuilt : Imperative.Tl -> Imperative.Tl
+rebuilt t = rebuiltK.tl t
+
 -- | a definition of the imperative form, its references counted, what
 -- | is known of the program (`facts`) known, its variables kept as
 -- | `reprs` says (heff.compile.repr)
 rcDef : Facts.Facts -> Repr.Reprs -> Imperative.Def -> Def
 rcDef facts reprs (MkDef key _ (DefFun xs (MkBlock t))) =
-  funRc (ceOfFacts facts reprs) key xs t
+  funRc (ceOfFacts facts reprs) key xs (rebuilt t)
 rcDef facts reprs (MkDef key _ (DefVal (MkBlock t))) =
-  valRc (ceOfFacts facts reprs) key t
+  valRc (ceOfFacts facts reprs) key (rebuilt t)
