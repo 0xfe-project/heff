@@ -278,13 +278,20 @@ static void dm_set(DmAtomic *a, V v) {
 // what it held.  Once the body is done, what more than one holds of
 // what it counted up is shared.
 
+// (the log's entry for the cell, where it has one)
+static HeffOwnRoot *dm_own_entry(HeffOwnLog *g, DmAtomic *a) {
+  for (int64_t j = 0; j < g->nr; j++)
+    if (g->roots[j].cell == a) return &g->roots[j];
+  return NULL;
+}
+
 // (the log's entry for the cell `held` has, made where there is none:
 // `held` held by it, so that the cell is not let go of before the log
 // is done with it)
 static HeffOwnRoot *dm_own_root(HeffOwnLog *g, V held) {
   DmAtomic *a = heff_foreign_ptr(held);
-  for (int64_t j = 0; j < g->nr; j++)
-    if (g->roots[j].cell == a) return &g->roots[j];
+  HeffOwnRoot *had = dm_own_entry(g, a);
+  if (had) return had;
   if (!g->roots) {
     g->roots = g->first;
     g->cr = sizeof g->first / sizeof g->first[0];
@@ -304,10 +311,15 @@ static HeffOwnRoot *dm_own_root(HeffOwnLog *g, V held) {
 }
 
 // (what a cown's cell holds, one more count of it: held by the log
-// once too, where it is the cown's)
+// once too, where it is the cown's.  A number of a word, or a
+// constructor without fields, is no object: nothing of it to keep, the
+// log left as it is)
 static V dm_get_owned(V held) {
   HeffOwnLog *g = heff_own_log;
-  if (!g) return dm_get(heff_foreign_ptr(held));
+  DmAtomic *a = heff_foreign_ptr(held);
+  if (!g) return dm_get(a);
+  V now = atomic_load_explicit(&a->v, memory_order_acquire);
+  if ((!IS_OBJ(now) || !now) && !dm_own_entry(g, a)) return now;
   V v = dm_own_root(g, held)->v;
   if (!IS_OBJ(v) || !v) return v;
   uint32_t rc = heff_rc(OBJ(v));
@@ -319,9 +331,19 @@ static V dm_get_owned(V held) {
 // (... it is to hold `v` once the body is done; `v` consumed)
 static void dm_set_owned(V held, V v) {
   HeffOwnLog *g = heff_own_log;
+  DmAtomic *a = heff_foreign_ptr(held);
   if (!g) {
-    dm_set(heff_foreign_ptr(held), v);
+    dm_set(a, v);
     return;
+  }
+  // (no object written over another, the cell not read as one: written
+  // now, as the body's last steps write it, nothing kept)
+  if ((!IS_OBJ(v) || !v) && !dm_own_entry(g, a)) {
+    V now = atomic_load_explicit(&a->v, memory_order_acquire);
+    if (!IS_OBJ(now) || !now) {
+      atomic_store_explicit(&a->v, v, memory_order_release);
+      return;
+    }
   }
   HeffOwnRoot *e = dm_own_root(g, held);
   if (e->written) heff_drop(e->put);
@@ -367,6 +389,7 @@ static void dm_own_restore(HeffOwnLog *g, HeffOwnArr *e) {
 // each cell
 // written; and what it counted up shared where more than one holds it)
 static void dm_own_done(HeffOwnLog *g, int failed) {
+  if (!g->nr && !g->nt) return;
   if (failed)
     for (int64_t j = 0; j < g->nr; j++)
       if (g->roots[j].written) {
@@ -805,7 +828,10 @@ static void dm_run_behaviour(DmBehaviour *b) {
   V out;
   dm_fuel = 0;
   dm_in_body = 1;
-  HeffOwnLog log = {0}, *outer = heff_own_log;
+  // (the log's lists empty, its room for the first cells' entries not
+  // cleared: none is read before it is written)
+  HeffOwnLog log, *outer = heff_own_log;
+  memset(&log, 0, __builtin_offsetof(HeffOwnLog, first));
   heff_own_log = &log;
   const char *why = heff_try(b->c, (V)&dm_behaved_clo, &out);
   heff_own_log = NULL;
