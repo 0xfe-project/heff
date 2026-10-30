@@ -1,0 +1,473 @@
+-- Values shared by boc's behaviours, on the C backend's threads: each
+-- computed by a behaviour on a cown of its own, at once on the pool's
+-- threads, and handed to a behaviour after them (`spread`) -- values of
+-- definitions every thread asks for, of the caller's, frozen or made
+-- there, handed from one thread to another, and held by the caller
+-- alone again once the behaviours let them go.
+
+module test.node.boc-shared
+
+import array as Array
+import boc as BOC
+import co
+import int64 as Int64
+import std.io
+import std.process
+import uint64 as UInt64
+
+-- The work: pure, split into parts -------------------------------------------------
+
+noDivisor : Int -> Int -> Bool
+noDivisor n d =
+  if d * d > n then True else if n % d == 0 then False else noDivisor n (d + 1)
+
+isPrime : Int -> Bool
+isPrime n = n >= 2 && noDivisor n 2
+
+countIn : Int -> Int -> Int -> Int
+countIn acc i hi =
+  if i >= hi then acc
+  else countIn (if isPrime i then acc + 1 else acc) (i + 1) hi
+
+-- | the primes below `n` in block `b` of 4096
+primesIn : Int -> Int -> Int
+primesIn n b = countIn 0 (b * 4096) (min n (b * 4096 + 4096))
+
+fib : Int -> Int
+fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+-- (fib n's calls `d` deep: what is left to compute at each)
+leaves : Int -> Int -> List Int
+leaves d n =
+  if d == 0 || n < 2 then [n]
+  else List.append (leaves (d - 1) (n - 1)) (leaves (d - 1) (n - 2))
+
+safe : Int -> Int -> List Int -> Bool
+safe c d [] = True
+safe c d (q :: qs) = c /= q && c - q /= d && q - c /= d && safe c (d + 1) qs
+
+place : Int -> Int -> List Int -> Int
+place n row qs =
+  if row == n then 1
+  else List.foldl
+      (\acc c -> if safe c 1 qs then acc + place n (row + 1) (c :: qs) else acc)
+      0
+      (List.range 0 (n - 1))
+
+-- | the `n` queens' solutions whose first two queens are in the columns
+-- | `t / n` and `t % n`
+queensAt : Int -> Int -> Int
+queensAt n t = if safe (t % n) 1 [t / n] then place n 2 [t % n, t / n] else 0
+
+nthOr : Int -> List Int -> Int
+nthOr i [] = 0
+nthOr i (x :: xs) = if i == 0 then x else nthOr (i - 1) xs
+
+-- | fib `n`'s leaf `i`, 7 deep
+fibAt : Int -> Int -> Int
+fibAt n i = fib (nthOr i (leaves 7 n))
+
+-- (a definition every thread asks for, computed once and shared)
+squares : List Int
+squares = List.map (\x -> x * x) (List.range 1 1000)
+
+-- (records whose numbers the C backend keeps flat (#39): a definition
+-- frozen, and one of the caller's each thread holds, shared)
+type Mass = { m : Float64, k : Int64, u : UInt64, tag : String }
+
+masses : List Mass
+masses =
+  List.map
+    (\x ->
+       ({ m = toFloat x * 0.5
+        , k = Int64.fromInt x * 4611686018427387903
+        , u = UInt64.fromInt x * 0xF000000000000001
+        , tag = "m"
+        } :
+          Mass))
+    (List.range 1 100)
+
+-- (... and tags whose numbers it keeps flat (#64), built where their
+-- type is known: list cells, a definition frozen, and one of the
+-- caller's each thread holds, shared, of `Float64`s and of `UInt64`s
+-- beyond 62 bits; 0 between them)
+weightsFrom : Int -> List Float64
+weightsFrom n = if n == 0 then Nil else toFloat n * 0.25 :: weightsFrom (n - 1)
+
+weights : List Float64
+weights = weightsFrom 100
+
+widesFrom : Int -> List UInt64
+widesFrom n =
+  if n == 0 then Nil
+  else UInt64.fromInt n * 0xF000000000000001 :: widesFrom (n - 1)
+
+massOf : Mass -> List UInt64 -> Int
+massOf mine us =
+  floor (List.foldl (\s (x : Mass) -> s + x.m) 0.0 masses)
+  + Int64.toInt (mine.k / 4611686018427387903)
+  + UInt64.toInt (mine.u / 0xF000000000000001)
+  + floor (List.foldl (\s w -> s + w) 0.0 weights - 1262.5)
+  + UInt64.toInt (List.foldl (\s u -> s + u / 0xF000000000000001) 0 us)
+  - 1
+
+-- (functions whose C workers take and give their numbers unboxed (#39),
+-- each thread calling them: directly, and through a closure)
+spin : UInt64 -> Int -> UInt64
+spin x n =
+  if n == 0 then x
+  else spin
+      (xor (x * 6364136223846793005 + 1442695040888963407) (shiftR x 29))
+      (n - 1)
+
+low : UInt64 -> Int
+low x = UInt64.toInt (and x 0xFFFF)
+
+spun : Int -> Int
+spun t =
+  low (spin (UInt64.fromInt t) 100000)
+  + List.sum
+    (List.map
+       low
+       (List.map (\x -> spin x 10) [UInt64.fromInt t, 0xFFFFFFFFFFFFFFFF]))
+
+-- Spread over behaviours --------------------------------------------------------------
+
+-- (`(i, x)` put in the list ordered by the `i`s, the least first)
+inserted : {a : Type} -> (Int, a) -> List (Int, a) -> List (Int, a)
+inserted p [] = [p]
+inserted p (q :: qs) =
+  if fst p <= fst q then p :: q :: qs else q :: inserted p qs
+
+-- (`f i` for each `i` from `i` below `n`, each computed by a behaviour on
+-- a cown of its own, and put on `results` by a behaviour after it)
+spawned : {e : HFunctor}
+        -> {a : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> BOC.Cown (List (Int, a))
+        -> (Int -> a)
+        -> Int
+        -> Int
+        -> Co e Unit
+spawned results f i n =
+  if i >= n then pure ()
+  else do
+    c <- BOC.newCown ()
+    with u := c do
+      v <- later (\x -> f i)
+      with r := results do
+        r := inserted (i, v) r
+    spawned results f (i + 1) n
+
+-- | `f i` for each `i` below `n`, by behaviours at once, their values in
+-- | order given to `k` by a behaviour once all are done, of a
+-- | `scheduled` of its own: what `k` spawns, done before this is.  A
+-- | behaviour that fails is said, and the program abandons.
+spread : {e : HFunctor}
+       -> {a : Type}
+       -> {{bc : BOC.boc <: e}}
+       -> {{io : stdio <: e}}
+       -> Int
+       -> (Int -> a)
+       -> (List a -> Co e Unit)
+       -> Co e Unit
+spread n f k = do
+  results <- BOC.newCown Nil
+  BOC.scheduled
+      (\why -> bind (printErr ("failed: " ^ why)) (\u -> abandon))
+      (spawned results f 0 n)
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when results (\r -> do
+       k (List.map snd r)
+       pure r))
+
+-- | ... `f` of each of `xs`.
+spreadOver : {e : HFunctor}
+           -> {a b : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{io : stdio <: e}}
+           -> (b -> a)
+           -> List b
+           -> (List a -> Co e Unit)
+           -> Co e Unit
+spreadOver f xs k = do
+  let arr = Array.fromList xs
+  spread (Array.length arr) (\i -> f (Array.arrayIndex arr i)) k
+
+-- The programs ---------------------------------------------------------------------
+
+showInts : List Int -> String
+showInts xs = unwords (List.map debug xs)
+
+program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> Co e Unit
+program = do
+  print "said before the spread, once"
+  spread 4 (\i -> i * i) (\sq -> print ("squares: " ^ showInts sq))
+  spread
+      3
+      (\m -> List.sum (List.map (\x -> x * m) (List.range 1 5)))
+      (\own -> print ("each its own: " ^ showInts own))
+  spread
+      4
+      (\n -> List.sum squares + n)
+      (\shared -> print ("a definition, shared: " ^ showInts shared))
+  mine <-
+    pure
+      ({ m = 2.5
+       , k = 9223372036854775807
+       , u = 18446744073709551615
+       , tag = "own"
+       } :
+         Mass)
+  us <- pure (widesFrom 3)
+  spread
+      3
+      (\f -> massOf mine us + f)
+      (\flat -> print ("flat fields, frozen and shared: " ^ showInts flat))
+  spread 3 spun (\ws -> print ("workers: " ^ showInts ws))
+  spreadOver
+      (primesIn 100000)
+      (List.range 0 (100000 / 4096))
+      (\ps -> print ("primes below 100000: " ^ debug (List.sum ps)))
+  spreadOver
+      fib
+      (List.replicate 4 20)
+      (\fs -> print ("forced at once: " ^ showInts fs))
+
+main : Co (BOC.boc <+> stdio <+> process) Unit
+main = program
+
+-- (deeper than any stack: no tail call)
+sumTo : Int -> Int
+sumTo n = if n == 0 then 0 else n + sumTo (n - 1)
+
+-- (a behaviour whose stack overflows: caught there, told to `failed`,
+-- which says it, and the program abandons)
+overflowingIn : {e : HFunctor}
+              -> {{bc : BOC.boc <: e}}
+              -> {{io : stdio <: e}}
+              -> Co e Unit
+overflowingIn = do
+  print "said before the spread"
+  spread
+      3
+      (\i -> if i == 2 then sumTo 1000000000000 else i)
+      (\xs -> print ("not said: " ^ showInts xs))
+
+overflowing : Co (BOC.boc <+> stdio <+> process) Unit
+overflowing = overflowingIn
+
+showList : List Int -> String
+showList xs = "[" ^ joinWith "," (List.map debug xs) ^ "]"
+
+-- (any value, there and back: strings and lists mapped; a value of the
+-- caller's, not a definition, shared by each behaviour that holds it; a
+-- closure of the caller's, called by behaviours at once)
+generics : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> Co e Unit
+generics = do
+  spreadOver
+      (\s -> s ^ "!")
+      ["a", "bb", "ccc", "dddd", "eeeee"]
+      (\shouted -> print ("strings: " ^ unwords shouted))
+  spreadOver
+      (\i -> List.range 1 i)
+      (List.range 0 4)
+      (\ranges -> print ("lists: " ^ unwords (List.map showList ranges)))
+  mine <- pure (List.map (\x -> x * 3) (List.range 1 100))
+  spreadOver
+      (\n -> List.sum (List.take n mine))
+      [0, 1, 10, 100, 1000]
+      (\sums -> print ("a list of the caller's, in each: " ^ showInts sums))
+  thunk <- pure (\(u : Unit) -> List.range 1 (List.length mine / 20))
+  spreadOver
+      thunk
+      (List.replicate 8 MkUnit)
+      (\forced ->
+         print
+           ("a closure of the caller's, called at once: "
+            ^ showInts (List.map List.sum forced)))
+  spreadOver
+      (\(p : Pair String Int) -> MkPair (fst p) (fib (snd p)))
+      [MkPair "one" 10, MkPair "two" 11]
+      (\pairs ->
+         print
+           ("pairs: "
+            ^ unwords
+              (List.map
+                 (\(p : Pair String Int) -> fst p ^ "=" ^ debug (snd p))
+                 pairs)))
+  spreadOver
+      (\(x : Int) -> x)
+      Nil
+      (\none -> print ("of none: " ^ showList none))
+  text <-
+    pure
+      (joinWith "" (List.replicate 50 (strSlice "0123456789--" 0 10)))
+  spreadOver
+      (\k -> strSlice (strSlice text k 500) 10 (300 + k))
+      [0, 1, 2, 3, 4, 5]
+      (\cut ->
+         print
+           ("views of the caller's string: "
+            ^ unwords
+              (List.map
+                 (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 3)
+                 cut)))
+  spreadOver
+      (\k -> strSlice (joinWith "" (List.replicate 100 (debug k))) 2 90)
+      [0, 1, 2]
+      (\own ->
+         print
+           ("views of each's own: "
+            ^ unwords
+              (List.map
+                 (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 2)
+                 own)))
+  c <- processors
+  print (if c >= 1 then "processors: at least one" else "processors: none")
+
+generic : Co (BOC.boc <+> stdio <+> process) Unit
+generic = generics
+
+-- (`cpu WORK N`: WORK -- primes, queens or fib -- of N, a behaviour a
+-- part)
+tasks : String -> Int -> Pair Int (Int -> Int)
+tasks w n =
+  if strEq w "queens" then MkPair (n * n) (queensAt n)
+  else if strEq w "fib" then MkPair (List.length (leaves 7 n)) (fibAt n)
+  else MkPair (n / 4096 + 1) (primesIn n)
+
+cpuArgs : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> List String
+        -> Co e Unit
+cpuArgs (w :: n :: _) = do
+  let t = tasks w (fromMaybe 0 (parseInt n))
+  spreadOver
+      (snd t)
+      (List.range 0 (fst t - 1))
+      (\xs -> print (w ^ ": answer " ^ debug (List.sum xs)))
+cpuArgs _ = print "cpu primes|queens|fib N"
+
+cpu : Co (BOC.boc <+> stdio <+> process) Unit
+cpu = do
+  argv <- args
+  cpuArgs argv
+
+-- (`handOver R W`: R rounds, each W lists of 100,000 made by
+-- behaviours and summed by the one after them, on another thread --
+-- made in one thread, let go of in another, round after round, in
+-- memory that does not grow; the sums added up on `total`)
+madeThere : Int -> List Int
+madeThere i = List.range i (i + 99999)
+
+handRounds : {e : HFunctor}
+           -> {{bc : BOC.boc <: e}}
+           -> {{io : stdio <: e}}
+           -> BOC.Cown Int
+           -> Int
+           -> Int
+           -> Co e Unit
+handRounds total r w =
+  if r == 0 then pure ()
+  else do
+    spread
+        w
+        madeThere (\xs -> do
+          with t := total do
+            t := t + List.sum (List.map List.sum xs))
+    handRounds total (r - 1) w
+
+handArgs : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{io : stdio <: e}}
+         -> List String
+         -> Co e Unit
+handArgs (r :: w :: _) = do
+  total <- BOC.newCown 0
+  handRounds total (fromMaybe 0 (parseInt r)) (fromMaybe 2 (parseInt w))
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when total (\s -> do
+       print ("handed over: " ^ debug s)
+       pure s))
+handArgs _ = print "handOver ROUNDS W"
+
+handOver : Co (BOC.boc <+> stdio <+> process) Unit
+handOver = do
+  argv <- args
+  handArgs argv
+
+-- (`unshared`: a tree, a list and two arrays shared with the pool's
+-- threads, each behaviour reading all of them; held by the caller alone
+-- again once the behaviours let them go, and then taken apart and built
+-- in where they are, not copied)
+data Tree = Leaf | Node Tree Int Tree
+
+grown : Int -> Int -> Tree
+grown d k =
+  if d == 0 then Leaf
+  else Node (grown (d - 1) (2 * k)) k (grown (d - 1) (2 * k + 1))
+
+treeSum : Tree -> Int
+treeSum Leaf = 0
+treeSum (Node l x r) = treeSum l + x + treeSum r
+
+bumped : Tree -> Tree
+bumped Leaf = Leaf
+bumped (Node l x r) = Node (bumped l) (x + 1) (bumped r)
+
+bumpedAll : List Int -> List Int
+bumpedAll [] = Nil
+bumpedAll (x :: xs) = x + 1 :: bumpedAll xs
+
+arraySum : Array Int -> Int -> Int -> Int
+arraySum a i acc =
+  if i >= Array.length a then acc
+  else arraySum a (i + 1) (acc + Array.arrayIndex a i)
+
+tripled : Array Int -> Int -> Array Int
+tripled a i =
+  if i >= Array.length a then a else tripled (Array.set a i (i * 3)) (i + 1)
+
+namesLength : Array String -> Int -> Int -> Int
+namesLength a i acc =
+  if i >= Array.length a then acc
+  else namesLength a (i + 1) (acc + strLength (Array.arrayIndex a i))
+
+renamed : Array String -> Int -> Array String
+renamed a i =
+  if i >= Array.length a then a
+  else renamed (Array.set a i (debug (i * 1000))) (i + 1)
+
+unsharedRun : {e : HFunctor}
+            -> {{bc : BOC.boc <: e}}
+            -> {{io : stdio <: e}}
+            -> Co e Unit
+unsharedRun = do
+  t <- pure (grown 12 1)
+  a <- pure (Array.generate 1000 (\i -> i))
+  xs <- pure (List.range 1 (Array.length a))
+  names <- pure (Array.generate 100 (\i -> debug i))
+  spread
+      4
+      (\i ->
+         treeSum t + List.sum xs + arraySum a 0 0 + namesLength names 0 0 + i)
+      (\seen -> print ("read by 4: " ^ showInts seen))
+  print ("tree: " ^ debug (treeSum (bumped t)))
+  ys <- pure (bumpedAll xs)
+  print ("list: " ^ debug (List.sum ys) ^ " of " ^ debug (List.length ys))
+  print ("array: " ^ debug (arraySum (tripled a 0) 0 0))
+  print ("names: " ^ debug (namesLength (renamed names 0) 0 0))
+
+unshared : Co (BOC.boc <+> stdio <+> process) Unit
+unshared = unsharedRun

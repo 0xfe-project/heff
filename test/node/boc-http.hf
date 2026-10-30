@@ -1,0 +1,178 @@
+-- std.http's requests awaited by boc, each an act in the reactor of the
+-- worker that takes it: each pending while the others go on (libcurl's
+-- multi interface).  By C alone.
+--
+--   main BASE N REFUSED   N requests of BASE/item/I at once, an act
+--                         each, to a server that takes its time over
+--                         each (the test's): all of them in about the
+--                         time of one; and one to a port nothing
+--                         listens on, refused, while they wait
+--   self                  this program's own server
+--                         (std.http.bocserver's) asked by ten acts at
+--                         once, std.net's and libcurl's sockets waited
+--                         on together
+
+module test.node.boc-http
+
+import boc as BOC
+import co
+import custodian as Custodian
+import exception
+import std.http as HTTP
+import std.http.bocserver as BocServer
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.process
+import std.time
+import resource
+
+-- (what came back, as the test checks it: 1 where it is the item's)
+itemIs : Int -> Either HTTP.HttpError String -> Int
+itemIs i (Right t) = if strEq t ("item " ^ debug i ^ "\n") then 1 else 0
+itemIs i (Left err) = 0
+
+-- (items `i` down to 1 fetched, each an act awaited, counted on `got`)
+fetchers : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> String
+         -> BOC.Cown Int
+         -> Int
+         -> Co e Unit
+fetchers base got 0 = pure ()
+fetchers base got i = do
+  with n := got
+       r := BOC.await (HTTP.getText (base ^ "/item/" ^ debug i)) do
+    n := n + itemIs i r
+  fetchers base got (i - 1)
+
+-- (where no response came: curl's code)
+codeOf : Either HTTP.HttpError HTTP.Response -> String
+codeOf (Left err) = "code " ^ debug err.code
+codeOf (Right r) = "status " ^ debug r.status
+
+-- (n items fetched at once, and one refused meanwhile, an act too:
+-- what each came to on `refusedSaid` and `got`)
+fetches : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{web : HTTP.http <: e}}
+        -> String
+        -> Int
+        -> Int
+        -> BOC.Cown String
+        -> BOC.Cown Int
+        -> Co e Unit
+fetches base n refused refusedSaid got = do
+  fetchers base got n
+  with s := refusedSaid
+       r := BOC.await (HTTP.get ("http://127.0.0.1:" ^ debug refused ^ "/")) do
+    s := codeOf r
+
+-- (what the cowns hold, every behaviour before done, said)
+saidOf : {e : HFunctor}
+       -> {{bc : BOC.boc <: e}}
+       -> {{io : stdio <: e}}
+       -> BOC.Cown String
+       -> BOC.Cown Int
+       -> Co e Unit
+saidOf refusedSaid got =
+  BOC.scheduled
+    (\why -> abandon)
+    (BOC.when (refusedSaid, got) (\p -> do
+     print ("refused, while the others wait: " ^ fst p)
+     print ("items fetched at once: " ^ debug (snd p))
+     print "main done"
+     pure p))
+
+-- (the arguments: BASE N REFUSED)
+argsOf : List String -> Maybe (Pair String (Pair Int Int))
+argsOf (b :: n :: r :: _) =
+  Just (MkPair b (MkPair (fromMaybe 0 (parseInt n)) (fromMaybe 1 (parseInt r))))
+argsOf _ = Nothing
+
+program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> {{web : HTTP.http <: e}}
+        -> {{sys : process <: e}}
+        -> Co e Unit
+program = do
+  argv <- args
+  case argsOf argv of
+    Just (MkPair b (MkPair n r)) -> do
+      refusedSaid <- BOC.newCown ""
+      got <- BOC.newCown 0
+      BOC.scheduled
+          (\why -> print ("failed: " ^ why))
+          (fetches b n r refusedSaid got)
+      saidOf refusedSaid got
+    Nothing -> printErr "main BASE N REFUSED"
+
+main : Co (BOC.boc <+> stdio <+> HTTP.http <+> process) Unit
+main = program
+
+-- This program's own server
+--------------------------------------------------------------------------------
+
+-- (the value of a `Right`; where there is none, the program abandoned)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+-- (each item answered as the server of the test's answers it)
+item : {e : HFunctor}
+     -> {{bc : BOC.boc <: e}}
+     -> Server.Request
+     -> BocServer.Responder
+     -> Co (exception Empty <+> e) Unit
+item r respond =
+  respond
+    (Server.plain
+       200
+       ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
+
+-- (the listener served, and asked of by ten acts at once; once each
+-- has its answer, the listener closed, so the server is done)
+askedOn : {e : HFunctor}
+        -> {s : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> {{web : HTTP.http <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{clock : time <: e}}
+        -> BOC.Cown Int
+        -> With s Net.TcpListener
+        -> Co e Unit
+askedOn got l = do
+  at <- Net.local l
+  BocServer.serve Empty l (item (e := e))
+  let base = "http://127.0.0.1:" ^ debug (must at).port
+  fetchers base got 10
+  with n := got
+    where n >= 10
+  do
+    with u := BOC.await (Net.closeListener l) do
+      pure ()
+
+self : Co
+       (BOC.boc
+        <+> Custodian.custodian
+        <+> stdio
+        <+> HTTP.http
+        <+> Net.net
+        <+> time)
+       Unit
+self = do
+  got <- BOC.newCown 0
+  r <-
+    Net.withListener
+      { host = "127.0.0.1", port = 0 }
+      64
+      (\l -> BOC.scheduled (\why -> print ("failed: " ^ why)) (askedOn got l))
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when got (\n -> do
+       print ("asked of its own server, at once: " ^ debug n)
+       print
+           (either (\err -> "not listening: " ^ show err) (\u -> "main done") r)
+       pure n))

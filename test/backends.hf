@@ -15,15 +15,16 @@
 -- held to what they are to do (the interpreter runs no provider): what
 -- they write, their exit status, loops a million rounds deep, time; an
 -- HTTP client, TCP sockets and an HTTP server, an API over HTTP
--- (std.remote), cml's threads, processes forked and threads truly at
--- once (`HEFF_TSAN=1`: built with ThreadSanitizer too, by clang, and run
--- again).  The other side of their network, where it is not their own,
--- is Node.js's (the tests' peers).
+-- (std.remote), boc's behaviours and the acts they await, processes
+-- forked and threads truly at once (`HEFF_TSAN=1`: built with
+-- ThreadSanitizer too, by clang, and run again).  The other side of
+-- their network, where it is not their own, is Node.js's (the tests'
+-- peers).
 --
 --   heff test test/backends.hf
 --   heff test --run backends/programs/dollar.hf/c test/backends.hf
 --   heff test --run backends/generated test/backends.hf
---   heff test --run backends/c/threads/generic test/backends.hf
+--   heff test --run 'backends/c/boc, values shared/generic' test/backends.hf
 
 module test.backends
 
@@ -2755,7 +2756,7 @@ bocSockets = do
 -- (the requests to the slow peer, its port on its first line, and to
 -- the program's own server, each held to what it is to do; the peer
 -- ended after)
-cmlHttpTo : {e : HFunctor}
+bocHttpTo : {e : HFunctor}
           -> {s : Type}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
@@ -2763,9 +2764,9 @@ cmlHttpTo : {e : HFunctor}
           -> With s Started
           -> String
           -> Co e Unit
-cmlHttpTo started port = do
+bocHttpTo started port = do
   ports <- freePorts 1
-  bin <- built "test/node/cml-http.hf" "main" Nil ""
+  bin <- built "test/node/boc-http.hf" "main" Nil ""
   r <-
     run
       { command = bin
@@ -2779,12 +2780,12 @@ cmlHttpTo started port = do
       (fromMaybe
          0
          (parseInt (trim (strSlice ended.out 5 (strLength ended.out)))))
-  self <- built "test/node/cml-http.hf" "self" Nil ""
+  self <- built "test/node/boc-http.hf" "self" Nil ""
   own <- run { command = self, timeout = 60000 }
   failingWith
       (List.append
          (against
-            "cml http"
+            "boc http"
             { out =
                 Just
                   "refused, while the others wait: code 7\nitems fetched at once: 10\nmain done\n"
@@ -2793,30 +2794,31 @@ cmlHttpTo started port = do
             r)
          (List.append
             (if most >= 2 then Nil
-             else [ "cml http: 10 requests, never more than "
+             else [ "boc http: 10 requests, never more than "
                   ^ debug most
                   ^ " in the server's hands at once"
                   ])
             (against
-               "cml http, self"
+               "boc http, self"
                { out = Just "asked of its own server, at once: 10\nmain done\n"
                , err = Just ""
                }
                own)))
 
--- | std.http's requests from cml's threads, by C alone: ten at once, to
--- | a server of Node.js's that takes half a second over each -- at once
--- | as the server sees it, more than one of them in hand together -- and
+-- | std.http's requests awaited by boc, by C alone: ten at once, to a
+-- | server of Node.js's that takes half a second over each -- at once as
+-- | the server sees it, more than one of them in hand together -- and
 -- | one refused while they wait; and ten asked of the program's own
--- | server, std.net's sockets and libcurl's waited on together
-cmlHttp : {e : HFunctor}
+-- | server, std.http.bocserver's, std.net's sockets and libcurl's waited
+-- | on together
+bocHttp : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
         -> {{ex : exception ProcessError <: e}}
         -> {{cu : Custodian.custodian <: e}}
         -> Co e Unit
-cmlHttp = withPeer ["slow", "500"] cmlHttpTo
+bocHttp = withPeer ["slow", "500"] bocHttpTo
 
 -- | time limits on what waits, by C alone: std.net's connection to an
 -- | address nothing answers and its read of a side that writes nothing,
@@ -2913,64 +2915,6 @@ httpTimeouts = do
                      "http timeouts, multi"
                      { out = Just (want ^ "scheduler done\n"), err = Just "" }
                      c))))
-
--- | std.http.cmlserver's `serve`, by C alone: a cml thread a
--- | connection, waiting on the world through each domain's reactor,
--- | forty clients holding theirs open at once, each answered, then asked
--- | again on the same connection
-cmlServer : {e : HFunctor}
-          -> {{chk : check <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : filesystem <: e}}
-          -> Co e Unit
-cmlServer =
-  ran
-    "test/node/cml-served.hf"
-    "main"
-    Nil
-    { out =
-        Just
-          "first requests answered, every connection held open: 40\nsecond requests answered, on the same connections: 40\nthrown: closed at once, unanswered\nasked after: 1\nmain done\n"
-    }
-
--- | std.http.cmlserver's `serve`, by C alone: Node.js's
--- | clients, three hundred one after another, then two hundred whose
--- | connections are opened at once, every one answered -- each
--- | connection's thread under no more handlers than the first's, so the
--- | server accepts them as fast as they come, where the listener's queue
--- | would otherwise overflow, connections reset
-cmlBurst : {e : HFunctor}
-         -> {{chk : check <: e}}
-         -> {{sys : process <: e}}
-         -> {{ex : exception ProcessError <: e}}
-         -> {{cu : Custodian.custodian <: e}}
-         -> Co e Unit
-cmlBurst = do
-  root <- given "HEFF_TEST_ROOT"
-  ports <- freePorts 1
-  bin <- built "test/node/cml-served.hf" "burst" Nil ""
-  both <-
-    withProcess
-      { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
-        client <-
-          run
-            { command = "node"
-            , args =
-                [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
-            , timeout = 60000
-            }
-        server <- wait p
-        pure (MkPair client server))
-  failingWith
-      (List.append
-         (against
-            "cml server, a burst: the clients"
-            { out = Just "answered 200 of 200\n", err = Just "" }
-            (fst both))
-         (against
-            "cml server, a burst"
-            { out = Just "answered 500\nmain done\n", err = Just "" }
-            (snd both)))
 
 -- | a server's head limit, 1 s, by `burst PORT ... HEAD` of `file`, by
 -- | C alone: Node.js's clients, one sending a head a byte every 100 ms,
@@ -3682,35 +3626,36 @@ threadedRun file name arguments w = do
            r)
   failingWith msgs
 
--- (a program of the threads' run)
-threadRun : {e : HFunctor}
+-- (a program of boc-shared.hf's run)
+sharedRun : {e : HFunctor}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
           -> String
           -> List String
           -> Want
           -> Co e Unit
-threadRun name arguments w = threadedRun "test/node/threads.hf" name arguments w
+sharedRun name arguments w =
+  threadedRun "test/node/boc-shared.hf" name arguments w
 
--- (what the threads' `main` says)
-threadsMain : String
-threadsMain =
-  "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
+-- (what boc-shared.hf's `main` says)
+sharedMain : String
+sharedMain =
+  "said before the spread, once\nsquares: 0 1 4 9\neach its own: 0 15 30\n"
   ^ "a definition, shared: 333833500 333833501 333833502 333833503\n"
   ^ "flat fields, frozen and shared: 2528 2529 2530\nworkers: 82810 92940 102988\n"
-  ^ "primes below 100000, by 4: 9592\n"
-  ^ "forced at once: 6765 6765 6765 6765\nfib 20, each Parallel a thread: 6765\n"
+  ^ "primes below 100000: 9592\n"
+  ^ "forced at once: 6765 6765 6765 6765\n"
 
--- (the threads' `main` compiled as parts, run: every part built for
+-- (boc-shared.hf's `main` compiled as parts, run: every part built for
 -- threads, as the one with the program's `main` is)
-threadsParts : {e : HFunctor}
-             -> {{chk : check <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : filesystem <: e}}
-             -> {{fx : exception FileError <: e}}
-             -> Co e Unit
-threadsParts = do
-  bin <- builtParts "threads" "main"
+sharedParts : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
+            -> Co e Unit
+sharedParts = do
+  bin <- builtParts "boc-shared" "main"
   r <-
     run
       { command = bin
@@ -3718,84 +3663,66 @@ threadsParts = do
       , timeout = 60000
       }
   failingWith
-      (against "main, as parts" { out = Just threadsMain, err = Just "" } r)
+      (against "main, as parts" { out = Just sharedMain, err = Just "" } r)
 
--- | threads truly at once (std.thread, on domains): a computation run
--- | by each of n domains, their answers in order; a definition every thread asks for,
--- | computed once; tasks taken by threads as they end one; thunks
--- | forced by threads at once; workers taking their numbers unboxed;
--- | `Parallel` each side a thread; answers of any type; and a thread
--- | abandoning, the program abandoning when it is joined, and one whose
--- | stack overflows (not under ThreadSanitizer, which handles faults
--- | itself), the program ending so when it is joined; lists made
--- | by one thread and given back by another, round after round; values
--- | shared, then the caller's alone again, built in where they are.
--- | `HEFF_TSAN=1`: built with ThreadSanitizer too, and run again
-threads : {e : HFunctor}
-        -> {{chk : check <: e}}
-        -> {{sys : process <: e}}
-        -> {{disk : filesystem <: e}}
-        -> {{fx : exception FileError <: e}}
-        -> Co e Unit
-threads = do
-  subtest "main" (threadRun "main" Nil { out = Just threadsMain })
-  subtest "parts" threadsParts
+-- | values shared by boc's behaviours, on the system's threads: values
+-- | computed by behaviours at once, each on a cown of its own, handed
+-- | to one after them; a definition every behaviour asks for, computed
+-- | once; numbers kept flat, frozen and shared; workers taking their
+-- | numbers unboxed; a closure of the caller's called at once; values
+-- | of any type; a behaviour whose stack overflows (not under
+-- | ThreadSanitizer, which handles faults itself), told to `failed`;
+-- | lists made by one thread and let go of by another, round after
+-- | round; values shared, then the caller's alone again, built in where
+-- | they are.  `HEFF_TSAN=1`: built with ThreadSanitizer too, and run
+-- | again
+shared : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
+       -> Co e Unit
+shared = do
+  subtest "main" (sharedRun "main" Nil { out = Just sharedMain })
+  subtest "parts" sharedParts
   subtest
       "generic"
-      (threadRun
+      (sharedRun
          "generic"
          Nil
          { out =
              Just
-               ("strings, by 3: a! bb! ccc! dddd! eeeee!\nlists, by 4: [] [1] [1,2] [1,2,3] [1,2,3,4]\n"
+               ("strings: a! bb! ccc! dddd! eeeee!\nlists: [] [1] [1,2] [1,2,3] [1,2,3,4]\n"
                 ^ "a list of the caller's, in each: 0 3 165 15150 15150\n"
-                ^ "a thunk of the caller's, forced at once: 15 15 15 15 15 15 15 15\npairs: one=55 two=89\nof none: []\n"
+                ^ "a closure of the caller's, called at once: 15 15 15 15 15 15 15 15\npairs: one=55 two=89\nof none: []\n"
                 ^ "views of the caller's string: 290:012 291:123 292:234 293:345 294:456 295:567\n"
                 ^ "views of each's own: 88:00 88:11 88:22\n"
-                ^ "spread: ,ab,abab\na Parallel of two types: fib 15 is 610; [1,1,2,3,5,8,13,21]\ncores: at least one\n")
-         })
-  subtest
-      "failing"
-      (threadRun
-         "failing"
-         Nil
-         { out = Just "", err = Just "heff:abandon\n", status = Exited 1 })
-  subtest
-      "failingTask"
-      (threadRun
-         "failingTask"
-         Nil
-         { out = Just "said before the pool\n"
-         , err = Just "heff:abandon\n"
-         , status = Exited 1
+                ^ "processors: at least one\n")
          })
   sanitized <- isSet "HEFF_SANITIZE"
   subtest
       "overflowing"
       (if sanitized then skip "a sanitizer handles faults itself"
        else ran
-           "test/node/threads.hf"
+           "test/node/boc-shared.hf"
            "overflowing"
            Nil
            { out = Just "said before the spread\n"
-           , err = Just "heff: stack overflow\n"
-           , status = Exited 2
+           , err = Just "failed: stack overflow\nheff:abandon\n"
+           , status = Exited 1
            })
   subtest
       "cpu"
-      (threadRun
-         "cpu"
-         ["queens", "8", "4"]
-         { out = Just "queens: answer 92\n" })
+      (sharedRun "cpu" ["queens", "8"] { out = Just "queens: answer 92\n" })
   subtest
       "handOver"
-      (threadRun
+      (sharedRun
          "handOver"
          ["20", "4"]
          { out = Just "handed over: 400008000000\n" })
   subtest
       "unshared"
-      (threadRun
+      (sharedRun
          "unshared"
          Nil
          { out =
@@ -3803,55 +3730,6 @@ threads = do
                ("read by 4: 9386750 9386751 9386752 9386753\ntree: 8390655\n"
                 ^ "list: 501500 of 1000\narray: 1498500\nnames: 487\n")
          })
-
--- (what the scopes' program says: on threads here, and the same in
--- JavaScript's one domain)
-scopesSaid : String
-scopesSaid =
-  "waited for 3: 300000\nspawned by its domains: 6000, joined 42\n"
-  ^ "a domain failing: failed broken, its sibling wound up\n"
-  ^ "the body failing: failed the body broke, its domain wound up first\n"
-  ^ "cancelled: came to 7, its domain wound up\n"
-  ^ "nested: 3000, the outer not cancelled; one inside failed inner broke\n"
-
--- (what the domains' program says, test/node/domains-program.hf's:
--- on threads here, and the same in JavaScript's one domain,
--- test/apps.hf's)
-domainsSaid : String
-domainsSaid =
-  "fetchAdd by 4: 400000\ncas by 4: 200000\npushed by 4: 4000, their sum 8002000\n"
-  ^ "an equal list, not the same: kept\nhanded over by 6: 55\nanswers: 0! 1! 2!\n"
-  ^ "a flag read until set: set\nlocked after main let go: 1\n"
-  ^ "through a queue by 4, taken by 2: 2002000 cells, heads 6004000\nin the order put: 1 2 3 4 5\n"
-  ^ "made and let go of: 100000\ncores: at least one\n"
-
--- | domains (std.domain), on threads of the system: a counter added to
--- | by `fetchAdd`, and by a `cas` retried, a list pushed onto so,
--- | compared by identity, values handed over under a mutex and waited
--- | for on a condition, a flag read until another sets it, a mutex
--- | locked after main lets go of it; a domain's failure its joiner's.
--- | `HEFF_TSAN=1`: built with ThreadSanitizer too, and run again
-domains : {e : HFunctor}
-        -> {{chk : check <: e}}
-        -> {{sys : process <: e}}
-        -> Co e Unit
-domains = do
-  subtest
-      "threads"
-      (threadedRun "test/node/domains.hf" "main" Nil { out = Just domainsSaid })
-  subtest
-      "failing"
-      (threadedRun
-         "test/node/domains.hf"
-         "failing"
-         Nil
-         { out = Just "spawned\n"
-         , err = Just "heff:abandon\n"
-         , status = Exited 1
-         })
-  subtest
-      "scopes"
-      (threadedRun "test/node/scopes.hf" "main" Nil { out = Just scopesSaid })
 
 -- (what the fuel program says, test/node/fuel-program.hf's: the same
 -- on the C backend, test/backends.hf's, and in JavaScript, test/apps.hf's)
@@ -3869,7 +3747,7 @@ fuelSaid =
   ^ "calling one another, not last: near its rounds\n"
   ^ "a loop after a limit inside run out: near its rounds\n"
 
--- | fuel, by std.domain's `limited` (#133), on the C backend: a pure
+-- | fuel, by std.fuel's `limited` (#133), on the C backend: a pure
 -- | loop with no operation in it stopped, a computation finishing within
 -- | its fuel, limits within limits, a `tried` not catching running out
 fuel : {e : HFunctor}
@@ -4085,7 +3963,7 @@ statics = do
     ds -> ["the table's init, " ^ debug (List.length ds) ^ " of them"])
 
 -- (what boc's program says, test/node/cowns-program.hf's: on threads
--- here, and the same in JavaScript's one domain, test/apps.hf's)
+-- here, and the same in JavaScript's one thread, test/apps.hf's)
 cownsSaid : String
 cownsSaid =
   "added by 1000: 1000\naccounts: 600 -150 100 -150 400\n"
@@ -4099,7 +3977,7 @@ cownsSaid =
   ^ "an array in a cown: 1 0 0 4, given on by a body that failed: 7, a write not kept: 1 0 3 0, one read: 9, given on: 5, strings: a b\n"
   ^ "an array in a pair in a cown: 1 0 5 and 0, given on by a body that failed: 7\n"
 
--- | behaviours (boc), on std.domain's threads of the system: a counter
+-- | behaviours (boc), on the pool's threads of the system: a counter
 -- | many behaviours add to, money moved round accounts two cowns a
 -- | behaviour, behaviours on one cown in the order spawned, one spawned
 -- | in another's body.  `HEFF_TSAN=1`: built with ThreadSanitizer too,
@@ -4184,52 +4062,6 @@ bocCustody = do
          , status = Exited 1
          }
          r2)
-
--- (what cml's program says, test/node/cml-program.hf's: on threads
--- here, and the same in JavaScript's one domain, test/apps.hf's)
-cmlSaid : String
-cmlSaid =
-  "pinged: 1\nsummed from 100 senders: 5050\nchosen: a 1, b told: yes\nnested: b 2, a told: yes\n"
-  ^ "guard ran: 0 1 2\nwrapped: 21\nivar read by 3: 7 14 21\n"
-  ^ "two always: both chosen\n"
-  ^ "going on, the one readied ran meanwhile: yes\n"
-  ^ "failed in a guard: heff:abandon, its nack told: yes\n"
-  ^ "dropped waiting: main done, its nack told: yes\nall waiting: Nothing\n"
-  ^ "a scope of threads: Just 3\n"
-  ^ "a custodian shut down: first second under; failed: heff:abandon; again: 0; kept after: no\n"
-
--- | threads and channels (cml), on std.domain's threads of the system:
--- | ping-pong over two channels, many senders and one receiver, a
--- | choice with the branch not chosen told, a guard run at sync time, a
--- | wrap, an ivar read by several threads, a program whose threads all
--- | wait.  `HEFF_TSAN=1`: built with ThreadSanitizer too, and run again
-cml : {e : HFunctor}
-    -> {{chk : check <: e}}
-    -> {{sys : process <: e}}
-    -> Co e Unit
-cml = threadedRun "test/node/cml.hf" "main" Nil { out = Just cmlSaid }
-
--- | cml's threads waiting on the world through each domain's reactor
--- | (`CML.scheduledWithReactor`): 64 sleeping at once, more than the
--- | domains, in about one sleep's time; a `choose` of a channel and a
--- | sleep, each way, the sleep let go of where the channel comes first,
--- | its branch told; and a thread waiting on the world, no deadlock.
--- | `HEFF_TSAN=1`: built with ThreadSanitizer too, and run again
-cmlReactor : {e : HFunctor}
-           -> {{chk : check <: e}}
-           -> {{sys : process <: e}}
-           -> Co e Unit
-cmlReactor =
-  threadedRun
-    "test/node/cml-reactor.hf"
-    "main"
-    Nil
-    { out =
-        Just
-          ("slept: 2080, at once\ntimed out: timed out\n"
-           ^ "not timed out: sent, the sleep told, soon\n"
-           ^ "waiting on the world: 7\n")
-    }
 
 -- (what the deep loops say)
 deepWant : String
@@ -4514,21 +4346,11 @@ backends =
       , integration "sockets" sockets
       , withinTime 180000 (integration "signals" signals)
       , withinTime 180000 (integration "boc sockets" bocSockets)
-      , withinTime 180000 (integration "cml http" cmlHttp)
+      , withinTime 180000 (integration "boc http" bocHttp)
       , withinTime 180000 (integration "timeouts" timeouts)
       , withinTime 180000 (integration "http timeouts" httpTimeouts)
-      , withinTime 180000 (integration "cml server" cmlServer)
-      , withinTime 180000 (integration "cml server, a burst" cmlBurst)
       , withinTime 180000 (integration "boc server, a burst" bocBurst)
       , withinTime 180000 (integration "boc server, idle connections" bocIdle)
-      , withinTime
-        180000
-        (integration
-           "cml server, a head limit"
-           (headLimited
-              "test/node/cml-served.hf"
-              Nil
-              "answered 2\nmain done\n"))
       , withinTime
         180000
         (integration
@@ -4548,8 +4370,7 @@ backends =
       , integration "bytes described in C" describedBytes
       , integration "processes" processes
       , integration "the first thread lent" lentFirstThread
-      , integration "threads" threads
-      , integration "domains" domains
+      , integration "boc, values shared" shared
       , integration "fuel" fuel
       , integration "fuel, without it" unfueled
       , integration "fuel, by heff run" fuelRun
@@ -4559,8 +4380,6 @@ backends =
       , integration "cowns" cowns
       , withinTime 180000 (integration "boc, acts awaited" bocAwait)
       , withinTime 180000 (integration "boc, custody" bocCustody)
-      , withinTime 180000 (integration "cml" cml)
-      , withinTime 180000 (integration "cml, the reactor" cmlReactor)
       , integration "deep loops" deepLoops
       , integration "files held by a with" heldFiles
       , integration "output redirected by a with" redirectedOutput
