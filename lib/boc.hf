@@ -190,81 +190,46 @@
 --     n := n + 1
 -- ```
 --
--- Under `scheduledWithReactor`, each domain has a group of std.reactor's
--- of its own: an act awaited by a behaviour is started there once that
--- behaviour is done, pending there with the others while it waits, and
--- after every 64th behaviour the domain takes the acts come to their
--- values -- a look at every act pending there, which costs as many as
--- there are -- spawning the behaviours after them, which it keeps in its slot as it
--- would one a body spawned, and the rest in a queue of its own.  A
--- domain with no behaviour to run takes one from another's queue; with
--- none there either and acts pending, it waits in its reactor, until
--- one comes to its value or a behaviour is put in a queue.  The run ends once no behaviour
--- runs or is ready and no act is pending: a server whose listener is
--- closed ends once its connections are done.  An act awaited by main
--- is started by a behaviour on no cown, on whichever domain takes it.
--- An act that itself fails -- abandons, or fails in the runtime, not
--- an error it comes to -- is as a body that fails: `failed` is given
--- why, on the domain it ran on, the `with`'s body is never run, and
--- every other act and behaviour goes on (it held no cown, so none is
--- let go of).  Each step of an act runs under a catch for that, as a
--- body does.  Under
--- `scheduled`, an act is run where it is awaited, there and then, the
--- behaviour holding its domain and its cowns until it is done:
--- `scheduled` is for programs that await nothing.
+-- Under `scheduledWithReactor`, an act awaited runs in one of as many
+-- places as the machine has cores, given them in turn: each place a
+-- domain of its own with a group of std.reactor's, where the acts given
+-- it wait at once.  A place with acts pending waits in its reactor until
+-- one has come to its value or another is given it, and with none
+-- pending, on a condition of its own; the behaviour after an act is
+-- spawned, on no cown, from the place, once the act has come to its
+-- value, and spawns what it was to on its cowns.  Main runs as a
+-- behaviour on no cown, so that it and what it spawns are handled by
+-- none of the places' scope.  The run ends once no behaviour is queued
+-- or runs and no act is pending: a server whose listener is closed ends
+-- once its connections are done.  An act that itself fails -- abandons,
+-- or fails in the runtime, not an error it comes to -- is as a body that
+-- fails: `failed` is given why, on its place's domain, the `with`'s body
+-- is never run, and every other act and behaviour goes on (it held no
+-- cown, so none is let go of).  Under `scheduled`, an act is run where
+-- it is awaited, there and then, the behaviour holding its domain and
+-- its cowns until it is done: `scheduled` is for programs that await
+-- nothing.
 --
--- The scheduling is the paper's, as Verona's runtime has it: each cown
--- has a queue, kept as the last request for it, and a behaviour is
--- spawned in two phases.  First it comes to the queue of each of its
--- cowns, in the order of the cowns, by swapping itself in as the last
--- request, linked behind the one before it; then each of its requests
--- is marked come, and only then may one behind it link to it.  It
--- counts the cowns it still waits for (and one more, for its spawning)
--- and runs when none is left.  When it ends, each of its requests hands
--- its cown to the one linked behind it, or, where none is, takes itself
--- out as the last.  No lock is held for any of it: a request is a cell
--- (`Domain.Atomic`) holding its link, changed by `cas`, and told from
--- the others by the cell it is.  A behaviour whose turn has come is put
--- in a queue (`Domain.Queue`) the domains running behaviours take from
--- -- unless its turn came by a behaviour running on one of those
--- domains, spawning it or ending and handing it a cown: then that
--- domain keeps it, one at a time, and runs it next itself, as the
--- paper's threads keep a batch of their own, until it has run its
--- batch in a row, when it puts the next in the queue, so the others
--- are not starved; a behaviour spawned by main is put in the queue.
--- Under `scheduledWithReactor`, a domain keeps those beyond the one
--- in a queue of its own instead -- a cell changed by `cas`, no lock --
--- and runs them after it, in their order; a domain with nothing to run
--- takes the front of another's, and a domain that puts one there wakes
--- a domain waiting, where one does.  Only the shared queue, and a
--- domain about to wait, take a lock.  The order behaviours run in is
--- the cowns' queues' still: one comes to a domain's queue only once
--- its turn has come.
---
--- The batch is 64 behaviours, or what `batch` is given (`scheduled
--- (batch := 16) failed c`).  Longer batches keep a chain of behaviours
--- on one domain, its cowns' cells warm there, and go through the queue
--- -- its lock, and waking the domain that takes from it -- less often;
--- the behaviours waiting in the queue wait for them meanwhile.  On 14
--- cores, 64 chains of 5000 behaviours, each spawning the next on its
--- cown once an act it awaited came back, ran 1.17 million behaviours a
--- second on 14 domains with batches of 64, 1.02 million with 16 and
--- 0.51 million with 4.  std.http.bocserver, 256 connections on 14
--- domains, answered 92 to 93 thousand requests a second with batches of
--- 64 or 16, with a 99th percentile of 5 ms and the slowest in 9 to 15
--- ms, and 86 thousand with 4, no faster at the tail.  A shorter batch
--- lets the behaviours in the queue in sooner, at the cost of the
--- chains; worth it where one domain's chains keep many others waiting.
+-- The scheduling is the paper's, as Verona's runtime has it, and the
+-- runtime's own: std.domain's pools and turnstiles (`Domain.behave`).
+-- Each cown is a turnstile, the last request queued at it; a behaviour
+-- is queued at each of its cowns' in two phases, by swaps, then runs on
+-- a domain of the pool once it is first at each, and lets the next
+-- through at each as it ends.  No lock but the pool's own, around the
+-- behaviours ready.  A behaviour readied by one a domain runs --
+-- spawned, or handed a cown -- is kept by that domain and run next
+-- there, nothing woken, until it has run 64 in a row with others ready
+-- (`batch` is kept for the programs that give it).  What a cown holds
+-- is a cell (`Domain.Atomic`) only its behaviour reads and writes, and
+-- the behaviours waiting on it to be written (`where`) a list beside it.
 --
 -- A behaviour is never stopped partway -- its body runs to its end,
 -- holding its cowns -- so the one a domain keeps would wait for the
 -- end of the body it runs, however long that goes on.  The domain
--- counts the operations of that body as it hands them on (the world's,
--- and `when` and `newCown`), and at every 256th puts the behaviour it
--- keeps in the queue, which wakes a domain waiting there to take it:
--- a behaviour kept waits for at most 256 operations of the body.  A
--- body that computes long doing none holds its domain, and the one
--- kept, until it ends; that is the program's to avoid.
+-- counts the body's operations of std.domain's, and at every 256th puts
+-- the behaviour it keeps with the others ready, which wakes a domain to
+-- take it.  A body that computes long doing none holds its domain, and
+-- the one kept, until it ends; that is the program's to avoid.
 
 module boc
   ( Cown
@@ -299,10 +264,10 @@ import custodian as Custodian
 import std.domain as Domain
 import std.reactor as Reactor
 
--- Behaviours, requests and cowns
+-- Cowns, and the world awaited
 --------------------------------------------------------------------------------
 
--- (a worker's group of the reactor: each act started in it comes to
+-- (a place's group of the reactor: each act started in it comes to
 -- what is to run once the act has come to its value)
 type Group (w : HFunctor) = Reactor.Group (Co w Unit)
 
@@ -312,144 +277,40 @@ type Group (w : HFunctor) = Reactor.Group (Co w Unit)
 data Starting (w : HFunctor)
   = MkStarting (Maybe Custodian.Custodian) (Co w (Co w Unit))
 
--- (a worker's queue of behaviours ready: none, or its front and its
--- back reversed.  None is no value held, so a domain looking for one to
--- take reads an empty queue without touching it)
-data Local b = NoneQueued | Queued (List b) (List b)
-
--- (a worker, as the computations of the scheduler's on it see it: its
--- slot, for the behaviour -- a `b` -- it is to run next, where one is;
--- where the scheduler waits on the world through the reactor, its
--- queue, for those it made ready beyond its slot, which it runs after
--- it and the others take from when they have none; the others' queues,
--- in the order it takes from them, its own record's alone; how many
--- operations the body it runs may still do before the slot is let out;
--- and, where the scheduler waits on the world through the reactor, its
--- group there, opened on its domain, each of whose acts comes to what
--- is to run once it has come to its value; the acts awaited by the
--- behaviour it runs, to be started in the group after it, the last
--- first; whether it waits in the reactor, to be woken there; how many
--- behaviours it has run since it last looked at its group's acts
--- finished; and how many behaviours and acts have ended on it that the
--- scheduler's `live` still counts.  Cells only that worker touches, but
--- its queue, which the others take from, its group, which others read
--- to wake it, and whether it waits, which the one that wakes it takes
--- back, so that no other wakes it again)
-type Worker (w : HFunctor) (b : Type) =
-  { slot : Domain.Atomic (Maybe b)
-  , local : Domain.Atomic (Local b)
-  , others : List (Domain.Atomic (Local b))
-  , fuel : Domain.Atomic Int
-  , starting : Domain.Atomic (List (Starting w))
-  , group : Domain.Atomic (Maybe (Group w))
-  , polling : Domain.Atomic Bool
-  , turns : Domain.Atomic Int
-  , ended : Domain.Atomic Int
-  }
-
 -- (the reactor's operations, its evidence given: where the scheduler
 -- waits on the world through it.  `startIn` starts an act in a custody,
--- one of its things: in a group of its own within the worker's, which
--- the custody's shutdown gives up)
+-- one of its things: in a group of its own within the place's, which
+-- the custody's shutdown gives up, what is given coming in place of
+-- what follows the act)
 type Outside (w : HFunctor) =
   { open : (String -> Co w Unit) -> Co w (Group w)
   , start : Group w -> Co w (Co w Unit) -> Co w (Maybe (Co w Unit))
   , startIn :
         Custodian.Custodian
         -> Group w
+        -> Co w Unit
         -> Co w (Co w Unit)
         -> Co w (Maybe (Co w Unit))
   , finished : Group w -> Bool -> Co w (List (Co w Unit))
   , pending : Group w -> Co w Int
   , close : Group w -> Co w Unit
-  , wake : Group w -> Co w Unit
+  , number : Group w -> Int
   }
 
--- (what the domains running behaviours share: the next cown's number;
--- how many behaviours are not yet done, and acts not yet come to their
--- values, main's own run one of them; what is run where a body fails,
--- and how many times that failed too; those ready, which the domains
--- take from, `Nothing` telling a domain to stop; and where the last
--- behaviour done says so, once, for `scheduled` to wait on.  Where the
--- scheduler waits on the world through the reactor, its operations;
--- and, as a domain waiting there cannot wait on a queue too, those
--- ready are kept apart instead, under a mutex -- a queue, its front and
--- its back reversed, and how many it holds, read without the mutex --
--- unless a worker made them ready, which keeps them in a queue of its
--- own; the domains with nothing to do waiting on a
--- condition, counted, or in the reactor, where they have acts pending,
--- counted too; whether the domains are to stop; and the workers, for
--- those waiting in the reactor to be woken; and how many behaviours a
--- domain runs in a row from its slot, its batch, before it puts the
--- next among those ready; `b` the behaviours.  It is kept forever
--- (`Domain.forever`), with the workers' cells, so that no domain
--- counts it, nor what it holds, as every domain reads them all through
--- the run)
-type Scheduler (w : HFunctor) (b : Type) =
-  { numbers : Domain.Atomic Int
-  , live : Domain.Atomic Int
-  , failed : String -> Co w Unit
-  , unreported : Domain.Atomic (Maybe String)
-  , ready : Domain.Queue (Maybe b)
-  , done : Domain.Queue Unit
-  , outside : Maybe (Outside w)
-  , mutex : Domain.Mutex
-  , work : Domain.Condition
-  , waiting : Domain.Atomic (Pair (List b) (List b))
-  , queued : Domain.Atomic Int
-  , idle : Domain.Atomic Int
-  , polling : Domain.Atomic Int
-  , stopping : Domain.Atomic Bool
-  , workers : List (Worker w b)
-  , batch : Int
-  }
+-- (a behaviour let go of, its condition not holding: spawned again)
+type Again (w : HFunctor) = Co w Unit
 
--- (a behaviour spawned: how many of its cowns it still waits for, and
--- one more until its spawning is done; and its turn, given the
--- scheduler as the domain it runs on holds it, and that domain -- a
--- worker, or nothing, for main, which runs none)
-data Behaviour (w : HFunctor)
-  = MkBehaviour (Domain.Atomic Int) (Scheduler w (Behaviour w)
-                                     -> Maybe (Worker w (Behaviour w))
-                                     -> Co w Unit)
-
--- (the scheduler's state, as a domain holds it)
-type Sched (w : HFunctor) = Scheduler w (Behaviour w)
-
--- (the domain a computation of the scheduler's runs on: a worker, or
--- main, with neither)
-type Runner (w : HFunctor) = Maybe (Worker w (Behaviour w))
-
--- (what a request holds -- a behaviour's request for one cown is a
--- cell holding its link: it has not come to all its cowns' queues yet;
--- it has, and none is linked behind it; or the behaviour linked behind
--- it.  `NoRequest` is held by the one cell a cown's queue keeps as its
--- last while no behaviour waits for it, which no behaviour's request
--- is)
-data Link (w : HFunctor)
-  = NotCome
-  | Come
-  | Behind (Behaviour w)
-  | NoRequest
-
--- (a request: compared only as the cell it is, never rebuilt)
-type Request (w : HFunctor) = Domain.Atomic (Link w)
-
--- (a behaviour let go of, its condition not holding: spawned again,
--- given the scheduler as the domain spawning it holds it)
-type Again (w : HFunctor) = Sched w -> Runner w -> Co w Unit
-
--- (a cown, as its queue: its number, which orders the cowns of a
--- behaviour; the last request for it; the request it keeps as the
--- last while no behaviour waits for it; and the behaviours waiting for
--- it to be written, their conditions reading it -- held, as what it
--- holds is, only by the behaviour that has the cown)
+-- (a cown, as the runtime orders its behaviours: its turnstile; and the
+-- behaviours waiting for it to be written, their conditions reading it
+-- -- held, as what it holds is, only by the behaviour that has the cown)
 data Handle (w : HFunctor)
-  = MkHandle Int (Domain.Atomic (Request w)) (Request w) (Domain.Atomic
-                                                            (List (Again w)))
+  = MkHandle Domain.Turnstile (Domain.Atomic (List (Again w)))
 
 -- | A cown holding an `a`, of behaviours run in the world `w`.
 data Cown (w : HFunctor) a = MkCown (Handle w) (Domain.Atomic a)
+
+turnstileOf : {w : HFunctor} -> Handle w -> Domain.Turnstile
+turnstileOf (MkHandle t waiting) = t
 
 handleOf : {w : HFunctor} -> {a : Type} -> Cown w a -> Handle w
 handleOf (MkCown h at) = h
@@ -457,11 +318,8 @@ handleOf (MkCown h at) = h
 cellOf : {w : HFunctor} -> {a : Type} -> Cown w a -> Domain.Atomic a
 cellOf (MkCown h at) = at
 
-numberOf : {w : HFunctor} -> Handle w -> Int
-numberOf (MkHandle n last none waiting) = n
-
 waitingOf : {w : HFunctor} -> Handle w -> Domain.Atomic (List (Again w))
-waitingOf (MkHandle n last none waiting) = waiting
+waitingOf (MkHandle t waiting) = waiting
 
 -- (a `Bool` of a `with`'s names, the first's, or `True` where none is)
 firstFlag : List Bool -> Bool
@@ -1062,440 +920,24 @@ instanceHolderCownsAwait =
 -- The scheduler
 --------------------------------------------------------------------------------
 
--- (how many operations a body does, on a worker, before the worker
--- lets its slot out: puts the behaviour in it among those ready)
-fuelLimit : Int
-fuelLimit = 256
+-- (a place, under `scheduledWithReactor`: a domain of its own working the
+-- pool, with a group of the reactor opened there, where the acts awaited
+-- by the behaviours it runs wait; those acts given it and not yet
+-- started, the last first)
+type Place (w : HFunctor) = { inbox : Domain.Atomic (List (Starting w)) }
 
--- (a worker waiting in the reactor woken, the first found that no
--- other has woken: taken out of those waiting there, so the next
--- behaviour put among those ready wakes another; the mutex not held,
--- so no domain waits for it while the wake goes to the system.  For a
--- behaviour put among those ready where no domain waits on the
--- condition)
-wokenPolling : {w : HFunctor}
-             -> {{dm : Domain.domain <: w}}
-             -> Sched w
-             -> Outside w
-             -> List (Worker w (Behaviour w))
-             -> Co w Unit
-wokenPolling st o Nil = pure ()
-wokenPolling st o (worker :: rest) = do
-  mine <- Domain.cas worker.polling True False
-  if mine
-  then do
-    _ <- Domain.fetchAdd st.polling (0 - 1)
-    g <- Domain.get worker.group
-    case g of
-      Just grp -> o.wake grp
-      Nothing -> pure ()
-  else wokenPolling st o rest
-
--- (every worker waiting in the reactor woken, the mutex held: the
--- domains to stop)
-wokenAllPolling : {w : HFunctor}
-                -> {{dm : Domain.domain <: w}}
-                -> Outside w
-                -> List (Worker w (Behaviour w))
-                -> Co w Unit
-wokenAllPolling o Nil = pure ()
-wokenAllPolling o (worker :: rest) = do
-  p <- Domain.get worker.polling
-  g <- Domain.get worker.group
-  case g of
-    Just grp -> if p then o.wake grp else pure ()
-    Nothing -> pure ()
-  wokenAllPolling o rest
-
--- (`b` put among those ready, for any domain to take: where the
--- scheduler waits on the world through the reactor, at the back of
--- the queue, a domain waiting on the condition woken, or else, once
--- the mutex is let go of, one waiting in the reactor.  A domain about
--- to wait there counts itself among those waiting, under the mutex,
--- before it looks at the queue a last time; so one counted after `b`
--- was put finds `b`, and one counted before is seen here)
-readied : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Behaviour w
-        -> Co w Unit
-readied st b = case st.outside of
-  Nothing -> Domain.put st.ready (Just b)
-  Just o -> do
-    Domain.lock st.mutex
-    q <- Domain.get st.waiting
-    Domain.set st.waiting (MkPair (fst q) (b :: snd q))
-    _ <- Domain.fetchAdd st.queued 1
-    idle <- Domain.get st.idle
-    if idle > 0
-    then do
-      Domain.signal st.work
-      Domain.unlock st.mutex
-    else do
-      Domain.unlock st.mutex
-      p <- Domain.get st.polling
-      if p > 0 then wokenPolling st o st.workers else pure ()
-
--- (the first behaviour of the queue, the mutex held, if one is)
-dequeued : {w : HFunctor}
-         -> {{dm : Domain.domain <: w}}
-         -> Sched w
-         -> Co w (Maybe (Behaviour w))
-dequeued st = do
-  q <- Domain.get st.waiting
-  case q of
-    MkPair (b :: front) back -> do
-      Domain.set st.waiting (MkPair front back)
-      _ <- Domain.fetchAdd st.queued (0 - 1)
-      pure (Just b)
-    MkPair Nil Nil -> pure Nothing
-    MkPair Nil back -> do
-      Domain.set st.waiting (MkPair (List.reverse back) Nil)
-      dequeued st
-
--- (the first of those ready, where any is, the mutex taken only where
--- the count says one may be)
-dequeuedAny : {w : HFunctor}
-            -> {{dm : Domain.domain <: w}}
-            -> Sched w
-            -> Co w (Maybe (Behaviour w))
-dequeuedAny st = do
-  n <- Domain.get st.queued
-  if n > 0
-  then do
-    Domain.lock st.mutex
-    first <- dequeued st
-    Domain.unlock st.mutex
-    pure first
-  else pure Nothing
-
--- (the queue with `b` at its back)
-withBack : {b : Type} -> b -> Local b -> Local b
-withBack b NoneQueued = Queued [b] Nil
-withBack b (Queued front back) = Queued front (b :: back)
-
--- (the queue without its front; none left, `NoneQueued`)
-withoutFront : {b : Type} -> List b -> List b -> Local b
-withoutFront Nil Nil = NoneQueued
-withoutFront front back = Queued front back
-
--- (`b` put at the back of a worker's queue: by that worker alone, the
--- others only taking from it)
-pushedBack : {w : HFunctor}
-           -> {b : Type}
-           -> {{dm : Domain.domain <: w}}
-           -> Domain.Atomic (Local b)
-           -> b
-           -> Co w Unit
-pushedBack at b = do
-  q <- Domain.get at
-  ok <- Domain.cas at q (withBack b q)
-  if ok then pure () else pushedBack at b
-
--- (the front of a worker's queue taken, where one is: by that worker,
--- or by another taking from it)
-poppedFront : {w : HFunctor}
-            -> {b : Type}
-            -> {{dm : Domain.domain <: w}}
-            -> Domain.Atomic (Local b)
-            -> Co w (Maybe b)
-poppedFront at = do
-  q <- Domain.get at
-  case q of
-    NoneQueued -> pure Nothing
-    Queued (x :: front) back -> do
-      ok <- Domain.cas at q (withoutFront front back)
-      if ok then pure (Just x) else poppedFront at
-    Queued Nil back -> do
-      _ <- Domain.cas at q (Queued (List.reverse back) Nil)
-      poppedFront at
-
--- (one taken from the first of the others' queues that has one)
-stolen : {w : HFunctor}
-       -> {b : Type}
-       -> {{dm : Domain.domain <: w}}
-       -> List (Domain.Atomic (Local b))
-       -> Co w (Maybe b)
-stolen Nil = pure Nothing
-stolen (at :: rest) = do
-  got <- poppedFront at
-  case got of
-    Just x -> pure got
-    Nothing -> stolen rest
-
--- (a domain with nothing to do woken, where one is, to take what a
--- worker has just put in its queue: one waiting on the condition, else
--- one waiting in the reactor.  A domain about to wait counts itself
--- among those waiting before it looks at the queues a last time; so one
--- counted after `b` was put finds it, and one counted before is seen
--- here)
-wokenOne : {w : HFunctor}
-         -> {{dm : Domain.domain <: w}}
-         -> Sched w
-         -> Outside w
-         -> Co w Unit
-wokenOne st o = do
-  idle <- Domain.get st.idle
-  if idle > 0
-  then do
-    Domain.lock st.mutex
-    Domain.signal st.work
-    Domain.unlock st.mutex
-  else do
-    p <- Domain.get st.polling
-    if p > 0 then wokenPolling st o st.workers else pure ()
-
--- (`b`'s turn come on a worker whose slot is taken, or which lets it
--- out: where the scheduler waits on the world through the reactor, at
--- the back of the worker's queue, a domain with nothing to do woken to
--- take it; else among those ready)
-spilled : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Worker w (Behaviour w)
-        -> Behaviour w
-        -> Co w Unit
-spilled st worker b = case st.outside of
-  Nothing -> readied st b
-  Just o -> do
-    pushedBack worker.local b
-    wokenOne st o
-
--- (`b`'s turn come, on `runner`: kept in the worker's slot where it is
--- a worker's and the slot is empty, else put in its queue, or, from
--- main, among those ready)
-ready : {w : HFunctor}
-      -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Runner w
-      -> Behaviour w
-      -> Co w Unit
-ready st Nothing b = readied st b
-ready st (Just worker) b = do
-  kept <- Domain.get worker.slot
-  case kept of
-    Nothing -> Domain.set worker.slot (Just b)
-    Just k -> spilled st worker b
-
--- (one operation of the body on `runner` charged to its fuel: on a
--- worker whose body has used its fuel, the behaviour in the slot, where
--- one is, put among those ready, which wakes a domain waiting for one,
--- and the fuel filled again)
-charged : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Runner w
-        -> Co w Unit
-charged st Nothing = pure ()
-charged st (Just worker) = do
-  left <- Domain.fetchAdd worker.fuel (0 - 1)
-  if left > 1 then pure ()
-  else do
-    Domain.set worker.fuel fuelLimit
-    kept <- Domain.get worker.slot
-    case kept of
-      Just b -> do
-        Domain.set worker.slot (Nothing : Maybe (Behaviour w))
-        spilled st worker b
-      Nothing -> pure ()
-
--- (one fewer cown, or the spawning, waited for: where none is left, its
--- turn come)
-resolved : {w : HFunctor}
-         -> {{dm : Domain.domain <: w}}
-         -> Sched w
-         -> Runner w
-         -> Behaviour w
-         -> Co w Unit
-resolved st runner b = case b of
-  MkBehaviour count turn -> do
-    n <- Domain.fetchAdd count (0 - 1)
-    if n == 1 then ready st runner b else pure ()
-
--- (the cell holds `v` now: what it held)
-swapped : {w : HFunctor}
-        -> {a : Type}
-        -> {{dm : Domain.domain <: w}}
-        -> Domain.Atomic a
-        -> a
-        -> Co w a
-swapped at v = do
-  old <- Domain.get at
-  ok <- Domain.cas at old v
-  if ok then pure old else swapped at v
-
--- (the request's link, waiting until its behaviour has come to all its
--- cowns' queues)
-linkOnceCome : {w : HFunctor}
-             -> {{dm : Domain.domain <: w}}
-             -> Request w
-             -> Co w (Link w)
-linkOnceCome r = do
-  link <- Domain.get r
-  case link of
-    NotCome -> linkOnceCome r
-    _ -> pure link
-
--- (the behaviour linked behind the request, waiting until one is)
-linkedBehind : {w : HFunctor}
-             -> {{dm : Domain.domain <: w}}
-             -> Request w
-             -> Co w (Behaviour w)
-linkedBehind r = do
-  link <- Domain.get r
-  case link of
-    Behind b -> pure b
-    _ -> linkedBehind r
-
--- (a request, as a behaviour holds it: its cown's queue, and the very
--- cell swapped in as the last, which only it takes out again)
-type Held (w : HFunctor) = Pair (Handle w) (Request w)
-
--- (a new request for the cown)
-requested : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Handle w
-          -> Co w (Held w)
-requested h = do
-  r <- Domain.newAtomic (NotCome : Link w)
-  pure (MkPair h r)
-
-requestedAll : {w : HFunctor}
-             -> {{dm : Domain.domain <: w}}
-             -> List (Handle w)
-             -> Co w (List (Held w))
-requestedAll Nil = pure Nil
-requestedAll (h :: hs) = do
-  r <- requested h
-  rs <- requestedAll hs
-  pure (r :: rs)
-
--- (the first phase: the behaviour come to each cown's queue as its last
--- request, linked behind the one before, once that one has come; where
--- none was, the cown is its at once)
-queued : {w : HFunctor}
-       -> {{dm : Domain.domain <: w}}
-       -> Sched w
-       -> Runner w
-       -> Behaviour w
-       -> List (Held w)
-       -> Co w Unit
-queued st runner b Nil = pure ()
-queued st runner b (MkPair (MkHandle n last none waiting) r :: rest) = do
-  prev <- swapped last r
-  link <- linkOnceCome prev
-  case link of
-    NoRequest -> resolved st runner b
-    _ -> Domain.set prev (Behind b)
-  queued st runner b rest
-
--- (the second phase: each request marked come)
-markedCome : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> List (Held w)
-           -> Co w Unit
-markedCome Nil = pure ()
-markedCome (MkPair h r :: rest) = do
-  Domain.set r Come
-  markedCome rest
-
--- (the behaviour done with the cown: handed to the one linked behind
--- it; where none is, the request taken out as the last, unless one has
--- just swapped itself in, which is then waited for to link)
-released : {w : HFunctor}
-         -> {{dm : Domain.domain <: w}}
-         -> Sched w
-         -> Runner w
-         -> Held w
-         -> Co w Unit
-released st runner (MkPair (MkHandle n last none waiting) r) = do
-  link <- Domain.get r
-  case link of
-    Behind b -> resolved st runner b
-    _ -> do
-      out <- Domain.cas last r none
-      if out then pure ()
-      else do
-        b <- linkedBehind r
-        resolved st runner b
-
-releasedAll : {w : HFunctor}
-            -> {{dm : Domain.domain <: w}}
-            -> Sched w
-            -> Runner w
-            -> List (Held w)
-            -> Co w Unit
-releasedAll st runner Nil = pure ()
-releasedAll st runner (r :: rs) = do
-  released st runner r
-  releasedAll st runner rs
-
--- (`n` behaviours or acts done, or main: where none is left, said
--- once, for `scheduled`)
-finishedBy : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> Sched w
-           -> Int
-           -> Co w Unit
-finishedBy st n = do
-  was <- Domain.fetchAdd st.live (0 - n)
-  if was == n then Domain.put st.done MkUnit else pure ()
-
--- (main done)
-finished : {w : HFunctor} -> {{dm : Domain.domain <: w}} -> Sched w -> Co w Unit
-finished st = finishedBy st 1
-
--- (a behaviour or an act done, on `runner`: on a worker, counted there,
--- `live` told only once the worker has nothing to run -- so `live`
--- never counts fewer than are not done, and the domains do not all
--- change it at once for every behaviour)
-finishedOn : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> Sched w
-           -> Runner w
-           -> Co w Unit
-finishedOn st Nothing = finished st
-finishedOn st (Just worker) = do
-  _ <- Domain.fetchAdd worker.ended 1
-  pure ()
-
--- (a behaviour or an act begun, on `runner`: on a worker where one has
--- ended that `live` still counts, counted as that one, `live` not
--- changed)
-begunOn : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Runner w
-        -> Co w Unit
-begunOn st Nothing = do
-  _ <- Domain.fetchAdd st.live 1
-  pure ()
-begunOn st (Just worker) = do
-  e <- Domain.get worker.ended
-  if e > 0 then Domain.set worker.ended (e - 1)
-  else do
-    _ <- Domain.fetchAdd st.live 1
-    pure ()
-
--- (those ended on the worker taken off `live`: before it looks for a
--- behaviour beyond its slot, or waits)
-toldEnded : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Worker w (Behaviour w)
-          -> Co w Unit
-toldEnded st worker = do
-  e <- Domain.get worker.ended
-  if e > 0
-  then do
-    Domain.set worker.ended 0
-    finishedBy st e
-  else pure ()
-
--- (no number twice, of numbers in order)
-distinct : List Int -> Bool
-distinct (a :: b :: rest) = a /= b && distinct (b :: rest)
-distinct _ = True
+-- (the scheduler: the runtime's pool its behaviours run in; what is run
+-- where a body or an act fails, and the first time that failed too;
+-- and, under `scheduledWithReactor`, the reactor's operations and the
+-- places working the pool.  Kept forever (`Domain.forever`), so that no
+-- domain counts it as it reads it)
+type Sched (w : HFunctor) =
+  { pool : Domain.Pool
+  , failed : String -> Co w Unit
+  , unreported : Domain.Atomic (Maybe String)
+  , outside : Maybe (Outside w)
+  , places : List (Place w)
+  }
 
 -- (a `failed` failed, as `why` says: the first such failure kept, for
 -- the run to fail with at its end)
@@ -1508,16 +950,25 @@ unreportedAs st why = do
   _ <- Domain.cas st.unreported (Nothing : Maybe String) (Just why)
   pure ()
 
+-- (a body or an act failed, as `why` says: `failed` given why, kept
+-- where that fails too)
+reported : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> String
+         -> Co w Unit
+reported st why = do
+  r <- Domain.tried (bind (later (\u -> st.failed why)) (\c -> c))
+  case r of
+    Right u -> pure ()
+    Left again -> unreportedAs st again
+
 -- (each spawned again, in order)
-spawnedAgain : {w : HFunctor}
-             -> Sched w
-             -> Runner w
-             -> List (Again w)
-             -> Co w Unit
-spawnedAgain st runner Nil = pure ()
-spawnedAgain st runner (again :: rest) = do
-  again st runner
-  spawnedAgain st runner rest
+spawnedAgain : {w : HFunctor} -> List (Again w) -> Co w Unit
+spawnedAgain Nil = pure ()
+spawnedAgain (again :: rest) = do
+  again
+  spawnedAgain rest
 
 -- (`once` waiting on each cown)
 waitingOn : {w : HFunctor}
@@ -1536,16 +987,17 @@ waitingOn (h :: hs) once = do
 -- came to wait)
 woken : {w : HFunctor}
       -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Runner w
       -> List (Handle w)
       -> Co w Unit
-woken st runner Nil = pure ()
-woken st runner (h :: hs) = do
+woken Nil = pure ()
+woken (h :: hs) = do
   waiting <- Domain.get (waitingOf h)
-  Domain.set (waitingOf h) Nil
-  spawnedAgain st runner (List.reverse waiting)
-  woken st runner hs
+  case waiting of
+    Nil -> pure ()
+    _ -> do
+      Domain.set (waitingOf h) (Nil : List (Again w))
+      spawnedAgain (List.reverse waiting)
+  woken hs
 
 -- (a behaviour whose condition does not hold, which still has its
 -- cowns: waiting on those its condition reads, to be spawned again,
@@ -1557,128 +1009,135 @@ waited : {w : HFunctor}
        -> Co w Unit
 waited hs again = do
   armed <- Domain.newAtomic (True : Bool)
-  let once : Again w = \here on -> do
+  let once : Again w = do
     first <- Domain.cas armed True False
-    if first then again here on else pure ()
+    if first then again else pure ()
   waitingOn hs once
 
--- (a behaviour spawned on its cowns' queues, `rd` and `wr` reading and
--- writing what they hold, `wt` what it waits for, `body` its work,
--- given the scheduler as the domain running it holds it: what they hold
--- is written after the body, by its answer, and the behaviours waiting
--- on the cowns written spawned again; a body that fails leaves them as
--- they were, and its failure is given to `failed` before they are let
--- go.  Where its condition does not hold of what they hold, the
--- behaviour lets go of them untouched and waits on those it reads, to
--- be spawned again)
-spawnedOn : {w : HFunctor}
-          -> {t : Type}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Runner w
-          -> List (Handle w)
-          -> Reading w t
-          -> Writing w t
-          -> Waiting w t
-          -> (t -> Sched w -> Runner w -> Co w t)
-          -> Co w Unit
-spawnedOn st runner hs rd wr wt body = do
-  let ordered = List.sortOn (\h -> numberOf h) hs
-  if not (distinct (List.map numberOf ordered)) then abandon
-  else do
-    begunOn st runner
-    held <- requestedAll ordered
-    count <- Domain.newAtomic (List.length held + 1)
-    let turn : Sched w -> Runner w -> Co w Unit = \here on -> do
-      v <- rd dm
-      -- (the condition and the body applied when the computation
-      -- tried runs, not where it is built: one that fails as it is
-      -- applied fails there, caught)
-      outcome <-
-        Domain.tried
-          (bind
-             (later
-                (\u ->
-                   if wt.holds v
-                   then bind (body v here on) (\a -> pure (Just a))
-                   else pure (Nothing : Maybe t)))
-             (\c -> c))
-      case outcome of
-        Right (Just after) -> do
-          wr dm after
-          woken here on wt.writes
-        Right Nothing ->
-          waited wt.reads (\st2 on2 -> spawnedOn st2 on2 hs rd wr wt body)
-        Left why -> do
-          reported <-
-            Domain.tried (bind (later (\u -> here.failed why)) (\c -> c))
-          case reported of
-            Right u -> pure ()
-            Left again -> unreportedAs here again
-      releasedAll here on held
-      finishedOn here on
-    let b : Behaviour w = MkBehaviour count turn
-    queued st runner b held
-    markedCome held
-    resolved st runner b
+-- (a behaviour spawned on its cowns' turnstiles, `rd` and `wr` reading
+-- and writing what they hold, `wt` what it waits for, `body` its work:
+-- what they hold is written after the body, by its answer, and the
+-- behaviours waiting on the cowns written spawned again; a body that
+-- fails leaves them as they were, and the pool gives its failure to
+-- `failed` before they are let go.  Where its condition does not hold
+-- of what they hold, the behaviour lets go of them untouched and waits
+-- on those it reads, to be spawned again.  The same cown twice
+-- abandons, here)
+spawned : {w : HFunctor}
+        -> {t : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> List (Handle w)
+        -> Reading w t
+        -> Writing w t
+        -> Waiting w t
+        -> (t -> Co w t)
+        -> Co w Unit
+spawned st hs rd wr wt body =
+  Domain.behave
+    st.pool
+    (List.map turnstileOf hs)
+    (do
+     v <- rd dm
+     if wt.holds v
+     then do
+       after <- body v
+       wr dm after
+       woken wt.writes
+     else waited wt.reads (spawned st hs rd wr wt body))
+    st.failed
 
 -- (a cown made)
 madeCown : {w : HFunctor}
          -> {x a : Type}
          -> {{dm : Domain.domain <: w}}
-         -> Sched w
          -> Making w x a
          -> Co w x
-madeCown st (MkMaking v k) = do
-  n <- Domain.fetchAdd st.numbers 1
-  none <- Domain.newAtomic (NoRequest : Link w)
-  last <- Domain.newAtomic none
-  waiting <- Domain.newAtomic Nil
+madeCown (MkMaking v k) = do
+  t <- Domain.newTurnstile
+  waiting <- Domain.newAtomic (Nil : List (Again w))
   cell <- Domain.newAtomic v
-  pure (k (MkCown (MkHandle n last none waiting) cell))
+  pure (k (MkCown (MkHandle t waiting) cell))
 
--- (`act` awaited, from `runner`, and `k` given its value once it has
--- come to it, on that runner, and the scheduler as it holds it.  Where
--- the scheduler waits on the world through the reactor: on a worker,
--- the act kept, to be started in its group once the behaviour running
--- is done, and counted until it has come to its value; from main, a
--- behaviour on no cown spawned, to do that on a worker.  Where it does
--- not, the act run there and then)
+-- (`v` put at the front of what the cell holds, by a compare-and-swap)
+pushed : {w : HFunctor}
+       -> {x : Type}
+       -> {{dm : Domain.domain <: w}}
+       -> Domain.Atomic (List x)
+       -> x
+       -> Co w Unit
+pushed cell v = do
+  xs <- Domain.get cell
+  ok <- Domain.cas cell xs (v :: xs)
+  if ok then pure () else pushed cell v
+
+-- (what the cell holds taken out, by a compare-and-swap: first pushed
+-- first)
+takenAll : {w : HFunctor}
+         -> {x : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> Domain.Atomic (List x)
+         -> Co w (List x)
+takenAll cell = do
+  xs <- Domain.get cell
+  case xs of
+    Nil -> pure Nil
+    _ -> do
+      ok <- Domain.cas cell xs (Nil : List x)
+      if ok then pure (List.reverse xs) else takenAll cell
+
+nthPlace : {w : HFunctor} -> Int -> List (Place w) -> Maybe (Place w)
+nthPlace i Nil = Nothing
+nthPlace i (p :: ps) = if i <= 0 then Just p else nthPlace (i - 1) ps
+
+-- (what comes once an act has come to its value: a behaviour on no
+-- cown spawned to run it, then the act no longer holding the pool)
+afterAct : {w : HFunctor}
+         -> {{dm : Domain.domain <: w}}
+         -> Sched w
+         -> Co w Unit
+         -> Co w Unit
+afterAct st c = do
+  spawned
+      st
+      Nil
+      (\dm2 -> pure MkUnit)
+      (\dm2 u -> pure MkUnit)
+      unconditioned
+      (\u -> c)
+  Domain.unhold st.pool
+
+-- (`act` awaited, and `k` given its value once it has come to it.
+-- Where the scheduler waits on the world through the reactor: the act
+-- given the place whose domain this is, holding the pool until it has
+-- come to its value or is given up, to be started in its group once the
+-- behaviour running is done; from a domain working no place, by a
+-- behaviour on no cown spawned to await it.  Where it does not, the act
+-- run there and then)
 awaited : {w : HFunctor}
         -> {a : Type}
         -> {{dm : Domain.domain <: w}}
         -> Sched w
-        -> Runner w
         -> Maybe Custodian.Custodian
         -> Co w a
-        -> (a -> Sched w -> Runner w -> Co w Unit)
+        -> (a -> Co w Unit)
         -> Co w Unit
-awaited st runner cust act k = case st.outside of
-  Nothing -> bind act (\v -> k v st runner)
-  Just o -> case runner of
-    Just worker -> do
-      begunOn st runner
-      acts <- Domain.get worker.starting
-      Domain.set
-          worker.starting
-          (MkStarting cust (bind act (\v -> pure (k v st runner))) :: acts)
-    Nothing ->
-      spawnedOn
-        st
-        Nothing
-        Nil
-        (\dm -> pure MkUnit)
-        (\dm u -> pure MkUnit)
-        unconditioned
-        (\u here on -> awaited here on cust act k)
-
--- (the handler's monad, a computation given the domain it runs on, as
--- a functor)
-runnerFunctor : (w : HFunctor) -> RawFunctor
-runnerFunctor w =
-  { f = \a -> Runner w -> Co w a
-  , fmap = \g m -> \runner -> bind (m runner) (\x -> val (g x))
-  }
+awaited st cust act k = case st.outside of
+  Nothing -> bind act k
+  Just o -> do
+    i <- Domain.here st.pool
+    case nthPlace i st.places of
+      Just pl -> do
+        Domain.hold st.pool
+        pushed
+            pl.inbox
+            (MkStarting cust (bind act (\v -> pure (afterAct st (k v)))))
+      Nothing ->
+        Domain.behave
+          st.pool
+          Nil
+          (awaited st cust act k)
+          (\why -> reported st why)
 
 -- (`c` run with `k` the custodian current, where there is one: a body
 -- run later, elsewhere, as the custodian current where it was spawned
@@ -1692,558 +1151,195 @@ custodiedAt : {w : HFunctor}
 custodiedAt Nothing c = c
 custodiedAt (Just k) c = Custodian.custodied k c
 
--- (an operation, on `runner`, charged to the body's fuel: the world's
--- own forwarded, their computations given the runner; a behaviour
--- spawned, and an act awaited and what comes after it, run with the
--- custodian current here)
+-- (an operation of boc's: a cown made, a behaviour spawned -- run, by the
+-- pool, with the custodian current here -- and an act awaited and what
+-- comes after it, run with the custodian current here; `opened` how a
+-- body spawned is run)
 bocAlg : {w : HFunctor}
        -> {x : Type}
        -> {{dm : Domain.domain <: w}}
        -> {{cu : Custodian.custodian <: w}}
        -> Sched w
-       -> ({t : Type} -> Sched w -> Body (BocF w) w t -> Runner w -> Co w t)
-       -> Runner w
-       -> (boc w <+> w).f (\a -> Runner w -> Co w a) x
+       -> ({t : Type} -> Body (BocF w) w t -> Co w t)
+       -> BocF w (Co w) x
        -> Co w x
-bocAlg st opened runner (InL (NewCown s)) = do
-  charged st runner
-  s (Co w x) (\a mk -> madeCown st mk)
-bocAlg st opened runner (InL (When s)) = do
-  charged st runner
-  cust <- Custodian.current
+bocAlg st opened (NewCown s) = s (Co w x) (\a mk -> madeCown mk)
+bocAlg st opened (When s) =
   s (Co w x) (\t bh -> case bh of
     MkBehaving hs rd wr wt body k ->
-      bind
-        (spawnedOn
-           st
-           runner
-           hs
-           rd
-           wr
-           wt
-           (\v here on -> custodiedAt cust (opened here (body v) on)))
-        (\u -> pure k))
-bocAlg st opened runner (InL (Awaits s)) = do
-  charged st runner
+      bind (spawned st hs rd wr wt (\v -> opened (body v))) (\u -> pure k))
+bocAlg st opened (Awaits s) = do
   cust <- Custodian.current
   s (Co w x) (\t aw -> case aw of
     MkAwaiting act k next ->
       bind
         (awaited
            st
-           runner
            cust
            (custodiedAt cust act)
-           (\v here on -> custodiedAt cust (opened here (k v) on)))
+           (\v -> custodiedAt cust (opened (k v))))
         (\u -> pure next))
-bocAlg st opened runner (InR q) = do
-  charged st runner
-  op (w.hmap (runnerFunctor w) (coFunctor w) (\m -> m runner) q) val
 
--- (the handler: a computation given the domain it runs on, so that a
--- body's spawning knows the worker's slot; `opened` how a body spawned
--- is run, given the scheduler as the domain running it holds it)
-bocHandlerBy : {w : HFunctor}
-             -> {{dm : Domain.domain <: w}}
-             -> {{cu : Custodian.custodian <: w}}
-             -> Sched w
-             -> ({t : Type}
-                 -> Sched w
-                 -> Body (BocF w) w t
-                 -> Runner w
-                 -> Co w t)
-             -> Handler (boc w <+> w)
-bocHandlerBy st opened =
-  { M = \a -> Runner w -> Co w a
-  , ret = \v -> \runner -> pure v
-  , bind = \m f -> \runner -> bind (m runner) (\x -> f x runner)
-  , malg = \p -> \runner -> bocAlg st opened runner p
-  }
+-- (a computation of the scheduler's world with boc's operations, run:
+-- handled by `bocAlg`, the world's own handed on)
+handled : {w : HFunctor}
+        -> {a : Type}
+        -> {{dm : Domain.domain <: w}}
+        -> {{cu : Custodian.custodian <: w}}
+        -> Sched w
+        -> ({t : Type} -> Body (BocF w) w t -> Co w t)
+        -> Co (boc w <+> w) a
+        -> Co w a
+handled st opened c = handle (through (boc w) w (\p -> bocAlg st opened p)) c
 
 -- (a body spawned, run: put in the scheduler's world, `boc w <+> w`,
--- and handled there, with the scheduler as the domain running it holds
--- it)
+-- and handled there)
 opening : {w : HFunctor}
         -> {t : Type}
         -> {{dm : Domain.domain <: w}}
         -> {{cu : Custodian.custodian <: w}}
         -> Sched w
         -> Body (BocF w) w t
-        -> Runner w
         -> Co w t
 opening st b =
-  handle
-    (bocHandlerBy st (\here b2 -> opening here b2))
+  handled
+    st
+    (\b2 -> opening st b2)
     (b (boc w <+> w) (inl (boc w) w) (inr (boc w) w))
 
--- (the handler, its bodies spawned run by it too)
-bocHandler : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> {{cu : Custodian.custodian <: w}}
-           -> Sched w
-           -> Handler (boc w <+> w)
-bocHandler st = bocHandlerBy st (\here b -> opening here b)
-
--- (an act come to its value: what comes after it run, and the act no
--- longer counted)
-resumed : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Worker w (Behaviour w)
-        -> Co w Unit
-        -> Co w Unit
-resumed st worker k = do
-  k
-  finishedOn st (Just worker)
-
-resumedAll : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> Sched w
-           -> Worker w (Behaviour w)
-           -> List (Co w Unit)
-           -> Co w Unit
-resumedAll st worker Nil = pure ()
-resumedAll st worker (k :: ks) = do
-  resumed st worker k
-  resumedAll st worker ks
-
--- (an act started in the group: in a custody, as one of its things)
+-- (an act started in the group: in a custody, as one of its things,
+-- the pool let go of where it is given up)
 startedIn : {w : HFunctor}
+          -> {{dm : Domain.domain <: w}}
+          -> Sched w
           -> Outside w
           -> Group w
           -> Starting w
           -> Co w (Maybe (Co w Unit))
-startedIn o g (MkStarting Nothing act) = o.start g act
-startedIn o g (MkStarting (Just c) act) = o.startIn c g act
+startedIn st o g (MkStarting Nothing act) = o.start g act
+startedIn st o g (MkStarting (Just c) act) =
+  o.startIn c g (Domain.unhold st.pool) act
+
+-- (each run, in order)
+ranAll : {w : HFunctor} -> List (Co w Unit) -> Co w Unit
+ranAll Nil = pure ()
+ranAll (k :: ks) = do
+  k
+  ranAll ks
 
 -- (the acts given, started in the group in their order: each come to
--- its value at once resumed there)
+-- its value at once, what follows it run)
 startedEach : {w : HFunctor}
             -> {{dm : Domain.domain <: w}}
             -> Sched w
-            -> Worker w (Behaviour w)
             -> Outside w
             -> Group w
             -> List (Starting w)
             -> Co w Unit
-startedEach st worker o g Nil = pure ()
-startedEach st worker o g (act :: acts) = do
-  r <- startedIn o g act
+startedEach st o g Nil = pure ()
+startedEach st o g (act :: acts) = do
+  r <- startedIn st o g act
   case r of
-    Just k -> resumed st worker k
+    Just k -> k
     Nothing -> pure ()
-  startedEach st worker o g acts
+  startedEach st o g acts
 
--- (how many behaviours a worker runs between two looks at its group's
+-- (how many behaviours a place runs before it looks at its group's
 -- acts finished, not waiting: a look polls every act pending there, so
--- a domain holding many -- a server's idle connections -- would spend
--- its time looking after each behaviour; one with nothing else to run
--- looks, waiting, at once)
+-- one holding many -- a server's idle connections -- would spend its
+-- time looking; one with nothing else to run looks, waiting, at once)
 pollEvery : Int
 pollEvery = 64
 
--- (after a behaviour, on its worker, where the scheduler waits on the
--- world through the reactor: the acts it awaited started in the
--- worker's group, and, every `pollEvery` behaviours, those of the group
--- finished since it last asked resumed, not waiting for one)
-afterTurn : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Worker w (Behaviour w)
-          -> Co w Unit
-afterTurn st worker = case st.outside of
-  Nothing -> pure ()
-  Just o -> do
-    on <- Domain.get worker.group
-    case on of
-      Just g -> do
-        acts <- Domain.get worker.starting
-        case acts of
-          Nil -> pure ()
-          _ -> do
-            Domain.set worker.starting (Nil : List (Starting w))
-            startedEach st worker o g (List.reverse acts)
-        t <- Domain.get worker.turns
-        if t + 1 < pollEvery then Domain.set worker.turns (t + 1)
-        else do
-          Domain.set worker.turns 0
-          done <- o.finished g False
-          resumedAll st worker done
-      Nothing -> pure ()
-
--- (the batch run, the next let out: where the scheduler waits on the
--- world through the reactor, at the back of the worker's queue, after
--- those there, the others free to take it; else among those ready)
-letOut : {w : HFunctor}
-       -> {{dm : Domain.domain <: w}}
-       -> Sched w
-       -> Worker w (Behaviour w)
-       -> Behaviour w
-       -> Co w Unit
-letOut st worker b = case st.outside of
-  Nothing -> readied st b
-  Just o -> pushedBack worker.local b
-
--- (the behaviour run on the worker, its body given the fuel in full,
--- and after it the one left in the slot, and so on, `n` run so far in a
--- row: the batch run, the next is put among those ready instead, at
--- their back)
-ran : {w : HFunctor}
-    -> {{dm : Domain.domain <: w}}
-    -> Sched w
-    -> Worker w (Behaviour w)
-    -> Behaviour w
-    -> Int
-    -> Co w Unit
-ran st worker (MkBehaviour count turn) n = do
-  Domain.set worker.fuel fuelLimit
-  turn st (Just worker)
-  afterTurn st worker
-  next <- Domain.get worker.slot
-  case next of
-    Just b -> do
-      Domain.set worker.slot (Nothing : Maybe (Behaviour w))
-      if n < st.batch then ran st worker b (n + 1) else letOut st worker b
-    Nothing -> pure ()
-
--- (a domain running behaviours, each ready one it takes and those left
--- in its slot after, until it is told to stop)
-working : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Worker w (Behaviour w)
-        -> Co w Unit
-working st worker = do
-  toldEnded st worker
-  next <- Domain.take st.ready
-  case next of
-    Just b -> do
-      ran st worker b 1
-      working st worker
-    Nothing -> pure ()
-
--- (what a worker does next: run a behaviour, look again, or stop)
-data Next b = Run b | LookAgain | Stop
-
--- (a worker no longer counted among those waiting in the reactor,
--- unless the one that woke it has taken that back)
-uncounted : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Worker w (Behaviour w)
-          -> Co w Unit
-uncounted st worker = do
-  stillCounted <- Domain.cas worker.polling True False
-  if stillCounted
-  then do
-    _ <- Domain.fetchAdd st.polling (0 - 1)
-    pure ()
-  else pure ()
-
--- (a worker with acts pending and nothing to run, counted among those
--- waiting in the reactor: the others' queues looked at a last time,
--- else waiting there for an act to come to its value, or to be woken,
--- and those come resumed, which may fill its slot)
-polled : {w : HFunctor}
-       -> {{dm : Domain.domain <: w}}
-       -> Sched w
-       -> Outside w
-       -> Worker w (Behaviour w)
-       -> Group w
-       -> Co w (Next (Behaviour w))
-polled st o worker g = do
-  got <- stolen worker.others
-  case got of
-    Just b -> do
-      uncounted st worker
-      pure (Run b)
-    Nothing -> do
-      done <- o.finished g True
-      uncounted st worker
-      resumedAll st worker done
-      pure LookAgain
-
--- (a worker with nothing to run and no act pending, counted among
--- those idle, the mutex held: the others' queues looked at a last time,
--- else waiting on the condition)
-idled : {w : HFunctor}
-      -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Worker w (Behaviour w)
-      -> Co w (Next (Behaviour w))
-idled st worker = do
-  got <- stolen worker.others
-  case got of
-    Just b -> do
-      _ <- Domain.fetchAdd st.idle (0 - 1)
-      Domain.unlock st.mutex
-      pure (Run b)
-    Nothing -> do
-      Domain.wait st.work st.mutex
-      _ <- Domain.fetchAdd st.idle (0 - 1)
-      Domain.unlock st.mutex
-      pure LookAgain
-
--- (a worker that found nothing to run, under the mutex: the first of
--- those ready, where one is; else, with acts pending in its group,
--- waiting in the reactor; else those of its group finished and not yet
--- taken -- an act that failed as it started, say, which no look since
--- has taken -- resumed, where there are any; else waiting on the
--- condition.  `Stop` once the domains are to stop)
-parked : {w : HFunctor}
-       -> {{dm : Domain.domain <: w}}
-       -> Sched w
-       -> Outside w
-       -> Worker w (Behaviour w)
-       -> Group w
-       -> Co w (Next (Behaviour w))
-parked st o worker g = do
-  Domain.lock st.mutex
-  stop <- Domain.get st.stopping
-  if stop
-  then do
-    Domain.unlock st.mutex
-    pure Stop
-  else do
-    first <- dequeued st
-    case first of
-      Just b -> do
-        Domain.unlock st.mutex
-        pure (Run b)
-      Nothing -> do
-        n <- o.pending g
-        if n > 0
-        then do
-          Domain.set worker.polling True
-          _ <- Domain.fetchAdd st.polling 1
-          Domain.unlock st.mutex
-          polled st o worker g
-        else do
-          left <- o.finished g False
-          case left of
-            Nil -> do
-              _ <- Domain.fetchAdd st.idle 1
-              idled st worker
-            _ -> do
-              Domain.unlock st.mutex
-              resumedAll st worker left
-              pure LookAgain
-
--- (the next behaviour for a worker, where the scheduler waits on the
--- world through the reactor: the one in its slot; else the first of
--- those ready, where the count says one may be; else the front of its
--- own queue; else one taken from another's; else it parks)
-taken : {w : HFunctor}
-      -> {{dm : Domain.domain <: w}}
-      -> Sched w
-      -> Outside w
-      -> Worker w (Behaviour w)
-      -> Group w
-      -> Co w (Next (Behaviour w))
-taken st o worker g = do
-  kept <- Domain.get worker.slot
-  case kept of
-    Just b -> do
-      Domain.set worker.slot (Nothing : Maybe (Behaviour w))
-      pure (Run b)
-    Nothing -> do
-      first <- dequeuedAny st
-      case first of
-        Just b -> pure (Run b)
-        Nothing -> do
-          mine <- poppedFront worker.local
-          case mine of
-            Just b -> pure (Run b)
-            Nothing -> do
-              toldEnded st worker
-              got <- stolen worker.others
-              case got of
-                Just b -> pure (Run b)
-                Nothing -> parked st o worker g
-
--- (a domain running behaviours, where the scheduler waits on the world
--- through the reactor, each it takes and those left in its slot after,
--- until it is to stop)
-serving : {w : HFunctor}
-        -> {{dm : Domain.domain <: w}}
-        -> Sched w
-        -> Outside w
-        -> Worker w (Behaviour w)
-        -> Group w
-        -> Co w Unit
-serving st o worker g = do
-  next <- taken st o worker g
-  case next of
-    Run b -> do
-      ran st worker b 1
-      serving st o worker g
-    LookAgain -> serving st o worker g
-    Stop -> pure ()
-
--- (an act that failed, as what it comes to among its group's finished:
--- `failed` given why, as for a body that fails, and counted where that
--- fails too)
-actFailed : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> String
-          -> Co w Unit
-actFailed st why = do
-  reported <- Domain.tried (bind (later (\u -> st.failed why)) (\c -> c))
-  case reported of
-    Right u -> pure ()
-    Left again -> unreportedAs st again
-
--- (a worker's group opened, on its domain, an act of it that fails
--- coming to `actFailed`; it serving, and its group closed once it
--- stops)
-servingIn : {w : HFunctor}
+-- (a place, on its domain, the pool's `i`th: behaviours run, the acts
+-- they awaited started in its group, and what follows those come to
+-- their values run.  With nothing to run, it waits in the reactor where
+-- acts are pending -- woken there where a behaviour is ready -- else on
+-- the pool, until it is drained)
+placeLoop : {w : HFunctor}
           -> {{dm : Domain.domain <: w}}
           -> Sched w
           -> Outside w
-          -> Worker w (Behaviour w)
+          -> Place w
+          -> Int
+          -> Group w
           -> Co w Unit
-servingIn st o worker = do
-  g <- o.open (\why -> actFailed st why)
-  Domain.lock st.mutex
-  Domain.set worker.group (Just g)
-  Domain.unlock st.mutex
-  serving st o worker g
-  Domain.lock st.mutex
-  Domain.set worker.group (Nothing : Maybe (Group w))
-  Domain.unlock st.mutex
+placeLoop st o pl i g = do
+  ran <- Domain.work st.pool i pollEvery
+  new <- takenAll pl.inbox
+  startedEach st o g new
+  case new of
+    (s :: rest) -> placeLoop st o pl i g
+    Nil ->
+      if ran >= pollEvery
+      then do
+        done <- o.finished g False
+        ranAll done
+        placeLoop st o pl i g
+      else if ran > 0 then placeLoop st o pl i g
+      else do
+        n <- o.pending g
+        left <- if n > 0 then pure Nil else o.finished g False
+        case left of
+          (k :: ks) -> do
+            ranAll left
+            placeLoop st o pl i g
+          Nil -> do
+            r <- Domain.idle st.pool (o.number g) (n > 0)
+            if r == 2 then pure ()
+            else if r == 1
+            then do
+              done <- o.finished g True
+              ranAll done
+              placeLoop st o pl i g
+            else placeLoop st o pl i g
+
+-- (a place, on its domain: its group opened there, an act of it that
+-- fails given to `failed` and letting go of the pool; it working the
+-- pool as its `i`th, and its group closed once the pool is drained)
+placeOn : {w : HFunctor}
+        -> {{dm : Domain.domain <: w}}
+        -> Sched w
+        -> Outside w
+        -> Place w
+        -> Int
+        -> Co w Unit
+placeOn st o pl i = do
+  g <-
+    o.open (\why -> do
+      reported st why
+      Domain.unhold st.pool)
+  placeLoop st o pl i g
   o.close g
 
--- (a worker, on its domain.  Where the scheduler waits on the world
--- through the reactor, a failure of the worker's own -- not of a body,
--- nor of an act, which its group finishes as `actFailed` -- fails the
--- run: `failed` given why, counted as a `failed` that failed, and
--- `scheduled` told at once that it is over, the acts pending of the
--- worker gone with it)
-workingAs : {w : HFunctor}
-          -> {{dm : Domain.domain <: w}}
-          -> Sched w
-          -> Worker w (Behaviour w)
-          -> Co w Unit
-workingAs st worker = case st.outside of
-  Nothing -> working st worker
-  Just o -> do
-    outcome <-
-      Domain.tried (bind (later (\u -> servingIn st o worker)) (\c -> c))
-    case outcome of
-      Right u -> pure ()
-      Left why -> do
-        reported <- Domain.tried (bind (later (\u -> st.failed why)) (\c -> c))
-        unreportedAs st why
-        Domain.put st.done MkUnit
-
--- (a worker's cells, in a record of its domain's own, with the others'
--- queues it takes from)
-workerHere : {w : HFunctor}
-           -> {b : Type}
-           -> Worker w b
-           -> List (Domain.Atomic (Local b))
-           -> Worker w b
-workerHere worker others =
-  { slot = worker.slot
-  , local = worker.local
-  , others = others
-  , fuel = worker.fuel
-  , starting = worker.starting
-  , group = worker.group
-  , polling = worker.polling
-  , turns = worker.turns
-  , ended = worker.ended
-  }
-
--- (a worker, on its domain, with its own cells in a record of its own)
-workerOn : {w : HFunctor}
-         -> {{dm : Domain.domain <: w}}
-         -> Sched w
-         -> Worker w (Behaviour w)
-         -> List (Domain.Atomic (Local (Behaviour w)))
-         -> Co w Unit
-workerOn st worker others = do
-  mine <- later (\u -> workerHere worker others)
-  workingAs st mine
-
--- (`n` workers, none on a domain yet)
-workersMade : {w : HFunctor}
-            -> {{dm : Domain.domain <: w}}
-            -> Int
-            -> Co w (List (Worker w (Behaviour w)))
-workersMade n =
+-- (`n` places, none on a domain yet)
+placesMade : {w : HFunctor}
+           -> {{dm : Domain.domain <: w}}
+           -> Int
+           -> Co w (List (Place w))
+placesMade n =
   if n <= 0 then pure Nil
   else do
-    slot <- Domain.newAtomic (Nothing : Maybe (Behaviour w))
-    local <- Domain.newAtomic (NoneQueued : Local (Behaviour w))
-    fuel <- Domain.newAtomic fuelLimit
-    starting <- Domain.newAtomic (Nil : List (Starting w))
-    group <- Domain.newAtomic (Nothing : Maybe (Group w))
-    polling <- Domain.newAtomic False
-    turns <- Domain.newAtomic 0
-    ended <- Domain.newAtomic 0
-    rest <- workersMade (n - 1)
-    pure
-        ({ slot = slot
-         , local = local
-         , others = Nil
-         , fuel = fuel
-         , starting = starting
-         , group = group
-         , polling = polling
-         , turns = turns
-         , ended = ended
-         }
-         :: rest)
+    inbox <- Domain.newAtomic (Nil : List (Starting w))
+    rest <- placesMade (n - 1)
+    pure ({ inbox = inbox } :: rest)
 
--- (the workers' queues)
-localsOf : {w : HFunctor}
-         -> {b : Type}
-         -> List (Worker w b)
-         -> List (Domain.Atomic (Local b))
-localsOf Nil = Nil
-localsOf (worker :: rest) = worker.local :: localsOf rest
-
--- (each worker on a domain of its own, spawned in the scheduler's
--- scope, taking from the others' queues those after it first, the
--- workers before it, `before`, last)
-workers : {e w : HFunctor}
-        -> {s : Type}
-        -> {{dm : Domain.domain <: w}}
-        -> {{sp : Domain.scoped w <: e}}
-        -> Domain.Scope s w
-        -> Sched w
-        -> List (Worker w (Behaviour w))
-        -> List (Worker w (Behaviour w))
-        -> Co e Unit
-workers sc st before Nil = pure ()
-workers sc st before (worker :: rest) = do
-  _ <-
-    Domain.spawn
-      sc
-      (workerOn st worker (localsOf (rest ++ List.reverse before)))
-  workers sc st (worker :: before) rest
-
--- (each domain told to stop, once no behaviour is left: one `Nothing`
--- a domain, whichever takes it; where the scheduler waits on the world
--- through the reactor, the domains woken where they wait, to stop)
-stoppedAll : {w : HFunctor}
-           -> {{dm : Domain.domain <: w}}
-           -> Sched w
-           -> List (Worker w (Behaviour w))
-           -> Co w Unit
-stoppedAll st Nil = pure ()
-stoppedAll st (d :: ds) = case st.outside of
-  Nothing -> do
-    Domain.put st.ready (Nothing : Maybe (Behaviour w))
-    stoppedAll st ds
-  Just o -> do
-    Domain.lock st.mutex
-    Domain.set st.stopping True
-    Domain.broadcast st.work
-    wokenAllPolling o st.workers
-    Domain.unlock st.mutex
+-- (each place on a domain of its own, spawned in the scheduler's scope,
+-- the `i`th and on)
+placesOn : {e w : HFunctor}
+         -> {s : Type}
+         -> {{dm : Domain.domain <: w}}
+         -> {{sp : Domain.scoped w <: e}}
+         -> Domain.Scope s w
+         -> Sched w
+         -> Outside w
+         -> Int
+         -> List (Place w)
+         -> Co e Unit
+placesOn sc st o i Nil = pure ()
+placesOn sc st o i (pl :: rest) = do
+  _ <- Domain.spawn sc (placeOn st o pl i)
+  placesOn sc st o (i + 1) rest
 
 -- (main's answer, or its failure handed on)
 mainAnswered : {w : HFunctor}
@@ -2254,77 +1350,81 @@ mainAnswered : {w : HFunctor}
 mainAnswered (Right x) = pure x
 mainAnswered (Left why) = Domain.fail why
 
--- (`c` run, its main, then every behaviour waited for, and each domain
--- told to stop -- where main fails too, before this fails as it did)
+-- (main, `c`, run, its answer or why it failed kept in `out`)
 mainRun : {w : HFunctor}
         -> {a : Type}
         -> {{dm : Domain.domain <: w}}
         -> {{cu : Custodian.custodian <: w}}
         -> Sched w
+        -> Domain.Atomic (Maybe (Either String a))
         -> Co (boc w <+> w) a
-        -> Co w a
-mainRun st c = do
-  r <- Domain.tried (handle (bocHandler st) c Nothing)
-  finished st
-  Domain.take st.done
-  stoppedAll st st.workers
-  mainAnswered r
+        -> Co w Unit
+mainRun st out c = do
+  r <- Domain.tried (handled st (\b -> opening st b) c)
+  Domain.set out (Just r)
 
 -- (`c` and its behaviours run, waiting on the world through the
--- reactor where `outside` gives its operations)
+-- reactor where `outside` gives its operations.  Under the reactor,
+-- main is a behaviour on no cown, spawned before the places' scope is
+-- opened: what main spawns, and what they spawn, is handled by none of
+-- the scope's handlers, which would hand on each of their operations.
+-- Every behaviour and act waited for, the places told to stop; where
+-- main failed, this fails as it did, once they are)
 scheduledBy : {w : HFunctor}
             -> {a : Type}
             -> {{dm : Domain.domain <: w}}
             -> {{cu : Custodian.custodian <: w}}
             -> Maybe (Outside w)
-            -> Int
             -> (String -> Co w Unit)
             -> Co (boc w <+> w) a
             -> Co w a
-scheduledBy outside batch failed c = do
-  numbers <- Domain.newAtomic 0
-  live <- Domain.newAtomic 1
+scheduledBy outside failed c = do
+  -- (under the reactor, the places work the pool: none of its own)
+  pool <-
+    Domain.newPool (case outside of
+      Just o -> 0 - 1
+      Nothing -> 0)
   unreported <- Domain.newAtomic (Nothing : Maybe String)
-  ready <- (Domain.newQueue : Co w (Domain.Queue (Maybe (Behaviour w))))
-  done <- (Domain.newQueue : Co w (Domain.Queue Unit))
-  mutex <- Domain.newMutex
-  work <- Domain.newCondition
-  waiting <-
-    Domain.newAtomic
-      (MkPair Nil Nil : Pair (List (Behaviour w)) (List (Behaviour w)))
-  queued <- Domain.newAtomic 0
-  idle <- Domain.newAtomic 0
-  polling <- Domain.newAtomic 0
-  stopping <- Domain.newAtomic False
   n <- Domain.cores
-  ws <- workersMade n
+  places <- case outside of
+    Just o -> placesMade n
+    Nothing -> pure Nil
   let made : Sched w =
-    { numbers = numbers
-    , live = live
+    { pool = pool
     , failed = failed
     , unreported = unreported
-    , ready = ready
-    , done = done
     , outside = outside
-    , mutex = mutex
-    , work = work
-    , waiting = waiting
-    , queued = queued
-    , idle = idle
-    , polling = polling
-    , stopping = stopping
-    , workers = ws
-    , batch = batch
+    , places = places
     }
   st <- Domain.forever made
-  x <-
-    with sc := Domain.scope do
-      workers sc st Nil ws
-      lift (mainRun st c)
+  out <- Domain.newAtomic (Nothing : Maybe (Either String a))
+  case outside of
+    Nothing -> do
+      mainRun st out c
+      drained <- Domain.drain st.pool
+      case drained of
+        Just why -> unreportedAs st why
+        Nothing -> pure ()
+    Just o -> do
+      Domain.behave
+          st.pool
+          Nil
+          (mainRun st out c)
+          (\why -> Domain.set out (Just (Left why)))
+      with sc := Domain.scope do
+        placesOn sc st o 0 places
+        lift (do
+          drained <- Domain.drain st.pool
+          case drained of
+            Just why -> unreportedAs st why
+            Nothing -> pure ())
   k <- Domain.get unreported
+  r <- Domain.get out
   case k of
     Just why -> Domain.fail why
-    Nothing -> pure x
+    Nothing -> case r of
+      Just answered -> mainAnswered answered
+      Nothing -> Domain.fail "boc: main never ran"
 
 -- | `c` and the behaviours it spawns, run on as many domains as the
 -- | machine has cores (`Domain.cores`), every behaviour waited for:
@@ -2336,10 +1436,10 @@ scheduledBy outside batch failed c = do
 -- | every behaviour is waited for, and this fails as main did.  An act awaited (`await`) is run where it is
 -- | awaited, there and then, the behaviour holding its domain, and its
 -- | cowns, until it is done.  A behaviour runs with the custodian
--- | current where it was spawned, `w`'s.  A domain runs at most `batch`
+-- | current where it was spawned, `w`'s.  A domain runs at most 64
 -- | behaviours in a row that it made ready itself before the others
--- | ready get their turn: fewer, for the others to wait less; more, for
--- | long chains of behaviours to run faster.
+-- | ready get their turn (`batch` is kept for the programs that give
+-- | it, and asks nothing of the runtime's pool).
 scheduled : {w : HFunctor}
           -> {a : Type}
           -> {batch : Int := 64}
@@ -2348,40 +1448,45 @@ scheduled : {w : HFunctor}
           -> (String -> Co w Unit)
           -> Co (boc w <+> w) a
           -> Co w a
-scheduled failed c = scheduledBy Nothing (max 1 batch) failed c
+scheduled failed c = scheduledBy Nothing failed c
 
 -- (an act started in a group of its own within `g`, which the custody
 -- `k` has among its things: shut down while the act waits, the group is
--- given up, the act's continuation let go of, and `pure ()` comes in
--- its place, for the act to be counted done; come to its value, the
--- group closed before what comes after it runs)
+-- given up, the act's continuation let go of, and `gone` comes in its
+-- place, for the act to be counted done; come to its value, the group
+-- closed before what comes after it runs)
 startedInCustody : {w : HFunctor}
                  -> {{cu : Custodian.custodian <: w}}
                  -> {{rx : Reactor.reactor <: w}}
                  -> Custodian.Custodian
                  -> Group w
+                 -> Co w Unit
                  -> Co w (Co w Unit)
                  -> Co w (Maybe (Co w Unit))
-startedInCustody k g act = do
+startedInCustody k g gone act = do
   inner <- Reactor.openWithin g
-  gv <- Reactor.giving inner (pure ())
+  gv <- Reactor.giving inner gone
   Custodian.custodied k (Custodian.owned gv)
   Reactor.start
       inner
       (bind act (\next -> pure (bind (Reactor.closeGiving gv) (\u -> next))))
 
--- | `scheduled`, each domain waiting on the world through a reactor of
--- | its own (std.reactor's, the C backend's): an act awaited (`await`)
--- | is run outside every behaviour, started in the reactor of the
--- | domain whose behaviour awaited it once that behaviour is done, and
--- | the behaviour that is to follow it spawned on that domain once it
--- | has come to its value.  A domain with no behaviour to run and acts
--- | pending waits in its reactor, until one has come to its value, or a
--- | behaviour is ready.  Every behaviour, and every act awaited, is
--- | waited for, but an act given up: one whose custodian is shut down
--- | while it waits, its `with`'s body never run.  An act that fails -- abandons, or fails in the runtime
--- | -- is as a body that fails: `failed` given why, its `with`'s body
--- | not run, the others going on.  `batch` as `scheduled`'s.
+-- (a group's number, as the runtime knows it)
+groupNumber : {t : Type} -> Reactor.Group t -> Int
+groupNumber (MkGroup i) = i
+
+-- | `scheduled`, the acts awaited (`await`) run outside every behaviour,
+-- | each in a reactor (std.reactor's, the C backend's) of one of as many
+-- | places as the machine has cores, each place a domain of its own,
+-- | given the acts in turn: an act is started there once awaited, and
+-- | the behaviour that is to follow it spawned once it has come to its
+-- | value.  A place with acts pending waits in its reactor, until one has
+-- | come to its value, or another act is given it.  Every behaviour, and
+-- | every act awaited, is waited for, but an act given up: one whose
+-- | custodian is shut down while it waits, its `with`'s body never run.
+-- | An act that fails -- abandons, or fails in the runtime -- is as a
+-- | body that fails: `failed` given why, its `with`'s body not run, the
+-- | others going on.  `batch` as `scheduled`'s.
 scheduledWithReactor : {w : HFunctor}
                      -> {a : Type}
                      -> {batch : Int := 64}
@@ -2396,12 +1501,11 @@ scheduledWithReactor failed c =
     (Just
        { open = \f -> Reactor.open (failed := Just f)
        , start = \g m -> Reactor.start g m
-       , startIn = \k g m -> startedInCustody k g m
+       , startIn = \k g gone m -> startedInCustody k g gone m
        , finished = \g wait -> Reactor.finished g wait
        , pending = \g -> Reactor.pending g
        , close = \g -> Reactor.close g
-       , wake = \g -> Reactor.wake g
+       , number = \g -> groupNumber g
        })
-    (max 1 batch)
     failed
     c

@@ -163,6 +163,17 @@ module std.domain
   , put
   , take
   , forever
+  , Pool
+  , Turnstile
+  , newPool
+  , newTurnstile
+  , behave
+  , hold
+  , unhold
+  , drain
+  , work
+  , idle
+  , here
   , instanceBinderScope
   , instanceHolderScope
   , rooted
@@ -191,6 +202,16 @@ data Condition
 -- | one domain takes out, first in first out.  (The runtime's own, a
 -- | foreign value: no value of the program has it.)
 data Queue a
+
+-- | A pool of domains running behaviours, each once it is first at every
+-- | turnstile it is queued at.  (The runtime's own, a foreign value: no
+-- | value of the program has it.)
+data Pool
+
+-- | A turnstile: where behaviours queue for a cown, each let through
+-- | once those queued before it are done.  (The runtime's own, a foreign
+-- | value: no value of the program has it.)
+data Turnstile
 
 -- | A value of some type, the type hidden: what an operation of a type
 -- | of its own holds (the effect has no parameter for it).
@@ -229,6 +250,12 @@ data Putting x a = MkPutting (Queue a) a x
 data Taking x a = MkTaking (Queue a) (a -> x)
 
 data Keeping x a = MkKeeping a (a -> x)
+
+-- (a behaviour: its pool, the turnstiles it queues at, what it runs,
+-- what runs where that fails, given why, and what comes after the
+-- asking)
+data Behaving (m : Type -> Type) x
+  = MkBehaving Pool (List Turnstile) (m Unit) (String -> m Unit) x
 
 spawningThen : {m : Type -> Type}
              -> {x y a : Type}
@@ -295,6 +322,7 @@ data HoldingF (m : Type -> Type) x
   = Spawn (Some (Spawning m x))
   | Tried (Some (Trying m x))
   | CustodyOp (Maybe Custodian.Custodian) (Custodian.CustodianF m x)
+  | Behave (Behaving m x)
 
 -- (an operation holding none: the same whatever its computations are)
 data PlainF x
@@ -317,6 +345,14 @@ data PlainF x
   | PutQueue (Some (Putting x))
   | TakeQueue (Some (Taking x))
   | Forever (Some (Keeping x))
+  | NewPool Int (Pool -> x)
+  | NewTurnstile (Turnstile -> x)
+  | Hold Pool x
+  | Unhold Pool x
+  | Drain Pool (Maybe String -> x)
+  | Work Pool Int Int (Int -> x)
+  | Idle Pool Int Bool (Int -> x)
+  | Here Pool (Int -> x)
 
 -- (the operations, those holding computations apart: what a handler
 -- between maps is those few, and every other operation passes it as it
@@ -331,6 +367,8 @@ holdingThen : {m : Type -> Type}
 holdingThen g (Spawn s) = Spawn (someThen (spawningThen g) s)
 holdingThen g (Tried s) = Tried (someThen (tryingThen g) s)
 holdingThen g (CustodyOp at q) = CustodyOp at (Custodian.custodianThen g q)
+holdingThen g (Behave (MkBehaving pl ts c f x)) =
+  Behave (MkBehaving pl ts c f (g x))
 
 holdingBy : {m n : Type -> Type}
           -> {x : Type}
@@ -340,6 +378,8 @@ holdingBy : {m n : Type -> Type}
 holdingBy nt (Spawn s) = Spawn (someThen (spawningBy nt) s)
 holdingBy nt (Tried s) = Tried (someThen (tryingBy nt) s)
 holdingBy nt (CustodyOp at q) = CustodyOp at (Custodian.custodianBy nt q)
+holdingBy nt (Behave (MkBehaving pl ts c f x)) =
+  Behave (MkBehaving pl ts (nt c) (\why -> nt (f why)) x)
 
 plainThen : {x y : Type} -> (x -> y) -> PlainF x -> PlainF y
 plainThen g (Join s) = Join (someThen (joiningThen g) s)
@@ -361,6 +401,14 @@ plainThen g (NewQueue s) = NewQueue (someThen (makingQueueThen g) s)
 plainThen g (PutQueue s) = PutQueue (someThen (puttingThen g) s)
 plainThen g (TakeQueue s) = TakeQueue (someThen (takingThen g) s)
 plainThen g (Forever s) = Forever (someThen (keepingThen g) s)
+plainThen g (NewPool n k) = NewPool n (\pl -> g (k pl))
+plainThen g (NewTurnstile k) = NewTurnstile (\t -> g (k t))
+plainThen g (Hold pl x) = Hold pl (g x)
+plainThen g (Unhold pl x) = Unhold pl (g x)
+plainThen g (Drain pl k) = Drain pl (\r -> g (k r))
+plainThen g (Work pl i n k) = Work pl i n (\r -> g (k r))
+plainThen g (Idle pl grp p k) = Idle pl grp p (\r -> g (k r))
+plainThen g (Here pl k) = Here pl (\i -> g (k i))
 
 -- | For OS threads, domains: spawned and joined, a failure caught, and
 -- | what they share -- atomics, mutexes, conditions and queues.
@@ -546,6 +594,92 @@ take q =
 forever : {e : HFunctor} -> {a : Type} -> {{dm : domain <: e}} -> a -> Co e a
 forever v =
   op (dm (Plain (Forever (\r use -> use a (MkKeeping v (\u -> u)))))) val
+
+-- Behaviours
+--------------------------------------------------------------------------------
+
+-- Behaviour-oriented concurrency's order (Cheeseman et al., OOPSLA 2023),
+-- kept by the runtime: a behaviour is queued at each of its turnstiles
+-- at once, all or none -- so two queued at the same turnstiles are in
+-- the same order at each -- and runs once it is first at every one of
+-- them, on a domain of its pool, then lets the next through at each.
+-- What the behaviours run is the program's world's computations: each
+-- handler between `behave` and the program's world runs it too, as a
+-- `spawn`'s.  The C backend's: the pool's domains are threads of the
+-- system, a turnstile a cell of the last request at it, and a behaviour
+-- queued by swaps and let through by compare-and-swaps alone -- no
+-- mutex, but the pool's own around the behaviours ready to run.
+-- JavaScript's: the pool's behaviours are domains of the one, each
+-- started once it is first at its turnstiles.
+
+-- | A pool of `n` domains running behaviours (where it is 0, as many as
+-- | the machine has cores; where it is less, none of its own: its
+-- | behaviours run by the domains that `work` it).
+newPool : {e : HFunctor} -> {{dm : domain <: e}} -> Int -> Co e Pool
+newPool n = op (dm (Plain (NewPool n (\pl -> pl)))) val
+
+-- | A turnstile no behaviour is queued at.
+newTurnstile : {e : HFunctor} -> {{dm : domain <: e}} -> Co e Turnstile
+newTurnstile = op (dm (Plain (NewTurnstile (\t -> t)))) val
+
+-- | `c` queued at the turnstiles, run on a domain of the pool once it is
+-- | first at each, this domain going on.  A turnstile twice abandons.
+-- | Where `c` fails, `failed` is given why, run there before the next
+-- | is let through; what that fails at is the pool's, for `drain`.
+behave : {e : HFunctor}
+       -> {{dm : domain <: e}}
+       -> Pool
+       -> List Turnstile
+       -> Co e Unit
+       -> (String -> Co e Unit)
+       -> Co e Unit
+behave pl ts c failed =
+  op
+    (dm
+       (Holding
+          (Behave
+             (MkBehaving
+                pl
+                ts
+                c
+                -- (`failed why` computed where it runs, under the pool's
+                -- catch: one that fails as it is applied fails there)
+                (\why -> bind (later (\u -> failed why)) (\f -> f))
+                MkUnit))))
+    val
+
+-- | The pool kept from being drained, until as many `unhold`s: what is to
+-- | queue behaviours later, from outside them (an act awaited).
+hold : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Co e Unit
+hold pl = op (dm (Plain (Hold pl MkUnit))) val
+
+unhold : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Co e Unit
+unhold pl = op (dm (Plain (Unhold pl MkUnit))) val
+
+-- | Waiting until no behaviour of the pool is queued or running and none
+-- | holds it, its domains then stopped: `Just` why the first `failed`
+-- | that failed did, where one did.
+drain : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Co e (Maybe String)
+drain pl = op (dm (Plain (Drain pl (\r -> r)))) val
+
+-- | Up to `n` of the pool's behaviours run here, this domain working the
+-- | pool as its `i`th: how many.  A behaviour this one readies is kept
+-- | for it to run next, nothing woken.
+work : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Int -> Int -> Co e Int
+work pl i n = op (dm (Plain (Work pl i n (\r -> r)))) val
+
+-- | This domain, working the pool, with nothing to run: 0 where there is
+-- | something after all; 1 where it has acts pending in its reactor
+-- | group (std.reactor's, its number `g`), said to wait there -- woken
+-- | there once a behaviour is ready; else waiting until one is, 0 then,
+-- | or 2 once the pool is drained.
+idle : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Int -> Bool -> Co e Int
+idle pl g pending = op (dm (Plain (Idle pl g pending (\r -> r)))) val
+
+-- | Which of the domains working the pool this one is, as `work` said;
+-- | -1 where it works none.
+here : {e : HFunctor} -> {{dm : domain <: e}} -> Pool -> Co e Int
+here pl = op (dm (Plain (Here pl (\i -> i)))) val
 
 -- Scopes
 --------------------------------------------------------------------------------
