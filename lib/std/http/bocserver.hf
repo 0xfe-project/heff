@@ -28,8 +28,9 @@
 --
 -- -- | each request answered at once
 -- hello : {e : HFunctor}
+--       -> {{bc : BOC.boc <: e}}
 --       -> Server.Request
---       -> BocServer.Responder Empty e
+--       -> BocServer.Responder
 --       -> Co (exception Empty <+> e) Unit
 -- hello r respond = respond (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 --
@@ -75,11 +76,16 @@
 -- server: when its client ends it or fails, when a request asks
 -- (HTTP/1.0, `Connection: close`), or when the server stops.  The
 -- handler is given each request in a behaviour on its connection's
--- cown, and a responder, of its world: it may answer there and then,
--- or later, from another behaviour -- after acts of its own awaited, a
--- request of std.http, a query -- the connection meanwhile waiting, read
--- no further.  An act it awaits is of its world, which it says (boc's
--- `await`): `BOC.await (sleep d : Co (exception err <+> e) Unit)`.  Its first response is written; one after it is not.  A
+-- cown, and a responder: it may answer there and then, or later, from
+-- another behaviour -- after acts of its own awaited, a request of
+-- std.http, a query -- the connection meanwhile waiting, read no
+-- further.  An act it awaits is of its world, which it says (boc's
+-- `await`): `BOC.await (sleep d : Co (exception err <+> e) Unit)`.  The
+-- response is kept on the connection's cown, and written by a
+-- behaviour of the server's world waiting for it there (`where`): what
+-- comes after on the connection is the server's, not the handler's, so
+-- that the handler's `attempt`, around its behaviours, is not around
+-- the next request's.  Its first response is written; one after it is not.  A
 -- handler that never responds leaves its connection open until the
 -- program lets go of it.
 --
@@ -178,8 +184,9 @@ data HeadBy = Whenever | Within Int | By Int
 -- request, the last read first, `got` bytes in all, how many in all
 -- are wanted before it is read again, and how far that is; when its
 -- head is to be read by; whether a `100 Continue` was written for it;
--- and whether the server has stopped, for the connection to be closed
--- once the request in hand is answered)
+-- whether the server has stopped, for the connection to be closed once
+-- the request in hand is answered; and the handler's response to it,
+-- where it has given one and it is not yet being written)
 type Conn =
   { phase : Phase
   , parts : List Bytes
@@ -189,6 +196,7 @@ type Conn =
   , by : HeadBy
   , continued : Bool
   , stopping : Bool
+  , reply : Maybe HTTP.Response
   }
 
 -- (a connection, as the server keeps it: its socket, its number among
@@ -208,11 +216,10 @@ type Served (rg : Type) =
   , stopped : Bool
   }
 
--- | How a handler answers its request: in the handler's world, the
--- | server's `e` with the `err` it may throw -- where the handler is, or
--- | in a behaviour it spawns, after an act it awaits, say.
-type Responder (err : Type) (e : HFunctor) =
-  HTTP.Response -> Co (exception err <+> e) Unit
+-- | How a handler answers its request: in whichever world has boc's
+-- | behaviours, its own or a later behaviour's.
+type Responder =
+  {f : HFunctor} -> {{bc : BOC.boc <: f}} -> HTTP.Response -> Co f Unit
 
 -- (what every behaviour of the server knows: the time limits, a
 -- silence's and a head's, the server's cown, and the handler, of the
@@ -223,7 +230,7 @@ type Serving (e : HFunctor) (rg : Type) (err : Type) =
   , served : BOC.Cown (Served rg)
   , handler :
         Server.Request
-        -> Responder err e
+        -> Responder
         -> Co (exception err <+> e) Unit
   }
 
@@ -265,6 +272,7 @@ fresh within =
   , by = headStart within
   , continued = False
   , stopping = False
+  , reply = Nothing
   }
 
 -- (how much the next read asks for: what is wanted still, a body's, or
@@ -504,6 +512,28 @@ refusing : {e : HFunctor}
 refusing sg cn status = do
   with _ := BOC.await (refused sg.idle cn.socket status) do
     closing sg cn
+
+-- (whether the handler has given its response)
+replied : Conn -> Bool
+replied st = case st.reply of
+  Just res -> True
+  Nothing -> False
+
+-- (the response the handler gives, its first, kept on the connection's
+-- cown for the server to write: in the handler's world, whichever)
+responded : {f : HFunctor}
+          -> {rg : Type}
+          -> {{bc : BOC.boc <: f}}
+          -> Connection rg
+          -> HTTP.Response
+          -> Co f Unit
+responded cn res = do
+  with st := cn.state do
+    case st.phase of
+      Answering -> case st.reply of
+        Nothing -> st := { st | reply = Just res }
+        Just given -> pure ()
+      _ -> pure ()
 
 mutual
   -- (more of the connection read, `size` bytes at most, in `idle`
@@ -754,25 +784,20 @@ mutual
            -> Server.Got
            -> Co e Conn
   answered sg cn st (Asked r rest) = do
-    outcome <-
-      attempt
-        err
-        (sg.handler
-           r
-           (\res ->
-              lift (inj := inr (exception err) e) (responder sg cn r res)))
+    outcome <- attempt err (sg.handler r (\res -> responded cn res))
     case outcome of
-      Right u ->
+      Right u -> do
+        replying sg cn r
         pure
-          { st
-          | phase = Answering
-          , parts = [rest]
-          , got = Bytes.length rest
-          , want = 0
-          , part = InHead Bytes.empty
-          , by = headStart sg.headerWithin
-          , continued = False
-          }
+            { st
+            | phase = Answering
+            , parts = [rest]
+            , got = Bytes.length rest
+            , want = 0
+            , part = InHead Bytes.empty
+            , by = headStart sg.headerWithin
+            , continued = False
+            }
       Left thrown -> do
         closing sg cn
         pure { st | phase = Closing }
@@ -783,24 +808,29 @@ mutual
     closing sg cn
     pure { st | phase = Closing }
 
-  -- (what the handler is given to answer `r` by: its first response
-  -- written, the connection closed after where the request or the
-  -- response asks, or the server has stopped)
-  responder : {e : HFunctor}
-            -> {rg : Type}
-            -> {err : Type}
-            -> {{bc : BOC.boc <: e}}
-            -> {{nt : Net.net <: e}}
-            -> {{clock : Time.time <: e}}
-            -> Serving e rg err
-            -> Connection rg
-            -> Server.Request
-            -> HTTP.Response
-            -> Co e Unit
-  responder sg cn r res = do
-    with st := cn.state do
-      case st.phase of
-        Answering -> do
+  -- (the response to `r` written, once the handler has given it: the
+  -- connection closed after where the request or the response asks, or
+  -- the server has stopped.  A behaviour of the server's world, spawned
+  -- outside the handler's -- so that what comes after on the
+  -- connection, the requests after, is not of the handler's, run by its
+  -- `attempt` -- waiting for the response the handler gives, in its
+  -- world, on the connection's cown)
+  replying : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
+           -> Serving e rg err
+           -> Connection rg
+           -> Server.Request
+           -> Co e Unit
+  replying sg cn r = do
+    with st := cn.state
+      where replied st
+    do
+      case st.reply of
+        Just res -> do
           let close =
             st.stopping
             || not (Server.keptAlive r)
@@ -813,8 +843,8 @@ mutual
                  (connectionWord r close)
                  (not (strEq r.method "HEAD"))
                  res)
-          st := { st | phase = Writing }
-        _ -> pure ()
+          st := { st | phase = Writing, reply = Nothing }
+        Nothing -> pure ()
 
 -- (the server stopped, for a connection: closed at once where it waits
 -- for a request; else once the one in hand is answered)
@@ -906,7 +936,7 @@ serve : {e : HFunctor}
       -> {{clock : Time.time <: e}}
       -> With rg Net.TcpListener
       -> (Server.Request
-          -> Responder err e
+          -> Responder
           -> Co (exception err <+> e) Unit)
       -> Co e Unit
 serve err l handle = do
