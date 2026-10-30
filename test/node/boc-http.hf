@@ -32,19 +32,20 @@ itemIs : Int -> Either HTTP.HttpError String -> Int
 itemIs i (Right t) = if strEq t ("item " ^ debug i ^ "\n") then 1 else 0
 itemIs i (Left err) = 0
 
--- (items `i` down to 1 fetched, each an act awaited, counted on `got`)
+-- (items `i` down to 1 fetched, each an act awaited, counted on `got`:
+-- those answered, and those answered as they should be)
 fetchers : {e : HFunctor}
          -> {{bc : BOC.boc <: e}}
          -> {{web : HTTP.http <: e}}
          -> String
-         -> BOC.Cown Int
+         -> BOC.Cown (Int, Int)
          -> Int
          -> Co e Unit
 fetchers base got 0 = pure ()
 fetchers base got i = do
   with n := got
        r := BOC.await (HTTP.getText (base ^ "/item/" ^ debug i)) do
-    n := n + itemIs i r
+    n := (fst n + 1, snd n + itemIs i r)
   fetchers base got (i - 1)
 
 -- (where no response came: curl's code)
@@ -61,7 +62,7 @@ fetches : {e : HFunctor}
         -> Int
         -> Int
         -> BOC.Cown String
-        -> BOC.Cown Int
+        -> BOC.Cown (Int, Int)
         -> Co e Unit
 fetches base n refused refusedSaid got = do
   fetchers base got n
@@ -69,21 +70,23 @@ fetches base n refused refusedSaid got = do
        r := BOC.await (HTTP.get ("http://127.0.0.1:" ^ debug refused ^ "/")) do
     s := codeOf r
 
--- (what the cowns hold, every behaviour before done, said)
+-- (what the cowns hold, said once all `n` are answered and the refused
+-- one is too)
 saidOf : {e : HFunctor}
        -> {{bc : BOC.boc <: e}}
        -> {{io : stdio <: e}}
+       -> Int
        -> BOC.Cown String
-       -> BOC.Cown Int
+       -> BOC.Cown (Int, Int)
        -> Co e Unit
-saidOf refusedSaid got =
-  BOC.scheduled
-    (\why -> abandon)
-    (BOC.when (refusedSaid, got) (\p -> do
-     print ("refused, while the others wait: " ^ fst p)
-     print ("items fetched at once: " ^ debug (snd p))
-     print "main done"
-     pure p))
+saidOf n refusedSaid got = do
+  with s := refusedSaid
+       g := got
+    where not (strEq s "") && fst g >= n
+  do
+    print ("refused, while the others wait: " ^ s)
+    print ("items fetched at once: " ^ debug (snd g))
+    print "main done"
 
 -- (the arguments: BASE N REFUSED)
 argsOf : List String -> Maybe (Pair String (Pair Int Int))
@@ -102,11 +105,9 @@ program = do
   case argsOf argv of
     Just (MkPair b (MkPair n r)) -> do
       refusedSaid <- BOC.newCown ""
-      got <- BOC.newCown 0
-      BOC.scheduled
-          (\why -> print ("failed: " ^ why))
-          (fetches b n r refusedSaid got)
-      saidOf refusedSaid got
+      got <- BOC.newCown (0, 0)
+      fetches b n r refusedSaid got
+      saidOf n refusedSaid got
     Nothing -> printErr "main BASE N REFUSED"
 
 main : Co (BOC.boc <+> stdio <+> HTTP.http <+> process) Unit
@@ -133,14 +134,16 @@ item r respond =
        ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
 
 -- (the listener served, and asked of by ten acts at once; once each
--- has its answer, the listener closed, so the server is done)
+-- has its answer, the listener closed, so the server is done, and how
+-- many were answered as they should be said)
 askedOn : {e : HFunctor}
         -> {s : Type}
         -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
         -> {{web : HTTP.http <: e}}
         -> {{nt : Net.net <: e}}
         -> {{clock : time <: e}}
-        -> BOC.Cown Int
+        -> BOC.Cown (Int, Int)
         -> With s Net.TcpListener
         -> Co e Unit
 askedOn got l = do
@@ -149,10 +152,11 @@ askedOn got l = do
   let base = "http://127.0.0.1:" ^ debug (must at).port
   fetchers base got 10
   with n := got
-    where n >= 10
+    where fst n >= 10
   do
     with u := BOC.await (Net.closeListener l) do
-      pure ()
+      print ("asked of its own server, at once: " ^ debug (snd n))
+      print "main done"
 
 self : Co
        (BOC.boc
@@ -163,16 +167,12 @@ self : Co
         <+> time)
        Unit
 self = do
-  got <- BOC.newCown 0
+  got <- BOC.newCown (0, 0)
   r <-
     Net.withListener
       { host = "127.0.0.1", port = 0 }
       64
-      (\l -> BOC.scheduled (\why -> print ("failed: " ^ why)) (askedOn got l))
-  BOC.scheduled
-      (\why -> abandon)
-      (BOC.when got (\n -> do
-       print ("asked of its own server, at once: " ^ debug n)
-       print
-           (either (\err -> "not listening: " ^ show err) (\u -> "main done") r)
-       pure n))
+      (\l -> askedOn got l)
+  case r of
+    Left err -> print ("not listening: " ^ show err)
+    Right u -> pure ()

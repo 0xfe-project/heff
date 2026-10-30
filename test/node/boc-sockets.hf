@@ -13,13 +13,15 @@
 --            holding every connection open until all have had their
 --            echo
 --
--- What each part comes to is kept on cowns and said once its
--- `scheduled` is done, in an order of its own, whichever threads ran
--- them.
+-- The parts run at once, each awaiting its acts; what each comes to is
+-- put after its names on one cown of lines, said, in an order of their
+-- own, whichever threads ran them, by a behaviour waiting until every
+-- line has it.
 
 module test.node.boc-sockets
 
 import boc as BOC
+import array as Array
 import bytes as Bytes
 import co
 import custodian as Custodian
@@ -48,46 +50,64 @@ must : {a : Type} -> Either Net.NetError a -> a
 must (Right x) = x
 must (Left err) = abandon
 
--- (the line each cown holds, every behaviour before done, printed, in
--- order)
-saidEach : {e : HFunctor}
-         -> {{bc : BOC.boc <: e}}
-         -> {{io : stdio <: e}}
-         -> List (BOC.Cown String)
-         -> Co e Unit
-saidEach [] = pure ()
-saidEach (c :: cs) = do
-  BOC.scheduled
-      (\why -> abandon)
-      (BOC.when c (\l -> do
-       print l
-       pure l))
-  saidEach cs
+-- (the lines, each a name and what was put after it, and how many are
+-- still to have it)
+type Lines = (Int, Array String)
 
--- (`v` put after what the cown holds, a name)
+-- (`v` put after the `i`th line's name, by a behaviour on the lines)
 named : {e : HFunctor}
       -> {{bc : BOC.boc <: e}}
-      -> BOC.Cown String
+      -> BOC.Cown Lines
+      -> Int
       -> String
       -> Co e Unit
-named c v = do
-  with x := c do
-    x := x ^ v
+named ls i v = do
+  with x := ls do
+    x :=
+      ( fst x - 1
+      , Array.set (snd x) i (fromMaybe "" (Array.index (snd x) i) ^ v)
+      )
 
--- (`c` run in a `scheduled` of its own, given cowns of what each of
--- its acts comes to, failures said; then those cowns' lines said, in
--- their order)
-part : {e : HFunctor}
-     -> {{bc : BOC.boc <: e}}
-     -> {{io : stdio <: e}}
-     -> List String
-     -> (List (BOC.Cown String) -> Co e Unit)
-     -> Co e Unit
-part names c = do
-  cowns <- for name in names do
-    BOC.newCown name
-  BOC.scheduled (\why -> print ("failed: " ^ why)) (c cowns)
-  saidEach cowns
+-- (each part run, from the `i`th line: given, for each of its names,
+-- what puts what it comes to after it)
+partsFrom : {e : HFunctor}
+          -> {{bc : BOC.boc <: e}}
+          -> BOC.Cown Lines
+          -> Int
+          -> List
+            (Pair (List String) (List (String -> Co e Unit) -> Co e Unit))
+          -> Co e Unit
+partsFrom ls i [] = pure ()
+partsFrom ls i (MkPair names c :: rest) = do
+  c (List.map (\j -> named ls j) (List.range i (i + List.length names - 1)))
+  partsFrom ls (i + List.length names) rest
+
+-- (each line printed)
+printed : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
+printed [] = pure ()
+printed (l :: ls) = do
+  print l
+  printed ls
+
+-- (the parts run at once, their lines printed, in order, once each has
+-- what its part came to, and `main done` after them)
+parts : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> {{io : stdio <: e}}
+      -> List (Pair (List String) (List (String -> Co e Unit) -> Co e Unit))
+      -> Co e Unit
+parts ps = do
+  let names = List.concatMap fst ps
+  ls <- BOC.newCown (List.length names, Array.fromList names)
+  partsFrom ls 0 ps
+  with x := ls
+    where fst x == 0
+  do
+    printed
+        (List.map
+           (\i -> fromMaybe "" (Array.index (snd x) i))
+           (List.range 0 (Array.length (snd x) - 1)))
+    print "main done"
 
 -- A read lets a write run
 --------------------------------------------------------------------------------
@@ -103,31 +123,31 @@ readThenWrite : {e : HFunctor}
               -> {{cu : Custodian.custodian <: e}}
               -> With s Net.TcpListener
               -> Int
-              -> List (BOC.Cown String)
+              -> List (String -> Co e Unit)
               -> Co e Unit
 readThenWrite l port [read, wrote] = do
   with Net.withConnection (here port) as c do
     with Net.accept l as s do
       with got := BOC.await (Net.read c 100) do
-        named read (showRead got)
+        read (showRead got)
       with w := BOC.await (Net.write s b["hello"]) do
-        named wrote (showFailed w)
+        wrote (showFailed w)
 readThenWrite l port _ = pure ()
 
 -- What fails, while others run
 --------------------------------------------------------------------------------
 
 -- (a count to `n`, a step a behaviour on `c`, each spawning the next;
--- the last puts it after `said`)
+-- the last gives it to `said`)
 counting : {e : HFunctor}
          -> {{bc : BOC.boc <: e}}
          -> BOC.Cown Int
-         -> BOC.Cown String
+         -> (String -> Co e Unit)
          -> Int
          -> Co e Unit
 counting c said n = do
   with i := c do
-    if i + 1 < n then counting c said n else named said (debug (i + 1))
+    if i + 1 < n then counting c said n else said (debug (i + 1))
     i := i + 1
 
 -- (a connection made to `address` and let go of: `ok`, or why it was
@@ -170,17 +190,17 @@ failures : {e : HFunctor}
          -> {{nt : Net.net <: e}}
          -> {{cu : Custodian.custodian <: e}}
          -> Int
-         -> List (BOC.Cown String)
+         -> List (String -> Co e Unit)
          -> Co e Unit
 failures refused [refusedC, resolved, bad, counted] = do
   count <- BOC.newCown 0
   with r := BOC.await (connected (here refused)) do
-    named refusedC r
+    refusedC r
   with r := BOC.await byName do
-    named resolved r
+    resolved r
   with r :=
          BOC.await (connected { host = "no-such-host.invalid", port = 80 }) do
-    named bad (unresolved r)
+    bad (unresolved r)
   counting count counted 1000
 failures refused _ = pure ()
 
@@ -199,17 +219,17 @@ closings : {e : HFunctor}
          -> {{cu : Custodian.custodian <: e}}
          -> With s Net.TcpListener
          -> Int
-         -> List (BOC.Cown String)
+         -> List (String -> Co e Unit)
          -> Co e Unit
 closings l port [other, own] = do
   with Net.withConnection (here port) as c do
     with Net.accept l as s do
       with r := BOC.await (Net.read c 100) do
-        named other (showRead r)
+        other (showRead r)
   with Net.withConnection (here port) as d do
     with Net.accept l as t do
       with r := BOC.await (Net.read t 100) do
-        named own (showRead r)
+        own (showRead r)
 closings l port _ = pure ()
 
 -- Echo, many at once
@@ -321,7 +341,7 @@ echoes : {e : HFunctor}
        -> With s Net.TcpListener
        -> Int
        -> Int
-       -> List (BOC.Cown String)
+       -> List (String -> Co e Unit)
        -> Co e Unit
 echoes l port n [echoed, closedSaid] = do
   held <- BOC.newCown ((0, Nil) : Held s)
@@ -331,21 +351,21 @@ echoes l port n [echoed, closedSaid] = do
   with h := held
     where fst h >= n
   do
-    named echoed (debug (List.length (snd h)))
+    echoed (debug (List.length (snd h)))
     h := (fst h, Nil)
     with u := BOC.await (Net.closeListener l) do
       pure ()
   with c := closed
     where c >= n
   do
-    named closedSaid (debug c)
+    closedSaid (debug c)
 echoes l port n _ = pure ()
 
 -- The program
 --------------------------------------------------------------------------------
 
--- (the listener had: each part of the test on it, in a `scheduled` of
--- its own, in turn)
+-- (the listener had: the parts of the test on it, at once -- those
+-- accepting by `accept`, in turn, before the server of acts does)
 onListener : {e : HFunctor}
            -> {s : Type}
            -> {{bc : BOC.boc <: e}}
@@ -359,20 +379,24 @@ onListener : {e : HFunctor}
 onListener refused l = do
   at <- Net.local l
   let port = (must at).port
-  part
-      ["a read awaited, a write run meanwhile: read ", "wrote "]
-      (readThenWrite l port)
-  part
-      [ "refused: "
-      , "a name, resolved: "
-      , "a name not resolved: "
-      , "counted meanwhile: "
+  parts
+      [ MkPair
+        ["a read awaited, a write run meanwhile: read ", "wrote "]
+        (readThenWrite l port)
+      , MkPair
+        [ "refused: "
+        , "a name, resolved: "
+        , "a name not resolved: "
+        , "counted meanwhile: "
+        ]
+        (failures refused)
+      , MkPair
+        ["read, the other side closed: ", "read, its socket closed: "]
+        (closings l port)
+      , MkPair
+        ["echoed, all held open at once: ", "closed: "]
+        (echoes l port 50)
       ]
-      (failures refused)
-  part
-      ["read, the other side closed: ", "read, its socket closed: "]
-      (closings l port)
-  part ["echoed, all held open at once: ", "closed: "] (echoes l port 50)
 
 -- (the first argument, a number)
 firstInt : List String -> Int
@@ -388,7 +412,7 @@ main = do
     attempt
       Net.NetError
       (Net.withListener (here 0) 64 (onListener (firstInt argv)))
-  print (case r of
-    Left err -> "not heard: " ^ show err
-    Right (Left err) -> "not listening: " ^ show err
-    Right (Right u) -> "main done")
+  case r of
+    Left err -> print ("not heard: " ^ show err)
+    Right (Left err) -> print ("not listening: " ^ show err)
+    Right (Right u) -> pure ()

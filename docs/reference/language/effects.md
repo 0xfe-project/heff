@@ -54,10 +54,9 @@ scope: in a world `state Int <+> e`, as `runState`'s computation's,
 world is E0355; in more than one, E0356 (give the
 evidence there); an argument that is no `h <: e`, given `(x := _)`, or a
 world not known where the call is, E0357. The world must be known, not
-the effect's parameters: `boc ?w <: boc e <+> e`, a behaviour's under
-`scheduled`, is found by the one leaf `boc ?w` fits, which says `w` is
-`e`; so a body given to `scheduled` or to a `when` needs no `(w :=
-e)`. Where more than one leaf fits, the
+the effect's parameters: `state ?s <: state Int <+> e` is found by the
+one leaf `state ?s` fits, which says `s` is `Int`; so a `get` needs no
+`(st := _)` to say whose it is. Where more than one leaf fits, the
 parameter is waited for, and E0356 at the end.
 
 A value of `h <: e` is a function, and shows where `h` is in `e`:

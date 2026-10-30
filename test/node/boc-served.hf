@@ -1,14 +1,14 @@
 -- std.http.bocserver's `serve`, every wait of the server an act
--- awaited, under boc's `scheduled`, the listener held by a `with`
--- around the scheduler, which is run on the program's world itself.
--- By C alone.
+-- awaited, the listener held by a `with` the server outlives, which
+-- is run on the program's world itself.  By C alone.
 --
 --   main   PORT IDLE [HEAD]: served there, a connection closed after
 --          IDLE ms of silence, or HEAD ms (30 s unless given) without
 --          a request's head all read; `/slow` answered after 300 ms, slept by an act
 --          the handler awaits; served until SIGTERM or SIGINT, which
---          closes the listener; then, once the server is done, how many
---          requests it answered, and `main done`
+--          closes the listener; then how many requests it was handed,
+--          and `main done`, the program ending once the server is
+--          done
 --   burst  PORT [IDLE [HEAD]]: the same, but served until asked for
 --          `/stop`, which is answered, then closes the listener
 
@@ -36,14 +36,29 @@ here port = { host = "127.0.0.1", port = port }
 -- | What a handler throws.
 data Thrown = MkThrown
 
+-- (how many requests the server was handed, said, and `main done`: by
+-- a behaviour on the count, spawned once the listener is closed, so
+-- after every request handed before)
+counted : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> BOC.Cown Int
+        -> Co e Unit
+counted count = do
+  with n := count do
+    print ("answered " ^ debug n)
+    print "main done"
+
 -- (a request answered, and counted, but `/stop`: `/slow` after 300
 -- ms, slept by an act the handler awaits; `/stop` answered, then the
--- listener closed; `/throw` thrown; any other, its target.  An act
+-- listener closed and the count said; `/throw` thrown; any other, its
+-- target.  An act
 -- awaited is of the world of its `with`, the handler's, which says it:
 -- its own evidence would put it in the server's)
 answering : {e : HFunctor}
           -> {rg : Type}
           -> {{bc : BOC.boc <: e}}
+          -> {{io : stdio <: e}}
           -> {{clock : time <: e}}
           -> {{nt : Net.net <: e}}
           -> BOC.Cown Int
@@ -60,22 +75,22 @@ answering count l r respond = do
   then do
     with _ :=
            BOC.await
-             (sleep (Duration.milliseconds 300)
-              : Co (exception Thrown <+> e) Unit) do
+             (sleep (Duration.milliseconds 300) :
+                Co (exception Thrown <+> e) Unit) do
       respond (Server.plain 200 "slow")
   else if r.target == "/stop"
   then do
     respond (Server.plain 200 "stopping")
     with _ :=
            BOC.await
-             (Net.closeListener l
-              : Co (exception Thrown <+> e) (Either Net.NetError Unit)) do
-      pure ()
+             (Net.closeListener l :
+                Co (exception Thrown <+> e) (Either Net.NetError Unit)) do
+      counted count
   else if r.target == "/throw" then throw (MkThrown : Thrown)
   else respond (Server.plain 200 r.target)
 
 -- (the listener served; where `bySignal`, until SIGTERM or SIGINT,
--- which closes it, said)
+-- which closes it, said, and then the count)
 served : {e : HFunctor}
        -> {rg : Type}
        -> {{bc : BOC.boc <: e}}
@@ -105,6 +120,7 @@ served bySignal idle head count l = do
                 (\s -> bind (Net.closeListener l) (\u -> pure s))) do
       print ("stopping on " ^ show s)
       flush
+      counted count
   else pure ()
 
 program : {e : HFunctor}
@@ -128,18 +144,10 @@ program bySignal = do
     Net.withListener
       (here port)
       512
-      (\l ->
-         BOC.scheduled
-           (\why -> printErr ("a behaviour failed: " ^ why))
-           (served bySignal idle head count l))
-  -- (what the server counted, every behaviour done: said by a behaviour
-  -- of a `scheduled` after it)
-  BOC.scheduled
-      (\why -> abandon)
-      (BOC.when count (\n -> do
-         print ("answered " ^ debug n)
-         print (either show (\u -> "main done") r)
-         pure n))
+      (\l -> served bySignal idle head count l)
+  case r of
+    Left err -> print (show err)
+    Right u -> pure ()
 
 -- | served until SIGTERM or SIGINT
 main : Co

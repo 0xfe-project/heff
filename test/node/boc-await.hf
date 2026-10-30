@@ -1,8 +1,9 @@
 -- Acts of the world awaited by boc's behaviours (`BOC.await`), on the
 -- C backend's threads: each run outside every behaviour, in the reactor
 -- of the worker whose behaviour awaited it, and the behaviour after it
--- spawned once it has come to its value.  What the runs leave is read
--- out of their cowns by a behaviour of a `scheduled` after each.
+-- spawned once it has come to its value.  What each part leaves is read
+-- out of its cowns by a behaviour waiting until they hold what its last
+-- writes, which then starts the next part.
 
 module test.node.boc-await
 
@@ -23,34 +24,11 @@ after : {e : HFunctor}
       -> Co e a
 after ms v = bind (sleep (Duration.milliseconds ms)) (\u -> pure v)
 
--- (what `c` came to, and how long it took, in milliseconds)
-timed : {e : HFunctor}
-      -> {a : Type}
-      -> {{clock : time <: e}}
-      -> Co e a
-      -> Co e (Int, a)
-timed c = do
-  start <- monotonic
-  x <- c
+-- (how long it has been since `start`, in milliseconds)
+since : {e : HFunctor} -> {{clock : time <: e}} -> Duration.Duration -> Co e Int
+since start = do
   end <- monotonic
-  pure (Duration.totalNanoseconds (end - start) / 1000000, x)
-
--- (what the cowns `cs` hold, every behaviour of the `scheduled` before
--- done, said as `f` says, by a behaviour of a `scheduled` of its own)
-said : {c : Type}
-     -> {e : HFunctor}
-     -> c
-     -> {{cw : BOC.Cowns c}}
-     -> {{bc : BOC.boc <: e}}
-     -> {{io : stdio <: e}}
-     -> (cw.Contents -> String)
-     -> Co e Unit
-said cs f =
-  BOC.scheduled
-    (\why -> abandon)
-    (BOC.when cs (\v -> do
-       print (f v)
-       pure v))
+  pure (Duration.totalNanoseconds (end - start) / 1000000)
 
 -- (", in time" where `ms` is about `want`, else how long it took)
 inTime : Int -> Int -> String
@@ -113,29 +91,30 @@ failing ran count = do
   chained count 3
 
 -- (acts awaited in a custody, shut down once a sleep of 50 ms is
--- done: a sleep of 5 s and a wait for SIGHUP, given up, their bodies
--- never run -- `ran` counts them -- and the run ends then)
+-- done: a sleep of two minutes, past the test's time, and a wait for
+-- SIGHUP, given up, their bodies never run -- each would say so -- and
+-- the program not kept by them; `stopped` set then)
 givenUp : {e : HFunctor}
         -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
         -> {{clock : time <: e}}
         -> {{sg : Signal.signals <: e}}
         -> {{cu : Custodian.custodian <: e}}
-        -> BOC.Cown Int
+        -> BOC.Cown Bool
         -> Co e Unit
-givenUp ran = do
+givenUp stopped = do
   with k := Custodian.custody do
-    with n := ran
-         u := BOC.await (after 5000 ()) do
-      n := n + 1
-    with n := ran
-         s := BOC.await (Signal.wait [Hangup]) do
-      n := n + 1
+    with u := BOC.await (after 120000 ()) do
+      print "a sleep given up: its body ran"
+    with s := BOC.await (Signal.wait [Hangup]) do
+      print "a wait given up: its body ran"
     with u := BOC.await (after 50 ()) do
       _ <- Custodian.shutdown k
-      pure ()
+      with s := stopped do
+        s := True
 
--- (two races, a sleep of 50 ms against one of 5 s, each way round: what
--- each came to, on the cown, the run ending once the first are done)
+-- (two races, a sleep of 50 ms against one of two minutes, each way
+-- round: what each came to, on the cown, the slow ones given up)
 raced : {e : HFunctor}
       -> {{bc : BOC.boc <: e}}
       -> {{clock : time <: e}}
@@ -143,51 +122,60 @@ raced : {e : HFunctor}
       -> Co e Unit
 raced log = do
   with l := log
-       r := BOC.awaitFirst (after 50 "quick") (after 5000 "slow") do
+       r := BOC.awaitFirst (after 50 "quick") (after 120000 "slow") do
     l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
   with l := log
-       r := BOC.awaitFirst (after 5000 "slow") (after 100 "quick") do
+       r := BOC.awaitFirst (after 120000 "slow") (after 100 "quick") do
     l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
 
 -- (the sleeps at once, their behaviours on the cown in the order they
--- woke, the chain done before the run ended; acts that fail, `failed`
--- told, the others going on)
-program : {e : HFunctor}
+-- woke, and the chain beside them, said once all are done; then
+-- `next`)
+reactor : {e : HFunctor}
         -> {{bc : BOC.boc <: e}}
         -> {{io : stdio <: e}}
         -> {{clock : time <: e}}
         -> Co e Unit
-program = do
+        -> Co e Unit
+reactor next = do
   log <- BOC.newCown Nil
   count <- BOC.newCown 0
-  (ms, u) <-
-    timed
-      (BOC.scheduled
-         (\why -> printErr ("failed: " ^ why))
-         (do
-          three log
-          chained count 5))
-  said
-      (log, count)
-      (\p -> case p of
-       (l, n) ->
-         "reactor: " ^ unwords l ^ ", chained " ^ debug n ^ inTime ms 300)
+  start <- monotonic
+  three log
+  chained count 5
+  with l := log
+       n := count
+    where List.length l == 3 && n == 5
+  do
+    ms <- since start
+    print ("reactor: " ^ unwords l ^ ", chained " ^ debug n ^ inTime ms 300)
+    next
+
+-- (acts that fail, said on stderr, the others going on: said once the
+-- chain beside them is done; then `next`)
+failingActs : {e : HFunctor}
+            -> {{bc : BOC.boc <: e}}
+            -> {{io : stdio <: e}}
+            -> {{clock : time <: e}}
+            -> Co e Unit
+            -> Co e Unit
+failingActs next = do
   ran <- BOC.newCown 0
-  count3 <- BOC.newCown 0
-  BOC.scheduled
-      (\why -> print ("an act failed: " ^ why))
-      (failing ran count3)
-  said
-      (ran, count3)
-      (\p -> case p of
-       (n, c) ->
-         "the run: done, their bodies run "
+  count <- BOC.newCown 0
+  failing ran count
+  with n := ran
+       c := count
+    where c == 3
+  do
+    print
+        ("the run: done, their bodies run "
          ^ debug n
          ^ " times, the chain beside them "
          ^ debug c)
+    next
 
--- (acts given up as their custody is shut down, and acts raced: each
--- run in about the time of its quickest)
+-- (acts given up as their custody is shut down, said once it is, by a
+-- behaviour outside it; then `next`)
 givingUp : {e : HFunctor}
          -> {{bc : BOC.boc <: e}}
          -> {{io : stdio <: e}}
@@ -195,33 +183,43 @@ givingUp : {e : HFunctor}
          -> {{sg : Signal.signals <: e}}
          -> {{cu : Custodian.custodian <: e}}
          -> Co e Unit
-givingUp = do
-  ran <- BOC.newCown 0
-  (ms, u) <-
-    timed
-      (BOC.scheduled
-         (\why -> printErr ("failed: " ^ why))
-         (givenUp ran))
-  said
-      ran
-      (\n ->
-         "given up: bodies run "
-         ^ debug n
-         ^ (if ms < 1000 then ", in time" else ", took " ^ debug ms ^ " ms"))
-  log <- BOC.newCown Nil
-  (ms2, u2) <-
-    timed (BOC.scheduled (\why -> printErr ("failed: " ^ why)) (raced log))
-  said
-      log
-      (\l ->
-         "raced: "
-         ^ joinWith ", " l
-         ^ (if ms2 < 1000 then ", in time" else ", took " ^ debug ms2 ^ " ms"))
+         -> Co e Unit
+givingUp next = do
+  stopped <- BOC.newCown False
+  start <- monotonic
+  with s := stopped
+    where s
+  do
+    ms <- since start
+    print
+        ("given up: "
+         ^ (if ms < 1000 then "in time" else "took " ^ debug ms ^ " ms"))
+    next
+  givenUp stopped
 
--- | the program, on the system's threads
+-- (acts raced, said once both races are done: each run in about the
+-- time of its quickest)
+racing : {e : HFunctor}
+       -> {{bc : BOC.boc <: e}}
+       -> {{io : stdio <: e}}
+       -> {{clock : time <: e}}
+       -> Co e Unit
+racing = do
+  log <- BOC.newCown Nil
+  start <- monotonic
+  raced log
+  with l := log
+    where List.length l == 2
+  do
+    ms <- since start
+    print
+        ("raced: "
+         ^ joinWith ", " l
+         ^ (if ms < 1000 then ", in time" else ", took " ^ debug ms ^ " ms"))
+
+-- | the program, on the system's threads: each part started once the
+-- | one before has said its line
 main : Co
        (BOC.boc <+> stdio <+> time <+> Signal.signals <+> Custodian.custodian)
        Unit
-main = do
-  program
-  givingUp
+main = reactor (failingActs (givingUp racing))

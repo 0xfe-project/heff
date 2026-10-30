@@ -59,14 +59,15 @@
 // cown is to hold what it held.  A value of a word read and written
 // keeps nothing in the log.
 //
-// A body that fails leaves its cowns as they were, and the pool's
-// `failed` is run, on the thread, before the cowns are let go: what that
-// fails at is the pool's, the first kept, for `scheduled` to fail with.
+// A body that fails leaves its cowns as they were, and why is said on
+// stderr, on the thread, before the cowns are let go; the program ends
+// by 1 (`bc_failures`).
 //
-// Which pool a `when` spawns in is this thread's (`bc_current`): the
-// pool a `scheduled` opened, while its computation runs on this thread,
-// or the pool whose worker this is.  So no operation carries a pool.
-// A scope's computation gives what it came to as a body does (`Given`).
+// The program has one pool (`bc_program`), opened by its first operation
+// of boc's outside every worker, and drained once the program's
+// computation has returned (`heff_returned`).  Which pool a `when`
+// spawns in is this thread's (`bc_current`): the program's, or the pool
+// whose worker this is.  So no operation carries a pool.
 // Each body starts its chain of calls last from naught (`heff_dep`), as
 // a bounce's step does, not one past the last body's.
 
@@ -203,8 +204,6 @@ struct BcPool {
   atomic_llong live;
   int sleeping, stopping, n;
   pthread_t *threads;
-  V failed;        // String -> m Unit, shared
-  char *why;       // the first `failed` that failed
   BcWait *parked;  // those waiting, under `mu`
   // (the reactor groups of the workers waiting in their reactors, acts
   // pending there, to be woken there where a behaviour is ready)
@@ -217,8 +216,12 @@ static void bc_wait_less(BcWait *w) {
 }
 
 // (a cown holding `v`, shared; `v` consumed)
+// (a cown on a cache line of its own: each spawn on it swaps `last`, and
+// a line two cowns shared would be written by the spawns on both)
+#define BC_LINE 128
 static BcCown *bc_cown(V v) {
-  BcCown *c = heff_alloc(sizeof(BcCown));
+  BcCown *c = aligned_alloc(BC_LINE, BC_LINE);
+  if (!c) heff_fail("out of memory");
   atomic_init(&c->last, NULL);
   c->v = heff_share(v);
   c->waiting = NULL;
@@ -273,11 +276,46 @@ static inline int bc_bit(int64_t bits, int i) {
   return bits < 0 ? 1 : i < 62 && ((bits >> i) & 1);
 }
 
-static void bc_pool_less(BcPool *pl) {
-  if (atomic_fetch_sub_explicit(&pl->live, 1, memory_order_acq_rel) == 1) {
+// The pool counts what is queued, running or pending (`live`) a batch
+// at a time, not one at a time, each a write all threads make to one
+// line: a thread takes `BC_CREDIT` at once and spends them as it
+// spawns, and what is done on it -- a behaviour, an act -- is its
+// credit again, given back a batch at a time where it has too many.
+// So `live` is what is queued, running or pending and the credit the
+// threads hold; a thread gives back all it holds before it waits --
+// to sleep, in its reactor -- and the program's before the end, so
+// that `live` comes to 0 once nothing is left.
+#define BC_CREDIT 64
+static HEFF_TLS int64_t bc_credit;
+
+// (one more queued, running or pending)
+static inline void bc_pool_more(BcPool *pl) {
+  if (bc_credit > 0) {
+    bc_credit--;
+    return;
+  }
+  atomic_fetch_add_explicit(&pl->live, BC_CREDIT, memory_order_acq_rel);
+  bc_credit = BC_CREDIT - 1;
+}
+
+// (what this thread holds given back, before it waits: where nothing is
+// left then, the end told)
+static void bc_settle(BcPool *pl) {
+  int64_t c = bc_credit;
+  bc_credit = 0;
+  if (c && atomic_fetch_sub_explicit(&pl->live, c, memory_order_acq_rel) == c) {
     pthread_mutex_lock(&pl->mu);
     pthread_cond_broadcast(&pl->idle);
     pthread_mutex_unlock(&pl->mu);
+  }
+}
+
+// (one done: this thread's credit; a batch given back where it holds
+// two, never all it holds, so `live` stays above 0 here)
+static void bc_pool_less(BcPool *pl) {
+  if (++bc_credit > 2 * BC_CREDIT) {
+    atomic_fetch_sub_explicit(&pl->live, BC_CREDIT, memory_order_acq_rel);
+    bc_credit -= BC_CREDIT;
   }
 }
 
@@ -434,7 +472,7 @@ static void bc_behave(BcPool *pl, V cs, V body, V cond, int64_t ws, int64_t rs) 
   b->rs = rs;
   b->act = NULL;
   b->moved = 0;
-  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  bc_pool_more(pl);
   bc_enqueue(b);
   return;
 twice:
@@ -534,7 +572,7 @@ static void bc_wake(BcWait *w) {
     return;
   BcBehaviour *b = w->b;
   BcPool *pl = b->pool;
-  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  bc_pool_more(pl);
   pthread_mutex_lock(&pl->mu);
   bc_unparked(pl, w);
   pthread_mutex_unlock(&pl->mu);
@@ -743,7 +781,7 @@ static void bc_written(HeffOwnLog *g, V cs, V v, int64_t ws, int *i) {
 
 // (what the cowns of the behaviour this thread runs hold, for its body
 // to take (`Taken`), and what they are to hold after it, as its body
-// gives it (`Given`) -- or what a scope's computation came to)
+// gives it (`Given`))
 static HEFF_TLS V bc_taken, bc_given;
 
 static V bc_dropped(V self, V *a) {
@@ -754,16 +792,18 @@ static V bc_dropped(V self, V *a) {
 
 static Clo bc_dropped_clo = {{0x80000000u, K_CLO, 0}, bc_dropped, 1, 0};
 
-// (`failed why` run, under a catch: what it fails at the pool's, the
-// first kept)
+// (how many behaviours and acts failed: the program ends by 1 where any
+// did)
+static atomic_int bc_failures;
+
+// (a behaviour or an act failed, why: said on stderr, as a failure of
+// the program's is, the others going on)
 static void bc_failed(BcPool *pl, const char *why) {
-  V out;
-  why = bc_try2(heff_dup(pl->failed), heff_str_text(why), (V)&bc_dropped_clo, &out);
-  if (why) {
-    pthread_mutex_lock(&pl->mu);
-    if (!pl->why) pl->why = bc_strdup(why);
-    pthread_mutex_unlock(&pl->mu);
-  } else heff_drop(out);
+  (void)pl;
+  atomic_fetch_add_explicit(&bc_failures, 1, memory_order_relaxed);
+  fflush(stdout);
+  if (strcmp(why, "heff:abandon") == 0) fputs("heff:abandon\n", stderr);
+  else fprintf(stderr, "heff: %s\n", why);
 }
 
 // Acts awaited ----------------------------------------------------------------
@@ -781,7 +821,7 @@ static void bc_failed(BcPool *pl, const char *why) {
 // it -- runs on the worker that started it, and that behaviour is the
 // one the worker runs next, in its slot: no other thread between an
 // act and its behaviour.  An act awaited outside every worker (by a
-// `scheduled`'s computation) is a behaviour on no cown, whose worker
+// `main`) is a behaviour on no cown, whose worker
 // takes the act as its own.
 //
 // A worker with nothing to run waits in its reactor where acts of its
@@ -791,9 +831,9 @@ static void bc_failed(BcPool *pl, const char *why) {
 // every 64 behaviours (`BC_POLL_EVERY`), so that acts done meanwhile
 // are not passed over.  The pool counts an act given a worker and not
 // yet started, and a worker with acts pending (`bc_holding`): the
-// `scheduled` ends once no behaviour is queued or runs and no act is
+// program ends once no behaviour is queued or runs and no act is
 // pending.  An act that fails -- abandons, or fails in the runtime --
-// fails as a body does: `failed` is given why (the group's function for
+// fails as a body does: why is said (the group's function for
 // failures), and what was to come after it does not.
 //
 // An act awaited with a custodian current is in that custodian's
@@ -841,7 +881,7 @@ static HEFF_TLS int bc_holding;
 // reactor, the look comes back, not waiting on, so that the act starts
 // now -- not once an act of the worker's is done)
 static void bc_inboxed(BcPool *pl, BcAct *a) {
-  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  bc_pool_more(pl);
   a->next = NULL;
   if (bc_inbox_last) bc_inbox_last->next = a;
   else bc_inbox = a;
@@ -867,7 +907,7 @@ static void bc_act_behaviour(BcPool *pl, BcAct *a) {
   b->ws = b->rs = 0;
   b->act = a;
   b->moved = 1;
-  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  bc_pool_more(pl);
   bc_enqueue(b);
 }
 
@@ -942,7 +982,7 @@ static void bc_hold_update(BcPool *pl) {
   int now = bc_group && heff_reactor_pending(bc_group) > 0;
   if (now == bc_holding) return;
   bc_holding = now;
-  if (now) atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  if (now) bc_pool_more(pl);
   else bc_pool_less(pl);
 }
 
@@ -1137,6 +1177,7 @@ static void *bc_worker(void *u) {
       for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->front, __ATOMIC_RELAXED)
                       && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++)
         bc_relax();
+    bc_settle(pl);
     pthread_mutex_lock(&pl->mu);
     if (!pl->front && !pl->stopping && bc_holding) {
       // (waiting in the reactor, said to be, so that a behaviour ready
@@ -1190,9 +1231,8 @@ static void *bc_worker(void *u) {
   return NULL;
 }
 
-// (a pool of as many threads as the machine has cores; `failed`
-// consumed, shared: every thread of the pool may run it)
-static BcPool *bc_pool(V failed) {
+// (a pool of as many threads as the machine has cores)
+static BcPool *bc_pool(void) {
   int64_t n = bc_cores();
   BcPool *pl = heff_alloc(sizeof(BcPool));
   pthread_mutex_init(&pl->mu, NULL);
@@ -1203,10 +1243,8 @@ static BcPool *bc_pool(V failed) {
   pl->sleeping = 0;
   pl->stopping = 0;
   pl->n = (int)n;
-  pl->why = NULL;
   pl->parked = NULL;
   pl->npolling = 0;
-  pl->failed = heff_share(failed);
   pl->threads = heff_alloc((size_t)n * sizeof(pthread_t));
   for (int i = 0; i < pl->n; i++) {
     BcWorkerStart *s = heff_alloc(sizeof(BcWorkerStart));
@@ -1218,14 +1256,26 @@ static BcPool *bc_pool(V failed) {
 }
 
 // (no behaviour left but those waiting: those dropped, the threads
-// stopped and the pool freed; why the first `failed` failed, where one
-// did, the caller's to free.  One being queued again meanwhile, by a
-// body of another pool's, is waited for, and then what it runs)
-static char *bc_drain(BcPool *pl) {
+// stopped and the pool freed.  One being queued again meanwhile is
+// waited for, and then what it runs)
+static void bc_drain(BcPool *pl) {
   BcWait *dropped = NULL;
+  bc_settle(pl);
   pthread_mutex_lock(&pl->mu);
   for (;;) {
     while (atomic_load_explicit(&pl->live, memory_order_acquire) > 0) pthread_cond_wait(&pl->idle, &pl->mu);
+    // (what is due on this thread -- the program's -- run first: a
+    // custodian's `stop` given by `main`, the custodian shut down by a
+    // failure since; what it spawns, or wakes, waited for in turn)
+#ifdef HEFF_CUSTODY_LOCK
+    if (heff_due_here && __atomic_load_n(&heff_due_here->n, __ATOMIC_ACQUIRE)) {
+      pthread_mutex_unlock(&pl->mu);
+      heff_due_run();
+      bc_settle(pl);
+      pthread_mutex_lock(&pl->mu);
+      continue;
+    }
+#endif
     int waking = 0;
     for (BcWait *w = pl->parked, *next; w; w = next) {
       next = w->next;
@@ -1256,51 +1306,46 @@ static char *bc_drain(BcPool *pl) {
     bc_wait_less(dropped);
     dropped = next;
   }
-  char *why = pl->why;
   pthread_mutex_destroy(&pl->mu);
   pthread_cond_destroy(&pl->work);
   pthread_cond_destroy(&pl->idle);
-  heff_drop(pl->failed);
   free(pl->threads);
   free(pl);
-  return why;
 }
 
-// (`c` run here with a pool of its own as this thread's, every behaviour
-// waited for: what it came to, given (`Given`); or it fails, as `c`
-// did, else as the first `failed` did)
-static V bc_scheduled(V failed, V c) {
-  BcPool *pl = bc_pool(failed);
-  BcPool *was = bc_current;
-  V given = bc_given;
-  bc_current = pl;
-  bc_given = 0;
-  V out;
-  const char *why = bc_try2(c, NTAG(TAG_MkUnit), (V)&bc_dropped_clo, &out);
-  char *cwhy = why ? bc_strdup(why) : NULL;
-  if (!why) heff_drop(out);
-  V answer = bc_given;
-  bc_given = given;
-  bc_current = was;
-  char *fwhy = bc_drain(pl);
-  if (cwhy) {
-    free(fwhy);
-    if (answer) heff_drop(answer);
-    heff_fail_again(cwhy);
+// (the program's pool: opened by its first operation of boc's, outside
+// every worker, and its behaviours and acts waited for once the
+// program's computation has returned (`heff_returned`), then those
+// waiting dropped and the threads stopped)
+static BcPool *bc_program;
+static pthread_mutex_t bc_program_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int bc_program_end(void) {
+  pthread_mutex_lock(&bc_program_mu);
+  BcPool *pl = bc_program;
+  bc_program = NULL;
+  pthread_mutex_unlock(&bc_program_mu);
+  if (pl) bc_drain(pl);
+  bc_current = NULL;
+  return atomic_load_explicit(&bc_failures, memory_order_relaxed) > 0;
+}
+
+static BcPool *bc_program_pool(void) {
+  pthread_mutex_lock(&bc_program_mu);
+  if (!bc_program) {
+    bc_program = bc_pool();
+    heff_returned = bc_program_end;
   }
-  if (fwhy) {
-    if (answer) heff_drop(answer);
-    heff_fail_again(fwhy);
-  }
-  if (!answer) heff_fail("boc: a scheduled computation ended without a value");
-  return answer;
+  BcPool *pl = bc_program;
+  pthread_mutex_unlock(&bc_program_mu);
+  return pl;
 }
 
 // (the pool a `when` here spawns in; a body's operation counted, and at
 // its fuel's end the behaviour kept let out)
 static BcPool *bc_here(void) {
   BcPool *pl = bc_current;
-  if (!pl) heff_fail("boc: a when outside every scheduled");
+  if (!pl) pl = bc_current = bc_program_pool();
   if (bc_slot && bc_in_body && ++bc_fuel >= BC_FUEL) {
     BcBehaviour *kept = bc_slot;
     bc_slot = NULL;
@@ -1396,16 +1441,6 @@ static V heff_provider_boc(V p, V k) {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     x = heff_answer(f, NTAG(first ? TAG_True : TAG_False));
-    break;
-  }
-  case TAG_Scheduled: {
-    V failed = heff_carried_fn(heff_dup(heff_field(p, 0)));
-    V c = heff_carried_fn(heff_dup(heff_field(p, 1)));
-    V an = bc_open(heff_dup(heff_field(p, 2)));
-    heff_drop(p);
-    V g = heff_dup(heff_field(an, 0));
-    heff_drop(an);
-    x = heff_answer(g, bc_scheduled(failed, c));
     break;
   }
   default:

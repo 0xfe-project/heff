@@ -1,9 +1,10 @@
 -- Values shared by boc's behaviours, on the C backend's threads: each
 -- computed by a behaviour on a cown of its own, at once on the pool's
--- threads, and handed to a behaviour after them (`spread`) -- values of
--- definitions every thread asks for, of the caller's, frozen or made
--- there, handed from one thread to another, and held by the caller
--- alone again once the behaviours let them go.
+-- threads, and handed to a behaviour after them (`spread`), which says
+-- them and starts the next -- values of definitions every thread asks
+-- for, of the caller's, frozen or made there, handed from one thread to
+-- another, and held by the behaviour after them once the others let
+-- them go.
 
 module test.node.boc-shared
 
@@ -160,33 +161,33 @@ spawned results f i n =
     spawned results f (i + 1) n
 
 -- | `f i` for each `i` below `n`, by behaviours at once, their values in
--- | order given to `k` by a behaviour once all are done, of a
--- | `scheduled` of its own: what `k` spawns, done before this is.  A
--- | behaviour that fails is said, and the program abandons.
+-- | order given to `k` by a behaviour once all are done, which waits
+-- | until they are.  A behaviour that fails is said, and the program
+-- | ends by 1, `k` never run.
 spread : {e : HFunctor}
        -> {a : Type}
        -> {{bc : BOC.boc <: e}}
-       -> {{io : stdio <: e}}
        -> Int
        -> (Int -> a)
        -> (List a -> Co e Unit)
        -> Co e Unit
 spread n f k = do
   results <- BOC.newCown Nil
-  BOC.scheduled
-      (\why -> bind (printErr ("failed: " ^ why)) (\u -> abandon))
-      (spawned results f 0 n)
-  BOC.scheduled
-      (\why -> abandon)
-      (BOC.when results (\r -> do
-       k (List.map snd r)
-       pure r))
+  spawned results f 0 n
+  with r := results
+    where List.length r == n
+  do
+    k (List.map snd r)
+
+-- (the steps, each given the next, to start once it is done)
+steps : {e : HFunctor} -> List (Co e Unit -> Co e Unit) -> Co e Unit
+steps [] = pure ()
+steps (s :: rest) = s (steps rest)
 
 -- | ... `f` of each of `xs`.
 spreadOver : {e : HFunctor}
            -> {a b : Type}
            -> {{bc : BOC.boc <: e}}
-           -> {{io : stdio <: e}}
            -> (b -> a)
            -> List b
            -> (List a -> Co e Unit)
@@ -206,15 +207,6 @@ program : {e : HFunctor}
         -> Co e Unit
 program = do
   print "said before the spread, once"
-  spread 4 (\i -> i * i) (\sq -> print ("squares: " ^ showInts sq))
-  spread
-      3
-      (\m -> List.sum (List.map (\x -> x * m) (List.range 1 5)))
-      (\own -> print ("each its own: " ^ showInts own))
-  spread
-      4
-      (\n -> List.sum squares + n)
-      (\shared -> print ("a definition, shared: " ^ showInts shared))
   mine <-
     pure
       ({ m = 2.5
@@ -224,19 +216,40 @@ program = do
        } :
          Mass)
   us <- pure (widesFrom 3)
-  spread
-      3
-      (\f -> massOf mine us + f)
-      (\flat -> print ("flat fields, frozen and shared: " ^ showInts flat))
-  spread 3 spun (\ws -> print ("workers: " ^ showInts ws))
-  spreadOver
-      (primesIn 100000)
-      (List.range 0 (100000 / 4096))
-      (\ps -> print ("primes below 100000: " ^ debug (List.sum ps)))
-  spreadOver
-      fib
-      (List.replicate 4 20)
-      (\fs -> print ("forced at once: " ^ showInts fs))
+  steps
+      [ \next ->
+        spread 4 (\i -> i * i) (\sq -> do
+          print ("squares: " ^ showInts sq)
+          next)
+      , \next ->
+        spread
+          3
+          (\m -> List.sum (List.map (\x -> x * m) (List.range 1 5))) (\own -> do
+            print ("each its own: " ^ showInts own)
+            next)
+      , \next ->
+        spread 4 (\n -> List.sum squares + n) (\shared -> do
+          print ("a definition, shared: " ^ showInts shared)
+          next)
+      , \next ->
+        spread 3 (\f -> massOf mine us + f) (\flat -> do
+          print ("flat fields, frozen and shared: " ^ showInts flat)
+          next)
+      , \next ->
+        spread 3 spun (\ws -> do
+          print ("workers: " ^ showInts ws)
+          next)
+      , \next ->
+        spreadOver
+          (primesIn 100000)
+          (List.range 0 (100000 / 4096)) (\ps -> do
+            print ("primes below 100000: " ^ debug (List.sum ps))
+            next)
+      , \next ->
+        spreadOver fib (List.replicate 4 20) (\fs -> do
+          print ("forced at once: " ^ showInts fs)
+          next)
+      ]
 
 main : Co (BOC.boc <+> stdio <+> process) Unit
 main = program
@@ -245,8 +258,8 @@ main = program
 sumTo : Int -> Int
 sumTo n = if n == 0 then 0 else n + sumTo (n - 1)
 
--- (a behaviour whose stack overflows: caught there, told to `failed`,
--- which says it, and the program abandons)
+-- (a behaviour whose stack overflows: caught there, and said, and the
+-- program ends by 1)
 overflowingIn : {e : HFunctor}
               -> {{bc : BOC.boc <: e}}
               -> {{io : stdio <: e}}
@@ -273,66 +286,78 @@ generics : {e : HFunctor}
          -> {{sys : process <: e}}
          -> Co e Unit
 generics = do
-  spreadOver
-      (\s -> s ^ "!")
-      ["a", "bb", "ccc", "dddd", "eeeee"]
-      (\shouted -> print ("strings: " ^ unwords shouted))
-  spreadOver
-      (\i -> List.range 1 i)
-      (List.range 0 4)
-      (\ranges -> print ("lists: " ^ unwords (List.map showList ranges)))
   mine <- pure (List.map (\x -> x * 3) (List.range 1 100))
-  spreadOver
-      (\n -> List.sum (List.take n mine))
-      [0, 1, 10, 100, 1000]
-      (\sums -> print ("a list of the caller's, in each: " ^ showInts sums))
   thunk <- pure (\(u : Unit) -> List.range 1 (List.length mine / 20))
-  spreadOver
-      thunk
-      (List.replicate 8 MkUnit)
-      (\forced ->
-         print
-           ("a closure of the caller's, called at once: "
-            ^ showInts (List.map List.sum forced)))
-  spreadOver
-      (\(p : Pair String Int) -> MkPair (fst p) (fib (snd p)))
-      [MkPair "one" 10, MkPair "two" 11]
-      (\pairs ->
-         print
-           ("pairs: "
-            ^ unwords
-              (List.map
-                 (\(p : Pair String Int) -> fst p ^ "=" ^ debug (snd p))
-                 pairs)))
-  spreadOver
-      (\(x : Int) -> x)
-      Nil
-      (\none -> print ("of none: " ^ showList none))
   text <-
     pure
       (joinWith "" (List.replicate 50 (strSlice "0123456789--" 0 10)))
-  spreadOver
-      (\k -> strSlice (strSlice text k 500) 10 (300 + k))
-      [0, 1, 2, 3, 4, 5]
-      (\cut ->
-         print
-           ("views of the caller's string: "
-            ^ unwords
-              (List.map
-                 (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 3)
-                 cut)))
-  spreadOver
-      (\k -> strSlice (joinWith "" (List.replicate 100 (debug k))) 2 90)
-      [0, 1, 2]
-      (\own ->
-         print
-           ("views of each's own: "
-            ^ unwords
-              (List.map
-                 (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 2)
-                 own)))
-  c <- processors
-  print (if c >= 1 then "processors: at least one" else "processors: none")
+  steps
+      [ \next ->
+        spreadOver
+          (\s -> s ^ "!")
+          ["a", "bb", "ccc", "dddd", "eeeee"] (\shouted -> do
+            print ("strings: " ^ unwords shouted)
+            next)
+      , \next ->
+        spreadOver (\i -> List.range 1 i) (List.range 0 4) (\ranges -> do
+          print ("lists: " ^ unwords (List.map showList ranges))
+          next)
+      , \next ->
+        spreadOver
+          (\n -> List.sum (List.take n mine))
+          [0, 1, 10, 100, 1000] (\sums -> do
+            print ("a list of the caller's, in each: " ^ showInts sums)
+            next)
+      , \next ->
+        spreadOver thunk (List.replicate 8 MkUnit) (\forced -> do
+          print
+              ("a closure of the caller's, called at once: "
+               ^ showInts (List.map List.sum forced))
+          next)
+      , \next ->
+        spreadOver
+          (\(p : Pair String Int) -> MkPair (fst p) (fib (snd p)))
+          [MkPair "one" 10, MkPair "two" 11] (\pairs -> do
+            print
+                ("pairs: "
+                 ^ unwords
+                   (List.map
+                      (\(p : Pair String Int) -> fst p ^ "=" ^ debug (snd p))
+                      pairs))
+            next)
+      , \next ->
+        spreadOver (\(x : Int) -> x) Nil (\none -> do
+          print ("of none: " ^ showList none)
+          next)
+      , \next ->
+        spreadOver
+          (\k -> strSlice (strSlice text k 500) 10 (300 + k))
+          [0, 1, 2, 3, 4, 5] (\cut -> do
+            print
+                ("views of the caller's string: "
+                 ^ unwords
+                   (List.map
+                      (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 3)
+                      cut))
+            next)
+      , \next ->
+        spreadOver
+          (\k -> strSlice (joinWith "" (List.replicate 100 (debug k))) 2 90)
+          [0, 1, 2] (\own -> do
+            print
+                ("views of each's own: "
+                 ^ unwords
+                   (List.map
+                      (\s -> debug (strLength s) ^ ":" ^ strSlice s 0 2)
+                      own))
+            next)
+      , \next -> do
+          c <- processors
+          print
+              (if c >= 1 then "processors: at least one"
+               else "processors: none")
+          next
+      ]
 
 generic : Co (BOC.boc <+> stdio <+> process) Unit
 generic = generics
@@ -365,8 +390,9 @@ cpu = do
 
 -- (`handOver R W`: R rounds, each W lists of 100,000 made by
 -- behaviours and summed by the one after them, on another thread --
--- made in one thread, let go of in another, round after round, in
--- memory that does not grow; the sums added up on `total`)
+-- made in one thread, let go of in another, round after round, each
+-- started by the one before, in memory that does not grow; the sums
+-- added up on `total`, said after the last)
 madeThere : Int -> List Int
 madeThere i = List.range i (i + 99999)
 
@@ -378,14 +404,14 @@ handRounds : {e : HFunctor}
            -> Int
            -> Co e Unit
 handRounds total r w =
-  if r == 0 then pure ()
-  else do
-    spread
-        w
-        madeThere (\xs -> do
-          with t := total do
-            t := t + List.sum (List.map List.sum xs))
-    handRounds total (r - 1) w
+  if r == 0
+  then do
+    with t := total do
+      print ("handed over: " ^ debug t)
+  else spread w madeThere (\xs -> do
+    with t := total do
+      t := t + List.sum (List.map List.sum xs)
+    handRounds total (r - 1) w)
 
 handArgs : {e : HFunctor}
          -> {{bc : BOC.boc <: e}}
@@ -395,11 +421,6 @@ handArgs : {e : HFunctor}
 handArgs (r :: w :: _) = do
   total <- BOC.newCown 0
   handRounds total (fromMaybe 0 (parseInt r)) (fromMaybe 2 (parseInt w))
-  BOC.scheduled
-      (\why -> abandon)
-      (BOC.when total (\s -> do
-       print ("handed over: " ^ debug s)
-       pure s))
 handArgs _ = print "handOver ROUNDS W"
 
 handOver : Co (BOC.boc <+> stdio <+> process) Unit
@@ -408,9 +429,8 @@ handOver = do
   handArgs argv
 
 -- (`unshared`: a tree, a list and two arrays shared with the pool's
--- threads, each behaviour reading all of them; held by the caller alone
--- again once the behaviours let them go, and then taken apart and built
--- in where they are, not copied)
+-- threads, each behaviour reading all of them; then, by the behaviour
+-- after them, once they have let them go, taken apart and built again)
 data Tree = Leaf | Node Tree Int Tree
 
 grown : Int -> Int -> Tree
@@ -461,13 +481,17 @@ unsharedRun = do
   spread
       4
       (\i ->
-         treeSum t + List.sum xs + arraySum a 0 0 + namesLength names 0 0 + i)
-      (\seen -> print ("read by 4: " ^ showInts seen))
-  print ("tree: " ^ debug (treeSum (bumped t)))
-  ys <- pure (bumpedAll xs)
-  print ("list: " ^ debug (List.sum ys) ^ " of " ^ debug (List.length ys))
-  print ("array: " ^ debug (arraySum (tripled a 0) 0 0))
-  print ("names: " ^ debug (namesLength (renamed names 0) 0 0))
+         treeSum t
+         + List.sum xs
+         + arraySum a 0 0
+         + namesLength names 0 0
+         + i) (\seen -> do
+        print ("read by 4: " ^ showInts seen)
+        print ("tree: " ^ debug (treeSum (bumped t)))
+        ys <- pure (bumpedAll xs)
+        print ("list: " ^ debug (List.sum ys) ^ " of " ^ debug (List.length ys))
+        print ("array: " ^ debug (arraySum (tripled a 0) 0 0))
+        print ("names: " ^ debug (namesLength (renamed names 0) 0 0)))
 
 unshared : Co (BOC.boc <+> stdio <+> process) Unit
 unshared = unsharedRun

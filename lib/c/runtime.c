@@ -638,6 +638,11 @@ HEFF_FN void heff_end(int status, int returned) {
   exit(status);
 }
 
+// (what a provider runs once the program's computation has returned, on
+// the program's thread, before its end: boc's, its behaviours waited
+// for.  Nonzero, the program ends by 1 where it would by 0)
+HEFF_VAR(int (*heff_returned)(void));
+
 // (the program ended by `status`, from any thread of it)
 HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
   heff_end(status, 0);
@@ -675,6 +680,18 @@ HEFF_FN V heff_abandon(void) {
 }
 
 HEFF_FN V heff_nomatch(V s);
+
+// (`panic why`: a failure, `why` its words -- caught as `heff_fail`'s
+// is, by the innermost `heff_try`, else said and the program ended.
+// The words are copied, and kept: the failure ends what would give
+// them back)
+HEFF_FN char *heff_cstr_text(V v);
+HEFF_FN V heff_panic(V s) {
+  char *why = heff_cstr_text(s);
+  heff_drop(s);
+  heff_fail(why ? why : "panic");
+  return NTAG(TAG_MkUnit);
+}
 
 HEFF_FN void *heff_alloc(size_t n) {
   void *p = malloc(n);
@@ -7065,6 +7082,7 @@ static void *heff_thread(void *u) {
   heff_layout_held();
   heff_watch_stack();
   heff_tr(heff_entry());
+  if (heff_returned && heff_returned() && heff_status == 0) heff_status = 1;
   return NULL;
 }
 #endif

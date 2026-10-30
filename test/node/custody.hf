@@ -9,8 +9,11 @@
 --            `with` has ended, then closed as the act is done: the
 --            other side reads what was written, then the end; and a
 --            behaviour holding a connection, waiting for a condition
---            that never holds, dropped where its `scheduled` ends: the
---            connection closed then, its other side reading the end
+--            that never holds, dropped at the program's end, which it
+--            does not keep from ending
+--
+-- What the acts come to is logged, each in its place, and printed once
+-- all of it is in.
 
 module test.node.custody
 
@@ -30,14 +33,18 @@ endedAs (Signalled n) = "signalled " ^ debug n
 endedAs TimedOut = "timed out"
 endedAs (NotRun err) = "not run: " ^ err.message
 
--- (`what` put at the end of the log, by a behaviour on it)
+-- (`what` put at the end of the log once it holds `n` lines, by a
+-- behaviour waiting until it does: in its place, wherever it runs)
 logged : {e : HFunctor}
        -> {{bc : BOC.boc <: e}}
        -> BOC.Cown (List String)
+       -> Int
        -> String
        -> Co e Unit
-logged log what = do
-  with l := log do
+logged log n what = do
+  with l := log
+    where List.length l == n
+  do
     l := List.append l [what]
 
 -- (each line printed)
@@ -46,20 +53,6 @@ printed [] = pure ()
 printed (l :: ls) = do
   print l
   printed ls
-
--- (the lines the log holds, every behaviour before done, printed, and
--- the log emptied, by a behaviour of a `scheduled` of its own)
-said : {e : HFunctor}
-     -> {{bc : BOC.boc <: e}}
-     -> {{io : stdio <: e}}
-     -> BOC.Cown (List String)
-     -> Co e Unit
-said log =
-  BOC.scheduled
-    (\why -> abandon)
-    (BOC.when log (\ls -> do
-     printed ls
-     pure Nil))
 
 -- A command ----------------------------------------------------------------------------
 
@@ -75,7 +68,7 @@ commanded : {e : HFunctor}
 commanded log = do
   with withProcess { command = "sleep", args = ["0.3"] } as p do
     with r := BOC.await (wait p) do
-      logged log ("an act waited: " ^ endedAs r.ended)
+      logged log 0 ("an act waited: " ^ endedAs r.ended)
 
 -- A connection -------------------------------------------------------------------------
 
@@ -126,28 +119,26 @@ connectedTo : {e : HFunctor}
             -> Co e Unit
 connectedTo log l port = do
   with got := BOC.await (reader l) do
-    logged log got
+    logged log 1 got
   with Net.withConnection (here port) as c do
     with w :=
            BOC.await
              (Net.write c (Bytes.fromString "written after the with")) do
       pure ()
 
--- A scope's end ------------------------------------------------------------------------
+-- The program's end -------------------------------------------------------------------
 
 -- (a connection held by a behaviour whose condition never holds, as
--- nothing writes the cown it reads: dropped, its body never run, where
--- the `scheduled` ends; the other side, accepted, given back)
+-- nothing writes the cown it reads: dropped, its body never run, at the
+-- program's end)
 dropped : {e : HFunctor}
-        -> {s : Type}
         -> {{bc : BOC.boc <: e}}
         -> {{nt : Net.net <: e}}
         -> {{ex : exception Net.NetError <: e}}
         -> {{cu : Custodian.custodian <: e}}
-        -> With s Net.TcpListener
         -> Int
-        -> Co e (With s Net.TcpStream)
-dropped l port = do
+        -> Co e Unit
+dropped port = do
   never <- BOC.newCown False
   with Net.withConnection (here port) as c do
     with n := never
@@ -155,10 +146,6 @@ dropped l port = do
     do
       w <- Net.write c (Bytes.fromString "never")
       pure ()
-  r <- Net.accepted l
-  case r of
-    Left err -> throw err
-    Right c -> pure c
 
 -- Main ---------------------------------------------------------------------------------
 
@@ -177,37 +164,28 @@ listened log l = do
     Left err -> print ("no port: " ^ err.name)
     Right at -> do
       r <-
-        BOC.scheduled
-          (\why -> print ("failed: " ^ why))
-          (attempt Net.NetError (connectedTo log l at.port))
+        attempt
+          Net.NetError (do
+            connectedTo log l at.port
+            dropped at.port)
       case r of
         Left err -> print ("thrown: " ^ err.name)
-        Right u -> said log
-      d <-
-        BOC.scheduled
-          (\why -> print ("failed: " ^ why))
-          (attempt Net.NetError (dropped l at.port))
-      case d of
-        Right c -> do
-          got <- drained c Bytes.empty
-          print
-              ("after the scope, the other side read: "
-               ^ (if strEq got "" then "the end" else got))
-        Left err -> print ("thrown: " ^ err.name)
+        Right u -> pure ()
 
 main : Co
        (BOC.boc <+> Custodian.custodian <+> stdio <+> process <+> Net.net)
        Unit
 main = do
   log <- BOC.newCown Nil
-  r <-
-    BOC.scheduled
-      (\why -> print ("failed: " ^ why))
-      (attempt ProcessError (commanded log))
+  r <- attempt ProcessError (commanded log)
   case r of
     Left err -> print ("thrown: " ^ err.message)
-    Right u -> said log
+    Right u -> pure ()
   l <- Net.withListener (here 0) 16 (listened log)
   case l of
     Left err -> print ("not listening: " ^ err.name)
     Right u -> pure ()
+  with ls := log
+    where List.length ls == 2
+  do
+    printed ls

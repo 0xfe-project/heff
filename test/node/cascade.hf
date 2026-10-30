@@ -8,9 +8,9 @@
 --            thing, held by a cown past its `with`, fails to end as the
 --            behaviour on the cown lets go of it; its custodian is shut
 --            down -- what it was given run, the one under it shut down
---            too, its connection closed, so the server's write on it
---            fails and its client reads nothing -- and the failure said,
---            the server going on to the third
+--            too, its connection closed, so the server's write on it, by
+--            the behaviour after, fails and its client reads nothing --
+--            and the failure said, the server going on to the third
 --   rooted   a thing that fails to end, in the custody of a custodian
 --            under another, in the same block, neither containing it:
 --            the failure goes up through both to the root, the
@@ -29,6 +29,9 @@
 --            go of it, its custodian alone shut down -- its connection
 --            closed, the server's write on it failing -- the others
 --            served
+--
+-- What a server logs is printed once all of it is in, each line in its
+-- place, and what its custodians ran after it.
 
 module test.node.cascade
 
@@ -45,18 +48,29 @@ import test.node.flaky as Flaky
 here : Int -> Net.Address
 here port = { host = "127.0.0.1", port = port }
 
--- (`what` put at the end of the log, by a behaviour of a `scheduled` of
--- its own, done when this is: wherever it runs, in order)
+-- (`what` put at the end of the log, by a behaviour on it)
 logged : {e : HFunctor}
        -> {{bc : BOC.boc <: e}}
        -> BOC.Cown (List String)
        -> String
        -> Co e Unit
-logged log what =
-  BOC.scheduled
-    (\why -> abandon) (do
-      with l := log do
-        l := List.append l [what])
+logged log what = do
+  with l := log do
+    l := List.append l [what]
+
+-- (... once it holds `n` lines, by a behaviour waiting until it does: in
+-- its place, wherever it runs)
+loggedAt : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> BOC.Cown (List String)
+         -> Int
+         -> String
+         -> Co e Unit
+loggedAt log n what = do
+  with l := log
+    where List.length l == n
+  do
+    l := List.append l [what]
 
 -- (each line printed)
 printed : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
@@ -65,18 +79,23 @@ printed (l :: ls) = do
   print l
   printed ls
 
--- (the lines the log holds, every behaviour before done, printed)
+-- (the lines of the log and then those of the stops printed, once they
+-- hold `n` and `m`, by a behaviour waiting until they do)
 said : {e : HFunctor}
      -> {{bc : BOC.boc <: e}}
      -> {{io : stdio <: e}}
      -> BOC.Cown (List String)
+     -> BOC.Cown (List String)
+     -> Int
+     -> Int
      -> Co e Unit
-said log =
-  BOC.scheduled
-    (\why -> abandon)
-    (BOC.when log (\ls -> do
-     printed ls
-     pure ls))
+said log stops n m = do
+  with l := log
+       s := stops
+    where List.length l == n && List.length s == m
+  do
+    printed l
+    printed s
 
 -- (what comes on the connection, to its end)
 drained : {e : HFunctor}
@@ -119,7 +138,9 @@ heldPast fails after = do
 -- (the `i`th connection, by its client and the server: the server's in
 -- a custodian of its own, which contains its failures, with one under
 -- it; the connection's thing held by a cown past its `with`, let go of
--- by a behaviour, all done before the write)
+-- by a behaviour, and the write by the behaviour after it; the client's
+-- read once the connection is closed, after it.  What each comes to
+-- logged in its place, what the custodians run put on `stops`)
 served : {e : HFunctor}
        -> {s : Type}
        -> {{bc : BOC.boc <: e}}
@@ -131,26 +152,38 @@ served : {e : HFunctor}
        -> With s Net.TcpListener
        -> Int
        -> BOC.Cown (List String)
+       -> BOC.Cown (List String)
        -> Int
        -> Co e Unit
-served l port log i = do
+served l port log stops i = do
   with Net.withConnection (here port) as cl do
     with k := Custodian.contained do
       _ <-
-        Custodian.manage k (logged log ("custodian " ^ debug i ^ " shut down"))
+        Custodian.manage
+          k
+          (logged stops ("custodian " ^ debug i ^ " shut down"))
       sub <- Custodian.make
       _ <-
         Custodian.manage
           sub
-          (logged log ("the one under " ^ debug i ^ " shut down"))
+          (logged stops ("the one under " ^ debug i ^ " shut down"))
       with Net.accept l as c do
-        BOC.scheduled (\why -> abandon) (heldPast (i == 2) (pure ()))
-        w <- Net.write c (Bytes.fromString ("served " ^ debug i))
-        case w of
-          Left err -> logged log ("connection " ^ debug i ^ ": " ^ err.name)
-          Right u -> logged log ("connection " ^ debug i ^ " written")
+        heldPast
+            (i == 2) (do
+              w <- Net.write c (Bytes.fromString ("served " ^ debug i))
+              case w of
+                Left err ->
+                  loggedAt
+                    log
+                    (2 * i - 2)
+                    ("connection " ^ debug i ^ ": " ^ err.name)
+                Right u ->
+                  loggedAt
+                    log
+                    (2 * i - 2)
+                    ("connection " ^ debug i ^ " written"))
     got <- drained cl Bytes.empty
-    logged log ("client " ^ debug i ^ " read: " ^ got)
+    loggedAt log (2 * i - 1) ("client " ^ debug i ^ " read: " ^ got)
 
 listened : {e : HFunctor}
          -> {s : Type}
@@ -160,9 +193,10 @@ listened : {e : HFunctor}
          -> {{nt : Net.net <: e}}
          -> {{fl : Flaky.flaky <: e}}
          -> BOC.Cown (List String)
+         -> BOC.Cown (List String)
          -> With s Net.TcpListener
          -> Co e Unit
-listened log l = do
+listened log stops l = do
   a <- Net.local l
   case a of
     Left err -> print ("no port: " ^ err.name)
@@ -172,14 +206,14 @@ listened log l = do
           String
           (attempt
              Net.NetError (do
-               served l at.port log 1
-               served l at.port log 2
-               served l at.port log 3))
+               served l at.port log stops 1
+               served l at.port log stops 2
+               served l at.port log stops 3))
       case r of
         Left why -> print ("thrown: " ^ why)
         Right (Left err) -> print ("thrown: " ^ err.name)
         Right (Right u) -> pure ()
-      said log
+      said log stops 6 2
 
 main : Co
        (BOC.boc
@@ -190,7 +224,8 @@ main : Co
        Unit
 main = do
   log <- BOC.newCown Nil
-  r <- Net.withListener (here 0) 16 (listened log)
+  stops <- BOC.newCown Nil
+  r <- Net.withListener (here 0) 16 (listened log stops)
   case r of
     Left err -> print ("not listening: " ^ err.name)
     Right u -> pure ()
@@ -223,7 +258,8 @@ thingOf name = do
   print (name ^ " went on")
 
 -- (two behaviours on one cown, the first spawned in a custodian of its
--- own)
+-- own; and a third after them, not reached where the second ends the
+-- program)
 inTurns : {e : HFunctor}
         -> {{bc : BOC.boc <: e}}
         -> {{cu : Custodian.custodian <: e}}
@@ -237,17 +273,17 @@ inTurns = do
       thingOf "the contained"
   with n := c do
     thingOf "the root's"
+  with n := c do
+    print "not reached"
 
 behaviours : Co
              (BOC.boc <+> Custodian.custodian <+> stdio <+> Flaky.flaky)
              Unit
-behaviours = do
-  BOC.scheduled (\why -> print ("failed: " ^ why)) inTurns
-  print "not reached"
+behaviours = inTurns
 
 -- (the server's part of the `i`th connection, behaviours: in a
 -- custodian of its own, which contains its failures, the connection
--- accepted by an act, then its thing held by a cown past its `with`,
+-- accepted by an act into its custody, then its thing held by a cown past its `with`,
 -- let go of by a behaviour, and the write after it)
 servedAfter : {e : HFunctor}
             -> {s : Type}
@@ -264,13 +300,10 @@ servedAfter l log stops i = do
   with k := Custodian.contained do
     _ <-
       Custodian.manage k (logged stops ("custodian " ^ debug i ^ " shut down"))
-    with r := BOC.await (Net.accepted l) do
+    with r := BOC.await (Net.acceptedOwned l) do
       case r of
-        Left err -> logged log ("not accepted: " ^ err.name)
+        Left err -> loggedAt log (2 * i - 2) ("not accepted: " ^ err.name)
         Right c -> do
-          -- (the connection put in `k`'s custody, the custodian current:
-          -- one `accepted` gives is had in the listener's region alone)
-          Custodian.owned (inside c)
           t <-
             attempt
               String
@@ -279,11 +312,17 @@ servedAfter l log stops i = do
                    w <- Net.write c (Bytes.fromString ("served " ^ debug i))
                    case w of
                      Left err ->
-                       logged log ("connection " ^ debug i ^ ": " ^ err.name)
+                       loggedAt
+                         log
+                         (2 * i - 2)
+                         ("connection " ^ debug i ^ ": " ^ err.name)
                      Right u ->
-                       logged log ("connection " ^ debug i ^ " written")))
+                       loggedAt
+                         log
+                         (2 * i - 2)
+                         ("connection " ^ debug i ^ " written")))
           case t of
-            Left why -> logged log ("thrown: " ^ why)
+            Left why -> loggedAt log (2 * i - 2) ("thrown: " ^ why)
             Right u -> pure ()
 
 -- (the client's part of the `i`th connection, an act: connected, what
@@ -323,7 +362,7 @@ connectedFrom l port log stops i =
   else do
     servedAfter l log stops i
     with got := BOC.await (asked port) do
-      logged log ("client " ^ debug i ^ " read: " ^ got)
+      loggedAt log (2 * i - 1) ("client " ^ debug i ^ " read: " ^ got)
       connectedFrom l port log stops (i + 1)
 
 connections : Co
@@ -341,12 +380,7 @@ connections = do
       a <- Net.local l
       case a of
         Left err -> print ("no port: " ^ err.name)
-        Right at ->
-          BOC.scheduled
-            (\why -> print ("failed: " ^ why))
-            (connectedFrom l at.port log stops 1))
+        Right at -> connectedFrom l at.port log stops 1)
   case r of
     Left err -> print ("not listening: " ^ err.name)
-    Right u -> pure ()
-  said log
-  said stops
+    Right u -> said log stops 6 1

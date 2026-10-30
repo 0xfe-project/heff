@@ -183,8 +183,8 @@ Other calls take stack:
 - A C program has a 1 GiB stack: recursion millions deep. When it runs
   out, the program says `heff: stack overflow` and exits with 2. A
   thread of boc's pool has a 256 MiB stack; when it runs out, the
-  behaviour fails, and its `scheduled`'s `failed` is told `stack
-  overflow`.
+  behaviour fails: `heff: stack overflow` is said, the others go on,
+  and the program exits with 1 at its end.
   `-DHEFF_MAIN_STACK=BYTES` when building its C sets another size.
 - A JavaScript program runs on the stack of what loads it, room for
   about ten thousand calls. Deeper, it throws a `RangeError`.

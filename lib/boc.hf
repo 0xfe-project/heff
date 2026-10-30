@@ -46,9 +46,9 @@
 --   with b := bob do
 --     print (showInt b)
 --
--- -- | the behaviours run, every one done before `scheduled` is
+-- -- | the program: it ends once every behaviour it spawned is done
 -- main : Co (BOC.boc <+> stdio) Unit
--- main = BOC.scheduled (\why -> print ("failed: " ^ why)) bobs
+-- main = bobs
 -- ```
 --
 -- Operation | What it does
@@ -60,7 +60,7 @@
 -- `with r := BOC.await act do ...` | `act`, of the world, run outside every behaviour; the body a behaviour once it has come to `r`; this one goes on
 -- `with a := c` / `r := BOC.await act do ...` | the same, the body a behaviour on `c` once `act` has come to `r`
 -- `with r := BOC.awaitFirst a b do ...` | `a` and `b` raced: the body once the first has come to its value, `r` `Left` or `Right` it, the other given up
--- `scheduled failed c` | `c` and its behaviours run, every behaviour and act waited for: `c`'s value; `failed why` where one fails
+-- `parMap f xs k` | `f` of each of `xs`, each in a behaviour of its own, at once; `k` given them, in order, by a behaviour once all are done
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`), and gives back their new
@@ -75,7 +75,7 @@
 -- waits until a behaviour writes a cown whose name `p` reads; then it is
 -- queued again on all of them, behind that one, and checks `p` again
 -- (the paper's `whenever`).  One still waiting once every other
--- behaviour of its `scheduled` is done is dropped, its body never run.
+-- behaviour of the program is done is dropped, its body never run.
 -- The same cown twice in one `when` abandons, there.
 --
 -- A body is a computation of the world the `when` is in (the `with`'s),
@@ -93,15 +93,20 @@
 -- cannot do in the world, it is given as a value.
 --
 -- So a behaviour runs before every behaviour spawned after it on a cown
--- they share, wherever in the source it is.  There is no barrier: a
--- behaviour that is to come after others on a cown is spawned after
--- them on it, and `scheduled` comes to its value once every behaviour is
--- done.
+-- they share, wherever in the source it is.  There is no barrier, and
+-- nothing waits for behaviours to come back with a value: a behaviour
+-- that is to come after others on a cown is spawned after them on it,
+-- and what they came to is given on, to the behaviours after them
+-- (`parMap`'s `k`).
 --
--- What pool a `when` spawns in is the runtime's to know, not the
--- program's: the one of the thread it runs on -- the pool a `scheduled`
--- opened while its `c` runs there, or the pool whose worker runs the
--- body that spawns.  A `when` outside every `scheduled` fails.
+-- The program is the scope: a program whose world has `boc` has one
+-- pool, of as many threads as the machine has cores, opened by its
+-- first operation of boc's; `main` spawns in it, and so does every
+-- body.  The program ends once `main` has come to its end and no
+-- behaviour is queued or runs and no act is pending -- those still
+-- waiting on a condition dropped then.  So a server ends once nothing
+-- awaits its listener any more: its listener closed (std.net's
+-- `closeListener`), or the custodian it was awaited in shut down.
 --
 -- A behaviour runs from its start to its end and never waits on the
 -- world: what it would wait for -- a connection accepted, a socket
@@ -121,10 +126,9 @@
 -- body that fails: `failed` is given why, and the `with`'s body never
 -- runs.  `awaitFirst a b` starts both; the first to come to its value
 -- gives up the other, and the body is a behaviour on its value alone.
--- An act is of the `with`'s world, not of the world its own evidence
--- finds first: in a world a handler adds to -- a `recover`'s, an
--- `attempt`'s -- it says so, `BOC.await (sleep d : Co (exception err
--- <+> e) Unit)`.
+-- An act is of the `with`'s world, whatever world that is -- a
+-- concrete `main`'s, or one a handler adds to, a `recover`'s, an
+-- `attempt`'s: the `with` says so, and the act needs no annotation.
 --
 -- ```haskell
 -- import boc as BOC
@@ -151,24 +155,21 @@
 -- hold are in its custody.  An act awaited is one of that custodian's
 -- things besides: where the custodian is shut down while the act waits,
 -- the act is given up -- its wait undone, what comes after it let go
--- of -- and the behaviour after it is never spawned.  So a server's
--- `/stop` that shuts down the custody its acts were awaited in lets go
--- of the act waiting for a signal, and the run ends.  One that has come
--- to its value is not given up.  No shutdown stops a behaviour.
+-- of -- and the behaviour after it is never spawned.  So a server is
+-- stopped by shutting down the custody its acts were awaited in: the
+-- act waiting for a connection let go of, its listener closed, and the
+-- program ends once the behaviours left are done.  One that has come to
+-- its value is not given up.  No shutdown stops a behaviour.
 --
--- A behaviour whose body fails -- abandons, or fails in the runtime --
--- is done with that: its cowns hold what they held, since what they are
--- to hold is written after the body.  Then `scheduled`'s `failed`, given
--- why, is run, a computation of the world the `scheduled` is in, on the
--- behaviour's thread while the behaviour still holds its cowns: one
--- after it on them comes after that.  Then the cowns are handed on as if
--- the behaviour had ended, and the other behaviours, and `c`, go on.
--- `failed` runs on whichever thread a behaviour fails on, at once with
--- the others, so what it does must be safe on threads.  A `failed` that
--- itself fails is the scope's: `scheduled`, once every behaviour is
--- done, fails as the first such `failed` did, its words kept, instead
--- of coming to `c`'s value.
---
+-- A behaviour whose body fails -- abandons, panics (`panic why`), or
+-- fails in the runtime -- is done with that: its cowns hold what they
+-- held, since what they are to hold is written after the body, and are
+-- handed on as if it had ended.  An act that fails is the same, and the
+-- behaviour after it is never spawned.  Each failure is said on stderr,
+-- as the program's own is (`heff: why`), and the others go on: the
+-- program ends as it would, by 1.  What a caller is to handle is an
+-- `exception`'s throw, caught in the body (`attempt`), not a failure.
+
 -- The runtime's side (boc.provider.c): each cown is a turnstile, the
 -- last request queued at it, and the value it holds.  A behaviour is
 -- queued at each of its cowns' in two phases, by swaps, in the order of
@@ -192,13 +193,14 @@
 -- reactor, the rest of the act kept with it.  So the act's rest, which
 -- spawns the behaviour after it, runs on that thread, and that
 -- behaviour is the one it runs next: no other thread between an act and
--- its behaviour.  An act awaited by `scheduled`'s computation is a
--- behaviour on no cown first, whose thread takes it.  A thread with
+-- its behaviour.  An act awaited by `main`, outside every behaviour, is
+-- a behaviour on no cown first, whose thread takes it.  A thread with
 -- nothing to run waits in its reactor where acts of its are pending --
 -- woken there where a behaviour is ready -- and looks at it, not
--- waiting, every 64 behaviours.  `scheduled` comes to its value once no
--- behaviour is queued or runs and no act is pending: a server whose
--- listener is closed ends once its connections are done.  An act in a
+-- waiting, every 64 behaviours.  The program's thread, once `main` has
+-- come to its end, waits until no behaviour is queued or runs and no act
+-- is pending, then stops the pool's threads: a server whose listener is
+-- closed ends once its connections are done.  An act in a
 -- custody is in a group of its own within its thread's, which a thing
 -- the custodian has gives up (std.reactor's `giving`); the two acts of
 -- a race are each in one, the first to come to its value closing the
@@ -244,9 +246,10 @@ module boc
   , boc
   , newCown
   , when
-  , scheduled
+  , parMap
   )
 
+import array as Array
 import co
 
 -- Cowns
@@ -325,8 +328,7 @@ data Cowning x a = MkCowning a (Cown a -> x)
 -- -1)
 data Behaviour c t = MkBehaviour c (Maybe (t -> Bool)) Int Int
 
--- | A behaviour running, or a scope's computation, as the runtime knows
--- | it: what its body takes and gives is its.  (The runtime's own: no
+-- | A behaviour running, or an act, as the runtime knows it: what its body takes and gives is its.  (The runtime's own: no
 -- | value of the program has it.)
 data Turn
 
@@ -335,9 +337,6 @@ data Turn
 data Taking x t = MkTaking Turn (t -> x)
 
 data Giving x t = MkGiving Turn t x
-
--- (what a scope's computation came to, given what comes after it)
-data Answering x a = MkAnswering (a -> x)
 
 cowningThen : {x y a : Type} -> (x -> y) -> Cowning x a -> Cowning y a
 cowningThen g (MkCowning v k) = MkCowning v (\c -> g (k c))
@@ -348,13 +347,9 @@ takingThen g (MkTaking tn k) = MkTaking tn (\v -> g (k v))
 givingThen : {x y t : Type} -> (x -> y) -> Giving x t -> Giving y t
 givingThen g (MkGiving tn v x) = MkGiving tn v (g x)
 
-answeringThen : {x y a : Type} -> (x -> y) -> Answering x a -> Answering y a
-answeringThen g (MkAnswering k) = MkAnswering (\v -> g (k v))
-
 -- | An operation of `boc`: a cown made; a behaviour spawned, its body a
 -- | computation of `m`'s, given its turn, that takes what its cowns hold
--- | (`Taken`) and gives what they are to hold (`Given`); a scope of
--- | them run, its computation giving its value so; an act awaited, run
+-- | (`Taken`) and gives what they are to hold (`Given`); an act awaited, run
 -- | outside every behaviour, what comes once it has its value -- the
 -- | behaviour after it spawned -- its own rest; two acts raced, each
 -- | given the race as its turn, and asking it, once it has its value,
@@ -367,14 +362,12 @@ data BocF (m : Type -> Type) x
   | When (Some2 Behaviour) (Turn -> m Unit) x
   | Taken (Some (Taking x))
   | Given (Some (Giving x))
-  | Scheduled (String -> m Unit) (Turn -> m Unit) (Some (Answering x))
   | Awaits (Turn -> m Unit) x
   | Races (Turn -> m Unit) (Turn -> m Unit) x
   | Won Turn (Bool -> x)
 
 -- | Behaviours on cowns, the runtime's: cowns made, behaviours queued on
--- | them, each run once its cowns are free, in the scope of a
--- | `scheduled`.
+-- | them, each run once its cowns are free, on the program's pool.
 boc : HFunctor
 boc =
   { f = BocF
@@ -383,7 +376,6 @@ boc =
       When s b x -> When s b (g x)
       Taken s -> Taken (someThen (takingThen g) s)
       Given s -> Given (someThen (givingThen g) s)
-      Scheduled f c s -> Scheduled f c (someThen (answeringThen g) s)
       Awaits c x -> Awaits c (g x)
       Races l r x -> Races l r (g x)
       Won tn k -> Won tn (\b -> g (k b))
@@ -392,7 +384,6 @@ boc =
       When s b x -> When s (\tn -> nt (b tn)) x
       Taken s -> Taken s
       Given s -> Given s
-      Scheduled f c s -> Scheduled (\why -> nt (f why)) (\tn -> nt (c tn)) s
       Awaits c x -> Awaits (\tn -> nt (c tn)) x
       Races l r x -> Races (\tn -> nt (l tn)) (\tn -> nt (r tn)) x
       Won tn k -> Won tn k
@@ -412,8 +403,7 @@ newCown v = op (bc (NewCown (\r use -> use a (MkCowning v (\c -> c))))) val
 taken : {e : HFunctor} -> {t : Type} -> {{bc : boc <: e}} -> Turn -> Co e t
 taken tn = op (bc (Taken (\r use -> use t (MkTaking tn (\v -> v))))) val
 
--- (... what they are to hold after it, for the runtime to write back;
--- or what a scope's computation came to)
+-- (... what they are to hold after it, for the runtime to write back)
 given : {e : HFunctor}
       -> {t : Type}
       -> {{bc : boc <: e}}
@@ -500,30 +490,6 @@ when cs body =
           (\r use -> use c cw.Contents (MkBehaviour cs Nothing (0 - 1) 0))
           (ran body)
           MkUnit))
-    val
-
--- | `c` run, with a pool of its own, the behaviours spawned in it, and in
--- | them, run on the pool's threads, as many as the machine has cores,
--- | and the acts they await in those threads' reactors: `c`'s value,
--- | once every one of them is done.  A behaviour whose body
--- | fails is done with that, its cowns holding what they held: `failed
--- | why` is run on its thread, while it still holds them, and the others
--- | go on.  Where a `failed` fails too, this fails as the first such
--- | `failed` did, once every behaviour is done; where `c` fails, every
--- | behaviour is waited for, and this fails as `c` did.
-scheduled : {e : HFunctor}
-          -> {a : Type}
-          -> {{bc : boc <: e}}
-          -> (String -> Co e Unit)
-          -> Co e a
-          -> Co e a
-scheduled failed c =
-  op
-    (bc
-       (Scheduled
-          failed
-          (\tn -> bind c (\v -> given tn v))
-          (\r use -> use a (MkAnswering (\v -> v)))))
     val
 
 -- The `with` of cowns
@@ -809,3 +775,66 @@ instanceHolderCownsAwait =
                (\t ->
                   bind (body (s := Unit) (t, v)) (\q -> pure (fst (snd q)))))
   }
+
+-- Work spread
+--------------------------------------------------------------------------------
+
+-- (how many values are still to come, and those come, each in its place)
+type Gathered b = (Int, Array (Maybe b))
+
+-- (the values come, in their order: each place has one by then)
+gatheredList : {b : Type} -> Array (Maybe b) -> List b
+gatheredList got =
+  Array.foldr
+    (\m acc -> case m of
+     Just y -> y :: acc
+     Nothing -> acc)
+    Nil
+    got
+
+-- (`f` of the `i`th of the list and those after it, each by a behaviour
+-- on a cown of its own, which puts it in its place in `into`'s, by a
+-- behaviour there; the last of them gives `k` the list)
+spreadFrom : {e : HFunctor}
+           -> {a b : Type}
+           -> {{bc : boc <: e}}
+           -> (a -> b)
+           -> Cown (Gathered b)
+           -> (List b -> Co e Unit)
+           -> Int
+           -> List a
+           -> Co e Unit
+spreadFrom f into k i [] = pure ()
+spreadFrom f into k i (x :: rest) = do
+  own <- newCown x
+  when own (\v -> do
+    let y = f v
+    when into (\(left, got) -> do
+      let now = Array.set got i (Just y)
+      if left == 1 then k (gatheredList now) else pure ()
+      pure (left - 1, now))
+    pure v)
+  spreadFrom f into k (i + 1) rest
+
+-- | `f` of each of `xs`, each computed by a behaviour of its own, on a
+-- | cown of its own, so that they run at once, on as many threads as
+-- | the pool has; then `k` given what they came to, in the order of
+-- | `xs`, by a behaviour once every one is done.  This one goes on at
+-- | once.  Each value is put in its place by a behaviour on one cown
+-- | the values gather in, which takes no longer than a write: the work
+-- | is `f`'s, which is the behaviour's of its element alone.  So an `f`
+-- | of little work is better given a piece of the list each (`xs` a
+-- | list of lists).  Where an `f` fails, the failure is said, and `k`
+-- | is never run.
+parMap : {e : HFunctor}
+       -> {a b : Type}
+       -> {{bc : boc <: e}}
+       -> (a -> b)
+       -> List a
+       -> (List b -> Co e Unit)
+       -> Co e Unit
+parMap f [] k = alone (k Nil)
+parMap f xs k = do
+  let n = List.length xs
+  into <- newCown (n, Array.replicate n (Nothing : Maybe b))
+  spreadFrom f into k 0 xs

@@ -377,7 +377,7 @@ behaviour, and the body a behaviour once it has come to `r`.
 - Its value is what the handler says: a file's `with` comes to what its
   body came to, a cown's to `()` (the behaviour runs later). `x <- with
   ... do` binds it. A behaviour that failed does not stop the others:
-  its `scheduled`'s `failed` is told why.
+  why is said on stderr, and the program exits with 1 at its end.
 - A handler is a pair of instances, co's `Binder` (of what the names are
   bound to: what they are in the body, the world it runs in, and what
   the `with` comes to) and `Holder` (how it runs in the world), and the
