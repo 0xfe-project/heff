@@ -9,7 +9,7 @@
 // (the runtime's part told what this provider does with a thing let go
 // of, as the first custodian is made)
 static void heff_custody_ready(void) {
-  // (set once: a custodian is made on any domain, and the others read
+  // (set once: a custodian is made on any thread, and the others read
   // these as they let go of foreign values)
   if (__atomic_load_n(&heff_foreign_disowned, __ATOMIC_ACQUIRE) == heff_custody_disowned) return;
   __atomic_store_n(&heff_foreign_failed, heff_custody_thing_failed, __ATOMIC_RELEASE);
@@ -80,11 +80,10 @@ static HeffCustody *heff_custody_of(V at) {
   return at && heff_tag_of(at) == TAG_Just ? heff_foreign_ptr(heff_field(at, 0)) : NULL;
 }
 
-// (the custodian current where the operation was asked: `here`, where
-// it says one -- std.domain's `rooted` says it -- else as the runtime
-// was told; its foreign value, or 0 for the root's)
-static V heff_custody_current(V here) {
-  V at = here && heff_tag_of(here) == TAG_Just ? here : heff_custody_env;
+// (the custodian current where the operation was asked, as the runtime
+// was told: its foreign value, or 0 for the root's)
+static V heff_custody_current(void) {
+  V at = heff_custody_env;
   return at && heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : 0;
 }
 
@@ -105,7 +104,7 @@ static V heff_custody_after(V self, V *a) {
 // and the custodian whose custody the `with` is in; dropped by its
 // `with`, the release goes with it.  A ticket the program lets go of
 // otherwise -- its `with` left by a throw, or by a handler dropping the
-// continuation -- puts its release on the queue of the domain that kept
+// continuation -- puts its release on the queue of the thread that kept
 // it (the runtime's part for custodians), never running it there; a
 // failure of it there is its custodian's.
 
@@ -131,10 +130,7 @@ static void heff_ticket_let_go(void *p) {
   free(t);
 }
 
-// (an operation, `here` the custodian current where it was asked, if
-// its asker says so -- std.domain's `rooted`, in a world without the
-// custodian's effect -- else 0, the one the runtime was told)
-static V heff_custodian_at(V p, V k, V here) {
+static V heff_provider_custodian(V p, V k) {
   V x;
   // (an operation, taken out of its `Asked` or `Given`)
   if (heff_tag_of(p) == TAG_Asked || heff_tag_of(p) == TAG_Given) {
@@ -153,7 +149,7 @@ static V heff_custodian_at(V p, V k, V here) {
     c->contains = contains;
     c->q = heff_due_queue();
     V cv = heff_share(heff_foreign(c, heff_custody_let_go));
-    V pv = heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : heff_custody_current(here);
+    V pv = heff_tag_of(at) == TAG_Just ? heff_field(at, 0) : heff_custody_current();
     HeffCustody *parent = pv ? heff_foreign_ptr(pv) : NULL;
     if (parent) {
       HEFF_CUSTODY_LOCK();
@@ -216,7 +212,7 @@ static V heff_custodian_at(V p, V k, V here) {
     break;
   }
   case TAG_Own: {
-    V cv = heff_custody_current(here);
+    V cv = heff_custody_current();
     // (a thing of the root's: as it is)
     if (!cv) {
       x = heff_dup(heff_field(p, 1));
@@ -245,7 +241,7 @@ static V heff_custodian_at(V p, V k, V here) {
     break;
   }
   case TAG_Failed: {
-    V cv = heff_custody_current(here);
+    V cv = heff_custody_current();
     size_t len;
     char *why = heff_bytes(heff_field(p, 0), &len);
     if (cv) heff_custody_failed(heff_foreign_ptr(cv), why);
@@ -257,8 +253,7 @@ static V heff_custodian_at(V p, V k, V here) {
   }
   case TAG_Current: {
     V g = heff_dup(heff_field(p, 0));
-    V at = here && heff_tag_of(here) == TAG_Just ? heff_dup(here)
-         : heff_custody_env ? heff_dup(heff_custody_env) : NTAG(TAG_Nothing);
+    V at = heff_custody_env ? heff_dup(heff_custody_env) : NTAG(TAG_Nothing);
     heff_drop(p);
     x = heff_answer(g, at);
     break;
@@ -278,7 +273,7 @@ static V heff_custodian_at(V p, V k, V here) {
   }
   case TAG_Kept: {
     HeffTicket *t = heff_alloc(sizeof *t);
-    V cv = heff_custody_current(here);
+    V cv = heff_custody_current();
     t->owner = cv ? heff_dup(cv) : 0;
     t->release = heff_share(heff_carried_fn(heff_dup(heff_field(p, 0))));
     t->q = heff_due_queue();
@@ -303,4 +298,3 @@ static V heff_custodian_at(V p, V k, V here) {
   return heff_tail(k, 1, &x);
 }
 
-static V heff_provider_custodian(V p, V k) { return heff_custodian_at(p, k, 0); }
