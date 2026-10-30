@@ -203,6 +203,11 @@ struct BcPool {
   BcBehaviour *front, *back;
   atomic_llong live;
   int sleeping, stopping, n;
+  // (the threads started, at most `n`, and those that look for a
+  // behaviour not sleeping -- spinning before they sleep, or just
+  // started -- which take one put with those ready without a wake)
+  int started, ready;  // `ready`: how many are put with those ready, under `mu`
+  atomic_int looking;
   pthread_t *threads;
   BcWait *parked;  // those waiting, under `mu`
   // (the reactor groups of the workers waiting in their reactors, acts
@@ -340,7 +345,12 @@ static void bc_movable(BcBehaviour *b) {
   b->moved = 1;
 }
 
-// (the behaviour put behind those ready, a sleeping thread woken)
+static void bc_thread_more(BcPool *pl);
+
+// (the behaviour put behind those ready, a sleeping thread woken; where
+// none sleeps or waits in its reactor, more are ready than threads look
+// for one, and fewer than the machine's cores are started, one more
+// started for it)
 static void bc_queued(BcBehaviour *b) {
   BcPool *pl = b->pool;
   bc_movable(b);
@@ -349,9 +359,12 @@ static void bc_queued(BcBehaviour *b) {
   if (pl->back) pl->back->after = b;
   else __atomic_store_n(&pl->front, b, __ATOMIC_RELAXED);
   pl->back = b;
+  pl->ready++;
   int64_t wake = 0;
   if (pl->sleeping > 0) pthread_cond_signal(&pl->work);
   else if (pl->npolling > 0) wake = pl->polling[--pl->npolling];
+  else if (pl->started < pl->n && pl->ready > atomic_load_explicit(&pl->looking, memory_order_acquire))
+    bc_thread_more(pl);
   pthread_mutex_unlock(&pl->mu);
   if (wake) heff_reactor_wake_group(wake);
 }
@@ -1144,6 +1157,7 @@ static void *bc_worker(void *u) {
   free(s);
   bc_running = pl;
   bc_current = pl;
+  atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_acq_rel);
   int row = 0, since = 0;
   for (;;) {
     BcBehaviour *kept = bc_slot;
@@ -1173,10 +1187,13 @@ static void *bc_worker(void *u) {
     // (a while looked at before sleeping: a behaviour readied soon after
     // by another thread taken without a wake; not where acts are pending,
     // which are waited for in the reactor instead)
-    if (!bc_holding)
+    if (!bc_holding) {
+      atomic_fetch_add_explicit(&pl->looking, 1, memory_order_acq_rel);
       for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->front, __ATOMIC_RELAXED)
                       && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++)
         bc_relax();
+      atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_acq_rel);
+    }
     bc_settle(pl);
     pthread_mutex_lock(&pl->mu);
     if (!pl->front && !pl->stopping && bc_holding) {
@@ -1210,6 +1227,7 @@ static void *bc_worker(void *u) {
     }
     __atomic_store_n(&pl->front, b->after, __ATOMIC_RELAXED);
     if (!pl->front) pl->back = NULL;
+    pl->ready--;
     pthread_mutex_unlock(&pl->mu);
     bc_run_behaviour(b);
     since++;
@@ -1231,7 +1249,22 @@ static void *bc_worker(void *u) {
   return NULL;
 }
 
-// (a pool of as many threads as the machine has cores)
+// (one more thread of the pool's started, looking until it runs: `mu`
+// held, so that the end, under it, joins every one started.  Threads
+// are started as behaviours are put with those ready and none is free
+// to take them, up to as many as the machine has cores; a thread
+// started waits, once it has nothing to run, as long as the pool is)
+static void bc_thread_more(BcPool *pl) {
+  BcWorkerStart *s = heff_alloc(sizeof(BcWorkerStart));
+  s->pl = pl;
+  s->dir = heff_dir_copy();
+  atomic_fetch_add_explicit(&pl->looking, 1, memory_order_acq_rel);
+  if (heff_thread_start(&pl->threads[pl->started], bc_worker, s) != 0) heff_fail("boc: cannot start a thread");
+  pl->started++;
+}
+
+// (a pool of up to as many threads as the machine has cores, one
+// started)
 static BcPool *bc_pool(void) {
   int64_t n = bc_cores();
   BcPool *pl = heff_alloc(sizeof(BcPool));
@@ -1246,12 +1279,12 @@ static BcPool *bc_pool(void) {
   pl->parked = NULL;
   pl->npolling = 0;
   pl->threads = heff_alloc((size_t)n * sizeof(pthread_t));
-  for (int i = 0; i < pl->n; i++) {
-    BcWorkerStart *s = heff_alloc(sizeof(BcWorkerStart));
-    s->pl = pl;
-    s->dir = heff_dir_copy();
-    if (heff_thread_start(&pl->threads[i], bc_worker, s) != 0) heff_fail("boc: cannot start a thread");
-  }
+  pl->started = 0;
+  pl->ready = 0;
+  atomic_init(&pl->looking, 0);
+  pthread_mutex_lock(&pl->mu);
+  bc_thread_more(pl);
+  pthread_mutex_unlock(&pl->mu);
   return pl;
 }
 
@@ -1299,7 +1332,7 @@ static void bc_drain(BcPool *pl) {
   pl->npolling = 0;
   pthread_mutex_unlock(&pl->mu);
   for (int i = 0; i < np; i++) heff_reactor_wake_group(woken[i]);
-  for (int i = 0; i < pl->n; i++) pthread_join(pl->threads[i], NULL);
+  for (int i = 0; i < pl->started; i++) pthread_join(pl->threads[i], NULL);
   while (dropped) {
     BcWait *next = dropped->next;
     bc_behaviour_drop(dropped->b);
