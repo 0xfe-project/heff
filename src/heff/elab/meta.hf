@@ -258,13 +258,14 @@ resolveListS : (Step Bool -> Step Bool)
              -> List (Wanted ElabSt)
              -> Step (List (Pair Bool (Wanted ElabSt)))
 resolveListS tried final [] = \st -> MkPair (Right Nil) st
-resolveListS tried final (MkWanted sp f :: rest) = \st ->
+resolveListS tried final (MkWanted sp ev f :: rest) = \st ->
     bindStep
       (tried (f final) st)
       (\done st2 ->
          bindStep
            (resolveListS tried final rest st2)
-           (\rs st3 -> MkPair (Right (MkPair done (MkWanted sp f) :: rs)) st3))
+           (\rs st3 ->
+              MkPair (Right (MkPair done (MkWanted sp ev f) :: rs)) st3))
 
 -- | each wanted instance tried (as `tried` says); those found dropped
 resolveByS : (Step Bool -> Step Bool) -> Bool -> Step Bool
@@ -279,6 +280,34 @@ resolveByS tried final = \st ->
 
 resolveS : Bool -> Step Bool
 resolveS final = resolveByS asItIs final
+
+-- (a wanted one tried by `commit`: evidence left waiting)
+committing : Wanted ElabSt -> Bool -> Step Bool -> Step Bool
+committing (MkWanted sp True f) final s = \st -> MkPair (Right False) st
+committing (MkWanted sp False f) final s = untilSettled s
+
+commitListS : List (Wanted ElabSt) -> Step (List (Pair Bool (Wanted ElabSt)))
+commitListS [] = \st -> MkPair (Right Nil) st
+commitListS (w :: rest) = \st -> case w of
+  MkWanted sp ev f ->
+    bindStep
+      (committing w True (f True) st)
+      (\done st2 ->
+         bindStep
+           (commitListS rest st2)
+           (\rs st3 -> MkPair (Right (MkPair done w :: rs)) st3))
+
+-- | each wanted instance that is not evidence tried as at the end, one
+-- | that fails undone; those found dropped
+commitS : Step Bool
+commitS = \st ->
+    if List.null (wantedOf st) then MkPair (Right False) st
+    else bindStep
+        (commitListS (wantedOf st) (withWanted (\w -> Nil) st))
+        (\rs st2 ->
+           MkPair
+             (Right (resolveAny rs))
+             (withWanted (\w -> List.append w (resolveKept rs)) st2))
 
 -- | the delayed checks whose types are known run, and the instance
 -- | arguments whose goals are found -- as soon as they are, not once the
@@ -318,10 +347,12 @@ deferAlg (Guess k) = \st ->
       (\b st2 -> MkPair (Right (k b)) st2)
 deferAlg (CanGuess k) = \st ->
     MkPair (Right (k (canGuessIn (core st).metas (delayedOf st)))) st
-deferAlg (Want sp f x) = \st ->
+deferAlg (Want sp ev f x) = \st ->
     MkPair
       (Right x)
-      (withWanted (\ws -> List.append ws [MkWanted sp f]) st)
+      (withWanted (\ws -> List.append ws [MkWanted sp ev f]) st)
+deferAlg (Commit k) = \st ->
+    bindStep (commitS st) (\b st2 -> MkPair (Right (k b)) st2)
 deferAlg (Wake all x) = \st ->
     bindStep (wakeResolveS all st) (\u st2 -> MkPair (Right x) st2)
 deferAlg (Resolve final k) = \st ->
@@ -453,9 +484,8 @@ lastResort : (Int -> Elab (List Postponed))
            -> Int
            -> Elab (List Postponed)
 lastResort again g fuel = do
-  can <- canGuess
   recoveredNone <- gets (\c -> List.null c.recovered)
-  if not can || not recoveredNone || fuel > 50 then forceAll g
+  if not recoveredNone || fuel > 50 then forceAll g
   else do
     before <- gets (\c -> c)
     waiting <- saveDelayed
@@ -464,13 +494,27 @@ lastResort again g fuel = do
       Just left -> pure left
       Nothing -> do
         restoreAll before waiting
-        made <- guess
-        guessedEnd <- if made then cleanly (again (fuel + 1)) else pure Nothing
-        case guessedEnd of
+        -- (an instance argument's one candidate taken, though it decides
+        -- a metavariable of its goal -- the world of `BOC.await act`, by
+        -- the `with`'s `Holder` -- before the evidence that waits for
+        -- that world is refused at the end; then settling goes on)
+        committed <-
+          catchE (bind (runDelayed True) (\u -> commit)) (\d -> pure False)
+        committedEnd <-
+          if committed then cleanly (again (fuel + 1)) else pure Nothing
+        case committedEnd of
           Just left -> pure left
           Nothing -> do
             restoreAll before waiting
-            forceAll g
+            can <- canGuess
+            made <- if can then guess else pure False
+            guessedEnd <-
+              if made then cleanly (again (fuel + 1)) else pure Nothing
+            case guessedEnd of
+              Just left -> pure left
+              Nothing -> do
+                restoreAll before waiting
+                forceAll g
 
 settleGo : Globals.Globals -> Int -> Elab (List Postponed)
 settleGo g fuel = do
