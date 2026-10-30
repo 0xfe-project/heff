@@ -12,34 +12,33 @@
 --                 as it was; and a client that sends nothing, its
 --                 connection served by `serveConnection` given an idle
 --                 limit of 300 ms, closed by it
---   threads       the same, by cml's threads waiting on the world
---                 through the reactor, the scheduler ending once main is
---                 done; and a client that sends nothing to a server of
---                 std.http.cmlserver's given an idle limit of 300 ms,
+--   threads       the same, an act awaited by boc, in a worker's
+--                 reactor, the scheduler ending once it is done; and a
+--                 client that sends nothing to a server of
+--                 std.http.bocserver's given an idle limit of 300 ms,
 --                 closed by it
 --   http BASE     std.http, the connection to 10.255.255.1 given 300 ms,
 --                 curl's code 28; and BASE/item/1, of a server that
 --                 takes 500 ms over it, given 300 ms to connect and 10 s
 --                 in all, answered (built with `-DHEFF_HTTP_SPAWN` too,
 --                 the curl spawned)
---   multi BASE    the same, by cml's main thread: libcurl's multi interface
+--   multi BASE    the same, an act awaited by boc: libcurl's multi
+--                 interface
 
 module test.node.timeouts
 
-import cml as CML
+import boc as BOC
 import co
 import custodian as Custodian
 import exception
-import std.domain as Domain
 import std.filesystem
 import std.http as HTTP
-import std.http.cmlserver as CmlServer
+import std.http.bocserver as BocServer
 import std.http.server as Server
 import std.io
 import std.net as Net
 import std.path as Path
 import std.process
-import std.reactor as Reactor
 import std.duration as Duration
 import std.time
 import resource
@@ -163,15 +162,14 @@ readLimited = do
 hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
 hello r = pure (Server.plain 200 "hello\n")
 
--- | A client that sends nothing to a server of std.http.cmlserver's,
+-- | A client that sends nothing to a server of std.http.bocserver's,
 -- | given an idle limit of 300 ms: its connection closed by the server
--- | in about that time, its read at the end, `b[]`.
-idleClosed : {e w : HFunctor}
-           -> {{cm : CML.cml w <: e}}
+-- | in about that time, its read at the end, `b[]`; then the listener
+-- | closed, the server's accept done at once, so the server is done.
+idleClosed : {e : HFunctor}
+           -> {{bc : BOC.boc <: e}}
            -> {{io : stdio <: e}}
            -> {{nt : Net.net <: e}}
-           -> {{ntw : Net.net <: w}}
-           -> {{clockw : time <: w}}
            -> {{clock : time <: e}}
            -> {{ex : exception Net.NetError <: e}}
            -> {{cu : Custodian.custodian <: e}}
@@ -180,7 +178,11 @@ idleClosed = do
   r <-
     Net.withListener (here 0) 16 (\l -> do
       at <- Net.local l
-      CML.spawn (CmlServer.serve (idle := 300) Empty l hello)
+      BocServer.serve
+          (idle := 300)
+          Empty
+          l
+          (\r respond -> respond (Server.plain 200 "hello\n"))
       (ms, r) <-
         timed
           (Net.withConnection
@@ -190,7 +192,9 @@ idleClosed = do
           ("a silent client, the server's idle limit 300 ms: "
            ^ showRead r
            ^ ", "
-           ^ inTime 300 ms))
+           ^ inTime 300 ms)
+      closed <- Net.closeListener l
+      either throw pure closed)
   either throw pure r
 
 -- | A client that sends nothing, its connection served by
@@ -223,11 +227,10 @@ idleServed = do
                  ^ inTime 300 ms)))
   either throw pure r
 
--- (what a scheduler's main came to)
-said : Maybe (Either Net.NetError Unit) -> String
-said Nothing = "a deadlock"
-said (Just (Left err)) = "not heard: " ^ show err
-said (Just (Right u)) = "scheduler done"
+-- (what an act awaited came to)
+said : Either Net.NetError Unit -> String
+said (Left err) = "not heard: " ^ show err
+said (Right u) = "scheduler done"
 
 unheard : {e : HFunctor}
         -> {{io : stdio <: e}}
@@ -258,33 +261,49 @@ main = do
   after <- openFds (disk := _)
   print (ev := _) (sameFds before after)
 
+-- (the program's parts in turn, their throws heard)
+parts : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> {{io : stdio <: e}}
+      -> {{nt : Net.net <: e}}
+      -> {{clock : time <: e}}
+      -> {{cu : Custodian.custodian <: e}}
+      -> Co e (Either Net.NetError Unit)
+parts =
+  attempt
+    Net.NetError (do
+      connectLimited
+      readLimited
+      idleClosed)
+
+-- (the parts, an act awaited: what they came to said, by the behaviour
+-- after it)
+awaited : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{clock : time <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> Co e Unit
+awaited = do
+  with r := BOC.await parts do
+    print (said r)
+
 threads : Co
-          (stdio
+          (BOC.boc
+           <+> Custodian.custodian
+           <+> stdio
            <+> Net.net
            <+> time
            <+> filesystem
            <+> HTTP.http
-           <+> Reactor.reactor
-           <+> process
-           <+> Domain.domain)
+           <+> process)
           Unit
 threads = do
-  before <- openFds (disk := _)
-  r <-
-    CML.scheduledWithReactor
-      (attempt
-         Net.NetError (do
-           connectLimited (io := _) (nt := _) (clock := _) (ex := _)
-           readLimited (io := _) (nt := _) (clock := _) (ex := _)
-           idleClosed
-               (cm := _)
-               (io := _)
-               (nt := _)
-               (clock := _)
-               (ex := _)))
-  print (ev := _) (said r)
-  after <- openFds (disk := _)
-  print (ev := _) (sameFds before after)
+  before <- openFds
+  BOC.scheduled (\why -> print ("failed: " ^ why)) awaited
+  after <- openFds
+  print (sameFds before after)
 
 -- std.http
 --------------------------------------------------------------------------------
@@ -330,18 +349,29 @@ http = do
   requests (io := _) (web := _) (clock := _) (baseOf argv)
 
 multi : Co
-        (stdio
+        (BOC.boc
+         <+> stdio
          <+> Net.net
          <+> time
          <+> filesystem
          <+> HTTP.http
-         <+> Reactor.reactor
-         <+> process
-         <+> Domain.domain)
+         <+> process)
         Unit
 multi = do
-  argv <- args (ev := _)
-  r <-
-    CML.scheduledWithReactor
-      (requests (io := _) (web := _) (clock := _) (baseOf argv))
-  print (ev := _) (maybe "a deadlock" (\u -> "scheduler done") r)
+  argv <- args
+  BOC.scheduled
+      (\why -> print ("failed: " ^ why)) (do
+        with u :=
+               BOC.await
+                 (requests (baseOf argv) :
+                    Co
+                      (BOC.boc
+                       <+> stdio
+                       <+> Net.net
+                       <+> time
+                       <+> filesystem
+                       <+> HTTP.http
+                       <+> process)
+                      Unit) do
+          pure ())
+  print "scheduler done"

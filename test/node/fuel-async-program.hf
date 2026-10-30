@@ -1,8 +1,9 @@
 -- What the asynchronous fuel tests run, on every backend, built with
 -- fuel: a limit across an operation that finishes later -- a sleep --
--- and across the turns of other domains, the limit the computation's on
--- both, so a pure loop after them is stopped by its own count, as before
--- them: the least fuel a loop after a sleep finishes on is its rounds, a
+-- and across boc's behaviours run in a `scheduled`, the limit the
+-- computation's on both, so a pure loop after them is stopped by its
+-- own count, as before them; a behaviour spawned in a limit has none
+-- (on C, a thread of the pool's, a thread's fuel its own): the least fuel a loop after a sleep finishes on is its rounds, a
 -- batch (`Fuel.batchMost`) and what the sleep and the effects' plumbing
 -- take (a few ticks, not the same on each backend, whose worlds differ:
 -- the page's and the terminal's) -- on C (test/node/fuel-async.hf) and in
@@ -11,8 +12,8 @@
 module test.node.fuel-async-program
 
 import bench as Bench
+import boc as BOC
 import co
-import std.domain as Domain
 import std.duration as Duration
 import std.fuel as Fuel
 import std.time as Time
@@ -69,45 +70,53 @@ leastIn c lo hi =
       Just _ -> leastIn c lo ((lo + hi) / 2)
       Nothing -> leastIn c ((lo + hi) / 2) hi
 
--- | the lines said
--- (1, a domain's answer, joined)
-joinedOne : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
-joinedOne = do
-  with s := Domain.scope do
-    d <- Domain.spawn s (pure 1)
-    Domain.join d
+-- (a behaviour on `c`, its `scheduled` run here)
+behaved : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> BOC.Cown Int
+        -> (Int -> Int)
+        -> Co e Unit
+behaved c f =
+  BOC.scheduled
+    (\why -> abandon) (do
+      with n := c do
+        n := f n)
 
--- (a sum by a pure loop on a domain of its own, joined)
-summedOnADomain : {e : HFunctor} -> {{dm : Domain.domain <: e}} -> Co e Int
-summedOnADomain = do
-  with s := Domain.scope do
-    d <- Domain.spawn s (later (\u -> sumTo 1000000 0))
-    Domain.join d
-
+-- | the lines said, given to `k` by a behaviour once every behaviour
+-- | before is done
 lines : {e : HFunctor}
       -> {{tm : Time.time <: e}}
       -> {{fl : Fuel.fuel <: e}}
-      -> {{dm : Domain.domain <: e}}
-      -> Co e (List String)
-lines = do
+      -> {{bc : BOC.boc <: e}}
+      -> (List String -> Co e Unit)
+      -> Co e Unit
+lines k = do
   slept <-
     Fuel.limited 100000 (do
       Time.sleep (Duration.milliseconds 1)
       later (\u -> spin 0))
   sleptWithin <- Fuel.limited 100000 (afterSleep 1000)
-  turned <-
+  turned <- BOC.newCown 0
+  afterTurn <-
     Fuel.limited 100000 (do
-      x <- joinedOne
-      later (\u -> spin x))
-  spawned <- Fuel.limited 1000 summedOnADomain
+      behaved turned (\n -> n + 1)
+      later (\u -> spin 0))
+  summed <- BOC.newCown 0
+  spawned <- Fuel.limited 1000 (behaved summed (\n -> sumTo 1000000 0))
   hi <- enough (afterSleep 5000) 1
   n <- leastIn (afterSleep 5000) 0 hi
-  pure
-      [ "a pure loop after a sleep: " ^ said slept
-      , "a loop after a sleep within its fuel: " ^ said sleptWithin
-      , "a pure loop after another domain's turn: " ^ said turned
-      , "a domain spawned in a limit, with none: " ^ said spawned
-      , "the least fuel of a loop after a sleep: "
-      ^ (if n >= 5000 && n <= 5000 + Fuel.batchMost + 32 then "near its rounds"
-         else debug n ^ " for 5000 rounds")
-      ]
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when summed (\sum -> do
+       k
+           [ "a pure loop after a sleep: " ^ said slept
+           , "a loop after a sleep within its fuel: " ^ said sleptWithin
+           , "a pure loop after a behaviour's turn: " ^ said afterTurn
+           , "a behaviour spawned in a limit, with none: "
+           ^ said (maybe Nothing (\u -> Just sum) spawned)
+           , "the least fuel of a loop after a sleep: "
+           ^ (if n >= 5000 && n <= 5000 + Fuel.batchMost + 32
+              then "near its rounds"
+              else debug n ^ " for 5000 rounds")
+           ]
+       pure sum))

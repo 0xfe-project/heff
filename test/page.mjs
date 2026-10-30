@@ -10,9 +10,8 @@
 //   node test/page.mjs APP SCRIPT...   counter, clock, finder, aliased,
 //                                      slept, clocked, painted, texts,
 //                                      names, greet, two (counter's and
-//                                      clock's), vecadd, pixels, domains,
-//                                      cowns, cml, fuel, fuel-async,
-//                                      scopes
+//                                      clock's), vecadd, pixels, cowns,
+//                                      fuel, fuel-async
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -165,24 +164,19 @@ const apps = {
     said("elements", page.children.length);
   },
   aliased: () => { const page = loaded(files[0], withOut); if (page) said("out", page.children[0].text); },
-  // (std.domain's one domain: its turns go on after the stack is let go
-  // of, every so often, so time is passed until it has written)
-  domains: () => {
+  // (boc's behaviours, in JavaScript's one thread: their turns go on
+  // after the stack is let go of, every so often, so time is passed
+  // until it has written)
+  cowns: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;
     const out = page.children[0];
     for (let i = 0; i < 100000 && out.text === "" && timers.length > 0; i++) tick();
     said("out", out.text);
   },
-  // (boc's behaviours, on std.domain's one domain: as `domains`)
-  cowns: () => apps.domains(),
-  // (cml's threads, on std.domain's one domain: as `domains`)
-  cml: () => apps.domains(),
-  // (std.domain's limits, in its one domain: as `domains`)
-  fuel: () => apps.domains(),
-  "fuel-async": () => apps.domains(),
-  // (std.domain's scopes, in its one domain: as `domains`)
-  scopes: () => apps.domains(),
+  // (std.fuel's limits, and boc's turns across them: as `cowns`)
+  fuel: () => apps.cowns(),
+  "fuel-async": () => apps.cowns(),
   slept: () => {
     const page = loaded(files[0], withOut);
     if (!page) return;

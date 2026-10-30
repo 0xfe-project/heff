@@ -1,29 +1,28 @@
 -- The notes' server: the API (notes.api) answered at `/api`, by its real
 -- handler, the notes in a cell of the world; the page at `/`, and its
--- script at `/client.js`, as `heff build` makes it.  Each connection is
--- a thread of its own, cml's, waiting on the world through each domain's
+-- script at `/client.js`, as `heff build` makes it.  Served by
+-- std.http.bocserver, under boc's `scheduled`: each request a behaviour
+-- on its connection's cown, each wait an act awaited in a worker's
 -- reactor.  Run from the project's root:
 --
 --   .heff/bin/server [PORT]      (8080 where none is given)
 
 module app.server.main
 
+import boc as BOC
 import bytes as Bytes
 import co
 import custodian as Custodian
 import exception
-import cml as CML
 import notes.api
 import std.filesystem
 import std.http as HTTP
-import std.http.cmlserver as CmlServer
+import std.http.bocserver as BocServer
 import std.http.server as Server
 import std.io
 import std.net as Net
 import std.path as Path
-import std.domain as Domain
 import std.process
-import std.reactor as Reactor
 import std.reference
 import std.remote as RemoteHTTP
 import std.time as Time
@@ -99,29 +98,41 @@ page : {e : HFunctor}
      -> Co e HTTP.Response
 page r = pageAt (RemoteHTTP.pathOf r.target)
 
--- (the listener's connections served, each a thread of its own, until
--- one cannot be accepted: in a thread, of cml's world, which says the
--- program's)
-listening : {w : HFunctor}
+-- (a request answered: the API's, or the page)
+answered : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{cell : reference (List Note) <: e}}
+         -> Reference (List Note)
+         -> Server.Request
+         -> BocServer.Responder
+         -> Co (exception FileError <+> e) Unit
+answered r req respond = do
+  res <- RemoteHTTP.routed "/api" notesApi (kept r) page req
+  respond res
+
+-- (the listener's connections served, as many at once as come, until
+-- the program is ended)
+listening : {e : HFunctor}
           -> {s : Type}
-          -> {{io : stdio <: w}}
-          -> {{nt : Net.net <: w}}
-          -> {{clock : Time.time <: w}}
-          -> {{disk : filesystem <: w}}
-          -> {{cell : reference (List Note) <: w}}
+          -> {{bc : BOC.boc <: e}}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> {{clock : Time.time <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{cell : reference (List Note) <: e}}
           -> Reference (List Note)
           -> With s Net.TcpListener
-          -> Co (CML.cml w <+> Custodian.custodian <+> w) Unit
+          -> Co e Unit
 listening r l = do
   at <- Net.local l
   print
       ("listening on http://127.0.0.1:"
        ^ either (\err -> "?") (\(a : Net.Address) -> debug a.port) at)
-  CmlServer.serve
-      FileError
-      l
-      (RemoteHTTP.routed "/api" notesApi (kept r) page)
-  printErr "server: a connection could not be accepted"
+  flush
+  BOC.scheduled
+      (\why -> printErr ("server: " ^ why))
+      (BocServer.serve FileError l (answered (e := e) r))
 
 -- (a port not listened on, said)
 listenedOr : {e : HFunctor}
@@ -136,26 +147,23 @@ portOf : List String -> Int
 portOf (p :: rest) = fromMaybe 8080 (parseInt p)
 portOf [] = 8080
 
--- (a connection's throws heard in its own thread, by the server, which
--- closes it; the threads' world is the program's, with cml's, and the
--- program names no custodian: the one in the threads' world is the only
--- one)
+-- (a request's throws heard by the server, which closes its connection)
 main : Co
-       (stdio
+       (BOC.boc
+        <+> Custodian.custodian
+        <+> stdio
         <+> Net.net
         <+> Time.time
-        <+> Reactor.reactor
         <+> process
         <+> filesystem
-        <+> reference (List Note)
-        <+> Domain.domain)
+        <+> reference (List Note))
        Unit
 main = do
-  with _ := CML.threadsWithReactor do
-    argv <- args
-    let port = portOf argv
-    r <- newReference (Nil : List Note)
-    listened <-
-      Net.withListener { host = "127.0.0.1", port = port } 128 (listening r)
-    listenedOr listened
-  pure MkUnit
+  argv <- args
+  r <- newReference (Nil : List Note)
+  listened <-
+    Net.withListener
+      { host = "127.0.0.1", port = portOf argv }
+      128
+      (listening r)
+  listenedOr listened

@@ -3,8 +3,8 @@
 -- `/stop`.  `main PORT`: served to the test's clients (node:http, curl,
 -- a socket's bytes), each request said on a line as it is answered.
 -- `self`: served, at a port the system picked, to std.http's client in
--- the same program, a domain of its own (std.thread's spread), what the client
--- got said.  `crowded`, run with few descriptors: connected to until
+-- the same program, each side an act boc awaits, what the client got
+-- said.  `crowded`, run with few descriptors: connected to until
 -- there is none left, each connection's `with` inside the one before,
 -- then served -- `serveUntil` and `serve` stop at the connection they
 -- cannot accept, why thrown and said.
@@ -12,6 +12,7 @@
 module test.node.served
 
 import bytes as Bytes
+import boc as BOC
 import co
 import custodian as Custodian
 import exception
@@ -19,9 +20,7 @@ import std.http as HTTP
 import std.http.server as Server
 import std.io
 import std.net as Net
-import std.domain as Domain
 import std.process
-import std.thread
 import uint8 as UInt8
 import std.time
 import resource
@@ -190,7 +189,7 @@ crowdedProgram : {e : HFunctor}
 crowdedProgram =
   bind (Net.withListener (here 0) 256 (\l -> crowdedAt l)) (either throw pure)
 
--- std.http's client, a thread of its own --------------------------------------------
+-- std.http's client, an act of its own ----------------------------------------------
 
 showGot : Either HTTP.HttpError HTTP.Response -> String
 showGot (Left err) = show err
@@ -254,35 +253,33 @@ printAll (s :: rest) = do
   print s
   printAll rest
 
--- (domain 0 the server, domain 1 the client: what the client got)
+-- (side 0 the server, side 1 the client: what the client got; or
+-- what was thrown)
 sides : {e : HFunctor}
       -> {s : Type}
       -> {{io : stdio <: e}}
       -> {{nt : Net.net <: e}}
       -> {{clock : time <: e}}
       -> {{web : HTTP.http <: e}}
-      -> {{ex : exception Net.NetError <: e}}
       -> {{cu : Custodian.custodian <: e}}
       -> With s Net.TcpListener
       -> String
       -> Int
       -> Co e (List String)
 sides l at 0 = do
-  try
-    Server.serveUntil isStop l (\r -> pure (routed r))
-    pure Nil
-  catch (err : Net.NetError) ->
-    pure ["accept: " ^ show err]
+  r <- attempt Net.NetError (Server.serveUntil isStop l (\r -> pure (routed r)))
+  pure (either (\err -> ["accept: " ^ show err]) (\u -> Nil) r)
 sides l at _ = askAll at Nil requests
 
+-- (the server and the client, each an act awaited, what each came to
+-- on a cown of its own; then said, the server's first)
 selfAt : {e : HFunctor}
        -> {s : Type}
+       -> {{bc : BOC.boc <: e}}
        -> {{io : stdio <: e}}
        -> {{nt : Net.net <: e}}
        -> {{clock : time <: e}}
        -> {{web : HTTP.http <: e}}
-       -> {{dm : Domain.domain <: e}}
-       -> {{ex : exception Net.NetError <: e}}
        -> {{cu : Custodian.custodian <: e}}
        -> With s Net.TcpListener
        -> Co e Unit
@@ -291,8 +288,21 @@ selfAt l = do
   let url =
     "http://127.0.0.1:"
     ^ either (\err -> "0") (\(a : Net.Address) -> debug a.port) at
-  got <- spread 2 (\i -> sides l url i)
-  printAll (List.concatMap (\(ls : List String) -> ls) got)
+  server <- BOC.newCown Nil
+  client <- BOC.newCown Nil
+  BOC.scheduled
+      (\why -> printErr ("failed: " ^ why)) (do
+        with g := server
+             r := BOC.await (sides l url 0) do
+          g := r
+        with g := client
+             r := BOC.await (sides l url 1) do
+          g := r)
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when (server, client) (\p -> do
+       printAll (fst p ++ snd p)
+       pure p))
 
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
@@ -313,7 +323,7 @@ selfProgram : {e : HFunctor}
             -> {{nt : Net.net <: e}}
             -> {{clock : time <: e}}
             -> {{web : HTTP.http <: e}}
-            -> {{dm : Domain.domain <: e}}
+            -> {{bc : BOC.boc <: e}}
             -> {{ex : exception Net.NetError <: e}}
             -> {{cu : Custodian.custodian <: e}}
             -> Co e Unit
@@ -325,7 +335,6 @@ main : Co
         <+> Net.net
         <+> time
         <+> HTTP.http
-        <+> Domain.domain
         <+> process
         <+> Custodian.custodian)
        Unit
@@ -341,11 +350,11 @@ main =
     (unheard (io := _))
 
 self : Co
-       (stdio
+       (BOC.boc
+        <+> stdio
         <+> Net.net
         <+> time
         <+> HTTP.http
-        <+> Domain.domain
         <+> process
         <+> Custodian.custodian)
        Unit
@@ -357,7 +366,6 @@ self =
           (io := _)
           (nt := _)
           (web := _)
-          (dm := _)
           (ex := _)))
     (unheard (io := _))
 
@@ -366,7 +374,6 @@ crowded : Co
            <+> Net.net
            <+> time
            <+> HTTP.http
-           <+> Domain.domain
            <+> process
            <+> Custodian.custodian)
           Unit

@@ -5,18 +5,18 @@
 --            closed as it ends, std.io's printing going on after; a
 --            release run once as its block is left; and one whose block
 --            a throw left, heard outside it, run by the runtime at the
---            next operation; and a domain's lock, its `with` left by a
---            throw, let go of as the domain ends, there being no
---            operation after, so that main takes it
+--            next operation; and one a behaviour's body left by a
+--            throw, there being no operation after it in the body, run
+--            by its worker before its `scheduled` comes to its value
 
 module test.node.held
 
+import boc as BOC
 import co
 import custodian
 import exception
 import resource
 import std.file as File
-import std.domain as Domain
 import std.filesystem
 import std.io
 
@@ -37,35 +37,29 @@ left : {e : HFunctor}
      -> Co e Unit
 left = said "left by a throw" (\h -> throw "thrown")
 
--- (the lock held by a `with`, its block left by a throw heard outside
--- it; nothing after)
-lockedLeft : {e : HFunctor}
-           -> {{dm : Domain.domain <: e}}
-           -> {{cu : custodian <: e}}
-           -> {{ex : exception String <: e}}
-           -> Domain.Mutex
-           -> Co e Unit
-lockedLeft m =
-  held (Domain.lock m) (\u -> Domain.unlock m) (\h -> throw "thrown")
+-- (a behaviour whose body's `with` a throw left, heard in the body,
+-- its release then due on the worker, with no operation after; then
+-- its `scheduled` done)
+behaved : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> {{cu : custodian <: e}}
+        -> Co e Unit
+behaved = do
+  BOC.scheduled
+      (\why -> print ("failed: " ^ why)) (do
+        c <- BOC.newCown 0
+        with n := c do
+          t <-
+            attempt
+              String
+              (said
+                 "in a behaviour, left by a throw"
+                 (\h -> (throw "thrown" : Co (exception String <+> e) Unit)))
+          n := n + 1)
+  print "after the behaviour's scheduled"
 
--- (a domain doing so, ended; then main takes the lock)
-domainEnded : {e : HFunctor}
-            -> {{dm : Domain.domain <: e}}
-            -> {{cu : custodian <: e}}
-            -> Co e String
-domainEnded = do
-  m <- Domain.newMutex
-  with s := Domain.scope do
-    d <-
-      Domain.spawn
-        s
-        (bind (attempt String (lockedLeft m)) (\r -> pure (MkUnit : Unit)))
-    Domain.join d
-  Domain.lock m
-  Domain.unlock m
-  pure "a domain's lock, let go of as it ended: taken by main"
-
-main : Co (stdio <+> filesystem <+> Domain.domain <+> custodian) Unit
+main : Co (BOC.boc <+> stdio <+> filesystem <+> custodian) Unit
 main = do
   r <-
     attempt
@@ -81,5 +75,4 @@ main = do
   print (ev := _) (case t of
     Left m -> "heard: " ^ m
     Right u -> "not thrown")
-  ended <- domainEnded (dm := _) (cu := _)
-  print (ev := _) ended
+  behaved

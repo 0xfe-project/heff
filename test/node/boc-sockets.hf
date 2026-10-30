@@ -1,0 +1,394 @@
+-- boc's acts doing std.net's operations, each awaited, waiting in the
+-- reactor of the worker that takes it: while one waits on a socket, the
+-- others, and the behaviours, go on.  By C alone.
+--
+--   main REFUSED
+--            a read awaited, whose bytes come from a write awaited
+--            after it; a connection refused, a name resolved and one
+--            not -- each thrown by its `with` and heard -- while
+--            behaviours count; a read ended by the other side's `with`
+--            ending, and one whose own `with` ended meanwhile, ended so
+--            too; and many clients echoed at once by a server of acts,
+--            an act a connection, each accepted by one, the server
+--            holding every connection open until all have had their
+--            echo
+--
+-- What each part comes to is kept on cowns and said once its
+-- `scheduled` is done, in an order of its own, whichever threads ran
+-- them.
+
+module test.node.boc-sockets
+
+import boc as BOC
+import bytes as Bytes
+import co
+import custodian as Custodian
+import exception
+import std.io
+import std.net as Net
+import std.process
+import resource
+
+-- (127.0.0.1's `port`)
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
+
+-- (where a connection was not made, or a read failed: why)
+showFailed : {a : Type} -> Either Net.NetError a -> String
+showFailed (Left err) = err.name
+showFailed (Right _) = "ok"
+
+showRead : Either Net.NetError Bytes -> String
+showRead (Left err) = err.name
+showRead (Right b) = debug b
+
+-- (the value of a `Right`; where there is none, the program abandoned:
+-- the test's own sockets, which do not fail)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+-- (the line each cown holds, every behaviour before done, printed, in
+-- order)
+saidEach : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{io : stdio <: e}}
+         -> List (BOC.Cown String)
+         -> Co e Unit
+saidEach [] = pure ()
+saidEach (c :: cs) = do
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when c (\l -> do
+       print l
+       pure l))
+  saidEach cs
+
+-- (`v` put after what the cown holds, a name)
+named : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> BOC.Cown String
+      -> String
+      -> Co e Unit
+named c v = do
+  with x := c do
+    x := x ^ v
+
+-- (`c` run in a `scheduled` of its own, given cowns of what each of
+-- its acts comes to, failures said; then those cowns' lines said, in
+-- their order)
+part : {e : HFunctor}
+     -> {{bc : BOC.boc <: e}}
+     -> {{io : stdio <: e}}
+     -> List String
+     -> (List (BOC.Cown String) -> Co e Unit)
+     -> Co e Unit
+part names c = do
+  cowns <- for name in names do
+    BOC.newCown name
+  BOC.scheduled (\why -> print ("failed: " ^ why)) (c cowns)
+  saidEach cowns
+
+-- A read lets a write run
+--------------------------------------------------------------------------------
+
+-- | A read of the client's side `c` awaited, nothing written to it yet:
+-- | it is pending, and a write of the server's side `s`, awaited after
+-- | it, runs meanwhile, whose bytes the read then has.
+readThenWrite : {e : HFunctor}
+              -> {s : Type}
+              -> {{bc : BOC.boc <: e}}
+              -> {{nt : Net.net <: e}}
+              -> {{ex : exception Net.NetError <: e}}
+              -> {{cu : Custodian.custodian <: e}}
+              -> With s Net.TcpListener
+              -> Int
+              -> List (BOC.Cown String)
+              -> Co e Unit
+readThenWrite l port [read, wrote] = do
+  with Net.withConnection (here port) as c do
+    with Net.accept l as s do
+      with got := BOC.await (Net.read c 100) do
+        named read (showRead got)
+      with w := BOC.await (Net.write s b["hello"]) do
+        named wrote (showFailed w)
+readThenWrite l port _ = pure ()
+
+-- What fails, while others run
+--------------------------------------------------------------------------------
+
+-- (a count to `n`, a step a behaviour on `c`, each spawning the next;
+-- the last puts it after `said`)
+counting : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> BOC.Cown Int
+         -> BOC.Cown String
+         -> Int
+         -> Co e Unit
+counting c said n = do
+  with i := c do
+    if i + 1 < n then counting c said n else named said (debug (i + 1))
+    i := i + 1
+
+-- (a connection made to `address` and let go of: `ok`, or why it was
+-- not made)
+connected : {e : HFunctor}
+          -> {{nt : Net.net <: e}}
+          -> {{cu : Custodian.custodian <: e}}
+          -> Net.Address
+          -> Co e String
+connected address = do
+  r <-
+    attempt
+      Net.NetError
+      (Net.withConnection
+         address
+         (\c -> (pure () : Co (exception Net.NetError <+> e) Unit)))
+  pure (either (\(err : Net.NetError) -> err.name) (\u -> "ok") r)
+
+-- (a listener on `localhost`, and a connection to it by that name: the
+-- name resolved, twice)
+byName : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> Co e String
+byName = do
+  r <-
+    Net.withListener { host = "localhost", port = 0 } 4 (\l -> do
+      at <- Net.local l
+      connected { host = "localhost", port = (must at).port })
+  pure (either (\(err : Net.NetError) -> err.name) (\s -> s) r)
+
+-- (what a name not resolved came to)
+unresolved : String -> String
+unresolved s = if startsWith "EAI_" s then "EAI_..." else s
+
+-- | A connection refused, a name resolved and one not, each an act
+-- | awaited, while behaviours count.
+failures : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{cu : Custodian.custodian <: e}}
+         -> Int
+         -> List (BOC.Cown String)
+         -> Co e Unit
+failures refused [refusedC, resolved, bad, counted] = do
+  count <- BOC.newCown 0
+  with r := BOC.await (connected (here refused)) do
+    named refusedC r
+  with r := BOC.await byName do
+    named resolved r
+  with r :=
+         BOC.await (connected { host = "no-such-host.invalid", port = 80 }) do
+    named bad (unresolved r)
+  counting count counted 1000
+failures refused _ = pure ()
+
+-- Reads ended by a close
+--------------------------------------------------------------------------------
+
+-- | A read awaited the other side ends, by its `with` ending; and one
+-- | whose own connection's `with` ends meanwhile -- letting go of it,
+-- | not closing it, as the act holds it still -- ended by the other
+-- | side's `with` ending after.
+closings : {e : HFunctor}
+         -> {s : Type}
+         -> {{bc : BOC.boc <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
+         -> {{cu : Custodian.custodian <: e}}
+         -> With s Net.TcpListener
+         -> Int
+         -> List (BOC.Cown String)
+         -> Co e Unit
+closings l port [other, own] = do
+  with Net.withConnection (here port) as c do
+    with Net.accept l as s do
+      with r := BOC.await (Net.read c 100) do
+        named other (showRead r)
+  with Net.withConnection (here port) as d do
+    with Net.accept l as t do
+      with r := BOC.await (Net.read t 100) do
+        named own (showRead r)
+closings l port _ = pure ()
+
+-- Echo, many at once
+--------------------------------------------------------------------------------
+
+-- (what is read written back, until the other side is done writing)
+echo : {e : HFunctor}
+     -> {s : Type}
+     -> {{nt : Net.net <: e}}
+     -> With s Net.TcpStream
+     -> Co e Unit
+echo c = do
+  r <- Net.read c 4096
+  case r of
+    Right b ->
+      if Bytes.length b == 0 then pure ()
+      else do
+        w <- Net.write c b
+        echo c
+    Left err -> pure ()
+
+-- (n bytes read, in as many reads as they take)
+readN : {e : HFunctor}
+      -> {s : Type}
+      -> {{nt : Net.net <: e}}
+      -> With s Net.TcpStream
+      -> Int
+      -> Bytes
+      -> Co e Bytes
+readN c n acc =
+  if Bytes.length acc >= n then pure acc
+  else bind
+      (Net.read c (n - Bytes.length acc))
+      (\r -> readN c n (Bytes.append acc (must r)))
+
+-- (what the server holds: how many connections it echoed, and those
+-- connections, held open)
+type Held s = (Int, List (With s Net.TcpStream))
+
+-- (each connection accepted by an act, the next accept awaited at once
+-- after it, and the connection echoed by an act of its own; once the
+-- other side is done writing, held, and counted)
+serving : {e : HFunctor}
+        -> {s : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> {{nt : Net.net <: e}}
+        -> With s Net.TcpListener
+        -> BOC.Cown (Held s)
+        -> Co e Unit
+serving l held = do
+  with r := BOC.await (Net.accepted l) do
+    case r of
+      Left err -> pure ()
+      Right c -> do
+        serving l held
+        with h := held
+             u := BOC.await (echo c) do
+          h := (fst h + 1, c :: snd h)
+
+-- | A client, an act: its line written and echoed back, then done
+-- | writing; it holds its connection until the server lets go of it --
+-- | which it does once every client has had its echo -- the read then
+-- | at the end.  1 where its echo was its line.
+client : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> Int
+       -> Int
+       -> Co e Int
+client port i = do
+  r <-
+    attempt
+      Net.NetError
+      (Net.withConnection (here port) (\c -> do
+       let line = Bytes.fromString ("client " ^ debug i ^ "\n")
+       w <- Net.write c line
+       got <- readN c (Bytes.length line) Bytes.empty
+       d <- Net.shutdown c
+       end <- Net.read c 100
+       pure (if got == line && showRead end == "b[]" then 1 else 0)))
+  pure (either (\(err : Net.NetError) -> 0) (\x -> x) r)
+
+-- (clients `i` down to 1, each an act, counted on `closed` as each is
+-- done)
+clients : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> Int
+        -> BOC.Cown Int
+        -> Int
+        -> Co e Unit
+clients port closed 0 = pure ()
+clients port closed i = do
+  with n := closed
+       x := BOC.await (client port i) do
+    n := n + x
+  clients port closed (i - 1)
+
+-- | n clients, each its line echoed, the server holding every
+-- | connection open until all have been: a server serving one
+-- | connection at a time would never echo the second.  Then the server
+-- | lets go of them all, and of its listener.
+echoes : {e : HFunctor}
+       -> {s : Type}
+       -> {{bc : BOC.boc <: e}}
+       -> {{nt : Net.net <: e}}
+       -> {{cu : Custodian.custodian <: e}}
+       -> With s Net.TcpListener
+       -> Int
+       -> Int
+       -> List (BOC.Cown String)
+       -> Co e Unit
+echoes l port n [echoed, closedSaid] = do
+  held <- BOC.newCown ((0, Nil) : Held s)
+  closed <- BOC.newCown 0
+  serving l held
+  clients port closed n
+  with h := held
+    where fst h >= n
+  do
+    named echoed (debug (List.length (snd h)))
+    h := (fst h, Nil)
+    with u := BOC.await (Net.closeListener l) do
+      pure ()
+  with c := closed
+    where c >= n
+  do
+    named closedSaid (debug c)
+echoes l port n _ = pure ()
+
+-- The program
+--------------------------------------------------------------------------------
+
+-- (the listener had: each part of the test on it, in a `scheduled` of
+-- its own, in turn)
+onListener : {e : HFunctor}
+           -> {s : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{io : stdio <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{ex : exception Net.NetError <: e}}
+           -> {{cu : Custodian.custodian <: e}}
+           -> Int
+           -> With s Net.TcpListener
+           -> Co e Unit
+onListener refused l = do
+  at <- Net.local l
+  let port = (must at).port
+  part
+      ["a read awaited, a write run meanwhile: read ", "wrote "]
+      (readThenWrite l port)
+  part
+      [ "refused: "
+      , "a name, resolved: "
+      , "a name not resolved: "
+      , "counted meanwhile: "
+      ]
+      (failures refused)
+  part
+      ["read, the other side closed: ", "read, its socket closed: "]
+      (closings l port)
+  part ["echoed, all held open at once: ", "closed: "] (echoes l port 50)
+
+-- (the first argument, a number)
+firstInt : List String -> Int
+firstInt (a :: _) = fromMaybe 1 (parseInt a)
+firstInt [] = 1
+
+main : Co
+       (BOC.boc <+> Custodian.custodian <+> stdio <+> Net.net <+> process)
+       Unit
+main = do
+  argv <- args
+  r <-
+    attempt
+      Net.NetError
+      (Net.withListener (here 0) 64 (onListener (firstInt argv)))
+  print (case r of
+    Left err -> "not heard: " ^ show err
+    Right (Left err) -> "not listening: " ^ show err
+    Right (Right u) -> "main done")

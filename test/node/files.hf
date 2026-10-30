@@ -11,24 +11,23 @@
 --                that kept it: EBADF, a value
 --   lines        the standard input a line at a time: `ping` answered
 --                at once, then how many lines and bytes there were
---   threaded     cml's threads, waiting on the world through the
---                reactor: one reads the standard input, a pipe, while
---                another counts
+--   threaded     boc's behaviours: an act awaited reads the standard
+--                input, a pipe, in a worker's reactor, while behaviours
+--                count
 
 module test.node.files
 
 import bytes as Bytes
+import boc as BOC
 import co
 import custodian
 import exception
-import cml as CML
 import int as Int
 import std.file
 import std.filesystem
 import std.io
 import std.path as Path
 import std.process
-import std.domain as Domain
 import std.reactor as Reactor
 import uint8 as UInt8
 import resource
@@ -687,43 +686,46 @@ stdinLines = do
   let c : Counted = r
   print ("lines " ^ debug c.lines ^ " bytes " ^ debug c.bytes)
 
--- (a thread counting to n, a yield at each)
-counting : {e w : HFunctor}
-         -> {{cm : CML.cml w <: e}}
-         -> CML.Chan w Int
-         -> Int
+-- (a count to `n`, a step a behaviour on `c`, each spawning the next:
+-- the last says what it came to, at once)
+counting : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{io : stdio <: e}}
+         -> BOC.Cown Int
          -> Int
          -> Co e Unit
-counting ch n i =
-  if i >= n then CML.send ch i
-  else bind CML.yield (\u -> counting ch n (i + 1))
+counting c n = do
+  with i := c do
+    if i + 1 >= n
+    then do
+      print ("counted while the reader waits: " ^ debug (i + 1))
+      flush
+    else counting c n
+    i := i + 1
 
--- | A thread reading the standard input, a pipe, while another counts:
--- | the count is written before any of the input comes (the test writes
--- | none until it is).
-threadedLines : {e w : HFunctor}
-              -> {{cm : CML.cml w <: e}}
+-- (the standard input's lines counted, or -1 where it fails)
+linesIn : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> {{cu : custodian <: e}}
+        -> Co e Int
+linesIn = do
+  r <- attempt FileError (foldStdinLines 0 (\n l -> pure (n + 1)))
+  pure (either (\err -> 0 - 1) (\n -> n) r)
+
+-- | The standard input, a pipe, read by an act awaited, while behaviours
+-- | count: the count is written before any of the input comes (the
+-- | test writes none until it is).
+threadedLines : {e : HFunctor}
+              -> {{bc : BOC.boc <: e}}
+              -> {{io : stdio <: e}}
               -> {{disk : filesystem <: e}}
-              -> {{diskw : filesystem <: w}}
-              -> {{fx : exception FileError <: e}}
               -> {{cu : custodian <: e}}
               -> Co e Unit
 threadedLines = do
-  with withStdout as o do
-    counted <- CML.newChan
-    read <- CML.newChan
-    CML.spawn
-        (bind
-           (attempt
-              FileError
-              (foldStdinLines 0 (\n l -> pure (n + 1))))
-           (\r -> CML.send read (either (\err -> 0 - 1) (\n -> n) r)))
-    CML.spawn (counting counted 1000 0)
-    n <- CML.recv counted
-    writeString o ("counted while the reader waits: " ^ debug n ^ "\n")
-    m <- CML.recv read
-    writeString o ("read: " ^ debug m ^ " lines\n")
-  pure MkUnit
+  count <- BOC.newCown 0
+  with n := BOC.await linesIn do
+    print ("read: " ^ debug n ^ " lines")
+  counting count 1000
 
 -- The programs
 --------------------------------------------------------------------------------
@@ -774,20 +776,7 @@ linesMain = do
   r <- attempt FileError (stdinLines (io := _) (disk := _) (fx := _))
   unheard (io := _) r
 
-threaded : Co
-           (stdio
-            <+> filesystem
-            <+> Reactor.reactor
-            <+> process
-            <+> Domain.domain)
-           Unit
+threaded : Co (BOC.boc <+> custodian <+> stdio <+> filesystem <+> process) Unit
 threaded = do
-  r <-
-    CML.scheduledWithReactor
-      (attempt
-         FileError
-         (threadedLines
-            (cm := _)
-            (disk := _)
-            (fx := _)))
-  print (ev := _) (maybe "a deadlock" (\u -> "main done") r)
+  BOC.scheduled (\why -> print ("failed: " ^ why)) threadedLines
+  print "main done"

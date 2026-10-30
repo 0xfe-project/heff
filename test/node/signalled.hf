@@ -4,23 +4,22 @@
 --
 --   plain      waits where it is: for SIGWINCH or SIGTERM, then, SIGWINCH
 --              come, for SIGTERM, which it stops on
---   cml        a thread of cml's ticking, main doing each tick until
---              SIGTERM or SIGINT, a `choose` of the two: stops on it
+--   boc        behaviours ticking, each after a sleep awaited, while an
+--              act awaits SIGTERM or SIGINT: the ticks stop on it, and
+--              the program, its behaviours done
 --   unawaited  a command started (a shell sleeping), its pid said, then
 --              SIGINT waited for: SIGTERM, not waited for, ends the
 --              program, and the command with it
 
 module test.node.signalled
 
-import cml as CML
+import boc as BOC
 import co
 import custodian as Custodian
 import exception
-import std.domain as Domain
 import std.duration as Duration
 import std.io
 import std.process
-import std.reactor as Reactor
 import std.signal as Signal
 import std.time as Time
 
@@ -42,66 +41,57 @@ plain = do
   t <- Signal.wait [Terminate]
   print ("stopping on " ^ show t)
 
--- (a tick on `ch` every 20 ms, for ever)
-ticker : {e w : HFunctor}
-       -> {{cm : CML.cml w <: e}}
-       -> {{tm : Time.time <: e}}
-       -> CML.Chan w Int
-       -> Int
-       -> Co e Unit
-ticker ch n = do
-  Time.sleep (Duration.milliseconds 20)
-  CML.send ch n
-  ticker ch (n + 1)
-
--- (each tick taken, "waiting" said after the first -- the signals
--- caught by then -- until one of them comes)
-worked : {e w : HFunctor}
-       -> {{cm : CML.cml w <: e}}
-       -> {{sg : Signal.signals <: e}}
-       -> {{io : stdio <: e}}
-       -> CML.Chan w Int
-       -> Int
-       -> Co e Signal.Signal
-worked ticks n = do
-  next <-
-    (CML.choose
-       [ bind (CML.recv ticks) (\i -> pure (Right i))
-       , bind (Signal.wait [Terminate, Interrupt]) (\s -> pure (Left s))
-       ] :
-       Co e (Either Signal.Signal Int))
-  case next of
-    Right i -> do
+-- (a tick every 20 ms, a sleep awaited, the behaviour after it on
+-- `ticks` counting it -- "waiting" said at the first, the signals'
+-- wait pending by then -- and awaiting the next, until the count is
+-- stopped, -1)
+ticking : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> {{tm : Time.time <: e}}
+        -> BOC.Cown Int
+        -> Co e Unit
+ticking ticks = do
+  with n := ticks
+       u := BOC.await (Time.sleep (Duration.milliseconds 20)) do
+    if n >= 0
+    then do
       if n == 0 then said "waiting" else pure ()
-      worked ticks (n + 1)
-    Left s -> pure s
+      n := n + 1
+      ticking ticks
+    else pure ()
 
-ticked : {e w : HFunctor}
-       -> {{cm : CML.cml w <: e}}
-       -> {{sg : Signal.signals <: e}}
-       -> {{io : stdio <: e}}
-       -> {{tm : Time.time <: w}}
-       -> Co e Signal.Signal
-ticked = do
-  ticks <- CML.newChan
-  CML.spawn (ticker ticks 0)
-  worked ticks 0
+-- (SIGTERM or SIGINT awaited: once it comes, the count stopped, and
+-- the signal kept on `got`)
+stopping : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{sg : Signal.signals <: e}}
+         -> BOC.Cown Int
+         -> BOC.Cown (Maybe Signal.Signal)
+         -> Co e Unit
+stopping ticks got = do
+  with p := (ticks, got)
+       s := BOC.await (Signal.wait [Terminate, Interrupt]) do
+    p := (0 - 1, Just s)
 
-inCml : {e : HFunctor}
+inBoc : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
       -> {{io : stdio <: e}}
-      -> {{dm : Domain.domain <: e}}
-      -> {{rx : Reactor.reactor <: e}}
       -> {{tm : Time.time <: e}}
       -> {{sg : Signal.signals <: e}}
-      -> {{cu : Custodian.custodian <: e}}
       -> Co e Unit
-inCml = do
-  r <-
-    CML.scheduledWithReactor
-      (ticked (cm := _) (sg := _) (io := _) (tm := _))
-  case r of
-    Just s -> print ("stopping on " ^ show s)
-    Nothing -> print "every thread waiting"
+inBoc = do
+  ticks <- BOC.newCown 0
+  got <- BOC.newCown Nothing
+  BOC.scheduled
+      (\why -> print ("failed: " ^ why)) (do
+        stopping ticks got
+        ticking ticks)
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when got (\s -> do
+       print (maybe "no signal" (\x -> "stopping on " ^ show x) s)
+       pure s))
 
 unawaited : {e : HFunctor}
           -> {{io : stdio <: e}}
@@ -126,8 +116,7 @@ unawaited =
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{rx : Reactor.reactor <: e}}
+        -> {{bc : BOC.boc <: e}}
         -> {{tm : Time.time <: e}}
         -> {{sg : Signal.signals <: e}}
         -> {{cu : Custodian.custodian <: e}}
@@ -135,7 +124,7 @@ program : {e : HFunctor}
 program = do
   given <- args
   case given of
-    ["cml"] -> inCml
+    ["boc"] -> inBoc
     ["unawaited"] -> do
       r <-
         attempt
@@ -152,12 +141,11 @@ program = do
     _ -> plain
 
 main : Co
-       (stdio
+       (BOC.boc
+        <+> stdio
         <+> process
-        <+> Domain.domain
-        <+> Reactor.reactor
         <+> Time.time
         <+> Signal.signals
         <+> Custodian.custodian)
        Unit
-main = program (io := _) (sys := _) (dm := _) (rx := _) (tm := _) (sg := _)
+main = program
