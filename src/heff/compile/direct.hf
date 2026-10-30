@@ -3,9 +3,13 @@
 -- is (`PerformAt`, the world's sum taken apart there), built there of
 -- what it is known to be -- std.domain's cell read (`Plain (GetAtomic
 -- s)`, `s` the operation's own, `\use -> use (MkReading at g)`) or
--- written (`SetAtomic`, `MkWriting at v x`) -- is done there, by the
--- primitive that does what the provider would (`DomainGet`,
--- `DomainSet`), and what comes after it given the answer at once: no
+-- written (`SetAtomic`, `MkWriting at v x`); boc's behaviour spawned
+-- (`When s b x`, `s` holding `MkBehaviour cs ok ws rs`), cown made
+-- (`NewCown`, `MkCowning v g`), and what a body takes (`Taken`,
+-- `MkTaking tn g`) and gives (`Given`, `MkGiving tn v x`) -- is done
+-- there, by the primitive that does what the provider would
+-- (`DomainGet`, `DomainSet`, `BocWhen`, `BocNew`, `BocTaken`,
+-- `BocGiven`), and what comes after it given the answer at once: no
 -- operation built, nor taken apart, nor what comes after it made a
 -- closure where it is a lambda.  The provider answers these at once and
 -- calls what comes after once, last: so the program, doing them itself,
@@ -23,10 +27,10 @@ import std.ordmap as OrdMap
 -- (the values bound before, by name: operations built)
 type Known = OrdMap.OrdMap String IR.Expr
 
--- (whether the `i`th leaf of the world is std.domain's)
-domainAt : List Bool -> Int -> Bool
-domainAt [] i = False
-domainAt (b :: rest) i = if i == 0 then b else domainAt rest (i - 1)
+-- (the module of the `i`th leaf of the world)
+moduleAt : List String -> Int -> String
+moduleAt [] i = ""
+moduleAt (m :: rest) i = if i == 0 then m else moduleAt rest (i - 1)
 
 -- (what a value is, where it is bound to one before)
 valueOf : Known -> IR.Expr -> IR.Expr
@@ -86,9 +90,59 @@ directOp p k n = case oneOf "Plain" p of
       Nothing -> Nothing
   Nothing -> Nothing
 
+-- (... of boc's what is held, opened, where it is the one tag)
+heldBy : Known -> String -> IR.Expr -> Maybe (List IR.Expr)
+heldBy kn t s = case opened (valueOf kn s) of
+  Just (MkPair t2 fs) -> if strEq t t2 then Just fs else Nothing
+  Nothing -> Nothing
+
+-- (boc's operation `p` done at once: a behaviour spawned, `When s b x`,
+-- `k` given `x` after; a cown made, `k` given what `g` makes of it;
+-- what the cowns hold taken, `k` given what `g` makes of it; what they
+-- are to hold given, `k` given `x` after; the primitive's own value
+-- bound to the name `u`)
+directBoc : Known -> String -> IR.Expr -> IR.Expr -> Maybe IR.Expr
+directBoc kn u (ETag t fs _) k =
+  if strEq t "When"
+  then case fs of
+    [s, b, x] -> case heldBy kn "MkBehaviour" s of
+      Just [cs, ok, ws, rs] ->
+        Just (ELet u (EPrimCall BocWhen [cs, b, ok, ws, rs]) (applied k x))
+      _ -> Nothing
+    _ -> Nothing
+  else if strEq t "NewCown"
+  then case fs of
+    [s] -> case heldBy kn "MkCowning" s of
+      Just [v, g] -> Just (applied k (applied g (EPrimCall BocNew [v])))
+      _ -> Nothing
+    _ -> Nothing
+  else if strEq t "Taken"
+  then case fs of
+    [s] -> case heldBy kn "MkTaking" s of
+      Just [tn, g] -> Just (applied k (applied g (EPrimCall BocTaken [tn])))
+      _ -> Nothing
+    _ -> Nothing
+  else if strEq t "Given"
+  then case fs of
+    [s] -> case heldBy kn "MkGiving" s of
+      Just [tn, v, x] ->
+        Just (ELet u (EPrimCall BocGiven [tn, v]) (applied k x))
+      _ -> Nothing
+    _ -> Nothing
+  else Nothing
+directBoc kn u p k = Nothing
+
+-- (the operation `p`, handed to a leaf of the module `m`, done at once,
+-- where it is one of those; a name drawn from `n`)
+directAt : Known -> String -> IR.Expr -> IR.Expr -> Int -> Maybe IR.Expr
+directAt kn m p k n =
+  if strEq m "std.domain" then directOp p k n
+  else if strEq m "boc" then directBoc kn ("direct#u" ^ debug n) p k
+  else Nothing
+
 mutual
   -- (each of the expressions; names drawn from `n`)
-  directList : List Bool
+  directList : List String
              -> Known
              -> List IR.Expr
              -> Int
@@ -99,7 +153,7 @@ mutual
       MkPair es2 n3 -> MkPair (e2 :: es2) n3
 
   -- (... of a condition)
-  directCond : List Bool
+  directCond : List String
              -> Known
              -> IR.CondOf IR.Expr
              -> Int
@@ -119,7 +173,7 @@ mutual
         MkPair c2 n4 -> MkPair (CIf a2 b2 c2) n4
 
   -- (a record's fields)
-  directFields : List Bool
+  directFields : List String
                -> Known
                -> List (Pair String IR.Expr)
                -> Int
@@ -130,7 +184,7 @@ mutual
       MkPair fs2 n3 -> MkPair (MkPair l e2 :: fs2) n3
 
   -- (a match's arms)
-  directArms : List Bool
+  directArms : List String
              -> Known
              -> List IR.Arm
              -> Int
@@ -140,23 +194,20 @@ mutual
     MkPair b2 n2 -> case directArms ls kn rest n2 of
       MkPair rest2 n3 -> MkPair (MkArm t vs b2 :: rest2) n3
 
-  -- | an expression, each operation of std.domain's that it hands to the
-  -- | world where it is known done at once; `ls` whether each leaf of the
-  -- | world is std.domain's, `kn` the operations bound before; names
+  -- | an expression, each operation of std.domain's or boc's that it
+  -- | hands to the world where it is known done at once; `ls` the module
+  -- | of each leaf of the world, `kn` the operations bound before; names
   -- | drawn from `n`, and the next given back
-  directE : List Bool -> Known -> IR.Expr -> Int -> Pair IR.Expr Int
+  directE : List String -> Known -> IR.Expr -> Int -> Pair IR.Expr Int
   directE ls kn (EPrimCall (PerformAt i) [p, k]) n = case directList
       ls
       kn
       [p, k]
       n of
     MkPair args n2 -> case args of
-      [p2, k2] ->
-        if domainAt ls i
-        then case directOp (valueOf kn p2) k2 n2 of
-          Just e -> MkPair e (n2 + 1)
-          Nothing -> MkPair (EPrimCall (PerformAt i) [p2, k2]) n2
-        else MkPair (EPrimCall (PerformAt i) [p2, k2]) n2
+      [p2, k2] -> case directAt kn (moduleAt ls i) (valueOf kn p2) k2 n2 of
+        Just e -> MkPair e (n2 + 1)
+        Nothing -> MkPair (EPrimCall (PerformAt i) [p2, k2]) n2
       _ -> MkPair (EPrimCall (PerformAt i) args) n2
   directE ls kn (ELet x a b) n = case directE ls kn a n of
     MkPair a2 n2 ->
@@ -196,17 +247,17 @@ mutual
   directE ls kn e n = MkPair e n
 
 -- (each definition's; names drawn from `n`)
-directDefs : List Bool -> List IR.Def -> Int -> Pair (List IR.Def) Int
+directDefs : List String -> List IR.Def -> Int -> Pair (List IR.Def) Int
 directDefs ls [] n = MkPair Nil n
 directDefs ls (d :: ds) n = case directE ls OrdMap.empty d.body n of
   MkPair b n2 ->
     let rest : Pair (List IR.Def) Int = directDefs ls ds n2
     in MkPair (IR.mkDef d.key d.name b :: fst rest) (snd rest)
 
--- | the program, each operation of std.domain's it hands to the world
--- | where it is known done at once (`ls`: whether each leaf of the world
--- | is std.domain's -- none, where it is not known or the program is
+-- | the program, each operation of std.domain's or boc's it hands to
+-- | the world where it is known done at once (`ls`: the module of each
+-- | leaf of the world -- none, where it is not known or the program is
 -- | built with fuel); names drawn from where they went on from
-directProgram : List Bool -> Pair (List IR.Def) Int -> Pair (List IR.Def) Int
+directProgram : List String -> Pair (List IR.Def) Int -> Pair (List IR.Def) Int
 directProgram [] p = p
 directProgram ls (MkPair defs n) = directDefs ls defs n
