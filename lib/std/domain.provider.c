@@ -264,6 +264,151 @@ static void dm_set(DmAtomic *a, V v) {
   heff_drop(old);
 }
 
+// A cown's cell (`getOwned`, `setOwned`) is read and written by the one
+// behaviour holding the cown.  What it holds is the cown's: not shared,
+// but marked `OWNED` (`heff_own_at`), counted as a thread's own, out of
+// line, where the body's log (`HeffOwnLog`, the behaviour's while it
+// runs) keeps what the body counted up of it.  A write is kept by the
+// log too, and done once the body is: a body that fails, or does not
+// write a cell, leaves it as it was.  An array of what the cell holds
+// -- the value itself, or held in it by a way nothing but the log holds
+// any of, so that the body sees no other way to it -- held there, by the
+// log and by the body alone, the body writes in place (`heff_own_set`),
+// the log keeping what was there, put back where the cell is to hold
+// what it held.  Once the body is done, what more than one holds of
+// what it counted up is shared.
+
+// (the log's entry for the cell `held` has, made where there is none:
+// `held` held by it, so that the cell is not let go of before the log
+// is done with it)
+static HeffOwnRoot *dm_own_root(HeffOwnLog *g, V held) {
+  DmAtomic *a = heff_foreign_ptr(held);
+  for (int64_t j = 0; j < g->nr; j++)
+    if (g->roots[j].cell == a) return &g->roots[j];
+  if (!g->roots) {
+    g->roots = g->first;
+    g->cr = sizeof g->first / sizeof g->first[0];
+  } else if (g->roots == g->first && g->nr == g->cr) {
+    g->roots = malloc(sizeof g->first);
+    if (!g->roots) heff_fail("out of memory");
+    memcpy(g->roots, g->first, sizeof g->first);
+  }
+  g->roots = heff_own_room(g->roots, g->nr, &g->cr, sizeof(HeffOwnRoot));
+  HeffOwnRoot *e = &g->roots[g->nr++];
+  e->cell = a;
+  e->held = heff_dup(held);
+  e->v = atomic_load_explicit(&a->v, memory_order_acquire);
+  e->put = 0;
+  e->written = 0;
+  return e;
+}
+
+// (what a cown's cell holds, one more count of it: held by the log
+// once too, where it is the cown's)
+static V dm_get_owned(V held) {
+  HeffOwnLog *g = heff_own_log;
+  if (!g) return dm_get(heff_foreign_ptr(held));
+  V v = dm_own_root(g, held)->v;
+  if (!IS_OBJ(v) || !v) return v;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (heff_owned(rc)) OBJ(v)->rc = heff_own_touch(OBJ(v), rc) + 1;
+  else heff_dup(v);
+  return v;
+}
+
+// (... it is to hold `v` once the body is done; `v` consumed)
+static void dm_set_owned(V held, V v) {
+  HeffOwnLog *g = heff_own_log;
+  if (!g) {
+    dm_set(heff_foreign_ptr(held), v);
+    return;
+  }
+  HeffOwnRoot *e = dm_own_root(g, held);
+  if (e->written) heff_drop(e->put);
+  e->put = v;
+  e->written = 1;
+}
+
+// (what the body wrote of `r` put back as it was in `s` -- `r`, or a
+// copy of it -- the last first, each entry done with)
+static void dm_own_unwrite(HeffOwnLog *g, Arr *r, Arr *s) {
+  unsigned w = heff_arr_width[HEFF_ARR_KIND(r)];
+  for (int64_t j = g->ns; j-- > 0;) {
+    HeffOwnSet *e = &g->sets[j];
+    if (e->r != r) continue;
+    if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(s->a[e->i]);
+    memcpy((char *)s->a + e->i * w, &e->old, w);
+    e->r = NULL;
+  }
+}
+
+// (what the cell holds holding the array as it was before the body
+// wrote it: in place, where only what holds it there and the log do;
+// else a copy, shared, put in the slot -- or the cell -- that held it,
+// what else holds it keeping it as the body made it)
+static void dm_own_restore(HeffOwnLog *g, HeffOwnArr *e) {
+  Arr *r = e->r;
+  if (HEFF_COUNT(heff_rc(&r->h)) == 2) {
+    dm_own_unwrite(g, r, r);
+    return;
+  }
+  Arr *s = heff_arr_alloc(r->n, HEFF_ARR_KIND(r));
+  heff_arr_move(s, 0, r, 0, r->n);
+  dm_own_unwrite(g, r, s);
+  V c = heff_share((V)s);
+  if (e->at) *e->at = c;
+  else atomic_store_explicit(&((DmAtomic *)g->roots[e->root].cell)->v, c, memory_order_release);
+  heff_drop((V)r);
+}
+
+// (a behaviour's body done, or failed, and its log finished, with no
+// log of its own: what it was to write let go of where it failed; each
+// array it wrote in place, of what a cell not written holds, put back;
+// each cell
+// written; and what it counted up shared where more than one holds it)
+static void dm_own_done(HeffOwnLog *g, int failed) {
+  if (failed)
+    for (int64_t j = 0; j < g->nr; j++)
+      if (g->roots[j].written) {
+        heff_drop(g->roots[j].put);
+        g->roots[j].written = 0;
+      }
+  for (int64_t j = 0; j < g->na; j++)
+    if (!g->roots[g->arrs[j].root].written) dm_own_restore(g, &g->arrs[j]);
+  for (int64_t j = 0; j < g->ns; j++) {
+    HeffOwnSet *e = &g->sets[j];
+    if (e->r && HEFF_ARR_KIND(e->r) == HEFF_ARR_V) heff_own_at(&e->r->a[e->i]);
+  }
+  for (int64_t j = 0; j < g->nr; j++) {
+    HeffOwnRoot *e = &g->roots[j];
+    if (!e->written) continue;
+    DmAtomic *a = e->cell;
+    dm_hold(a);
+    V old = atomic_exchange_explicit(&a->v, e->put, memory_order_acq_rel);
+    dm_release(a);
+    heff_drop(old);
+    heff_own_at(&e->put);
+  }
+  for (int64_t j = 0; j < g->ns; j++) {
+    HeffOwnSet *e = &g->sets[j];
+    if (e->r && HEFF_ARR_KIND(e->r) == HEFF_ARR_V) heff_drop((V)e->old);
+  }
+  for (int64_t j = 0; j < g->nt; j++) {
+    V o = g->touched[j];
+    uint32_t rc = heff_rc(OBJ(o));
+    if (heff_owned(rc)) {
+      OBJ(o)->rc = rc &= ~HEFF_TOUCHED_BIT;
+      if (HEFF_COUNT(rc) > 2) heff_share(o);
+    }
+    heff_drop(o);
+  }
+  for (int64_t j = 0; j < g->nr; j++) heff_drop(g->roots[j].held);
+  free(g->touched);
+  if (g->roots != g->first) free(g->roots);
+  free(g->arrs);
+  free(g->sets);
+}
+
 // (... where it held `seen`, the same word: whether it did; `seen` and
 // `v` consumed)
 static int dm_cas(DmAtomic *a, V seen, V v) {
@@ -660,7 +805,11 @@ static void dm_run_behaviour(DmBehaviour *b) {
   V out;
   dm_fuel = 0;
   dm_in_body = 1;
+  HeffOwnLog log = {0}, *outer = heff_own_log;
+  heff_own_log = &log;
   const char *why = heff_try(b->c, (V)&dm_behaved_clo, &out);
+  heff_own_log = NULL;
+  dm_own_done(&log, why != NULL);
   if (why) {
     V fc = heff_answer(b->failed, heff_str_text(why));
     why = heff_try(fc, (V)&dm_behaved_clo, &out);
@@ -673,6 +822,7 @@ static void dm_run_behaviour(DmBehaviour *b) {
     heff_drop(out);
     heff_drop(b->failed);
   }
+  heff_own_log = outer;
   dm_in_body = 0;
   dm_behaved_all(b);
   heff_drop(b->held);
@@ -945,6 +1095,24 @@ static V heff_provider_domain(V p, V k) {
     V v = heff_tget_v(wr, 1);
     x = heff_dup(heff_field(wr, 2));
     dm_set(a, v);
+    heff_drop(wr);
+    break;
+  }
+  case TAG_GetOwned: {
+    V rd = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V g = heff_dup(heff_field(rd, 1));
+    V v = dm_get_owned(heff_field(rd, 0));
+    heff_drop(rd);
+    x = heff_answer(g, v);
+    break;
+  }
+  case TAG_SetOwned: {
+    V wr = dm_open(heff_dup(heff_field(p, 0)));
+    heff_drop(p);
+    V v = heff_tget_v(wr, 1);
+    x = heff_dup(heff_field(wr, 2));
+    dm_set_owned(heff_field(wr, 0), v);
     heff_drop(wr);
     break;
   }

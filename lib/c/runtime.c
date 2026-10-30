@@ -338,18 +338,32 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint64_t d[]; } Big;
 #define HEFF_SHARED_BIT 0x40000000u
 #define SHARED (IMMORTAL | HEFF_SHARED_BIT)
 #define heff_shared(rc) ((rc) & HEFF_SHARED_BIT)
-#define heff_immortal(rc) (((rc) & SHARED) == IMMORTAL)
+// (an object of a cown's (std.domain's `setOwned`, `heff_own`): one
+// behaviour's at a time, the one holding the cown, so counted as a
+// thread's own, but out of line, where what a body does to it is kept
+// (`HeffOwnLog`) -- marked `OWNED`, the highest bit and the one two
+// below it.  `TOUCHED`, one below that, where the body's log holds it
+// once, counted up)
+#define HEFF_OWNED_BIT 0x20000000u
+#define OWNED (IMMORTAL | HEFF_OWNED_BIT)
+#define heff_owned(rc) ((rc) & HEFF_OWNED_BIT)
+#define HEFF_TOUCHED_BIT 0x10000000u
+#define heff_immortal(rc) (((rc) & (SHARED | OWNED)) == IMMORTAL)
 #define heff_rc(o) __atomic_load_n(&(o)->rc, __ATOMIC_RELAXED)
 #else
 #define SHARED 0u
+#define OWNED 0u
+#define HEFF_TOUCHED_BIT 0u
 #define heff_shared(rc) 0
+#define heff_owned(rc) 0
 #define heff_immortal(rc) ((rc) & IMMORTAL)
 #define heff_rc(o) ((o)->rc)
 #endif
 // (an object's count but its marks)
-#define HEFF_COUNT(rc) ((rc) & ~(IMMORTAL | SHARED))
+#define HEFF_COUNT(rc) ((rc) & ~(IMMORTAL | SHARED | OWNED | HEFF_TOUCHED_BIT))
 
 HEFF_FN void heff_free(V v);
+HEFF_FN void heff_fail(const char *why);
 
 #ifdef HEFF_THREADS
 // (the fast paths below test the highest mark, as one thread does, and
@@ -372,11 +386,71 @@ HEFF_FN __attribute__((noinline)) int heff_down_shared(Obj *o) {
   return heff_shared(was) && HEFF_COUNT(was) == 1;
 }
 
+// (what a behaviour's body did to its cowns' objects, kept while it
+// runs (std.domain's provider), to be finished once it is done or has
+// failed: the owned objects it counted up, each held here once
+// (`TOUCHED`); the cells it read (`getOwned`), each held here, by the
+// value that has it, with what it held, held here once too, and what it
+// is to hold after (`setOwned`); the arrays of what a cell holds that
+// it writes in place, each with the cell's and the slot that holds it
+// there (none where the cell does); and the elements it wrote of them,
+// with what was there -- held here, where an array keeps `V`s, else
+// its bits)
+typedef struct { void *cell; V held, v, put; int written; } HeffOwnRoot;
+typedef struct { Arr *r; V *at; int64_t root; } HeffOwnArr;
+typedef struct { Arr *r; int64_t i; uint64_t old; } HeffOwnSet;
+typedef struct {
+  V *touched;
+  int64_t nt, ct;
+  HeffOwnRoot *roots;
+  int64_t nr, cr;
+  HeffOwnArr *arrs;
+  int64_t na, ca;
+  HeffOwnSet *sets;
+  int64_t ns, cs;
+  // (the first cells' entries, most bodies' all: none allocated)
+  HeffOwnRoot first[4];
+} HeffOwnLog;
+HEFF_VAR(HEFF_TLS HeffOwnLog *heff_own_log);
+
+// (room in one of a log's lists for one more)
+HEFF_FN void *heff_own_room(void *p, int64_t n, int64_t *cap, size_t size) {
+  if (n < *cap) return p;
+  *cap = *cap ? *cap * 2 : 8;
+  p = realloc(p, (size_t)*cap * size);
+  if (!p) heff_fail("out of memory");
+  return p;
+}
+
+// (the owned object held by the log, where it is not yet: one more
+// count, the log's)
+static inline uint32_t heff_own_touch(Obj *o, uint32_t rc) {
+  HeffOwnLog *g = heff_own_log;
+  if (!g || (rc & HEFF_TOUCHED_BIT)) return rc;
+  g->touched = heff_own_room(g->touched, g->nt, &g->ct, sizeof(V));
+  g->touched[g->nt++] = (V)o;
+  return (rc | HEFF_TOUCHED_BIT) + 1;
+}
+
+// (an owned object counted up `m` more: as a thread's own -- only the
+// behaviour holding its cown has it -- and kept by the body's log)
+HEFF_FN __attribute__((noinline)) void heff_own_dup(Obj *o, uint32_t m) {
+  o->rc = heff_own_touch(o, o->rc) + m;
+}
+
+// (... down: whether that was its last reference)
+HEFF_FN __attribute__((noinline)) int heff_own_down(Obj *o) {
+  uint32_t rc = o->rc - 1;
+  o->rc = rc;
+  return HEFF_COUNT(rc) == 0;
+}
+
 HEFF_FAST V heff_dup(V v) {
   if (IS_OBJ(v)) {
     uint32_t rc = heff_rc(OBJ(v));
     if (HEFF_LIKELY(heff_mine(rc))) OBJ(v)->rc = rc + 1;
     else if (heff_shared(rc)) __atomic_fetch_add(&OBJ(v)->rc, 1, __ATOMIC_RELAXED);
+    else if (heff_owned(rc)) heff_own_dup(OBJ(v), 1);
   }
   return v;
 }
@@ -386,7 +460,8 @@ HEFF_FAST V heff_dup(V v) {
 static inline int heff_down(Obj *o) {
   uint32_t rc = heff_rc(o);
   if (HEFF_LIKELY(heff_mine(rc))) return (o->rc = rc - 1) == 0;
-  return heff_shared(rc) && heff_down_shared(o);
+  if (heff_shared(rc)) return heff_down_shared(o);
+  return heff_owned(rc) && heff_own_down(o);
 }
 
 // (a count taken down where it is not the last unless the object is
@@ -395,7 +470,8 @@ static inline int heff_down(Obj *o) {
 HEFF_FAST void heff_unref(V v) {
   uint32_t rc = heff_rc(OBJ(v));
   if (HEFF_LIKELY(heff_mine(rc))) OBJ(v)->rc = rc - 1;
-  else if (heff_shared(rc) && heff_down_shared(OBJ(v))) heff_free(v);
+  else if (heff_shared(rc)) { if (heff_down_shared(OBJ(v))) heff_free(v); }
+  else if (heff_owned(rc) && heff_own_down(OBJ(v))) heff_free(v);
 }
 #else
 static inline V heff_dup(V v) {
@@ -431,12 +507,22 @@ HEFF_FN __attribute__((noinline)) int heff_unshare(Obj *o) {
   return 1;
 }
 
+// (an owned one counted once: unmarked, a thread's own from then on.
+// No object of a cell a body has read is held by the body alone: the
+// cell holds it too, or what holds it there, so the body counted it up)
+HEFF_FN __attribute__((noinline)) int heff_own_alone(Obj *o) {
+  if (HEFF_COUNT(o->rc) != 1) return 0;
+  o->rc = 1;
+  return 1;
+}
+
 // (a shared one's count compared out of line, as `heff_down_shared`
 // compares it)
 static inline int heff_alone(Obj *o) {
   uint32_t rc = heff_rc(o);
   if (HEFF_LIKELY(rc == 1)) return 1;
-  return heff_shared(rc) && heff_unshare(o);
+  if (heff_shared(rc)) return heff_unshare(o);
+  return heff_owned(rc) && heff_own_alone(o);
 }
 #else
 static inline int heff_alone(Obj *o) { return o->rc == 1; }
@@ -1772,8 +1858,8 @@ HEFF_FN void heff_share_one(HeffStack *s, V *at) {
   V v = *at;
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
-  if (!heff_mine(rc)) return;
-  OBJ(v)->rc = rc | SHARED;
+  if (!heff_mine(rc) && !heff_owned(rc)) return;
+  OBJ(v)->rc = HEFF_COUNT(rc) | SHARED;
   heff_stack_push(s, v);
 }
 
@@ -1786,7 +1872,9 @@ HEFF_FN void heff_share_one(HeffStack *s, V *at) {
 // by one more count (`heff_dup`).  What of `v` is mortal is this
 // thread's: no other changes it meanwhile)
 HEFF_FN V heff_share(V v) {
-  if (!IS_OBJ(v) || !v || !heff_mine(heff_rc(OBJ(v)))) return v;
+  if (!IS_OBJ(v) || !v) return v;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (!heff_mine(rc) && !heff_owned(rc)) return v;
   HeffStack s = {0};
   heff_share_one(&s, &v);
   while (s.n) {
@@ -1804,6 +1892,10 @@ HEFF_FN void heff_move_one(HeffStack *s, V *at) {
   V v = *at;
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
+  if (heff_owned(rc)) {
+    if (HEFF_COUNT(rc) != 1) { heff_share(v); return; }
+    OBJ(v)->rc = rc = 1;
+  }
   if (!heff_mine(rc)) return;
   if (rc == 1) heff_stack_push(s, v);
   else heff_share(v);
@@ -1825,6 +1917,8 @@ HEFF_FN void heff_move_one(HeffStack *s, V *at) {
 HEFF_FN V heff_move(V v) {
   if (!IS_OBJ(v) || !v) return v;
   uint32_t rc = heff_rc(OBJ(v));
+  if (heff_owned(rc) && HEFF_COUNT(rc) == 1) OBJ(v)->rc = rc = 1;
+  if (heff_owned(rc)) return heff_share(v);
   if (!heff_mine(rc)) return v;
   if (rc != 1) return heff_share(v);
   HeffStack s = {0};
@@ -1836,10 +1930,43 @@ HEFF_FN V heff_move(V v) {
   free(s.v);
   return v;
 }
+
+// (one slot of what a cown is given: an object of this thread's counted
+// once is held through this slot alone, and is the cown's, marked
+// `OWNED`, the walk going on below it; one counted more is held by
+// something else too, and is shared, with all it holds.  The walk stops
+// at what is owned already: what the body counted up of that its log
+// holds (`TOUCHED`), and the provider shares it after where more than
+// the cown holds it; what it did not, nothing else holds)
+HEFF_FN void heff_own_one(HeffStack *s, V *at) {
+  V v = *at;
+  if (!IS_OBJ(v) || !v) return;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (!heff_mine(rc)) return;
+  if (rc == 1) {
+    OBJ(v)->rc = OWNED | 1;
+    heff_stack_push(s, v);
+  } else heff_share(v);
+}
+
+// (what the slot holds made the cown's, as `heff_own_one` says: a
+// cown's objects are held by the one behaviour that holds the cown,
+// each counted as a thread's own, and handed on with the cown, by its
+// turnstile, never walked again where nothing changed them)
+HEFF_FN void heff_own_at(V *at) {
+  HeffStack s = {0};
+  heff_own_one(&s, at);
+  while (s.n) {
+    V o = s.v[--s.n];
+    HEFF_EACH_SLOT(o, heff_own_one, &s);
+  }
+  free(s.v);
+}
 #else
 // (one thread: nothing is shared, nothing to do)
 static inline V heff_share(V v) { return v; }
 static inline V heff_move(V v) { return v; }
+static inline void heff_own_at(V *at) { (void)at; }
 #endif
 
 // Calls of what is not known
@@ -3670,7 +3797,8 @@ static inline int heff_arr_mine(Arr *r, unsigned kind) {
   if (HEFF_LIKELY((h & ~((uint64_t)0xff00 << 48)) == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48)))
     return 1;
 #ifdef HEFF_THREADS
-  return heff_shared((uint32_t)h) && HEFF_ARR_KIND(r) == kind && heff_unshare(&r->h);
+  if (heff_shared((uint32_t)h)) return HEFF_ARR_KIND(r) == kind && heff_unshare(&r->h);
+  return heff_owned((uint32_t)h) && HEFF_ARR_KIND(r) == kind && heff_own_alone(&r->h);
 #else
   return 0;
 #endif
@@ -3906,6 +4034,105 @@ HEFF_FAST V heff_arrayKeeps_f64(V a) { return heff_arrayKeeps_f64_lent(a, 1); }
 // (`set` but where the array is held only here and keeps `x` as it is:
 // out of range, the array as it is; held elsewhere too, a copy, `x` at
 // `i` in it)
+#ifdef HEFF_THREADS
+// (a search, from what a cell holds, for the slot holding `want`: down
+// through owned objects held by what holds them there alone, and by the
+// log -- those the body counted up (`TOUCHED`), and, where `any` is,
+// those it did not, `left` of them at most)
+typedef struct {
+  HeffStack s;
+  V want, from;
+  V *at;
+  V parent;
+  int64_t left;
+  int any;
+} HeffOwnSeek;
+
+HEFF_FN void heff_own_seek(HeffOwnSeek *k, V *at) {
+  V v = *at;
+  if (k->at || !IS_OBJ(v) || !v) return;
+  if (v == k->want) {
+    k->at = at;
+    k->parent = k->from;
+    return;
+  }
+  uint32_t rc = heff_rc(OBJ(v));
+  if (!heff_owned(rc)) return;
+  if (rc & HEFF_TOUCHED_BIT) {
+    if (HEFF_COUNT(rc) != 2) return;
+  } else if (!k->any || HEFF_COUNT(rc) != 1 || k->left-- <= 0) return;
+  heff_stack_push(&k->s, v);
+}
+
+// (whether the slot `at` is one of the array's elements)
+static inline int heff_own_within(V *at, Arr *r) {
+  return HEFF_ARR_KIND(r) == HEFF_ARR_V && at >= r->a && at < r->a + r->n;
+}
+
+// (whether `r` is what a cell the body read holds, or is held there by a
+// way from it nothing else holds -- but the log, and the cell -- so that
+// nothing the body or another has sees it written in place: the way
+// counted, each object on it held once there, or twice, once by the log,
+// the body holding none; what holds the array then itself none the body
+// writes in place, nor the array what holds one: kept by the log, to
+// put back)
+HEFF_FN int heff_own_found(HeffOwnLog *g, Arr *r) {
+  for (int any = 0; any < 2; any++)
+    for (int64_t j = 0; j < g->nr; j++) {
+      V v = g->roots[j].v;
+      if (!IS_OBJ(v) || !v || !heff_owned(heff_rc(OBJ(v)))) continue;
+      V *at = NULL;
+      V parent = 0;
+      if (v == (V)r) {
+        if (any) continue;
+      } else {
+        if (HEFF_COUNT(heff_rc(OBJ(v))) != 2) continue;
+        HeffOwnSeek k = {{0}, (V)r, 0, NULL, 0, 256, any};
+        heff_stack_push(&k.s, v);
+        while (k.s.n && !k.at) {
+          V o = k.s.v[--k.s.n];
+          k.from = o;
+          HEFF_EACH_SLOT(o, heff_own_seek, &k);
+        }
+        free(k.s.v);
+        if (!k.at) continue;
+        at = k.at;
+        parent = k.parent;
+      }
+      for (int64_t i = 0; i < g->na; i++)
+        if ((V)g->arrs[i].r == parent || (g->arrs[i].at && heff_own_within(g->arrs[i].at, r)))
+          return 0;
+      g->arrs = heff_own_room(g->arrs, g->na, &g->ca, sizeof(HeffOwnArr));
+      g->arrs[g->na++] = (HeffOwnArr){r, at, j};
+      return 1;
+    }
+  return 0;
+}
+
+// (whether the array, counted up by the body and held by it once, and
+// once by what holds it in what a cell the body read holds, may be
+// written in place at `k` (`heff_own_found`): what is there then kept
+// by the log -- the reference, where the array keeps `V`s, else its
+// bits -- to be put back where the cell is to hold what it held (the
+// body failed, or did not write the cell))
+HEFF_FN __attribute__((noinline)) int heff_own_set(Arr *r, int64_t k) {
+  HeffOwnLog *g = heff_own_log;
+  uint32_t rc = r->h.rc;
+  if (!g || !(rc & HEFF_TOUCHED_BIT) || HEFF_COUNT(rc) != 3) return 0;
+  int64_t j = 0;
+  while (j < g->na && g->arrs[j].r != r) j++;
+  if (j == g->na && !heff_own_found(g, r)) return 0;
+  g->sets = heff_own_room(g->sets, g->ns, &g->cs, sizeof(HeffOwnSet));
+  HeffOwnSet *e = &g->sets[g->ns++];
+  e->r = r;
+  e->i = k;
+  e->old = 0;
+  unsigned w = heff_arr_width[HEFF_ARR_KIND(r)];
+  memcpy(&e->old, (char *)r->a + k * w, w);
+  return 1;
+}
+#endif
+
 HEFF_FN __attribute__((noinline)) V heff_arr_set_slow(V a, V i, V x) {
   Arr *r = (Arr *)a;
   if (!heff_arr_in(r, i)) {
@@ -3914,6 +4141,12 @@ HEFF_FN __attribute__((noinline)) V heff_arr_set_slow(V a, V i, V x) {
     return a;
   }
   int64_t k = INT_OF(i);
+#ifdef HEFF_THREADS
+  if (heff_owned(heff_rc(&r->h)) && heff_own_set(r, k)) {
+    heff_arr_put(r, k, x);
+    return a;
+  }
+#endif
   if (!heff_unique(a)) r = heff_arr_copy(a);
   if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
   heff_arr_put(r, k, x);
@@ -4049,6 +4282,7 @@ HEFF_FN V heff_arrayReplicate(V n, V x) {
     if (heff_mine(rc)) OBJ(x)->rc = rc + (uint32_t)(m - 1);
 #ifdef HEFF_THREADS
     else if (heff_shared(rc)) __atomic_fetch_add(&OBJ(x)->rc, (uint32_t)(m - 1), __ATOMIC_RELAXED);
+    else if (heff_owned(rc)) heff_own_dup(OBJ(x), (uint32_t)(m - 1));
 #endif
   }
   return (V)r;
