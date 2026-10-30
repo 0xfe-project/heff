@@ -833,7 +833,13 @@ static void dm_run_behaviour(DmBehaviour *b) {
   HeffOwnLog log, *outer = heff_own_log;
   memset(&log, 0, __builtin_offsetof(HeffOwnLog, first));
   heff_own_log = &log;
+  // (the body's chain of calls last counted from naught: each body starts
+  // a chain of its own, as a bounce's step does, not one past the last
+  // body's on this thread, every call of which would be a bounce)
+  long dep = heff_dep;
+  heff_dep = 0;
   const char *why = heff_try(b->c, (V)&dm_behaved_clo, &out);
+  heff_dep = dep;
   heff_own_log = NULL;
   dm_own_done(&log, why != NULL);
   if (why) {

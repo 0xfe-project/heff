@@ -1242,6 +1242,20 @@ calledFirst all x (ELet _ a b) =
 calledFirst all x (EMatch sc _) = calledFirst all x sc
 calledFirst all x _ = False
 
+-- (... given any values: past what cannot fail bound -- `hd.ret`, say)
+calledFirstAny : (IR.Expr -> Bool) -> String -> IR.Expr -> Bool
+calledFirstAny pure x (EApp (EVar y) argv) =
+  strEq x y && IR.allI (List.map IR.isValue argv)
+calledFirstAny pure x (ELet _ a b) =
+  calledFirstAny pure x a || (pure a && calledFirstAny pure x b)
+calledFirstAny pure x (EMatch sc _) = calledFirstAny pure x sc
+calledFirstAny pure x _ = False
+
+-- (an application of a global)
+globalCall : IR.Expr -> Bool
+globalCall (EApp (EGlobal _) _) = True
+globalCall _ = False
+
 -- | a binding, its value simplified: what could fail is computed where
 -- | it was, used or not.  A known function given fewer arguments than it
 -- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
@@ -1281,6 +1295,15 @@ letIn r x a b = do
   else if p then letPure r x a b (occCountOf x b)
   else if partialApp s a then letSplit r x a b
   else if calledFirst s.sp.all x b && occCountOf x b == 1
+  then r.simp (IR.subst (singletonM x a) b)
+  -- (a computation a global comes to, bound and called at once, every
+  -- argument a value -- `c = ping a b (n - 1)`, then `c hd k`, in a body
+  -- handed to an operation, its handler a variable there -- is the call
+  -- of the global given them all: computed in the same order, and a
+  -- call of itself that hands its handler on, seen to (`Spec.statics`))
+  else if globalCall a
+          && calledFirstAny (pureIn s.safe s.total) x b
+          && occCountOf x b == 1
   then r.simp (IR.subst (singletonM x a) b)
   else do
     b' <- r.simp b
@@ -3418,6 +3441,20 @@ boundPushed r orig s arms argv = do
     if p then pushBound r s arms argv else pure orig
   else pure orig
 
+-- (every arm a lambda: a choice of computations, each given the
+-- arguments at once -- its handler a variable still, as in a body
+-- handed to an operation, `if n > 0 then when b ... else print ...`,
+-- which so hands the handler it was given on to what it calls)
+lamArms : List IR.Arm -> Bool
+lamArms arms =
+  not (List.null arms)
+  && IR.allI
+    (List.map
+       (\b -> case IR.armBody b of
+        ELam _ _ -> True
+        _ -> False)
+       arms)
+
 -- (a match given a known handler and what follows)
 followerPushed : SK -> IR.Expr -> List IR.Arm -> List IR.Expr -> M IR.Expr
 followerPushed r s arms argv = do
@@ -3426,7 +3463,7 @@ followerPushed r s arms argv = do
   let orig : IR.Expr = mkApp (EMatch s arms) argv
   case followerNamed k argv of
     Just (MkPair argv2 f) ->
-      if List.any (handlerArg st.sp.kinds) argv2
+      if (List.any (handlerArg st.sp.kinds) argv2 || lamArms arms)
          && pushInto arms (List.keepIf (\a -> not (isVar k a)) argv2)
       then followerSet r orig k f s arms argv2
       else pure orig
@@ -3819,12 +3856,17 @@ grewIn s0 s1 b =
   && grew (aritiesOf s0 (IR.globalsIn b)) (aritiesOf s1 (IR.globalsIn b))
 
 -- | the copy `h` made to `b`: what it is known by, if that takes more
--- | arguments than what it was known by
+-- | arguments than what it was known by -- or if it calls itself: a loop
+-- | made for what was known where it was asked for (an effect's
+-- | evidence), which hands on more as it is now (a handler, its own
+-- | through the bodies it gives an operation), for a copy of it to be
+-- | made for those, where they are known
 knownMade : String -> IR.Expr -> M Unit
 knownMade h b = \s ->
     MkPair
       MkUnit
-      (if arityIn s.sp.all h < arityIn (singletonM h b) h
+      (if (arityIn s.sp.all h < arityIn (singletonM h b) h
+           || List.elem h (IR.globalsIn b))
           && not (IR.sizeAbove specBodySize b)
        then recordAll h b s
        else s)
