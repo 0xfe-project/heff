@@ -1,0 +1,212 @@
+-- Operations done at once, on the C backend (heff.compile.lower's
+-- `cKept`): an operation handed to its leaf's provider where the program
+-- is (`PerformAt`, the world's sum taken apart there), built there of
+-- what it is known to be -- std.domain's cell read (`Plain (GetAtomic
+-- s)`, `s` the operation's own, `\use -> use (MkReading at g)`) or
+-- written (`SetAtomic`, `MkWriting at v x`) -- is done there, by the
+-- primitive that does what the provider would (`DomainGet`,
+-- `DomainSet`), and what comes after it given the answer at once: no
+-- operation built, nor taken apart, nor what comes after it made a
+-- closure where it is a lambda.  The provider answers these at once and
+-- calls what comes after once, last: so the program, doing them itself,
+-- does the same.  An operation bound before (a `let` of it, a value:
+-- nothing computed building it) is the same, its binding gone where
+-- nothing else uses it.  Not where the program is built with fuel, whose
+-- every operation is a tick.
+
+module heff.compile.direct
+
+import heff.compile.ir as IR
+import heff.elab.primitive
+import std.ordmap as OrdMap
+
+-- (the values bound before, by name: operations built)
+type Known = OrdMap.OrdMap String IR.Expr
+
+-- (whether the `i`th leaf of the world is std.domain's)
+domainAt : List Bool -> Int -> Bool
+domainAt [] i = False
+domainAt (b :: rest) i = if i == 0 then b else domainAt rest (i - 1)
+
+-- (what a value is, where it is bound to one before)
+valueOf : Known -> IR.Expr -> IR.Expr
+valueOf kn (EVar x) = fromMaybe (EVar x) (OrdMap.lookup kn x)
+valueOf kn e = e
+
+-- (`f` given `a`: a lambda of one parameter, its body with it bound;
+-- else a call)
+applied : IR.Expr -> IR.Expr -> IR.Expr
+applied (ELam [x] b) a = ELet x a b
+applied f a = EApp f [a]
+
+-- (what an operation of a type of its own holds, `\use -> use (t fs)`:
+-- the tag and its fields)
+opened : IR.Expr -> Maybe (Pair String (List IR.Expr))
+opened (ELam [u] (EApp (EVar u2) [ETag t fs _])) =
+  if strEq u u2 then Just (MkPair t fs) else Nothing
+opened _ = Nothing
+
+-- (a tag of that name, its one field)
+oneOf : String -> IR.Expr -> Maybe IR.Expr
+oneOf t (ETag t2 [f] _) = if strEq t t2 then Just f else Nothing
+oneOf t _ = Nothing
+
+-- (a cell of std.domain's read at once, `k` given what the operation
+-- gives back of it)
+readAt : IR.Expr -> IR.Expr -> Maybe IR.Expr
+readAt s k = case opened s of
+  Just (MkPair t fs) ->
+    if strEq t "MkReading"
+    then case fs of
+      [at, g] -> Just (applied k (applied g (EPrimCall DomainGet [at])))
+      _ -> Nothing
+    else Nothing
+  Nothing -> Nothing
+
+-- (... written at once, `k` given what the operation comes to after;
+-- the write's own value bound to the name `u`)
+writeAt : String -> IR.Expr -> IR.Expr -> Maybe IR.Expr
+writeAt u s k = case opened s of
+  Just (MkPair t fs) ->
+    if strEq t "MkWriting"
+    then case fs of
+      [at, v, x] -> Just (ELet u (EPrimCall DomainSet [at, v]) (applied k x))
+      _ -> Nothing
+    else Nothing
+  Nothing -> Nothing
+
+-- (the operation `p` done at once, where it is one of those: what it
+-- comes to; a name drawn from `n`)
+directOp : IR.Expr -> IR.Expr -> Int -> Maybe IR.Expr
+directOp p k n = case oneOf "Plain" p of
+  Just q -> case oneOf "GetAtomic" q of
+    Just s -> readAt s k
+    Nothing -> case oneOf "SetAtomic" q of
+      Just s -> writeAt ("direct#u" ^ debug n) s k
+      Nothing -> Nothing
+  Nothing -> Nothing
+
+mutual
+  -- (each of the expressions; names drawn from `n`)
+  directList : List Bool
+             -> Known
+             -> List IR.Expr
+             -> Int
+             -> Pair (List IR.Expr) Int
+  directList ls kn [] n = MkPair Nil n
+  directList ls kn (e :: es) n = case directE ls kn e n of
+    MkPair e2 n2 -> case directList ls kn es n2 of
+      MkPair es2 n3 -> MkPair (e2 :: es2) n3
+
+  -- (... of a condition)
+  directCond : List Bool
+             -> Known
+             -> IR.CondOf IR.Expr
+             -> Int
+             -> Pair (IR.CondOf IR.Expr) Int
+  directCond ls kn CTrue n = MkPair CTrue n
+  directCond ls kn CFalse n = MkPair CFalse n
+  directCond ls kn (CRel p x y) n = case directE ls kn x n of
+    MkPair x2 n2 -> case directE ls kn y n2 of
+      MkPair y2 n3 -> MkPair (CRel p x2 y2) n3
+  directCond ls kn (CTest x) n = case directE ls kn x n of
+    MkPair x2 n2 -> MkPair (CTest x2) n2
+  directCond ls kn (CNot c) n = case directCond ls kn c n of
+    MkPair c2 n2 -> MkPair (CNot c2) n2
+  directCond ls kn (CIf a b c) n = case directCond ls kn a n of
+    MkPair a2 n2 -> case directCond ls kn b n2 of
+      MkPair b2 n3 -> case directCond ls kn c n3 of
+        MkPair c2 n4 -> MkPair (CIf a2 b2 c2) n4
+
+  -- (a record's fields)
+  directFields : List Bool
+               -> Known
+               -> List (Pair String IR.Expr)
+               -> Int
+               -> Pair (List (Pair String IR.Expr)) Int
+  directFields ls kn [] n = MkPair Nil n
+  directFields ls kn (MkPair l e :: fs) n = case directE ls kn e n of
+    MkPair e2 n2 -> case directFields ls kn fs n2 of
+      MkPair fs2 n3 -> MkPair (MkPair l e2 :: fs2) n3
+
+  -- (a match's arms)
+  directArms : List Bool
+             -> Known
+             -> List IR.Arm
+             -> Int
+             -> Pair (List IR.Arm) Int
+  directArms ls kn [] n = MkPair Nil n
+  directArms ls kn (MkArm t vs b :: rest) n = case directE ls kn b n of
+    MkPair b2 n2 -> case directArms ls kn rest n2 of
+      MkPair rest2 n3 -> MkPair (MkArm t vs b2 :: rest2) n3
+
+  -- | an expression, each operation of std.domain's that it hands to the
+  -- | world where it is known done at once; `ls` whether each leaf of the
+  -- | world is std.domain's, `kn` the operations bound before; names
+  -- | drawn from `n`, and the next given back
+  directE : List Bool -> Known -> IR.Expr -> Int -> Pair IR.Expr Int
+  directE ls kn (EPrimCall (PerformAt i) [p, k]) n = case directList
+      ls
+      kn
+      [p, k]
+      n of
+    MkPair args n2 -> case args of
+      [p2, k2] ->
+        if domainAt ls i
+        then case directOp (valueOf kn p2) k2 n2 of
+          Just e -> MkPair e (n2 + 1)
+          Nothing -> MkPair (EPrimCall (PerformAt i) [p2, k2]) n2
+        else MkPair (EPrimCall (PerformAt i) [p2, k2]) n2
+      _ -> MkPair (EPrimCall (PerformAt i) args) n2
+  directE ls kn (ELet x a b) n = case directE ls kn a n of
+    MkPair a2 n2 ->
+      let kn2 : Known = if IR.isValue a2 then OrdMap.insert kn x a2 else kn
+      in case directE ls kn2 b n2 of
+      MkPair b2 n3 ->
+        if IR.isValue a2 && IR.countW x 0 [b2] == 0
+        then MkPair b2 n3
+        else MkPair (ELet x a2 b2) n3
+  directE ls kn (ELam xs b) n = case directE ls kn b n of
+    MkPair b2 n2 -> MkPair (ELam xs b2) n2
+  directE ls kn (EApp f args) n = case directE ls kn f n of
+    MkPair f2 n2 -> case directList ls kn args n2 of
+      MkPair args2 n3 -> MkPair (EApp f2 args2) n3
+  directE ls kn (ERecord fs tys) n = case directFields ls kn fs n of
+    MkPair fs2 n2 -> MkPair (ERecord fs2 tys) n2
+  directE ls kn (EProj e l lbls ty) n = case directE ls kn e n of
+    MkPair e2 n2 -> MkPair (EProj e2 l lbls ty) n2
+  directE ls kn (ETag t args tys) n = case directList ls kn args n of
+    MkPair args2 n2 -> MkPair (ETag t args2 tys) n2
+  directE ls kn (EMatch sc arms) n = case directE ls kn sc n of
+    MkPair sc2 n2 -> case directArms ls kn arms n2 of
+      MkPair arms2 n3 -> MkPair (EMatch sc2 arms2) n3
+  directE ls kn (EPrimCall p args) n = case directList ls kn args n of
+    MkPair args2 n2 -> MkPair (EPrimCall p args2) n2
+  directE ls kn (ECall g args) n = case directList ls kn args n of
+    MkPair args2 n2 -> MkPair (ECall g args2) n2
+  directE ls kn (EBool c) n = case directCond ls kn c n of
+    MkPair c2 n2 -> MkPair (EBool c2) n2
+  directE ls kn (ESet xs a b) n = case directE ls kn a n of
+    MkPair a2 n2 -> case directE ls kn b n2 of
+      MkPair b2 n3 -> MkPair (ESet xs a2 b2) n3
+  directE ls kn (EValues es) n = case directList ls kn es n of
+    MkPair es2 n2 -> MkPair (EValues es2) n2
+  directE ls kn (EFix x e) n = case directE ls kn e n of
+    MkPair e2 n2 -> MkPair (EFix x e2) n2
+  directE ls kn e n = MkPair e n
+
+-- (each definition's; names drawn from `n`)
+directDefs : List Bool -> List IR.Def -> Int -> Pair (List IR.Def) Int
+directDefs ls [] n = MkPair Nil n
+directDefs ls (d :: ds) n = case directE ls OrdMap.empty d.body n of
+  MkPair b n2 ->
+    let rest : Pair (List IR.Def) Int = directDefs ls ds n2
+    in MkPair (IR.mkDef d.key d.name b :: fst rest) (snd rest)
+
+-- | the program, each operation of std.domain's it hands to the world
+-- | where it is known done at once (`ls`: whether each leaf of the world
+-- | is std.domain's -- none, where it is not known or the program is
+-- | built with fuel); names drawn from where they went on from
+directProgram : List Bool -> Pair (List IR.Def) Int -> Pair (List IR.Def) Int
+directProgram [] p = p
+directProgram ls (MkPair defs n) = directDefs ls defs n

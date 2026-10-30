@@ -1043,6 +1043,21 @@ static void dm_pool_let_go(void *x) {
 static V heff_custodian_at(V p, V k, V here);
 
 #define DM_ATOMIC(v) ((DmAtomic *)heff_foreign_ptr(v))
+
+// (a cell read, and written, where the program does it at once: its
+// operation not built, nor what comes after it, heff.compile.direct's --
+// the same as `GetAtomic`'s and `SetAtomic`'s, `at` let go of after)
+V heff_domainGet(V at) {
+  V v = dm_get(DM_ATOMIC(at));
+  heff_drop(at);
+  return v;
+}
+
+V heff_domainSet(V at, V v) {
+  dm_set(DM_ATOMIC(at), v);
+  heff_drop(at);
+  return NTAG(TAG_MkUnit);
+}
 #define DM_DOMAIN(v) ((DmDomain *)heff_foreign_ptr(v))
 #define DM_QUEUE(v) ((DmQueue *)heff_foreign_ptr(v))
 
