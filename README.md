@@ -75,7 +75,7 @@ heff dev                   # build and run; again at each change
 
 ## Documentation
 
-The tutorial and the reference: <https://dannypsnl.github.io/heff/>.
+The tutorial and the reference: <https://0xfe-project.github.io/heff/>.
 
 ## Developing
 
