@@ -7,13 +7,18 @@
 -- another; a behaviour that fails among others on its cown; one
 -- spawned on a free cown in a body that goes on long after; behaviours
 -- waiting (`with ... where`) until their condition holds, and one whose
--- condition never does; a `with` whose name holds two cowns.  Each is
+-- condition never does; a `with` whose name holds two cowns; an array
+-- a cown holds, written by bodies that fail, that do not write the
+-- cown, and that give it to another behaviour; and one a pair in a cown
+-- holds, by bodies that fail, give it on, and read the pair after.
+-- Each is
 -- run by a `scheduled` of its own, and what its cowns
 -- hold at the end is read out by a last behaviour on them, into a cell
 -- read once `scheduled` is done.
 
 module test.node.cowns-program
 
+import array as Array
 import boc as BOC
 import co
 import custodian as Custodian
@@ -276,6 +281,121 @@ spread = do
     b := (1, 2)
   readOut (c0, c1, c2, c3) (0, 0, 0, 0)
 
+-- (the array's numbers)
+numbers : Array Int -> List Int
+numbers a =
+  List.map
+    (\i -> fromMaybe 0 (Array.index a i))
+    (List.range 0 (Array.length a - 1))
+
+-- (... its strings)
+strings : Array String -> List String
+strings a =
+  List.map
+    (\i -> fromMaybe "" (Array.index a i))
+    (List.range 0 (Array.length a - 1))
+
+-- | an array of four 0s in a cown, which a body may write in place: 1
+-- | at 0, written; 2 at 1, by a body that then fails; 7 at 2, by a body
+-- | that gives it to a behaviour on another cown, which puts what it
+-- | holds at 2 in a cell, and then fails; 3 at 2, by a `with` that does
+-- | not write the cown but puts what it made in a cell; 9 at 3, by one
+-- | that only reads what it made; 4 at 3, written, by a body that gives
+-- | it to a behaviour on the other cown too, which adds what it holds
+-- | at 0 and 3 (read out by one spawned after it in the body).  The
+-- | cown then holds 1 0 0 4; the cells, 7 and 1 0 3 0; the one read, 9;
+-- | the other cown, 5.  And strings, `a b`, written as they are, then
+-- | the first made `x` by a body that then fails
+arrays : {e w : HFunctor}
+       -> {{bc : BOC.boc w <: e}}
+       -> {{dm : Domain.domain <: e}}
+       -> {{dmw : Domain.domain <: w}}
+       -> Co
+         e
+         ( Domain.Atomic (Array Int, Array String)
+         , Domain.Atomic Int
+         , Domain.Atomic (Array Int)
+         , Domain.Atomic Int
+         , Domain.Atomic Int
+         )
+arrays = do
+  c <- BOC.newCown (Array.replicate 4 (0 : Int))
+  s <- BOC.newCown (Array.fromList ["a", "b"])
+  d <- BOC.newCown (0 : Int)
+  madeOut <- Domain.newAtomic (Array.replicate 0 (0 : Int))
+  readAt <- Domain.newAtomic 0
+  dOut <- Domain.newAtomic 0
+  givenOut <- Domain.newAtomic 0
+  BOC.when c (\a -> pure (Array.set a 0 1))
+  BOC.when c (\a -> do
+    let b = Array.set a 1 2
+    if fromMaybe 0 (Array.index b 1) == 2 then abandon else pure b)
+  BOC.when c (\a -> do
+    let b = Array.set a 2 7
+    BOC.when d (\x -> do
+      Domain.set givenOut (fromMaybe 0 (Array.index b 2))
+      pure x)
+    if fromMaybe 0 (Array.index b 2) == 7 then abandon else pure b)
+  with a := c do
+    Domain.set madeOut (Array.set a 2 3)
+  with a := c do
+    Domain.set readAt (fromMaybe 0 (Array.index (Array.set a 3 9) 3))
+  BOC.when c (\a -> do
+    let b = Array.set a 3 4
+    BOC.when
+        d
+        (\x ->
+           pure (fromMaybe 0 (Array.index b 0) + fromMaybe 0 (Array.index b 3)))
+    BOC.when d (\x -> do
+      Domain.set dOut x
+      pure x)
+    pure b)
+  BOC.when s (\a -> pure (Array.set a 1 "b"))
+  BOC.when s (\a -> do
+    let b = Array.set a 0 "x"
+    if fromMaybe "" (Array.index b 0) == "x" then abandon else pure b)
+  out <- readOut (c, s) (Array.replicate 0 0, Array.fromList Nil)
+  pure (out, givenOut, madeOut, readAt, dOut)
+
+-- | a pair of an array of three 0s and 0 in a cown, its array written
+-- | in place where nothing else sees it: 1 at 0, written; 2 at 1, by a
+-- | body that then fails; 5 at 2, by a body that then reads the pair it
+-- | was given, adding what its array holds at 2 -- 0, the array as it
+-- | was -- to the count, where to read made of what it wrote, so read
+-- | after it; 7 at 2, by a body that gives the array to a
+-- | behaviour on another cown, which puts what it holds at 2 in a cell,
+-- | and then fails.  The pair then holds 1 0 5 and 0; the cell, 7
+pairs : {e w : HFunctor}
+      -> {{bc : BOC.boc w <: e}}
+      -> {{dm : Domain.domain <: e}}
+      -> {{dmw : Domain.domain <: w}}
+      -> Co e (Domain.Atomic (Array Int, Int), Domain.Atomic Int)
+pairs = do
+  c <- BOC.newCown (Array.replicate 3 (0 : Int), (0 : Int))
+  d <- BOC.newCown (0 : Int)
+  givenOut <- Domain.newAtomic 0
+  BOC.when c (\p -> case p of
+    (a, m) -> pure (Array.set a 0 1, m))
+  BOC.when c (\p -> case p of
+    (a, m) -> do
+      let b = Array.set a 1 2
+      if fromMaybe 0 (Array.index b 1) == 2 then abandon else pure (b, m))
+  BOC.when c (\p -> case p of
+    (a, m) -> do
+      let b = Array.set a 2 5
+      -- (where it reads, 2, read of what it wrote: after it)
+      let at = fromMaybe 0 (Array.index b 2) - 3
+      pure (b, m + fromMaybe 0 (Array.index (fst p) at)))
+  BOC.when c (\p -> case p of
+    (a, m) -> do
+      let b = Array.set a 2 7
+      BOC.when d (\x -> do
+        Domain.set givenOut (fromMaybe 0 (Array.index b 2))
+        pure x)
+      if fromMaybe 0 (Array.index b 2) == 7 then abandon else pure (b, m))
+  out <- readOut c (Array.replicate 0 0, 0)
+  pure (out, givenOut)
+
 -- (`why` pushed onto what `whys` holds, by a `cas` retried)
 reported : {e : HFunctor}
          -> {{dm : Domain.domain <: e}}
@@ -403,6 +523,17 @@ said = do
   never <- Domain.get neverOut
   spreadOut <- BOC.scheduled (\why -> abandon) (spread (bc := _) (dm := _))
   (s0, s1, s2, s3) <- Domain.get spreadOut
+  (arrOut, givenOut, madeOut, readAt, dOut) <-
+    BOC.scheduled (\why -> pure ()) (arrays (bc := _) (dm := _))
+  (arr, strs) <- Domain.get arrOut
+  (pairOut2, pairGiven) <-
+    BOC.scheduled (\why -> pure ()) (pairs (bc := _) (dm := _))
+  (pa, pm) <- Domain.get pairOut2
+  pg <- Domain.get pairGiven
+  given <- Domain.get givenOut
+  made <- Domain.get madeOut
+  readBack <- Domain.get readAt
+  dHeld <- Domain.get dOut
   cores <- Domain.cores
   pure
       [ "added by 1000: " ^ debug n
@@ -430,4 +561,22 @@ said = do
       , "a condition never holding: "
       ^ (if never then "its body ran" else "its body never ran")
       , "a name holding two cowns: " ^ unwords (List.map debug [s0, s1, s2, s3])
+      , "an array in a cown: "
+      ^ unwords (List.map debug (numbers arr))
+      ^ ", given on by a body that failed: "
+      ^ debug given
+      ^ ", a write not kept: "
+      ^ unwords (List.map debug (numbers made))
+      ^ ", one read: "
+      ^ debug readBack
+      ^ ", given on: "
+      ^ debug dHeld
+      ^ ", strings: "
+      ^ unwords (strings strs)
+      , "an array in a pair in a cown: "
+      ^ unwords (List.map debug (numbers pa))
+      ^ " and "
+      ^ debug pm
+      ^ ", given on by a body that failed: "
+      ^ debug pg
       ]

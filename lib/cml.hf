@@ -474,6 +474,27 @@ baseThen g (RecvBase s) = RecvBase (someThen (recvOnThen g) s)
 baseThen g (ReadBase s) = ReadBase (someThen (readOnThen g) s)
 baseThen g (AlwaysBase k) = AlwaysBase (\u -> g (k u))
 
+-- (a sync: its base events, and what comes after the one committed,
+-- given what it came to -- one function for all of them, so that what
+-- comes after is changed once, not in each base event)
+data Syncing (w : HFunctor) x a = MkSyncing (List (Base w a)) (a -> x)
+
+syncingThen : {w : HFunctor}
+            -> {x y a : Type}
+            -> (x -> y)
+            -> Syncing w x a
+            -> Syncing w y a
+syncingThen g (MkSyncing bs k) = MkSyncing bs (\v -> g (k v))
+
+-- (a sync's base events, each with what comes after it)
+syncBases : {w : HFunctor}
+          -> {x : Type}
+          -> Some (Syncing w x)
+          -> List (Base w x)
+syncBases s =
+  s (List (Base w x)) (\a sy -> case sy of
+    MkSyncing bs k -> List.map (baseThen k) bs)
+
 -- The effect
 --------------------------------------------------------------------------------
 
@@ -549,7 +570,7 @@ data CmlF (w : HFunctor) (m : Type -> Type) x
   | NewChan (Some (MakingChan w x))
   | NewIVar (Some (MakingIVar w x))
   | PutIVar (Some (Putting w x))
-  | Sync (List (Base w x))
+  | Sync (Some (Syncing w x))
   | Choose (Some (Choosing m x))
   | MadeNack (IVar w Unit) (Unit -> x)
   | Settled Int (Unit -> x)
@@ -566,7 +587,7 @@ stepThen g (Yield k) = Yield (\u -> g (k u))
 stepThen g (NewChan s) = NewChan (someThen (makingChanThen g) s)
 stepThen g (NewIVar s) = NewIVar (someThen (makingIVarThen g) s)
 stepThen g (PutIVar s) = PutIVar (someThen (puttingThen g) s)
-stepThen g (Sync bs) = Sync (List.map (baseThen g) bs)
+stepThen g (Sync s) = Sync (someThen (syncingThen g) s)
 stepThen g (Choose s) = Choose (someThen (choosingThen g) s)
 stepThen g (MadeNack iv k) = MadeNack iv (\u -> g (k u))
 stepThen g (Settled n k) = Settled n (\u -> g (k u))
@@ -585,7 +606,7 @@ cml w =
       NewChan s -> NewChan s
       NewIVar s -> NewIVar s
       PutIVar s -> PutIVar s
-      Sync bs -> Sync bs
+      Sync s -> Sync s
       Choose s -> Choose (someThen (choosingMapped nt) s)
       MadeNack iv k -> MadeNack iv k
       Settled n k -> Settled n k
@@ -682,7 +703,16 @@ send : {e w : HFunctor}
      -> a
      -> Co e Unit
 send ch v =
-  op (cm (Sync [SendBase (\r use -> use a (MkSendOn ch v (\u -> u)))])) val
+  op
+    (cm
+       (Sync
+          (\r use ->
+             use
+               Unit
+               (MkSyncing
+                  [SendBase (\t give -> give a (MkSendOn ch v (\u -> u)))]
+                  (\u -> u)))))
+    val
 
 -- | What a thread sends on the channel, once one does: waits for the
 -- | sender.  A base event.
@@ -692,7 +722,16 @@ recv : {e w : HFunctor}
      -> Chan w a
      -> Co e a
 recv ch =
-  op (cm (Sync [RecvBase (\r use -> use a (MkRecvOn ch (\v -> v)))])) val
+  op
+    (cm
+       (Sync
+          (\r use ->
+             use
+               a
+               (MkSyncing
+                  [RecvBase (\t give -> give a (MkRecvOn ch (\v -> v)))]
+                  (\v -> v)))))
+    val
 
 -- | What the ivar holds, waiting until it is written.  A base event.
 readIVar : {e w : HFunctor}
@@ -701,12 +740,21 @@ readIVar : {e w : HFunctor}
          -> IVar w a
          -> Co e a
 readIVar iv =
-  op (cm (Sync [ReadBase (\r use -> use a (MkReadOn iv (\v -> v)))])) val
+  op
+    (cm
+       (Sync
+          (\r use ->
+             use
+               a
+               (MkSyncing
+                  [ReadBase (\t give -> give a (MkReadOn iv (\v -> v)))]
+                  (\v -> v)))))
+    val
 
 -- | A base event never ready: waits for ever, and in a `choose` is
 -- | never the one committed.
 never : {e w : HFunctor} -> {a : Type} -> {{cm : cml w <: e}} -> Co e a
-never = op (cm (Sync Nil)) val
+never = op (cm (Sync (\r use -> use a (MkSyncing Nil (\v -> v))))) val
 
 -- | One of the branches: each run, in order, up to its first base event
 -- | -- what comes before it done as it comes, a guard's work -- then one
@@ -1517,7 +1565,9 @@ committedAmong st runner bs = do
 -- (the base events, their mutexes held: those that can be committed now
 -- found, claiming nothing, then one of them drawn and committed -- `Just`
 -- what comes after it; where every one drawn could not be after all,
--- the base events are asked again; `Nothing` where none can be)
+-- the base events are asked again; `Nothing` where none can be.  One
+-- alone is committed at once: its commit claims a partner where any
+-- can be claimed, the stale offers dropped, as asking first would)
 committedOne : {w : HFunctor}
              -> {x : Type}
              -> {{dm : Domain.domain <: w}}
@@ -1525,6 +1575,7 @@ committedOne : {w : HFunctor}
              -> Runner w
              -> List (Base w x)
              -> Co w (Maybe (Unit -> x))
+committedOne st runner [b] = committed st runner b
 committedOne st runner bs = do
   ready <- readyNow bs
   case ready of
@@ -1621,6 +1672,9 @@ locksOf : {w : HFunctor}
         -> {x : Type}
         -> List (Base w x)
         -> List (Pair Int Domain.Mutex)
+locksOf [b] = case lockOf b of
+  Just l -> l :: Nil
+  Nothing -> Nil
 locksOf bs = distinctLocks (List.sortOn (\l -> fst l) (List.mapMaybe lockOf bs))
 
 lockedAll : {e : HFunctor}
@@ -1908,7 +1962,7 @@ branched st turnOf runner (sb :: rest) acc =
             runner
             ((\t use -> use a (MkBranch (k MkUnit) up around)) :: rest)
             acc
-        Sync bs ->
+        Sync sy ->
           branched
             st
             turnOf
@@ -1916,7 +1970,8 @@ branched st turnOf runner (sb :: rest) acc =
             rest
             { acc
             | bases =
-                List.map (\b -> MkPair around (baseThen up b)) bs ++ acc.bases
+                List.map (\b -> MkPair around (baseThen up b)) (syncBases sy)
+                ++ acc.bases
             }
         Choose s ->
           s (Co w (Branches w)) (\c ch -> case ch of
@@ -2084,8 +2139,8 @@ stepped st turnOf runner (RStep (PutIVar s)) =
   s
     (Co w (Stepped w))
     (\a p -> bind (written runner p) (\k -> pure (GoesOn k)))
-stepped st turnOf runner (RStep (Sync bs)) =
-  synced st turnOf runner Nothing Nil bs
+stepped st turnOf runner (RStep (Sync s)) =
+  synced st turnOf runner Nothing Nil (syncBases s)
 stepped st turnOf runner (RStep (Choose s)) =
   s (Co w (Stepped w)) (\a ch -> case ch of
     MkChoosing bs k -> do
@@ -2278,7 +2333,7 @@ readyAlone st (sb :: rest) =
           readyAlone
             st
             ((\t use -> use a (MkAloneBranch (k MkUnit) up)) :: rest)
-        Sync bs -> readyAlone st rest
+        Sync s -> readyAlone st rest
         Choose s ->
           s (Co (w <+> Custodian.custodian) (Maybe x)) (\c ch -> case ch of
             MkChoosing bs k ->
@@ -2319,7 +2374,7 @@ alone st (RStep (PutIVar s)) =
   s
     (Co (w <+> Custodian.custodian) a)
     (\t p -> bind (scheduling (written Nothing p)) (\k -> alone st k))
-alone st (RStep (Sync bs)) = abandon
+alone st (RStep (Sync s)) = abandon
 alone st (RStep (MadeNack nack k)) = alone st (k MkUnit)
 alone st (RStep (Settled n k)) = alone st (k MkUnit)
 alone st (RStep (Choose s)) =

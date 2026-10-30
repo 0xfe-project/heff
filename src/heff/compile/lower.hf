@@ -80,6 +80,7 @@ import heff.compile.tested as Tested
 import heff.compile.trmc as TRMC
 import heff.compile.worker as Worker
 import heff.compile.worlds as Worlds
+import heff.elab.effect as Effect
 import std.ordmap as OrdMap
 
 -- | the definitions, what is known of them (heff.compile.facts), and
@@ -308,29 +309,98 @@ dueWorld ms =
 entryName : String -> Int -> Int -> String
 entryName s n i = s ^ "$" ^ debug (n + i)
 
+-- The world's sum taken apart where the program is: where the world is
+-- known, each of its `<+>`s is a definition of its own (`run$perform$i`,
+-- numbered in order, the outermost first), a match of `InL` and `InR`
+-- handing the operation inside to its side's, and each leaf the
+-- primitive that hands it to that leaf's provider (`PerformAt`, the
+-- leaves numbered left to right, as `Effect.leaves` has them).  So an
+-- operation put in the world by evidence the program says, `InL (InR
+-- p)`, given to the entry's algebra, is taken apart where it is built,
+-- the simplifier choosing each arm: no tag of the sum is built, and the
+-- provider is called with the operation itself.  Where the world is not
+-- known, the runtime takes it apart (`Perform`).
+
+-- (the name of the `i`th node's definition)
+dispatchKey : Int -> String
+dispatchKey i = "run$perform$" ^ debug i
+
+-- (how many `<+>`s the world has, and leaves)
+plusCount : Effect.Effect -> Int
+plusCount (Leaf _) = 0
+plusCount (Plus a b) = 1 + plusCount a + plusCount b
+
+leafCount : Effect.Effect -> Int
+leafCount (Leaf _) = 1
+leafCount (Plus a b) = leafCount a + leafCount b
+
+-- (`p` at the part `w` of the world, its node numbered `node` and its
+-- leaves from `leaf`, handed on, with what follows it, `k`)
+handedAt : Effect.Effect -> Int -> Int -> IR.Expr -> IR.Expr -> IR.Expr
+handedAt (Leaf _) node leaf p k = EPrimCall (PerformAt leaf) [p, k]
+handedAt (Plus _ _) node leaf p k = EApp (EGlobal (dispatchKey node)) [p, k]
+
+-- (the definitions of the nodes of the part `w`, numbered from `node`,
+-- its leaves from `leaf`)
+dispatchDefs : Effect.Effect -> Int -> Int -> List IR.Def
+dispatchDefs (Leaf _) node leaf = Nil
+dispatchDefs (Plus a b) node leaf =
+  let na = node + 1
+  in let nb = node + 1 + plusCount a
+  in let lb = leaf + leafCount a
+  in let p = "w#p" ^ debug node
+  in let k = "w#k" ^ debug node
+  in let x = "w#l" ^ debug node
+  in let y = "w#r" ^ debug node
+  in IR.mkDef
+    (dispatchKey node)
+    (dispatchKey node)
+    (ELam
+       [p, k]
+       (EMatch
+          (EVar p)
+          [ MkArm "InL" [x] (handedAt a na leaf (EVar x) (EVar k))
+          , MkArm "InR" [y] (handedAt b nb lb (EVar y) (EVar k))
+          ]))
+  :: List.append (dispatchDefs a na leaf) (dispatchDefs b nb lb)
+
+-- (an operation handed to the world: to its sum's root where it is
+-- known, else to the runtime)
+handedOn : Maybe Effect.Effect -> Int -> IR.Expr
+handedOn Nothing n =
+  EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]
+handedOn (Just w) n =
+  handedAt w 0 0 (EVar (entryName "p" n 6)) (EVar (entryName "k" n 7))
+
+-- (a world's shape: its leaves and sums)
+shapeSaid : Effect.Effect -> String
+shapeSaid (Leaf k) = k
+shapeSaid (Plus a b) = "(" ^ shapeSaid a ^ " + " ^ shapeSaid b ^ ")"
+
+-- (the world's shape, for the entry's version: its leaves and sums)
+worldSaid : Maybe Effect.Effect -> String
+worldSaid Nothing = ""
+worldSaid (Just w) = shapeSaid w ^ "/"
+
 -- (an operation performed: where releases are due, what is due on the
 -- domain run first, and the custodian current told the runtime)
-performed : EntryCustody -> Int -> IR.Expr
-performed NoCustody n =
-  EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]
-performed DueOnly n =
-  ELet
-    (entryName "due" n 6)
-    (EPrimCall CustodianDue Nil)
-    (EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)])
-performed Reading n =
+performed : EntryCustody -> Maybe Effect.Effect -> Int -> IR.Expr
+performed NoCustody w n = handedOn w n
+performed DueOnly w n =
+  ELet (entryName "due" n 6) (EPrimCall CustodianDue Nil) (handedOn w n)
+performed Reading w n =
   ELet
     (entryName "due" n 6)
     (EPrimCall CustodianDue Nil)
     (ELet
        (entryName "in" n 11)
        (EPrimCall CustodyIn [EVar (entryName "c" n 12)])
-       (EPrimCall Perform [EVar (entryName "p" n 6), EVar (entryName "k" n 7)]))
+       (handedOn w n))
 
 -- (the continuation monad's `ret`, `bind` and algebra, and the program's
 -- computation run: given its handler, what follows it, and its end)
-entryCps : EntryCustody -> String -> Int -> IR.Expr
-entryCps due key n =
+entryCps : EntryCustody -> Maybe Effect.Effect -> String -> Int -> IR.Expr
+entryCps due w key n =
   EApp
     (EGlobal key)
     [ ERecord
@@ -353,7 +423,7 @@ entryCps due key n =
               ]))
       , MkPair
         "malg"
-        (ELam [entryName "p" n 6, entryName "k" n 7] (performed due n))
+        (ELam [entryName "p" n 6, entryName "k" n 7] (performed due w n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
@@ -363,8 +433,8 @@ entryCps due key n =
     ]
 
 -- (... the monad reading the custodian current, `c$`: `Nothing` at first)
-entryReading : String -> Int -> IR.Expr
-entryReading key n =
+entryReading : Maybe Effect.Effect -> String -> Int -> IR.Expr
+entryReading w key n =
   EApp
     (EGlobal key)
     [ ERecord
@@ -397,7 +467,7 @@ entryReading key n =
         "malg"
         (ELam
            [entryName "p" n 6, entryName "c" n 12, entryName "k" n 7]
-           (performed Reading n))
+           (performed Reading w n))
       ]
       [FtOther, FtOther, FtOther]
     , ELam
@@ -407,9 +477,9 @@ entryReading key n =
     , ELam [entryName "x" n 10] (ETag "MkUnit" Nil Nil)
     ]
 
-entryBody : EntryCustody -> String -> Int -> IR.Expr
-entryBody Reading key n = entryReading key n
-entryBody due key n = entryCps due key n
+entryBody : EntryCustody -> Maybe Effect.Effect -> String -> Int -> IR.Expr
+entryBody Reading w key n = entryReading w key n
+entryBody due w key n = entryCps due w key n
 
 -- (... its workers, of what else is known)
 withWorkersOf : List IR.Def -> Facts.Facts -> Facts.Facts
@@ -723,13 +793,17 @@ entryPrefix NoCustody = "entry/"
 entryPrefix DueOnly = "entry-dueonly/"
 entryPrefix Reading = "entry-due/"
 
-entryVer : EntryCustody -> OrdMap.OrdMap String String -> String -> String
-entryVer due vers key = case OrdMap.lookup vers key of
-  Just v -> if strEq v "" then "" else entryPrefix due ^ v
+entryVer : EntryCustody
+         -> Maybe Effect.Effect
+         -> OrdMap.OrdMap String String
+         -> String
+         -> String
+entryVer due w vers key = case OrdMap.lookup vers key of
+  Just v -> if strEq v "" then "" else entryPrefix due ^ worldSaid w ^ v
   Nothing -> ""
 
-entryKept : EntryCustody -> String -> KeptUnit -> Piece
-entryKept due key u =
+entryKept : EntryCustody -> Maybe Effect.Effect -> String -> KeptUnit -> Piece
+entryKept due w key u =
   { owner = entryKey
   , key = u.def.key
   , name = u.def.name
@@ -738,21 +812,30 @@ entryKept due key u =
         u.def
         (\m ->
            MkPair
-             (Just (IR.mkDef entryKey entryKey (entryBody due key m)))
+             (Just (IR.mkDef entryKey entryKey (entryBody due w key m)))
              (m + 16))
   , refs = u.refs
   }
 
 entryPieces : EntryCustody
+            -> Maybe Effect.Effect
             -> OrdMap.OrdMap String String
             -> Keeps
             -> String
             -> Int
             -> List Piece
-entryPieces due vers ks key n = case keptFor vers ks entryKey of
-  Just us -> List.map (entryKept due key) us
+entryPieces due w vers ks key n = case keptFor vers ks entryKey of
+  Just us -> List.map (entryKept due w key) us
   Nothing ->
-    [freshPiece entryKey (IR.mkDef entryKey entryKey (entryBody due key n))]
+    [freshPiece entryKey (IR.mkDef entryKey entryKey (entryBody due w key n))]
+
+-- (the definitions of the world's sum's nodes, where it is known: first
+-- of all, so that every definition simplified after is simplified
+-- knowing them)
+dispatchPieces : Maybe Effect.Effect -> List Piece
+dispatchPieces (Just w) =
+  List.map (\(d : IR.Def) -> freshPiece d.key d) (dispatchDefs w 0 0)
+dispatchPieces Nothing = Nil
 
 -- (each definition's version: of the definition of the core it is lifted
 -- from, and of its key)
@@ -893,34 +976,39 @@ reachedPieces : List Piece -> List Piece
 reachedPieces ps = reachedIn (Shake.reached [entryKey] (refsMap ps)) ps
 
 piecesWith : EntryCustody
+           -> Maybe Effect.Effect
            -> OrdMap.OrdMap String String
            -> Keeps
            -> String
            -> PieceAcc
            -> SimplifiedKept
-piecesWith due vers ks key acc =
+piecesWith due w vers ks key acc =
   simplifyPieces
     (List.reverse acc.errors)
     vers
     ks
     (acc.supply + 16)
     (reachedPieces
-       (List.reverse
-          (revOnto (entryPieces due vers ks key acc.supply) acc.pieces)))
+       (List.append
+          (dispatchPieces w)
+          (List.reverse
+             (revOnto (entryPieces due w vers ks key acc.supply) acc.pieces))))
 
 -- | a program running the computation `key`, its entry (`entryKey`) and
 -- | what it reaches, simplified -- each definition of the core the cache keeps at its version (`vers`)
 -- | taken as it keeps it -- and what the cache is to keep of it
 lowerProgramKept : EntryCustody
+                 -> Maybe Effect.Effect
                  -> Globals.Globals
                  -> String
                  -> OrdMap.OrdMap String String
                  -> Keeps
                  -> SimplifiedKept
-lowerProgramKept due g key vers ks =
+lowerProgramKept due w g key vers ks =
   piecesWith
     due
-    (OrdMap.insert vers entryKey (entryVer due vers key))
+    w
+    (OrdMap.insert vers entryKey (entryVer due w vers key))
     ks
     key
     (List.foldl

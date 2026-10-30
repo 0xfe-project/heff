@@ -1200,6 +1200,9 @@ expF k (RTakeField x i) =
   pure ("heff_take_field(" ^ cLocal x ^ ", " ^ debug i ^ ")")
 expF k (RGetLabel e l) = wrapC k "heff_get(" (", " ^ lblName l ^ ")") e
 expF k (RPrimFn p) = primLit p
+expF k (RPrim (PerformAt i) es) = do
+  vs <- traverseC k.exp es
+  pure ("heff_performAt(" ^ debug i ^ ", " ^ joinWith ", " vs ^ ")")
 expF k (RPrim p es) =
   if Owned.lends p es then lentPrimC k p "" es
   else bind
@@ -1840,14 +1843,39 @@ fueledWorld : Effect.Effect -> Bool
 fueledWorld eff =
   List.any (\k -> strEq (Effect.moduleOfKey k) "std.fuel") (Effect.leaves eff)
 
+-- (an operation handed to the world's `i`th leaf, its sum taken apart
+-- where the program is (`PerformAt`, heff.compile.lower): to that
+-- leaf's provider -- `i` a constant where it is called, so the choice
+-- is made there where the call is inlined)
+performAtCode : Effect.Effect -> List String
+performAtCode eff =
+  List.append
+    [ "static V heff_performAt(int i, V p, V k) {"
+    , if fueledWorld eff then "  heff_fuelTick();" else "  "
+    , "  switch (i) {"
+    ]
+    (List.append
+       (List.zipWith
+          (\i k ->
+             "  case "
+             ^ debug i
+             ^ ": return heff_provider_"
+             ^ Effect.nameOfKey k
+             ^ "(p, k);")
+          (List.range 0 (List.length (Effect.leaves eff) - 1))
+          (Effect.leaves eff))
+       ["  default: return heff_abandon();", "  }", "}"])
+
 performCode : Effect.Effect -> List String
 performCode eff =
   List.append
     (fst (performNodes eff 0))
-    [ if fueledWorld eff
-    then "static V heff_perform(V p, V k) { heff_fuelTick(); return heff_perform_0(p, k); }"
-    else "static V heff_perform(V p, V k) { return heff_perform_0(p, k); }"
-    ]
+    (List.append
+       [ if fueledWorld eff
+       then "static V heff_perform(V p, V k) { heff_fuelTick(); return heff_perform_0(p, k); }"
+       else "static V heff_perform(V p, V k) { return heff_perform_0(p, k); }"
+       ]
+       (performAtCode eff))
 
 -- Glue: an effect's operations C functions do, as its module describes
 -- them (heff.compile.glue, which decides it): printed as a provider's
@@ -2465,6 +2493,7 @@ checkEnd : List (Pair String String) -> List IR.Def -> CE -> List String
 checkEnd exports defs ce =
   List.append
     [ "static V heff_perform(V p, V k) { (void)p; (void)k; return heff_abandon(); }"
+    , "static V heff_performAt(int i, V p, V k) { (void)i; (void)p; (void)k; return heff_abandon(); }"
     ]
     (List.append
        (List.concatMap
@@ -2527,7 +2556,9 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                   (List.append
                      (List.map (\(p : Emit.Provider) -> p.text) provs)
                      (List.append
-                        ["static V heff_perform(V p, V k);"]
+                        [ "static V heff_perform(V p, V k);"
+                        , "static V heff_performAt(int i, V p, V k);"
+                        ]
                         (List.append
                            (List.map shapeDef (usedOnce s.shapes))
                            (List.append
@@ -2656,6 +2687,8 @@ pubLine l =
      && not (contains "_init(void)" l)
   then strSlice l 7 (strLength l)
   else if startsWith "static V heff_perform(" l then strSlice l 7 (strLength l)
+  else if startsWith "static V heff_performAt(" l
+  then strSlice l 7 (strLength l)
   else if isWorkerLine l then strSlice l 7 (strLength l)
   else l
 
@@ -2675,7 +2708,12 @@ partHead : String -> Ending -> List String
 partHead runtime ending =
   List.append
     ["// Generated from Hippogriff; do not edit.", "#define HEFF_SPLIT"]
-    (List.append ending.prefix [runtime, "V heff_perform(V p, V k);"])
+    (List.append
+       ending.prefix
+       [ runtime
+       , "V heff_perform(V p, V k);"
+       , "V heff_performAt(int i, V p, V k);"
+       ])
 
 -- (the numbers of the tags and labels a part uses)
 numbersOf : CE -> Pair (List String) (List String) -> List String
@@ -3320,6 +3358,7 @@ compileProgramC fuel runtime provs g key eff =
        (Lower.lowerProgramKept
           (Lower.dueWorld
              (List.map (\k -> Effect.moduleOfKey k) (Effect.leaves eff)))
+          (Just eff)
           g
           key
           OrdMap.empty
@@ -3412,6 +3451,7 @@ compileProgramPartsKept fuel runtime provs g key eff vers ks kept =
        (Lower.lowerProgramKept
           (Lower.dueWorld
              (List.map (\k -> Effect.moduleOfKey k) (Effect.leaves eff)))
+          (Just eff)
           g
           key
           vers
