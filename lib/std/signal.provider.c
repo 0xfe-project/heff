@@ -6,11 +6,12 @@
 // pipe of its own, written a byte when it is given a signal: what the
 // reactor polls, so that a wait in a group of std.reactor's is pending
 // while the other threads go on, and elsewhere the program waits where
-// it is.  A wait let go of undone (a `choose` that committed another
-// branch) gives the signal it was given, if any, to the next.
+// it is.  A wait let go of undone (an act given up: a race lost, a
+// custody shut down) gives the signal it was given, if any, to the
+// next.
 //
 // (Neither signalfd nor kqueue: signalfd hears a signal only where every
-// thread holds it back, which the domains started before cannot be made
+// thread holds it back, which the threads started before cannot be made
 // to; one handler, for both systems, is std.process's way too.)
 //
 // A signal not waited for is as it was: std.process's handler, where it

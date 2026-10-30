@@ -19,17 +19,17 @@
 // end, there or later, or a release run for it that failed -- shuts it
 // down: the things in its custody, and of those under it, ended at once,
 // where the failure is heard; what it was given put on the queue of the
-// domain that made it, to run there.  Then it goes to the custodian it
+// thread that made it, to run there.  Then it goes to the custodian it
 // is under; one made to contain its failures says it, and it goes no
 // further; past the root's it is the program's: said, the program ended.
 //
-// Each domain's queue of releases due: those of `with`s (resource's
+// Each thread's queue of releases due: those of `with`s (resource's
 // `held`) a throw left, put there by the custodian's provider as the
 // program lets go of what kept them, from whichever thread that is, and
-// what a failure shut down.  The domain runs them before its next
+// what a failure shut down.  The thread runs them before its next
 // operation (`heff_custodianDue`, which the compiler puts before each,
 // where the world has the custodian's effect), each once, in the order
-// kept, and what is left as the domain ends (its thread's
+// kept, and what is left as the thread ends (its
 // `heff_thread_end`) -- not as the program ends, which the system
 // cleans up after; one that fails is a failure of its custodian's.
 
@@ -74,8 +74,8 @@ struct HeffDueQ {
 #endif
 };
 
-// (each domain's queue, made as it first keeps a release; never freed,
-// as what a domain kept may outlive it)
+// (each thread's queue, made as it first keeps a release; never freed,
+// as what a thread kept may outlive it)
 HEFF_VAR(HEFF_TLS HeffDueQ *heff_due_here);
 
 static void heff_due_drained(void);
@@ -169,7 +169,7 @@ static void heff_custody_said(int contained, const char *why) {
 }
 
 // (a failure of `c`'s, why said: `c` shut down, with those under it --
-// what they were given run by the domains that made them, a failure of
+// what they were given run by the threads that made them, a failure of
 // theirs there their custodian's -- and the failure passed up, to where
 // it stops; a thing that fails to end meanwhile is of this failure.  `c`
 // is held, or pinned, by the caller)
@@ -207,7 +207,7 @@ static V heff_due_finished(V self, V *a) {
   return NTAG(TAG_MkUnit);
 }
 
-// (what is on this domain's queue run, each once, in the order kept; one
+// (what is on this thread's queue run, each once, in the order kept; one
 // that fails, its custodian's failure)
 HEFF_SLOW void heff_due_run(void) {
   HeffDueQ *q = heff_due_here;
@@ -241,7 +241,7 @@ HEFF_SLOW void heff_due_run(void) {
   }
 }
 
-// (what is due on this domain run, before an operation)
+// (what is due on this thread run, before an operation)
 static void heff_due_drained(void) {
   if (heff_due_here && __atomic_load_n(&heff_due_here->n, __ATOMIC_ACQUIRE)) heff_due_run();
 }

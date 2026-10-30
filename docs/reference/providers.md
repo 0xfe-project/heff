@@ -310,8 +310,8 @@ The provider makes sure the thing is let go of:
 
 In C, an operation that must wait, such as a read from a socket that is
 not ready, is done in steps by the runtime's reactor, so the other
-threads of a scheduler that waits through it (cml's
-`scheduledWithReactor`) go on meanwhile. The provider's operation is a `HeffWait`, the first
+acts and behaviours of boc's go on meanwhile, an act awaited being
+started in a group of its worker's reactor. The provider's operation is a `HeffWait`, the first
 member of a struct of its own:
 
 | Member | Meaning |

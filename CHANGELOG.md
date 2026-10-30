@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Standard library
+
+- heff's concurrency is boc's: std.domain, cml, std.thread and std.http.cmlserver are removed. boc is the runtime's own effect, no longer a library on std.domain (lib/boc.provider.c, and lib/boc.provider.js in a page): a program names `BOC.boc` in its world, `main : Co (BOC.boc <+> stdio) Unit`, and `Cown a` has no world parameter. A body, and an act awaited, is a computation of the world the `when` (the `with`) is in, mapped by the handlers between there and the program's world; `scheduled failed c` runs `c` and its behaviours on a pool of as many threads as the machine has cores. `scheduledWithReactor` is gone: under `scheduled`, `with r := BOC.await act do` runs `act` in the reactor of the worker that takes it, and `BOC.awaitFirst a b` races two, the other given up. An act awaited in a custodian's custody is given up as it is shut down. What took a domain or a thread is a behaviour; what waited, an act awaited; a cell or a channel, a cown, read out by a behaviour of a `scheduled` after the one that wrote it. `Domain.tried` and `Domain.fail` have no successor: exception's `attempt` and `recover` catch what is thrown, and a behaviour that abandons, or fails in the runtime, is told to its `scheduled`'s `failed`. std.thread's `cores` is std.process's `processors`. std.http.bocserver serves many connections at once.
+- boc's `scheduled` no longer asks for the custodian's effect: a behaviour, and an act, takes the custodian current where its world has it, and none where it has not. A world without it no longer reaches the runtime's custodians: std.domain's `rooted` is gone, and with it the custodian's provider bundled with a program that did not ask for it.
+
 ## 0.6.0
 
 Released 2026-10-29.

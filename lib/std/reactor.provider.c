@@ -19,7 +19,7 @@
 // An `End` and a `Finished` are each a function given what to do with
 // what they hold, their types erased: `rx_open` takes it -- an end's
 // value and its function `k`, a finished's function `k` -- so that the
-// provider has each apart, as std.domain's provider takes a `Some`.
+// provider has each apart, as boc's provider takes a `Some`.
 
 // (what an end or a finished holds, where `rx_open` puts it)
 static HEFF_TLS V rx_held[2];
@@ -143,7 +143,7 @@ static V heff_provider_reactor(V p, V k) {
     heff_reactor_wake_group(g);
     return heff_tail(k, 1, &x);
   }
-  // (what gives up a group within another, from any domain, with what
+  // (what gives up a group within another, from any thread, with what
   // it is then finished as)
   case TAG_MakeGiving: {
     int64_t g = INT_OF(heff_field(p, 0));
@@ -154,7 +154,7 @@ static V heff_provider_reactor(V p, V k) {
     V x = heff_answer(f, heff_reactor_giving(g, gave));
     return heff_tail(k, 1, &x);
   }
-  // (its group closed, here, where it is this domain's)
+  // (its group closed, here, where it is this thread's)
   case TAG_CloseGiving: {
     HeffGiving *gv = heff_foreign_ptr(heff_field(p, 0));
     int64_t g = gv->group;

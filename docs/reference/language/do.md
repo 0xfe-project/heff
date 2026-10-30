@@ -198,7 +198,7 @@ release is kept by the program's top level while the block runs. Every
 above, and a `main` that uses one has `custodian` in its world. Where a throw heard outside the block
 leaves it, or a handler drops the continuation, the release still runs:
 
-- on the C backend, at the next operation of the domain that started
+- on the C backend, at the next operation of the thread that started
   the `with`;
 - in JavaScript, when the collector reaches what held it.
 
@@ -260,9 +260,9 @@ served l = do
 
 A `with` does not shut its custodian down as its body ends: each thing
 is let go of by its own `with`, as above. A custodian manages
-resources, not threads. A thread that took a thing in a custodian's
-custody that was then shut down finds the thing ended at its next
-operation on it (a socket's `EBADF`), and handles that itself. The
+resources, not behaviours. A behaviour that took a thing in a
+custodian's custody that was then shut down finds the thing ended at
+its next operation on it (a socket's `EBADF`), and handles that itself. The
 thing is ended, not freed: whoever still holds it holds a closed
 socket, not freed memory.
 
@@ -274,80 +274,25 @@ failure is printed, and the program goes on. At the root, the failure
 is the program's: it is printed and the program ends. So a server that
 serves each connection in a `contained` custodian loses only that
 connection when its close fails. What the custodians were given runs
-on the domain that made them, at its next operation.
+on the thread that made them, at its next operation.
 
 What starts to run later keeps the custodian current where it was
-started, as Racket's threads do. A domain spawned in a custodian's
-body has that custodian current.
+started, as Racket's threads do.
 
-A cml thread is a user of a custodian, not one of its things. What it
-carries is which custodian its `with`s give to: at first the one the
-`with`s gave to where it was spawned. No shutdown stops a thread. A
-thread's world, `CML.cml w <+> custodian <+> w`, has a custodian of
-the scheduler's, and that one covers the one outside. `CML.scheduled`
-runs in the scheduler's world `w` itself, `Co (CML.cml w <+> custodian
-<+> w) a -> Co w (Maybe a)`, and `w` need not name a custodian: the
-scheduler reaches the runtime's custodians through the domains'
-(`Domain.rooted`), or, where `w` names one, the one current where it
-runs. So a `main` that starts cml names no custodian, whether by
-`scheduled` or by `with _ := CML.threads do`: `main : Co (stdio <+>
-Net.net <+> Domain.domain) Unit`. The custodian in the threads' world
-is then the only one, and the threads' `with`s, a failure that
-cascades, and one that reaches the root, which ends the program, are as
-in a world that names it. Thread code is written for any world `e`,
-asking for `{{cm : CML.cml w <: e}}` and `{{cu : custodian <: e}}`, as
-other code is; the concrete world appears only where the program
-starts cml.
-
-So a `with k := Custodian.custody do` in a cml thread is cml's to
-answer. The body stays in the thread. It waits at a channel as
-anywhere else, and the other threads run meanwhile. For the extent of
-the body, the thread's `with`s give to `k`, and after it they give to
-the one before. That goes with the thread's continuation wherever its
-turns are taken, so another thread's `with`s never give to `k`, and a
-throw that leaves the body leaves `k` too. cml passes the custodian's
-other operations on to the one outside, with `k` current for them: a
-thing given to it, a custodian made, a release kept. One thread can
-accept connections and serve each in a `contained` custodian of its
-own:
-
-```haskell
-import bytes as Bytes
-import cml as CML
-import co
-import custodian as Custodian
-import exception
-import resource
-import std.net as Net
-
-serving : {e w : HFunctor}
-        -> {s : Type}
-        -> {{cm : CML.cml w <: e}}
-        -> {{cu : Custodian.custodian <: e}}
-        -> {{nt : Net.net <: e}}
-        -> {{ex : exception Net.NetError <: e}}
-        -> With s Net.TcpListener
-        -> CML.Chan w Int
-        -> Co e Unit
-serving l ch = do
-  with k := Custodian.contained do
-    with Net.accept l as c do
-      n <- CML.recv ch
-      _ <- Net.write c (Bytes.fromString (debug n))
-      pure ()
-  serving l ch
-```
-
-A boc behaviour is a user of a custodian too. It takes the custodian
-current where it is spawned, and its body runs with that one current:
-the things its `with`s hold are in its custody, and the behaviours it
-spawns take it as well. A behaviour runs to its end without waiting,
-so a `with` of a custodian in its body is the body's own, for its
-extent. The body is of the world the `when` is in, so where that world
-has the custodian's effect, so does the body, and a `main` that runs
-it names `custodian` in its world. A behaviour spawned in a
-`contained` custodian loses only that custodian when its file fails to
-close:
+A boc behaviour is a user of a custodian, not one of its things. It
+takes the custodian current where it is spawned, and its body runs with
+that one current: the things its `with`s hold are in its custody, and
+the behaviours it spawns take it as well. No shutdown stops a
+behaviour. A behaviour runs to its end without waiting, so a `with` of
+a custodian in its body is the body's own, for its extent. An act a
+behaviour awaits (`BOC.await`) takes the custodian current at the
+await, and is one of its things besides: where that custodian is shut
+down while the act waits, the act is given up, and the behaviour after
+it is never spawned. The body is of the world the `when` is in, so
+where that world has the custodian's effect, so does the body, and a
+`main` that runs it names `custodian` in its world. A behaviour spawned
+in a `contained` custodian loses only that custodian when its file
+fails to close:
 
 ```haskell
 import boc as BOC
@@ -412,13 +357,8 @@ which decides what the names are in the body, when and where the body
 runs, and what happens at its end: here one behaviour on both cowns, `a`
 and `b` what they hold, written back when it ends; with
 `std.file`'s `open path`, a file opened, the body run with it,
-and closed; with
-cml's `_ := CML.threads`, the body cml's main thread, in a world with
-cml, it and the threads it spawns scheduled on domains, and the `with`
-done once they are, no thread of it left running after it; with
-std.domain's `s := Domain.scope`, the body run here and every domain
-spawned in `s` waited for at its end
-([a scope of domains](#a-scope-of-domains)).
+and closed; with `r := BOC.await act`, `act` run outside every
+behaviour, and the body a behaviour once it has come to `r`.
 
 - The names are the body's variables: they can be set, `a := a - n`.
   The handler is told which ones the body sets, and is given what they
@@ -433,15 +373,11 @@ spawned in `s` waited for at its end
   holds it, and the handlers between the `with` and the program's world
   map it as they map any computation an operation holds, where the
   `with` is, not where it runs. What it needs that the world does not
-  give, it is given as a value. cml's threads are a scheduler's: a
-  `CML.spawn` takes a computation of `CML.cml w <+> Custodian.custodian <+> w`,
-  closed, none of the handlers around it around it.
+  give, it is given as a value.
 - Its value is what the handler says: a file's `with` comes to what its
-  body came to, a cown's to `()` (the behaviour runs later), cml's
-  threads' to `Just` main's answer (`Nothing` where every thread
-  waits). `x <- with ... do` binds it. A thread or behaviour that
-  failed does not stop the others: cml's `with` fails at its end as
-  the first thread that failed did.
+  body came to, a cown's to `()` (the behaviour runs later). `x <- with
+  ... do` binds it. A behaviour that failed does not stop the others:
+  its `scheduled`'s `failed` is told why.
 - A handler is a pair of instances, co's `Binder` (of what the names are
   bound to: what they are in the body, the world it runs in, and what
   the `with` comes to) and `Holder` (how it runs in the world), and the
@@ -451,8 +387,7 @@ The body runs in the world of the block around, `e`, unless the
 `Binder` says another, by its field `World`: a function from `e` to the
 body's world. What the names are, its field `Contents`, is given `e`
 too, and the body's region: a name can be of a type that says the
-world around, as std.domain's scope is. A handler that gives its body
-a count of its own:
+world around. A handler that gives its body a count of its own:
 
 ```haskell
 import state
@@ -548,76 +483,8 @@ later, `p` checked again, until it holds.
 - Only a handler that can let go and take again has the clause. Beside
   its `Holder`, it is an instance of co's `Waiter`, whose `heldWhere` is
   given what `held` is, which names `p` reads (a `Bool` each) and `p`.
-  A `with ... where` of a handler without one, a file or a scope of
-  domains, is a type error (E0341).
-
-### A scope of domains
-
-```haskell
-import std.domain as Domain
-
--- | `n` rounds of `step`, fewer where the scope is cancelled
-rounds : {e w : HFunctor}
-       -> {s : Type}
-       -> {{dm : Domain.domain <: e}}
-       -> Domain.Scope s w
-       -> Int
-       -> Co e Unit
-       -> Co e Unit
-rounds sc 0 step = pure ()
-rounds sc n step = do
-  stop <- Domain.cancelled sc
-  if stop then pure ()
-  else do
-    step
-    rounds sc (n - 1) step
-
-both : {e : HFunctor}
-     -> {{dm : Domain.domain <: e}}
-     -> Co e Unit
-     -> Co e Unit
-     -> Co e Unit
-both one other = do
-  with s := Domain.scope do
-    _ <- Domain.spawn s (rounds s 1000 one)
-    _ <- Domain.spawn s (rounds s 1000 other)
-    pure ()
-```
-
-`with s := Domain.scope do` is structured concurrency, as Rust's
-`std::thread::scope`: its body runs here, and `Domain.spawn s c` spawns
-`c` on a domain of its own, one of the scope's. At the body's end the
-`with` waits for every domain spawned in `s`; the body is free to do
-other work before. `Domain.join` gives a domain's answer.
-
-- A domain is spawned in a scope, and only there: there is no `spawn`
-  of any world. The body runs in the block's world with the scope's own
-  effect, `Domain.scoped e <+> e`, and `Domain.spawn s c` is that
-  effect's. `c` is a computation of `e`, the world around the `with`,
-  which has no `scoped`: a domain cannot spawn in its own scope, so
-  none is spawned after the body ends, and none outlives the `with`. A
-  domain that wants domains of its own opens a scope of its own.
-- A domain of the scope that fails fails the scope: once all of them
-  have ended, the `with` fails as the first to fail did (a
-  `Domain.tried` around it catches that). Where the body fails, its
-  domains are waited for too, and the `with` fails as the body did.
-- Cancelling is cooperative. The scope carries a cancel mark, set by
-  `Domain.cancel s`, or when one of its domains fails, or its body does.
-  A domain looks at it where it chooses, `Domain.cancelled s`, and
-  winds up as it chooses: here `rounds` stops between steps. The
-  `with` still waits for it, and a scope that is only cancelled comes
-  to its body's value.
-- No domain is stopped from outside. Stopped at an arbitrary operation,
-  it would leave a `Domain.lock` it holds locked, and the release of a
-  resource it holds (a `with`'s, a `held`'s) would not run, its
-  continuation dropped: that is why cancelling a thread of the system
-  from outside is unsafe. A domain waiting in a call of the system, or
-  in a loop with no operation, stops only where it looks at the mark;
-  a pure loop that never ends is std.fuel's to stop
-  ([fuel](../commands.md#fuel)).
-- `s` cannot leave the body: its type, `Domain.Scope s e`, is of the
-  `with`'s region. A body left by a throw handled outside the `with`
-  (an `exception`'s) does not wait: its domains run on.
+  A `with ... where` of a handler without one, a file or a custodian's
+  custody, is a type error (E0341).
 
 `with` and `as` are [keywords](definitions.md#keywords): neither is a
 name.

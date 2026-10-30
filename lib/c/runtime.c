@@ -338,7 +338,7 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint64_t d[]; } Big;
 #define HEFF_SHARED_BIT 0x40000000u
 #define SHARED (IMMORTAL | HEFF_SHARED_BIT)
 #define heff_shared(rc) ((rc) & HEFF_SHARED_BIT)
-// (an object of a cown's (std.domain's `setOwned`, `heff_own`): one
+// (an object of a cown's (boc's, `heff_own_at`): one
 // behaviour's at a time, the one holding the cown, so counted as a
 // thread's own, but out of line, where what a body does to it is kept
 // (`HeffOwnLog`) -- marked `OWNED`, the highest bit and the one two
@@ -387,15 +387,14 @@ HEFF_FN __attribute__((noinline)) int heff_down_shared(Obj *o) {
 }
 
 // (what a behaviour's body did to its cowns' objects, kept while it
-// runs (std.domain's provider), to be finished once it is done or has
-// failed: the owned objects it counted up, each held here once
-// (`TOUCHED`); the cells it read (`getOwned`), each held here, by the
-// value that has it, with what it held, held here once too, and what it
-// is to hold after (`setOwned`); the arrays of what a cell holds that
-// it writes in place, each with the cell's and the slot that holds it
-// there (none where the cell does); and the elements it wrote of them,
-// with what was there -- held here, where an array keeps `V`s, else
-// its bits)
+// runs (boc's provider), to be finished once it is done or has failed:
+// the owned objects it counted up, each held here once (`TOUCHED`);
+// the cowns it read, each held here, by the value that has it, with
+// what it held, held here once too, and what it is to hold after; the
+// arrays of what a cown holds that it writes in place, each with the
+// cown's and the slot that holds it there (none where the cown does);
+// and the elements it wrote of them, with what was there -- held here,
+// where an array keeps `V`s, else its bits)
 typedef struct { void *cell; V held, v, put; int written; } HeffOwnRoot;
 typedef struct { Arr *r; V *at; int64_t root; } HeffOwnArr;
 typedef struct { Arr *r; int64_t i; uint64_t old; } HeffOwnSet;
@@ -5167,7 +5166,7 @@ HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
 }
 
 // A thing that can be ended before it is let go of -- a socket closed,
-// a command killed, while another domain may hold it still -- is made
+// a command killed, while another thread may hold it still -- is made
 // with what ends it, `end`, besides what lets it go: `end` ends it, and
 // says why it failed, or 0; `let_go` frees what is left.  A custodian
 // ends it at its shutdown (the custodians' part of the runtime), the
@@ -5222,10 +5221,11 @@ HEFF_FN void *heff_foreign_ptr(V v) {
 // entry, as Reader does), and tells it here just before each operation
 // (`heff_custodyIn`): a `Maybe Custodian`, held until the next, for the
 // provider performing it to read.  A computation an operation carries
-// to run later -- a domain's, a custodian's `stop` -- is of that monad,
-// and the provider takes it given the custodian current where it was
-// asked (`heff_carried`).  In a world without custodians nothing is told,
-// and a computation is taken as it is.
+// to run later -- a custodian's `stop`, a `with`'s release -- is of
+// that monad, and the provider takes it given the custodian current
+// where it was asked (`heff_carried`, `heff_carried_fn`).  In a world
+// without custodians nothing is told, and a computation is taken as it
+// is.
 HEFF_VAR(HEFF_TLS V heff_custody_env);
 
 static inline V heff_custodyIn(V c) {

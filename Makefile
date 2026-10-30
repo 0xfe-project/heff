@@ -94,7 +94,7 @@ golden: ## write the golden texts anew, after an intended change (RUN=...)
 sanitize: ## the backends' C programs under AddressSanitizer and UBSan (GEN=...)
 	HEFF_SANITIZE=1 HEFF_GEN="$(GEN)" $(HEFF) test test/backends.hf
 
-tsan: ## the backends, the threads test under ThreadSanitizer too (GEN=...)
+tsan: ## the backends, boc's threads' tests under ThreadSanitizer too (GEN=...)
 	HEFF_TSAN=1 HEFF_GEN="$(GEN)" $(HEFF) test test/backends.hf
 
 bench: ## the benchmarks, timed (BENCH=...)

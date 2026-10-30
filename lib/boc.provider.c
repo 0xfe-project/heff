@@ -57,8 +57,7 @@
 // held by the log and by the body alone, the body writes in place
 // (`heff_own_set`), the log keeping what was there, put back where the
 // cown is to hold what it held.  A value of a word read and written
-// keeps nothing in the log.  (std.domain's provider does the same for a
-// cown's cell: `dm_own_*`.)
+// keeps nothing in the log.
 //
 // A body that fails leaves its cowns as they were, and the pool's
 // `failed` is run, on the thread, before the cowns are let go: what that

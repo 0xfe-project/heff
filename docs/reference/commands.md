@@ -182,9 +182,9 @@ Other calls take stack:
 
 - A C program has a 1 GiB stack: recursion millions deep. When it runs
   out, the program says `heff: stack overflow` and exits with 2. A
-  domain of std.domain (std.thread's are domains) has a 256 MiB stack;
-  when it runs out, the domain fails, and the program fails so when
-  it is joined.
+  thread of boc's pool has a 256 MiB stack; when it runs out, the
+  behaviour fails, and its `scheduled`'s `failed` is told `stack
+  overflow`.
   `-DHEFF_MAIN_STACK=BYTES` when building its C sets another size.
 - A JavaScript program runs on the stack of what loads it, room for
   about ten thousand calls. Deeper, it throws a `RangeError`.
@@ -261,11 +261,11 @@ built with fuel.
   it is `Nothing` and the outer goes on; where it runs out of what was
   left of the outer, the outer is `Nothing` too.
 - A failure inside is handed on as it came.
-- The count is each domain's (a thread of the system's): a domain
-  spawned inside runs with no limit. In JavaScript the limit is the
+- The count is each thread's: a behaviour of boc's spawned inside runs
+  on a thread of its pool, with no limit. In JavaScript the limit is the
   computation's too: it holds across an operation that finishes later (a
-  sleep, a fetch) and across other domains' turns, which run on counts of
-  their own.
+  sleep, a fetch) and across boc's behaviours' turns, which run on
+  counts of their own.
 - What the stopped computation had not finished is left undone, as a
   failure leaves it. A `with`'s release it skips is not run: the thing
   is let go of by its finalizer, as where a continuation is dropped --

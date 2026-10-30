@@ -1101,8 +1101,8 @@ static void heff_spawn_release(void) {
 }
 #endif
 
-// (ended by its custodian, while a domain may hold it still: killed,
-// with its group, unless it has exited -- the domain that waits for it
+// (ended by its custodian, while a thread may hold it still: killed,
+// with its group, unless it has exited -- the thread that waits for it
 // reaps it, and the program's letting go of it frees it)
 static const char *heff_sub_ended(void *x) {
   HeffSub *s = x;

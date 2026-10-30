@@ -64,7 +64,7 @@ static int net_close(NetSock *s) {
 }
 
 // (the socket ended: closed, unless it is already -- by the `with`, by
-// `close`, or by its custodian's shutdown, while a domain may hold it
+// `close`, or by its custodian's shutdown, while a thread may hold it
 // still -- or why it was not, a failure of its custodian's)
 static HEFF_TLS char net_unclosed[256];
 
