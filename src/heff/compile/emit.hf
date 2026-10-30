@@ -1489,7 +1489,10 @@ primHelperOne uses p =
 
 -- (the helpers of those of the primitives `uses` has)
 primHelpersOf : OrdMap.OrdMap String Unit -> List String
-primHelpersOf uses = List.concatMap (\p -> primHelperOne uses p) Prims.jsPrims
+primHelpersOf uses =
+  List.concatMap
+    (\p -> primHelperOne uses p)
+    (List.append Prims.jsPrims (List.map (\i -> PerformAt i) (List.range 0 63)))
 
 type Emitted = { lines : List String, globals : OrdMap.OrdMap String GInfo }
 
@@ -1795,17 +1798,22 @@ runStrBy ticked =
   joinWith
     "\n"
     [ "let $performer;"
+    , "let $performerAt;"
     , "let $custody;"
     , "let $custodyAt;"
     , "const $carried = (m) => $custody === undefined ? m : $tr(m($custody));"
     , "const $carriedFn = (f) => { if ($custody === undefined) return f; const c = $custody; return (u) => $tr($tr(f(u))(c)); };"
-    , "const $run = (entry, perform) => {"
+    , "const $run = (entry, leaves, sum) => {"
+    , "  const perform = sum(leaves);"
     , "  const later = typeof setImmediate === \"function\" ? setImmediate : (f) => setTimeout(f, 0);"
     , "  let depth = 0;"
     , "  const now = (k) => (x) => { x = $tr(x); if (depth > 1000) { depth = 0; later(() => $tr(k(x))); return; } depth++; $tr(k(x)); };"
     , if ticked
-    then "  $performer = (p, k) => { if (--$fuel < 0) $fuelOut(); const c = $fuelCtx; $fuelCaller = c; $fuelTo({ fuel: Infinity, stack: [] }); try { return perform(p, now($fuelResume(c, k))); } finally { $fuelTo(c); } };"
-    else "  $performer = (p, k) => perform(p, now(k));"
+    then "  const via = (f) => (p, k) => { if (--$fuel < 0) $fuelOut(); const c = $fuelCtx; $fuelCaller = c; $fuelTo({ fuel: Infinity, stack: [] }); try { return f(p, now($fuelResume(c, k))); } finally { $fuelTo(c); } };"
+    else "  const via = (f) => (p, k) => f(p, now(k));"
+    , "  $performer = via(perform);"
+    , "  const at = leaves.map(via);"
+    , "  $performerAt = (i, p, k) => at[i](p, k);"
     , "  return $tr(entry());"
     , "};"
     ]
@@ -1943,17 +1951,37 @@ provIndexGo i md [] = 0
 provIndexGo i md (p :: rest) =
   if strEq p.module md then i else provIndexGo (i + 1) md rest
 
--- (each effect's handler, an operation of a sum going to its side's; a
--- leaf's is its provider's factory, called for a fresh algebra)
+-- (each leaf's algebra, its provider's factory called for a fresh one,
+-- in order: what an operation given to a leaf at once (`PerformAt`,
+-- `$performerAt`) goes to, and the sum's leaves)
+leavesOf : List Provider -> Effect.Effect -> String
+leavesOf provs eff =
+  "["
+  ^ joinWith
+    ", "
+    (List.map
+       (\k ->
+          "$p"
+          ^ debug (provIndexGo 0 (Effect.moduleOfKey k) provs)
+          ^ "."
+          ^ Effect.nameOfKey k
+          ^ "()")
+       (Effect.leaves eff))
+  ^ "]"
+
+-- (each effect's handler, of the leaves' algebras `L`, from the `i`th:
+-- an operation of a sum going to its side's)
+sumOf : Effect.Effect -> Int -> String
+sumOf (Leaf k) i = "L[" ^ debug i ^ "]"
+sumOf (Plus a b) i =
+  "$sum("
+  ^ sumOf a i
+  ^ ", "
+  ^ sumOf b (i + List.length (Effect.leaves a))
+  ^ ")"
+
 handlerOf : List Provider -> Effect.Effect -> String
-handlerOf provs (Leaf k) =
-  "$p"
-  ^ debug (provIndexGo 0 (Effect.moduleOfKey k) provs)
-  ^ "."
-  ^ Effect.nameOfKey k
-  ^ "()"
-handlerOf provs (Plus a b) =
-  "$sum(" ^ handlerOf provs a ^ ", " ^ handlerOf provs b ^ ")"
+handlerOf provs eff = leavesOf provs eff ^ ", (L) => " ^ sumOf eff 0
 
 -- Outputs
 --------------------------------------------------------------------------------
@@ -2105,6 +2133,7 @@ compileProgramKept fuel available g key eff vers ks kept =
     (Lower.lowerProgramKept
        (Lower.dueWorld
           (List.map (\k -> Effect.moduleOfKey k) (Effect.leaves eff)))
+       (Just eff)
        g
        key
        vers
