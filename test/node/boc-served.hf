@@ -1,7 +1,7 @@
 -- std.http.bocserver's `serve`, every wait of the server an act
--- awaited, under boc's `scheduledWithReactor`, the listener held by a
--- `with` around the scheduler, which is run on the program's world
--- itself.  By C alone.
+-- awaited, under boc's `scheduled`, the listener held by a `with`
+-- around the scheduler, which is run on the program's world itself.
+-- By C alone.
 --
 --   main   PORT IDLE [HEAD]: served there, a connection closed after
 --          IDLE ms of silence, or HEAD ms (30 s unless given) without
@@ -18,7 +18,6 @@ import boc as BOC
 import co
 import custodian as Custodian
 import exception
-import std.domain as Domain
 import std.duration as Duration
 import std.http as HTTP
 import std.http.bocserver as BocServer
@@ -26,7 +25,6 @@ import std.http.server as Server
 import std.io
 import std.net as Net
 import std.process
-import std.reactor as Reactor
 import std.signal as Signal
 import std.time
 import resource
@@ -40,47 +38,55 @@ data Thrown = MkThrown
 
 -- (a request answered, and counted, but `/stop`: `/slow` after 300
 -- ms, slept by an act the handler awaits; `/stop` answered, then the
--- listener closed; `/throw` thrown; any other, its target)
-answering : {w : HFunctor}
+-- listener closed; `/throw` thrown; any other, its target.  An act
+-- awaited is of the world of its `with`, the handler's, which says it:
+-- its own evidence would put it in the server's)
+answering : {e : HFunctor}
           -> {rg : Type}
-          -> {{dm : Domain.domain <: w}}
-          -> {{clock : time <: w}}
-          -> {{nt : Net.net <: w}}
-          -> Domain.Atomic Int
+          -> {{bc : BOC.boc <: e}}
+          -> {{clock : time <: e}}
+          -> {{nt : Net.net <: e}}
+          -> BOC.Cown Int
           -> With rg Net.TcpListener
           -> Server.Request
-          -> BocServer.Responder w
-          -> Co (exception Thrown <+> (BOC.boc w <+> w)) Unit
+          -> BocServer.Responder Thrown e
+          -> Co (exception Thrown <+> e) Unit
 answering count l r respond = do
-  _ <- (if r.target == "/stop" then pure 0 else Domain.fetchAdd count 1)
+  if r.target == "/stop" then pure ()
+  else do
+    with n := count do
+      n := n + 1
   if r.target == "/slow"
   then do
-    with _ := BOC.await (sleep (Duration.milliseconds 300)) do
+    with _ :=
+           BOC.await
+             (sleep (Duration.milliseconds 300)
+              : Co (exception Thrown <+> e) Unit) do
       respond (Server.plain 200 "slow")
   else if r.target == "/stop"
   then do
     respond (Server.plain 200 "stopping")
-    with _ := BOC.await (Net.closeListener l) do
+    with _ :=
+           BOC.await
+             (Net.closeListener l
+              : Co (exception Thrown <+> e) (Either Net.NetError Unit)) do
       pure ()
   else if r.target == "/throw" then throw (MkThrown : Thrown)
   else respond (Server.plain 200 r.target)
 
 -- (the listener served; where `bySignal`, until SIGTERM or SIGINT,
 -- which closes it, said)
-served : {e w : HFunctor}
+served : {e : HFunctor}
        -> {rg : Type}
-       -> {{bc : BOC.boc w <: e}}
+       -> {{bc : BOC.boc <: e}}
        -> {{io : stdio <: e}}
-       -> {{iow : stdio <: w}}
-       -> {{dm : Domain.domain <: e}}
-       -> {{dmw : Domain.domain <: w}}
-       -> {{clock : time <: w}}
-       -> {{nt : Net.net <: w}}
-       -> {{sg : Signal.signals <: w}}
+       -> {{clock : time <: e}}
+       -> {{nt : Net.net <: e}}
+       -> {{sg : Signal.signals <: e}}
        -> Bool
        -> Int
        -> Int
-       -> Domain.Atomic Int
+       -> BOC.Cown Int
        -> With rg Net.TcpListener
        -> Co e Unit
 served bySignal idle head count l = do
@@ -89,7 +95,7 @@ served bySignal idle head count l = do
       (headerWithin := head)
       Thrown
       l
-      (answering count l)
+      (answering (e := e) count l)
   if bySignal
   then do
     with s :=
@@ -102,14 +108,12 @@ served bySignal idle head count l = do
   else pure ()
 
 program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
         -> {{io : stdio <: e}}
         -> {{clock : time <: e}}
         -> {{nt : Net.net <: e}}
         -> {{sg : Signal.signals <: e}}
         -> {{sys : process <: e}}
-        -> {{rx : Reactor.reactor <: e}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{cu : Custodian.custodian <: e}}
         -> Bool
         -> Co e Unit
 program bySignal = do
@@ -119,61 +123,44 @@ program bySignal = do
     fromMaybe 30000 (parseInt (fromMaybe "" (List.head (List.drop 1 argv))))
   let head =
     fromMaybe 30000 (parseInt (fromMaybe "" (List.head (List.drop 2 argv))))
-  count <- Domain.newAtomic 0
+  count <- BOC.newCown 0
   r <-
     Net.withListener
       (here port)
       512
       (\l ->
-         BOC.scheduledWithReactor
+         BOC.scheduled
            (\why -> printErr ("a behaviour failed: " ^ why))
            (served bySignal idle head count l))
-  n <- Domain.get count
-  print ("answered " ^ debug n)
-  print (either show (\u -> "main done") r)
+  -- (what the server counted, every behaviour done: said by a behaviour
+  -- of a `scheduled` after it)
+  BOC.scheduled
+      (\why -> abandon)
+      (BOC.when count (\n -> do
+         print ("answered " ^ debug n)
+         print (either show (\u -> "main done") r)
+         pure n))
 
 -- | served until SIGTERM or SIGINT
 main : Co
-       (stdio
+       (BOC.boc
+        <+> Custodian.custodian
+        <+> stdio
         <+> time
         <+> Net.net
         <+> Signal.signals
-        <+> process
-        <+> Reactor.reactor
-        <+> Domain.domain
-        <+> Custodian.custodian)
+        <+> process)
        Unit
-main =
-  program
-    (io := _)
-    (clock := _)
-    (nt := _)
-    (sg := _)
-    (sys := _)
-    (rx := _)
-    (dm := _)
-    (cu := _)
-    True
+main = program True
 
 -- | served until asked for `/stop`
 burst : Co
-        (stdio
+        (BOC.boc
+         <+> Custodian.custodian
+         <+> stdio
          <+> time
          <+> Net.net
          <+> Signal.signals
-         <+> process
-         <+> Reactor.reactor
-         <+> Domain.domain
-         <+> Custodian.custodian)
+         <+> process)
         Unit
-burst =
-  program
-    (io := _)
-    (clock := _)
-    (nt := _)
-    (sg := _)
-    (sys := _)
-    (rx := _)
-    (dm := _)
-    (cu := _)
-    False
+burst = program False

@@ -1,13 +1,12 @@
 -- Behaviours take the custodian current where they are spawned, by C
--- alone (std.domain, boc, and flaky.hf's things, one of which fails to
--- end).
+-- alone (boc, and flaky.hf's things, one of which fails to end).
 --
 --   main     a behaviour spawned in a custodian that contains its
---            failures holds a thing, kept by a domain past its `with`,
---            that fails to end as that domain lets go of it: the
---            custodian the behaviour took at its spawn is shut down
---            alone, the failure said, and the program goes on; a
---            behaviour spawned after it, outside, has the root's
+--            failures holds a thing, kept past its `with` by a cown
+--            and let go of by the behaviour after it, where it fails
+--            to end: the custodian the behaviour took at its spawn is
+--            shut down alone, the failure said, and the program goes
+--            on; a behaviour spawned after it, outside, has the root's
 --   rooted   a behaviour spawned outside every custodian's `with`, its
 --            thing failing to end in the root's custody: the program
 --            ended
@@ -18,20 +17,19 @@ import boc as BOC
 import co
 import custodian as Custodian
 import exception
-import std.domain as Domain
 import std.io
 import resource
 import test.node.flaky as Flaky
 
--- (`what` put at the end of the log)
+-- (`what` put at the end of the log, by a behaviour on it)
 logged : {e : HFunctor}
-       -> {{dm : Domain.domain <: e}}
-       -> Domain.Atomic (List String)
+       -> {{bc : BOC.boc <: e}}
+       -> BOC.Cown (List String)
        -> String
        -> Co e Unit
 logged log what = do
-  ls <- Domain.get log
-  Domain.set log (List.append ls [what])
+  with l := log do
+    l := List.append l [what]
 
 -- (each line printed)
 printed : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
@@ -40,117 +38,127 @@ printed (l :: ls) = do
   print l
   printed ls
 
--- (a domain holding the thing until it is told to let go of it)
-keeper : {e : HFunctor}
-       -> {s : Type}
-       -> {{dm : Domain.domain <: e}}
-       -> With s Flaky.Thing
-       -> Domain.Atomic Bool
-       -> Co e Unit
-keeper t go = do
-  g <- Domain.get go
-  if g then pure () else keeper t go
+-- (the lines the cown holds, every behaviour of the `scheduled` before
+-- done, printed by a behaviour of a `scheduled` of its own)
+said : {e : HFunctor}
+     -> {{bc : BOC.boc <: e}}
+     -> {{io : stdio <: e}}
+     -> BOC.Cown (List String)
+     -> Co e Unit
+said log =
+  BOC.scheduled
+    (\why -> abandon)
+    (BOC.when log (\ls -> do
+       printed ls
+       pure ls))
+
+-- (nothing, where `m` was: what the cown holding a thing is left with)
+gone : {a : Type} -> Maybe a -> Maybe a
+gone m = Nothing
 
 -- (a thing, one that fails to end where `fails`, held past its `with`
--- by a domain, which lets go of it once the `with` is done)
+-- by a cown of its own, which the behaviour after this one on `c` --
+-- which this one holds -- lets go of, once this one is done)
 heldPast : {e : HFunctor}
-         -> {{dm : Domain.domain <: e}}
+         -> {{bc : BOC.boc <: e}}
          -> {{fl : Flaky.flaky <: e}}
          -> {{cu : Custodian.custodian <: e}}
          -> {{ex : exception String <: e}}
          -> Bool
+         -> BOC.Cown Int
          -> Co e Unit
-heldPast fails = do
-  go <- Domain.newAtomic False
-  with sc := Domain.scope do
-    with Flaky.withThing fails as t do
-      _ <- Domain.spawn sc (keeper t go)
-      pure ()
-    Domain.set go True
+heldPast fails c = do
+  with Flaky.withThing fails as t do
+    keep <- BOC.newCown (Just t)
+    with n := c
+         k := keep do
+      k := gone k
 
 -- (a behaviour's work: which custodian is current, and a thing held
 -- past its `with`, one that fails to end where `fails`)
 held : {e : HFunctor}
-     -> {{dm : Domain.domain <: e}}
+     -> {{bc : BOC.boc <: e}}
      -> {{fl : Flaky.flaky <: e}}
      -> {{cu : Custodian.custodian <: e}}
-     -> Domain.Atomic (List String)
+     -> BOC.Cown (List String)
+     -> BOC.Cown Int
      -> String
      -> Bool
      -> Co e Unit
-held log name fails = do
+held log c name fails = do
   cur <- Custodian.current
   case cur of
     Just k -> logged log (name ^ ": a custodian of its own current")
     Nothing -> logged log (name ^ ": the root's current")
-  r <- attempt String (heldPast fails)
+  r <- attempt String (heldPast fails c)
   case r of
     Left why -> logged log ("thrown: " ^ why)
     Right u -> logged log (name ^ " went on")
 
 -- (two behaviours on one cown, the first spawned in a custodian that
--- contains its failures, the second after it, outside)
-spawned : {e w : HFunctor}
-        -> {{bc : BOC.boc w <: e}}
+-- contains its failures, the second after it, outside; what the
+-- custodian is given to run at its shutdown put on `stops`, by a
+-- `scheduled` of its own, wherever it runs)
+spawned : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
         -> {{cu : Custodian.custodian <: e}}
-        -> {{de : Domain.domain <: e}}
-        -> {{dm : Domain.domain <: w}}
-        -> {{fl : Flaky.flaky <: w}}
-        -> {{cw : Custodian.custodian <: w}}
-        -> Domain.Atomic (List String)
-        -> Domain.Atomic (List String)
+        -> {{fl : Flaky.flaky <: e}}
+        -> BOC.Cown (List String)
+        -> BOC.Cown (List String)
         -> Co e Unit
 spawned log stops = do
   c <- BOC.newCown 0
   with k := Custodian.contained do
-    _ <- Custodian.manage k (logged stops "the contained custodian shut down")
+    _ <-
+      Custodian.manage
+        k
+        (BOC.scheduled
+           (\why -> abandon)
+           (logged stops "the contained custodian shut down"))
     with n := c do
-      held log "the contained" True
+      held log c "the contained" True
       n := n + 1
   with n := c do
-    held log "the root's" False
+    held log c "the root's" False
     n := n + 1
 
 program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
         -> {{io : stdio <: e}}
-        -> {{dm : Domain.domain <: e}}
         -> {{fl : Flaky.flaky <: e}}
         -> {{cu : Custodian.custodian <: e}}
         -> Co e Unit
 program = do
-  log <- Domain.newAtomic (Nil : List String)
-  stops <- Domain.newAtomic (Nil : List String)
-  BOC.scheduled
-      (\why -> print ("failed: " ^ why))
-      (spawned log stops)
-  ls <- Domain.get log
-  printed ls
-  ss <- Domain.get stops
-  printed ss
+  log <- BOC.newCown Nil
+  stops <- BOC.newCown Nil
+  BOC.scheduled (\why -> print ("failed: " ^ why)) (spawned log stops)
+  said log
+  said stops
   print "the program went on"
 
-main : Co (stdio <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian) Unit
+main : Co (BOC.boc <+> stdio <+> Flaky.flaky <+> Custodian.custodian) Unit
 main = program
 
 -- (a behaviour spawned outside every custodian's `with`, its thing
--- failing to end)
-alone : {e w : HFunctor}
-      -> {{bc : BOC.boc w <: e}}
-      -> {{io : stdio <: w}}
-      -> {{dm : Domain.domain <: w}}
-      -> {{fl : Flaky.flaky <: w}}
-      -> {{cw : Custodian.custodian <: w}}
+-- failing to end, let go of by the behaviour after it, before the one
+-- after that)
+alone : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> {{io : stdio <: e}}
+      -> {{fl : Flaky.flaky <: e}}
+      -> {{cu : Custodian.custodian <: e}}
       -> Co e Unit
 alone = do
   c <- BOC.newCown 0
   with n := c do
     print "held"
-    r <- attempt String (heldPast True)
-    print "not reached"
+    r <- attempt String (heldPast True c)
+    with m := c do
+      print "not reached"
 
 rootedProgram : {e : HFunctor}
+              -> {{bc : BOC.boc <: e}}
               -> {{io : stdio <: e}}
-              -> {{dm : Domain.domain <: e}}
               -> {{fl : Flaky.flaky <: e}}
               -> {{cu : Custodian.custodian <: e}}
               -> Co e Unit
@@ -158,7 +166,5 @@ rootedProgram = do
   BOC.scheduled (\why -> print ("failed: " ^ why)) alone
   print "nor this"
 
-rooted : Co
-         (stdio <+> Domain.domain <+> Flaky.flaky <+> Custodian.custodian)
-         Unit
+rooted : Co (BOC.boc <+> stdio <+> Flaky.flaky <+> Custodian.custodian) Unit
 rooted = rootedProgram

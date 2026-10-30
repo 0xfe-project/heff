@@ -57,7 +57,10 @@
 -- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
 -- `with a := c do ...` | the same, its body statements, `a` what `c` holds (more cowns, a binding each)
 -- `with a := c where p do ...` | the same, its body run once `p` holds of what the cowns hold: until then, the behaviour waits for one `p` reads to be written
--- `scheduled failed c` | `c` and its behaviours run, every behaviour waited for: `c`'s value; `failed why` where one fails
+-- `with r := BOC.await act do ...` | `act`, of the world, run outside every behaviour; the body a behaviour once it has come to `r`; this one goes on
+-- `with a := c` / `r := BOC.await act do ...` | the same, the body a behaviour on `c` once `act` has come to `r`
+-- `with r := BOC.awaitFirst a b do ...` | `a` and `b` raced: the body once the first has come to its value, `r` `Left` or `Right` it, the other given up
+-- `scheduled failed c` | `c` and its behaviours run, every behaviour and act waited for: `c`'s value; `failed why` where one fails
 --
 -- A behaviour's body is given what its cowns hold, a tuple as the cowns
 -- are (`(a, b, log)` hands it an `(x, y, l)`), and gives back their new
@@ -100,6 +103,59 @@
 -- opened while its `c` runs there, or the pool whose worker runs the
 -- body that spawns.  A `when` outside every `scheduled` fails.
 --
+-- A behaviour runs from its start to its end and never waits on the
+-- world: what it would wait for -- a connection accepted, a socket
+-- read, a sleep -- it awaits, as Verona's behaviours do, by a `with`
+-- whose last binding is `r := BOC.await act`.  The `with` waits for
+-- nothing, and the behaviour goes on: `act`, a computation of the
+-- world the `with` is in, runs outside every behaviour, and once it
+-- has come to its value, the body is a behaviour of its own, `r` that
+-- value.  With cowns bound before it (`with x := c` and `r := BOC.await
+-- act` under it; several cowns, a tuple of them to one name, `x := (c0,
+-- c1)`), it is a behaviour on them, spawned only then: no cown is held
+-- while the act waits, and behaviours on a cown that await acts come in
+-- the order their acts came to their values.  What an act fails at is
+-- its value, for the body to handle -- `Net.read`'s `Either NetError
+-- Bytes`, a time limit its own (`Net.read (timeout := 5000) c n`); an
+-- act that itself fails -- abandons, or fails in the runtime -- is as a
+-- body that fails: `failed` is given why, and the `with`'s body never
+-- runs.  `awaitFirst a b` starts both; the first to come to its value
+-- gives up the other, and the body is a behaviour on its value alone.
+-- An act is of the `with`'s world, not of the world its own evidence
+-- finds first: in a world a handler adds to -- a `recover`'s, an
+-- `attempt`'s -- it says so, `BOC.await (sleep d : Co (exception err
+-- <+> e) Unit)`.
+--
+-- ```haskell
+-- import boc as BOC
+-- import co
+-- import std.duration as Duration
+-- import std.time
+--
+-- -- | a second's sleep awaited, then 1 added to the count, by a
+-- -- | behaviour on it: the count is held by none meanwhile
+-- ticked : {e : HFunctor}
+--        -> {{bc : BOC.boc <: e}}
+--        -> {{clock : time <: e}}
+--        -> BOC.Cown Int
+--        -> Co e Unit
+-- ticked count = do
+--   with n := count
+--        _ := BOC.await (sleep (Duration.seconds 1)) do
+--     n := n + 1
+-- ```
+--
+-- A behaviour, and an act, is a user of a custodian, not one of its
+-- things: it takes the custodian current where it is spawned or
+-- awaited, and runs with that one current, so the things its `with`s
+-- hold are in its custody.  An act awaited is one of that custodian's
+-- things besides: where the custodian is shut down while the act waits,
+-- the act is given up -- its wait undone, what comes after it let go
+-- of -- and the behaviour after it is never spawned.  So a server's
+-- `/stop` that shuts down the custody its acts were awaited in lets go
+-- of the act waiting for a signal, and the run ends.  One that has come
+-- to its value is not given up.  No shutdown stops a behaviour.
+--
 -- A behaviour whose body fails -- abandons, or fails in the runtime --
 -- is done with that: its cowns hold what they held, since what they are
 -- to hold is written after the body.  Then `scheduled`'s `failed`, given
@@ -128,6 +184,26 @@
 -- waiting on a cown to be written (`where`) are a list beside it, the
 -- holder's to read and write.
 --
+-- Each thread of a pool waits on the world through a group of the
+-- runtime's reactor of its own (std.reactor's).  An act awaited by a
+-- behaviour a thread runs is that thread's, started there once the
+-- behaviour is done, run until it is done or until an operation of it
+-- would wait (a read, a sleep), which is then pending in the thread's
+-- reactor, the rest of the act kept with it.  So the act's rest, which
+-- spawns the behaviour after it, runs on that thread, and that
+-- behaviour is the one it runs next: no other thread between an act and
+-- its behaviour.  An act awaited by `scheduled`'s computation is a
+-- behaviour on no cown first, whose thread takes it.  A thread with
+-- nothing to run waits in its reactor where acts of its are pending --
+-- woken there where a behaviour is ready -- and looks at it, not
+-- waiting, every 64 behaviours.  `scheduled` comes to its value once no
+-- behaviour is queued or runs and no act is pending: a server whose
+-- listener is closed ends once its connections are done.  An act in a
+-- custody is in a group of its own within its thread's, which a thing
+-- the custodian has gives up (std.reactor's `giving`); the two acts of
+-- a race are each in one, the first to come to its value closing the
+-- other's.
+--
 -- A behaviour is never stopped partway -- its body runs to its end,
 -- holding its cowns -- so the one a thread keeps would wait for the end
 -- of the body it runs, however long that goes on.  The thread counts
@@ -140,6 +216,9 @@
 -- turns, each once it is first at every cown it is queued at, in the
 -- order they were readied.  A body whose rest comes later (a sleep, an
 -- operation of another provider that waits) holds its cowns until then.
+-- An act awaited is a turn of its own, holding no cown; of two raced,
+-- the other is not given up, nothing there undoing a wait, but runs on,
+-- its rest doing nothing; nor is an act given up by a custodian.
 
 module boc
   ( Cown
@@ -155,6 +234,13 @@ module boc
   , instanceWaiterCown
   , instanceWaiterCowns
   , instanceWaiterCownsMore
+  , Await
+  , await
+  , awaitFirst
+  , instanceBinderAwait
+  , instanceBinderCownsAwait
+  , instanceHolderAwait
+  , instanceHolderCownsAwait
   , boc
   , newCown
   , when
@@ -268,15 +354,23 @@ answeringThen g (MkAnswering k) = MkAnswering (\v -> g (k v))
 -- | An operation of `boc`: a cown made; a behaviour spawned, its body a
 -- | computation of `m`'s, given its turn, that takes what its cowns hold
 -- | (`Taken`) and gives what they are to hold (`Given`); a scope of
--- | them run, its computation giving its value so.  The computations
--- | are `m`'s, wrapped where the operation is, by the handler in force
--- | there; what is of a type of its own is beside them, not mapped.
+-- | them run, its computation giving its value so; an act awaited, run
+-- | outside every behaviour, what comes once it has its value -- the
+-- | behaviour after it spawned -- its own rest; two acts raced, each
+-- | given the race as its turn, and asking it, once it has its value,
+-- | whether it is the first to (`Won`), the other given up where it is.
+-- | The computations are `m`'s, wrapped where the operation is, by the
+-- | handler in force there; what is of a type of its own is beside them,
+-- | not mapped.
 data BocF (m : Type -> Type) x
   = NewCown (Some (Cowning x))
   | When (Some2 Behaviour) (Turn -> m Unit) x
   | Taken (Some (Taking x))
   | Given (Some (Giving x))
   | Scheduled (String -> m Unit) (Turn -> m Unit) (Some (Answering x))
+  | Awaits (Turn -> m Unit) x
+  | Races (Turn -> m Unit) (Turn -> m Unit) x
+  | Won Turn (Bool -> x)
 
 -- | Behaviours on cowns, the runtime's: cowns made, behaviours queued on
 -- | them, each run once its cowns are free, in the scope of a
@@ -290,12 +384,18 @@ boc =
       Taken s -> Taken (someThen (takingThen g) s)
       Given s -> Given (someThen (givingThen g) s)
       Scheduled f c s -> Scheduled f c (someThen (answeringThen g) s)
+      Awaits c x -> Awaits c (g x)
+      Races l r x -> Races l r (g x)
+      Won tn k -> Won tn (\b -> g (k b))
   , hmap = \m n nt p -> case p of
       NewCown s -> NewCown s
       When s b x -> When s (\tn -> nt (b tn)) x
       Taken s -> Taken s
       Given s -> Given s
       Scheduled f c s -> Scheduled (\why -> nt (f why)) (\tn -> nt (c tn)) s
+      Awaits c x -> Awaits (\tn -> nt (c tn)) x
+      Races l r x -> Races (\tn -> nt (l tn)) (\tn -> nt (r tn)) x
+      Won tn k -> Won tn k
   }
 
 -- | A cown holding `v`.
@@ -403,8 +503,9 @@ when cs body =
     val
 
 -- | `c` run, with a pool of its own, the behaviours spawned in it, and in
--- | them, run on the pool's threads, as many as the machine has cores:
--- | `c`'s value, once every one of them is done.  A behaviour whose body
+-- | them, run on the pool's threads, as many as the machine has cores,
+-- | and the acts they await in those threads' reactors: `c`'s value,
+-- | once every one of them is done.  A behaviour whose body
 -- | fails is done with that, its cowns holding what they held: `failed
 -- | why` is run on its thread, while it still holds them, and the others
 -- | go on.  Where a `failed` fails too, this fails as the first such
@@ -574,4 +675,137 @@ instanceWaiterCownsMore =
           read
           (Just (\v -> p (s := Unit) v))
           (\v -> bind (body (s := Unit) v) (\q -> pure (snd q)))
+  }
+
+-- Awaiting the world
+--------------------------------------------------------------------------------
+
+-- (a behaviour on no cown, spawned: `body` its work)
+alone : {e : HFunctor} -> {{bc : boc <: e}} -> Co e Unit -> Co e Unit
+alone body =
+  op
+    (bc
+       (When
+          (\r use -> use Unit Unit (MkBehaviour MkUnit Nothing 0 0))
+          (ran (\(u : Unit) -> bind body (\v -> pure u)))
+          MkUnit))
+    val
+
+-- | What a `with` awaits, `r := BOC.await act` or `r := BOC.awaitFirst
+-- | a b`: an act of the world `w`, the `with`'s, or two raced, coming to
+-- | an `a`, outside every behaviour, the `with`'s body a behaviour once
+-- | it has.
+data Await (w : HFunctor) a
+  = MkAwait (Co w a)
+  | Raced (Co w a) (Co w a)
+
+-- | `act` awaited by a `with`: `with r := BOC.await act do ...`.
+await : {w : HFunctor} -> {a : Type} -> Co w a -> Await w a
+await act = MkAwait act
+
+-- (`c` run where the act of the race `tn` whose value this is came to
+-- it first: the other given up then)
+firstThen : {e : HFunctor}
+          -> {{bc : boc <: e}}
+          -> Turn
+          -> Co e Unit
+          -> Co e Unit
+firstThen tn c =
+  bind (op (bc (Won tn (\b -> b))) val) (\w -> if w then c else pure ())
+
+-- (the act awaited, and `k` given its value once it has come to it:
+-- both run outside every behaviour, `k`, as the act's rest, spawning
+-- what is to come after it; the act put in the world of the `with`)
+awaitedThen : {e : HFunctor}
+            -> {a : Type}
+            -> {{bc : boc <: e}}
+            -> Await e a
+            -> (a -> Co e Unit)
+            -> Co e Unit
+awaitedThen (MkAwait act) k = op (bc (Awaits (\tn -> bind act k) MkUnit)) val
+awaitedThen (Raced l r) k =
+  op
+    (bc
+       (Races
+          (\tn -> bind l (\x -> firstThen tn (k x)))
+          (\tn -> bind r (\y -> firstThen tn (k y)))
+          MkUnit))
+    val
+
+-- | `a` and `b` awaited by a `with`, raced: `with r := BOC.awaitFirst a
+-- | b do ...`, `r` `Left` what `a` came to or `Right` what `b` did,
+-- | whichever came to its value first.  Both are started together; the
+-- | first to come to its value gives up the other, and the body is a
+-- | behaviour on that one's value alone.  A time limit is a race with a
+-- | sleep.
+awaitFirst : {w : HFunctor}
+           -> {a b : Type}
+           -> Co w a
+           -> Co w b
+           -> Await w (Either a b)
+awaitFirst l r =
+  Raced (bind l (\x -> pure (Left x))) (bind r (\y -> pure (Right y)))
+
+-- | A `with` of an act awaited, `with r := BOC.await act do ...`: `r`
+-- | what the act comes to; the `with` comes to nothing at once.
+instance instanceBinderAwait : {w : HFunctor}
+                             -> {a : Type}
+                             -> Binder (Await w a)
+instanceBinderAwait = { Contents = \x s -> a, Result = \r -> Unit }
+
+-- | A `with` of cowns and an act awaited, the act the last binding
+-- | (`with x := c` and `r := BOC.await act` under it): `x` what `c`, a
+-- | cown or a tuple of them, holds, and `r` what the act comes to.
+instance instanceBinderCownsAwait : {c : Type}
+                                  -> {w : HFunctor}
+                                  -> {a : Type}
+                                  -> {{cw : Cowns c}}
+                                  -> Binder (c, Await w a)
+instanceBinderCownsAwait =
+  { Contents = \x s -> (cw.Contents, a), Result = \r -> Unit }
+
+-- | An act awaited by a `with`: the act run outside every behaviour,
+-- | and once it has come to its value, the body a behaviour on no cown,
+-- | given it.  The one awaiting goes on at once.
+instance instanceHolderAwait : {e : HFunctor}
+                             -> {a : Type}
+                             -> {{bc : boc <: e}}
+                             -> Holder
+                               e
+                               (Await e a)
+                               (\s -> a)
+                               (\x -> x)
+                               (\r -> Unit)
+instanceHolderAwait =
+  { held = \aw written body ->
+        awaitedThen
+          aw
+          (\v -> alone (bind (body (s := Unit) v) (\p -> pure MkUnit)))
+  }
+
+-- | ... and with cowns: once the act has come to its value, the body a
+-- | behaviour on them, spawned then -- so behaviours on a cown that
+-- | await acts are in the order their acts came to their values -- its
+-- | names set what they hold after it, as a `with` of the cowns alone.
+instance instanceHolderCownsAwait : {e : HFunctor}
+                                  -> {c a : Type}
+                                  -> {{cw : Cowns c}}
+                                  -> {{bc : boc <: e}}
+                                  -> Holder
+                                    e
+                                    (c, Await e a)
+                                    (\s -> (cw.Contents, a))
+                                    (\x -> x)
+                                    (\r -> Unit)
+instanceHolderCownsAwait =
+  { held = \p written body ->
+        awaitedThen
+          (snd p)
+          (\v ->
+             behaviour
+               (fst p)
+               (cw := cw)
+               [firstFlag written]
+               (\t ->
+                  bind (body (s := Unit) (t, v)) (\q -> pure (fst (snd q)))))
   }

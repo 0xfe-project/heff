@@ -1,28 +1,26 @@
 -- Acts of the world awaited by boc's behaviours (`BOC.await`), on the
--- C backend's threads, under `BOC.scheduledWithReactor`: each run
--- outside every behaviour, in the reactor of the domain whose behaviour
--- awaited it, and the behaviour after it spawned once it has come to
--- its value.  Under `BOC.scheduled`, run where it is awaited, in turn.
+-- C backend's threads: each run outside every behaviour, in the reactor
+-- of the worker whose behaviour awaited it, and the behaviour after it
+-- spawned once it has come to its value.  What the runs leave is read
+-- out of their cowns by a behaviour of a `scheduled` after each.
 
 module test.node.boc-await
 
 import boc as BOC
 import co
 import custodian as Custodian
-import std.domain as Domain
 import std.duration as Duration
 import std.io
-import std.reactor as Reactor
 import std.signal as Signal
 import std.time
 
 -- (`v`, after `ms` milliseconds' sleep)
-after : {w : HFunctor}
+after : {e : HFunctor}
       -> {a : Type}
-      -> {{clock : time <: w}}
+      -> {{clock : time <: e}}
       -> Int
       -> a
-      -> Co w a
+      -> Co e a
 after ms v = bind (sleep (Duration.milliseconds ms)) (\u -> pure v)
 
 -- (what `c` came to, and how long it took, in milliseconds)
@@ -37,241 +35,193 @@ timed c = do
   end <- monotonic
   pure (Duration.totalNanoseconds (end - start) / 1000000, x)
 
+-- (what the cowns `cs` hold, every behaviour of the `scheduled` before
+-- done, said as `f` says, by a behaviour of a `scheduled` of its own)
+said : {c : Type}
+     -> {e : HFunctor}
+     -> c
+     -> {{cw : BOC.Cowns c}}
+     -> {{bc : BOC.boc <: e}}
+     -> {{io : stdio <: e}}
+     -> (cw.Contents -> String)
+     -> Co e Unit
+said cs f =
+  BOC.scheduled
+    (\why -> abandon)
+    (BOC.when cs (\v -> do
+       print (f v)
+       pure v))
+
+-- (", in time" where `ms` is about `want`, else how long it took)
+inTime : Int -> Int -> String
+inTime ms want =
+  if ms >= want - 20 && ms < want + 250 then ", in time"
+  else ", took " ^ debug ms ^ " ms"
+
 -- (three sleeps -- 300, 100 and 200 ms -- awaited by one behaviour, so
--- in one domain's reactor at once, each followed by a behaviour on
--- `log` adding its name: `seen` what `log` holds after each)
-three : {e w : HFunctor}
-      -> {{bc : BOC.boc w <: e}}
-      -> {{clock : time <: w}}
-      -> {{dm : Domain.domain <: e}}
-      -> {{dmw : Domain.domain <: w}}
-      -> BOC.Cown w (List String)
-      -> Domain.Atomic (List String)
+-- in one worker's reactor at once, each followed by a behaviour on
+-- `log` adding its name)
+three : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> {{clock : time <: e}}
+      -> BOC.Cown (List String)
       -> Co e Unit
-three log seen = do
+three log = do
   with l := log do
     with l := log
          r := BOC.await (after 300 "a") do
       l := l ++ [r]
-      Domain.set seen l
     with l := log
          r := BOC.await (after 100 "b") do
       l := l ++ [r]
-      Domain.set seen l
     with l := log
          r := BOC.await (after 200 "c") do
       l := l ++ [r]
-      Domain.set seen l
 
--- (an act awaited in the body of a behaviour that came after one, `n`
--- times, the last counting `count` up: run ends only after it)
-chained : {e w : HFunctor}
-        -> {{bc : BOC.boc w <: e}}
-        -> {{clock : time <: w}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{dmw : Domain.domain <: w}}
-        -> Domain.Atomic Int
+-- (an act awaited, `n` times, each by the behaviour after the last,
+-- one on no cown, which counts `count` up: the run ends only after
+-- the last)
+chained : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{clock : time <: e}}
+        -> BOC.Cown Int
         -> Int
         -> Co e Unit
 chained count n =
   if n <= 0 then pure ()
   else do
     with u := BOC.await (after 20 ()) do
-      _ <- Domain.fetchAdd count 1
+      with c := count do
+        c := c + 1
       chained count (n - 1)
-
--- (three sleeps awaited, and a chain of five)
-awaits : {e w : HFunctor}
-       -> {{bc : BOC.boc w <: e}}
-       -> {{clock : time <: w}}
-       -> {{dm : Domain.domain <: e}}
-       -> {{dmw : Domain.domain <: w}}
-       -> Domain.Atomic (List String)
-       -> Domain.Atomic Int
-       -> Co e Unit
-awaits seen count = do
-  log <- BOC.newCown Nil
-  three log seen
-  chained count 5
-
--- (what the run left)
-said : {e : HFunctor}
-     -> {{io : stdio <: e}}
-     -> {{dm : Domain.domain <: e}}
-     -> String
-     -> Int
-     -> Int
-     -> Domain.Atomic (List String)
-     -> Domain.Atomic Int
-     -> Co e Unit
-said how ms want seen count = do
-  l <- Domain.get seen
-  n <- Domain.get count
-  print
-      (how
-       ^ ": "
-       ^ unwords l
-       ^ ", chained "
-       ^ debug n
-       ^ (if ms >= want - 20 && ms < want + 250 then ", in time"
-          else ", took " ^ debug ms ^ " ms"))
 
 -- (two acts that fail, one as it starts and one once it has waited,
 -- beside a chain of three: `ran` counts their bodies, which never run)
-failing : {e w : HFunctor}
-        -> {{bc : BOC.boc w <: e}}
-        -> {{clock : time <: w}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{dmw : Domain.domain <: w}}
-        -> Domain.Atomic Int
-        -> Domain.Atomic Int
+failing : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{clock : time <: e}}
+        -> BOC.Cown Int
+        -> BOC.Cown Int
         -> Co e Unit
 failing ran count = do
-  with r := BOC.await (bind (pure ()) (\u -> (abandon : Co w Int))) do
-    _ <- Domain.fetchAdd ran 1
-    pure ()
-  with r := BOC.await (bind (after 50 ()) (\u -> (abandon : Co w Int))) do
-    _ <- Domain.fetchAdd ran 1
-    pure ()
+  with n := ran
+       r := BOC.await (bind (pure ()) (\u -> (abandon : Co e Int))) do
+    n := n + 1
+  with n := ran
+       r := BOC.await (bind (after 50 ()) (\u -> (abandon : Co e Int))) do
+    n := n + 1
   chained count 3
 
 -- (acts awaited in a custody, shut down once a sleep of 50 ms is
 -- done: a sleep of 5 s and a wait for SIGHUP, given up, their bodies
 -- never run -- `ran` counts them -- and the run ends then)
-givenUp : {e w : HFunctor}
-        -> {{bc : BOC.boc w <: e}}
-        -> {{clock : time <: w}}
-        -> {{sg : Signal.signals <: w}}
+givenUp : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{clock : time <: e}}
+        -> {{sg : Signal.signals <: e}}
         -> {{cu : Custodian.custodian <: e}}
-        -> {{cuw : Custodian.custodian <: w}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{dmw : Domain.domain <: w}}
-        -> Domain.Atomic Int
+        -> BOC.Cown Int
         -> Co e Unit
 givenUp ran = do
   with k := Custodian.custody do
-    with u := BOC.await (after 5000 ()) do
-      _ <- Domain.fetchAdd ran 1
-      pure ()
-    with s := BOC.await (Signal.wait [Hangup]) do
-      _ <- Domain.fetchAdd ran 1
-      pure ()
+    with n := ran
+         u := BOC.await (after 5000 ()) do
+      n := n + 1
+    with n := ran
+         s := BOC.await (Signal.wait [Hangup]) do
+      n := n + 1
     with u := BOC.await (after 50 ()) do
       _ <- Custodian.shutdown k
       pure ()
 
 -- (two races, a sleep of 50 ms against one of 5 s, each way round: what
 -- each came to, on the cown, the run ending once the first are done)
-raced : {e w : HFunctor}
-      -> {{bc : BOC.boc w <: e}}
-      -> {{clock : time <: w}}
-      -> {{cuw : Custodian.custodian <: w}}
-      -> {{dm : Domain.domain <: e}}
-      -> {{dmw : Domain.domain <: w}}
-      -> Domain.Atomic (List String)
+raced : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> {{clock : time <: e}}
+      -> BOC.Cown (List String)
       -> Co e Unit
-raced seen = do
-  log <- BOC.newCown Nil
+raced log = do
   with l := log
        r := BOC.awaitFirst (after 50 "quick") (after 5000 "slow") do
     l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
-    Domain.set seen l
   with l := log
        r := BOC.awaitFirst (after 5000 "slow") (after 100 "quick") do
     l := l ++ [either (\x -> "Left " ^ x) (\y -> "Right " ^ y) r]
-    Domain.set seen l
 
--- (under `scheduledWithReactor`: the sleeps at once, their behaviours
--- on the cown in the order they woke, the chain done before the run
--- ended; under `scheduled`, each sleep in turn; acts that fail, the
--- others going on)
+-- (the sleeps at once, their behaviours on the cown in the order they
+-- woke, the chain done before the run ended; acts that fail, `failed`
+-- told, the others going on)
 program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
         -> {{io : stdio <: e}}
         -> {{clock : time <: e}}
-        -> {{rx : Reactor.reactor <: e}}
-        -> {{dm : Domain.domain <: e}}
-        -> {{cu : Custodian.custodian <: e}}
         -> Co e Unit
 program = do
-  seen <- Domain.newAtomic Nil
-  count <- Domain.newAtomic 0
+  log <- BOC.newCown Nil
+  count <- BOC.newCown 0
   (ms, u) <-
     timed
-      (BOC.scheduledWithReactor
-         (\why -> printErr ("failed: " ^ why))
-         (awaits (bc := _) (clock := _) (dm := _) seen count))
-  said "reactor" ms 300 seen count
-  seen2 <- Domain.newAtomic Nil
-  count2 <- Domain.newAtomic 0
-  (ms2, u2) <-
-    timed
       (BOC.scheduled
-         (batch := 1)
          (\why -> printErr ("failed: " ^ why))
-         (awaits (bc := _) (clock := _) (dm := _) seen2 count2))
-  said "scheduled" ms2 600 seen2 count2
-  ran <- Domain.newAtomic 0
-  count3 <- Domain.newAtomic 0
-  r <-
-    Domain.tried
-      (BOC.scheduledWithReactor
-         (\why -> print ("an act failed: " ^ why))
-         (failing (bc := _) (clock := _) (dm := _) ran count3))
-  n <- Domain.get ran
-  c <- Domain.get count3
-  print
-      (either
-         (\why -> "the run: " ^ why)
-         (\v ->
-            "the run: done, their bodies run "
-            ^ debug n
-            ^ " times, the chain beside them "
-            ^ debug c)
-         r)
+         (do
+          three log
+          chained count 5))
+  said
+      (log, count)
+      (\p -> case p of
+       (l, n) ->
+         "reactor: " ^ unwords l ^ ", chained " ^ debug n ^ inTime ms 300)
+  ran <- BOC.newCown 0
+  count3 <- BOC.newCown 0
+  BOC.scheduled
+      (\why -> print ("an act failed: " ^ why))
+      (failing ran count3)
+  said
+      (ran, count3)
+      (\p -> case p of
+       (n, c) ->
+         "the run: done, their bodies run "
+         ^ debug n
+         ^ " times, the chain beside them "
+         ^ debug c)
 
--- (acts given up as their custody is shut down, and acts raced, under
--- `scheduledWithReactor`: each run in about the time of its quickest)
+-- (acts given up as their custody is shut down, and acts raced: each
+-- run in about the time of its quickest)
 givingUp : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
          -> {{io : stdio <: e}}
          -> {{clock : time <: e}}
          -> {{sg : Signal.signals <: e}}
-         -> {{rx : Reactor.reactor <: e}}
-         -> {{dm : Domain.domain <: e}}
          -> {{cu : Custodian.custodian <: e}}
          -> Co e Unit
 givingUp = do
-  ran <- Domain.newAtomic 0
+  ran <- BOC.newCown 0
   (ms, u) <-
     timed
-      (BOC.scheduledWithReactor
+      (BOC.scheduled
          (\why -> printErr ("failed: " ^ why))
-         (givenUp (bc := _) (clock := _) (cu := _) (dm := _) ran))
-  n <- Domain.get ran
-  print
-      ("given up: bodies run "
-       ^ debug n
-       ^ (if ms < 1000 then ", in time" else ", took " ^ debug ms ^ " ms"))
-  seen <- Domain.newAtomic Nil
+         (givenUp ran))
+  said
+      ran
+      (\n ->
+         "given up: bodies run "
+         ^ debug n
+         ^ (if ms < 1000 then ", in time" else ", took " ^ debug ms ^ " ms"))
+  log <- BOC.newCown Nil
   (ms2, u2) <-
-    timed
-      (BOC.scheduledWithReactor
-         (\why -> printErr ("failed: " ^ why))
-         (raced (bc := _) (clock := _) (dm := _) seen))
-  l <- Domain.get seen
-  print
-      ("raced: "
-       ^ joinWith ", " l
-       ^ (if ms2 < 1000 then ", in time" else ", took " ^ debug ms2 ^ " ms"))
+    timed (BOC.scheduled (\why -> printErr ("failed: " ^ why)) (raced log))
+  said
+      log
+      (\l ->
+         "raced: "
+         ^ joinWith ", " l
+         ^ (if ms2 < 1000 then ", in time" else ", took " ^ debug ms2 ^ " ms"))
 
 -- | the program, on the system's threads
 main : Co
-       (stdio
-        <+> time
-        <+> Signal.signals
-        <+> Reactor.reactor
-        <+> Domain.domain
-        <+> Custodian.custodian)
+       (BOC.boc <+> stdio <+> time <+> Signal.signals <+> Custodian.custodian)
        Unit
 main = do
-  program (io := _) (clock := _) (rx := _) (dm := _) (cu := _)
-  givingUp (io := _) (clock := _) (sg := _) (rx := _) (dm := _) (cu := _)
+  program
+  givingUp

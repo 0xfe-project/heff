@@ -144,11 +144,14 @@ static V bc_open(V s) {
 
 // Cowns and behaviours ------------------------------------------------------
 
+#define BC_POLLERS 1024
+
 typedef struct BcBehaviour BcBehaviour;
 typedef struct BcCown BcCown;
 typedef struct BcPool BcPool;
 typedef struct BcWait BcWait;
 typedef struct BcPark BcPark;
+typedef struct BcAct BcAct;
 
 typedef struct {
   _Atomic(BcBehaviour *) next;
@@ -187,6 +190,7 @@ struct BcBehaviour {
   V cond;    // Nothing, or Just (t -> Bool)
   int64_t ws, rs;
   BcBehaviour *after;
+  BcAct *act;  // an act awaited outside every worker: run by one
   int n;
   int moved;
   BcRequest *req;  // `few`, where the cowns are as few
@@ -203,6 +207,10 @@ struct BcPool {
   V failed;        // String -> m Unit, shared
   char *why;       // the first `failed` that failed
   BcWait *parked;  // those waiting, under `mu`
+  // (the reactor groups of the workers waiting in their reactors, acts
+  // pending there, to be woken there where a behaviour is ready)
+  int npolling;
+  int64_t polling[BC_POLLERS];
 };
 
 static void bc_wait_less(BcWait *w) {
@@ -237,9 +245,14 @@ static int bc_is_cown(V v) {
 
 #define BC_COWN(v) ((BcCown *)((Fgn *)(v))->p)
 
+// (none: a behaviour on no cown, `()`, boc's own -- what an act's
+// `with` of no cown spawns)
+#define BC_NONE(cs) ((cs) == NTAG(TAG_MkUnit))
+
 // (how many cowns `cs` is, a cown or a tuple of them)
 static int bc_count(V cs) {
   if (bc_is_cown(cs)) return 1;
+  if (BC_NONE(cs)) return 0;
   if (heff_tag_of(cs) != TAG_MkPair) heff_fail("boc: a behaviour on what is not a cown, nor a tuple of them");
   return bc_count(heff_field(cs, 0)) + bc_count(heff_field(cs, 1));
 }
@@ -250,6 +263,7 @@ static void bc_each(V cs, BcRequest *req, int *i) {
     req[(*i)++].t = BC_COWN(cs);
     return;
   }
+  if (BC_NONE(cs)) return;
   bc_each(heff_field(cs, 0), req, i);
   bc_each(heff_field(cs, 1), req, i);
 }
@@ -298,15 +312,27 @@ static void bc_queued(BcBehaviour *b) {
   if (pl->back) pl->back->after = b;
   else __atomic_store_n(&pl->front, b, __ATOMIC_RELAXED);
   pl->back = b;
+  int64_t wake = 0;
   if (pl->sleeping > 0) pthread_cond_signal(&pl->work);
+  else if (pl->npolling > 0) wake = pl->polling[--pl->npolling];
   pthread_mutex_unlock(&pl->mu);
+  if (wake) heff_reactor_wake_group(wake);
 }
+
+// (whether this worker is looking at its reactor: where an act's rest
+// readies a behaviour into its slot, the look comes back, not waiting
+// on, so that the behaviour runs now)
+static HEFF_TLS int bc_polling;
 
 // (the behaviour ready: in this thread's slot, where it runs the pool's
 // behaviours and the slot is empty, else queued)
 static void bc_ready(BcBehaviour *b) {
-  if (bc_running == b->pool && !bc_slot) bc_slot = b;
-  else bc_queued(b);
+  if (bc_running == b->pool && !bc_slot) {
+    bc_slot = b;
+#ifndef _WIN32
+    if (bc_polling) heff_woken = 1;
+#endif
+  } else bc_queued(b);
 }
 
 static void bc_through(BcBehaviour *b) {
@@ -407,6 +433,7 @@ static void bc_behave(BcPool *pl, V cs, V body, V cond, int64_t ws, int64_t rs) 
   b->cond = cond;
   b->ws = ws;
   b->rs = rs;
+  b->act = NULL;
   b->moved = 0;
   atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
   bc_enqueue(b);
@@ -450,6 +477,7 @@ static void bc_park_on(V cs, BcWait *w, int64_t rs, int *i) {
     }
     return;
   }
+  if (BC_NONE(cs)) return;
   bc_park_on(heff_field(cs, 0), w, rs, i);
   bc_park_on(heff_field(cs, 1), w, rs, i);
 }
@@ -469,6 +497,7 @@ static BcBehaviour *bc_again(BcBehaviour *b) {
   nb->cond = b->cond;
   nb->ws = b->ws;
   nb->rs = b->rs;
+  nb->act = NULL;
   nb->moved = 1;
   b->cs = b->body = b->cond = 0;
   return nb;
@@ -539,6 +568,7 @@ static void bc_woken(V cs, int64_t ws, int *i) {
     }
     return;
   }
+  if (BC_NONE(cs)) return;
   bc_woken(heff_field(cs, 0), ws, i);
   bc_woken(heff_field(cs, 1), ws, i);
 }
@@ -687,6 +717,7 @@ static void bc_own_done(HeffOwnLog *g, int failed) {
 // (what the cowns `cs` hold, a tuple as they are: each read by the log)
 static V bc_contents(HeffOwnLog *g, V cs) {
   if (bc_is_cown(cs)) return bc_get_owned(g, BC_COWN(cs));
+  if (BC_NONE(cs)) return cs;
   V f[2] = { bc_contents(g, heff_field(cs, 0)), bc_contents(g, heff_field(cs, 1)) };
   return heff_tag_n(TAG_MkPair, 2, f);
 }
@@ -697,6 +728,10 @@ static void bc_written(HeffOwnLog *g, V cs, V v, int64_t ws, int *i) {
   if (bc_is_cown(cs)) {
     if (bc_bit(ws, (*i)++)) bc_set_owned(g, BC_COWN(cs), v);
     else heff_drop(v);
+    return;
+  }
+  if (BC_NONE(cs)) {
+    heff_drop(v);
     return;
   }
   V l = heff_dup(heff_field(v, 0)), r = heff_dup(heff_field(v, 1));
@@ -732,12 +767,274 @@ static void bc_failed(BcPool *pl, const char *why) {
   } else heff_drop(out);
 }
 
+// Acts awaited ----------------------------------------------------------------
+
+// An act awaited (`Awaits`) is a computation of the program's, `Turn ->
+// m Unit`, run outside every behaviour: the act, then what comes once
+// it has its value -- the behaviour after it spawned -- its own rest.
+// Each worker of a pool has a group of the runtime's reactor
+// (`bc_group`), opened as it starts its first act.  An act awaited by a
+// behaviour a worker runs is given that worker (its `bc_inbox`), and
+// started there once the behaviour is done, in its group: run until it
+// is done, or until an operation of it would wait (a read, a sleep),
+// which is then pending in the worker's reactor, the rest of the act
+// kept with it.  So the act's rest -- the `when` of the behaviour after
+// it -- runs on the worker that started it, and that behaviour is the
+// one the worker runs next, in its slot: no other thread between an
+// act and its behaviour.  An act awaited outside every worker (by a
+// `scheduled`'s computation) is a behaviour on no cown, whose worker
+// takes the act as its own.
+//
+// A worker with nothing to run waits in its reactor where acts of its
+// are pending, said to be (`polling`) so that a behaviour put with
+// those ready wakes it there (`heff_reactor_wake_group`), else on the
+// pool's condition; and it looks at its reactor, not waiting, after
+// every 64 behaviours (`BC_POLL_EVERY`), so that acts done meanwhile
+// are not passed over.  The pool counts an act given a worker and not
+// yet started, and a worker with acts pending (`bc_holding`): the
+// `scheduled` ends once no behaviour is queued or runs and no act is
+// pending.  An act that fails -- abandons, or fails in the runtime --
+// fails as a body does: `failed` is given why (the group's function for
+// failures), and what was to come after it does not.
+//
+// An act awaited with a custodian current is in that custodian's
+// custody, as std.reactor's `giving` has it: started in a group of its
+// own within the worker's, which a thing the custodian has among its
+// things gives up as it is shut down -- what of the act is pending let
+// go of, undone, and the behaviour after it never spawned.  One that
+// has come to its value is not given up.  Two acts raced (`Races`) are
+// each in a group of their own, given the race as their turn: the
+// first to come to its value asks it (`Won`), and is told so, and the
+// other's group is closed, its wait undone; the other, coming to its
+// value too, is told it is not the first.  Both are on one worker, so
+// the race is that worker's alone.
+
+#define BC_POLL_EVERY 64
+
+// (an act awaited: its computation, of the program's, given the
+// custodian current at its await, as a body is; or, `race`, two of
+// them; and that custodian, its foreign value, or 0)
+struct BcAct {
+  BcAct *next;
+  V arm[2];
+  int race;
+  V custody;
+};
+
+// (a race's: whether one of its acts has come to its value first, and
+// their groups)
+typedef struct {
+  int won;
+  int64_t g[2];
+} BcRace;
+
+static void bc_race_let_go(void *p) { free(p); }
+
+// (this worker's acts awaited, to be started, the first first; its
+// group, 0 before its first act; and whether it counts as one of its
+// pool's for acts pending in its reactor)
+static HEFF_TLS BcAct *bc_inbox, *bc_inbox_last;
+static HEFF_TLS int64_t bc_group;
+static HEFF_TLS int bc_holding;
+
+// (the act given this worker, counted its pool's until it is started)
+static void bc_inboxed(BcPool *pl, BcAct *a) {
+  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  a->next = NULL;
+  if (bc_inbox_last) bc_inbox_last->next = a;
+  else bc_inbox = a;
+  bc_inbox_last = a;
+}
+
+// (an act awaited where no worker of its pool is: a behaviour on no
+// cown, whose worker takes it)
+static void bc_act_behaviour(BcPool *pl, BcAct *a) {
+  a->arm[0] = heff_move(a->arm[0]);
+  if (a->race) a->arm[1] = heff_move(a->arm[1]);
+  if (a->custody) a->custody = heff_move(a->custody);
+  BcBehaviour *b = bc_behaviour_room();
+  b->req = b->few;
+  b->n = 0;
+  b->pool = pl;
+  b->cs = NTAG(TAG_MkUnit);
+  b->body = 0;
+  b->cond = 0;
+  b->ws = b->rs = 0;
+  b->act = a;
+  b->moved = 1;
+  atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  bc_enqueue(b);
+}
+
+// (an act awaited, `arm1` 0, or two raced: in the pool of here, given
+// this worker where it is one of that pool's, else a behaviour; the
+// arms consumed)
+static void bc_await(BcPool *pl, V arm0, V arm1) {
+  BcAct *a = heff_alloc(sizeof(BcAct));
+  a->arm[0] = arm0;
+  a->arm[1] = arm1;
+  a->race = arm1 != 0;
+  V env = heff_custody_env;
+  a->custody = env && heff_tag_of(env) == TAG_Just ? heff_dup(heff_field(env, 0)) : 0;
+  if (bc_running == pl) bc_inboxed(pl, a);
+  else bc_act_behaviour(pl, a);
+}
+
+// (an act that failed: `failed` given why; what the group finishes
+// with, nothing)
+static V bc_act_failed(V self, V *a) {
+  size_t len;
+  char *why = heff_bytes(a[0], &len);
+  heff_drop(a[0]);
+  heff_drop(self);
+  bc_failed(bc_running, why);
+  free(why);
+  return NTAG(TAG_MkUnit);
+}
+
+// (an act begun: its computation given its turn, and its end)
+static V bc_act_begun(V self, V *a) {
+  V *e = heff_env(self);
+  V act = heff_dup(e[0]), args[2] = { heff_dup(e[1]), heff_dup(e[2]) };
+  heff_drop(self);
+  heff_drop(a[0]);
+  return heff_tail(act, 2, args);
+}
+
+// (the end of an act in a group of its own: the group closed, given up
+// no more, before what gives it up, in the closure's room, is let go
+// of)
+static V bc_act_ended(V self, V *a) {
+  heff_reactor_close(INT_OF(heff_env(self)[0]));
+  heff_drop(self);
+  return a[0];
+}
+
+// (the thing `thing` in the custody of the custodian `cv`: ended at once
+// where it is shut down.  Where no program's world has custodians,
+// there is none)
+static void bc_owned_by(V cv, V thing) {
+#ifdef HEFF_CUSTODY_LOCK
+  HeffCustody *c = heff_foreign_ptr(cv);
+  char *ended = NULL;
+  HEFF_CUSTODY_LOCK();
+  V was = heff_custody_owned(c, cv, (Fgn *)thing, &ended);
+  HEFF_CUSTODY_UNLOCK();
+  if (ended) {
+    heff_custody_failed(c, ended);
+    free(ended);
+  }
+  if (was) heff_drop(was);
+#else
+  (void)cv;
+  (void)thing;
+#endif
+}
+
+// (whether this worker counts as one of its pool's: so while acts of it
+// are pending)
+static void bc_hold_update(BcPool *pl) {
+  int now = bc_group && heff_reactor_pending(bc_group) > 0;
+  if (now == bc_holding) return;
+  bc_holding = now;
+  if (now) atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
+  else bc_pool_less(pl);
+}
+
+// (the act started, in this worker's group, or one of its own within
+// it: run until it is done or pending.  Of a race, both, each in one of
+// its own, the second not begun where the first came to its value at
+// once.  `a` let go of)
+static void bc_start(BcAct *a) {
+  if (!bc_group) bc_group = heff_reactor_open(heff_clo(bc_act_failed, 1, 0, NULL));
+  int arms = a->race ? 2 : 1;
+  BcRace *rc = NULL;
+  V race = NTAG(TAG_MkUnit);
+  if (a->race) {
+    rc = heff_alloc(sizeof(BcRace));
+    rc->won = 0;
+    race = heff_foreign(rc, bc_race_let_go);
+  }
+  int64_t gs[2];
+  V ends[2];
+  for (int i = 0; i < arms; i++) {
+    int64_t g = bc_group;
+    if (a->race || a->custody) {
+      g = heff_reactor_open_within(bc_group);
+      V gv = NTAG(TAG_MkUnit);
+      if (a->custody) {
+        gv = heff_reactor_giving(g, NTAG(TAG_MkUnit));
+        bc_owned_by(a->custody, gv);
+      }
+      V e[2] = { heff_int(g), gv };
+      ends[i] = heff_clo(bc_act_ended, 1, 2, e);
+    } else ends[i] = heff_clo(heff_kept, 1, 0, NULL);
+    gs[i] = g;
+    if (rc) rc->g[i] = g;
+  }
+  for (int i = 0; i < arms; i++) {
+    if (rc && rc->won) {
+      heff_drop(a->arm[i]);
+      heff_drop(ends[i]);
+      continue;
+    }
+    V e[3] = { a->arm[i], heff_dup(race), ends[i] };
+    V begin = heff_clo(bc_act_begun, 1, 3, e);
+    V r;
+    if (!heff_group_step(gs[i], begin, NTAG(TAG_MkUnit), &r) && r != HEFF_PENDING) heff_drop(r);
+  }
+  heff_drop(race);
+  if (a->custody) heff_drop(a->custody);
+  free(a);
+}
+
+// (the acts given this worker started, in the order given, each then no
+// longer counted as given)
+static void bc_start_all(BcPool *pl) {
+  while (bc_inbox) {
+    BcAct *a = bc_inbox;
+    bc_inbox = a->next;
+    if (!bc_inbox) bc_inbox_last = NULL;
+    bc_start(a);
+    bc_hold_update(pl);
+    bc_pool_less(pl);
+  }
+}
+
+// (this worker's reactor looked at, waiting where `wait` until an act of
+// it is done or a behaviour is ready: the rest of each act done run)
+static void bc_poll(BcPool *pl, int wait) {
+  bc_polling = 1;
+  heff_drop(heff_reactor_finished(bc_group, wait));
+  bc_polling = 0;
+  bc_hold_update(pl);
+}
+
+// (the race `tn`'s act asking, its value come to, whether it is the
+// first: where it is, the other's group closed, what of it is pending
+// let go of)
+static int bc_won(V tn) {
+  BcRace *rc = heff_foreign_ptr(tn);
+  if (rc->won) return 0;
+  rc->won = 1;
+  heff_reactor_close(rc->g[heff_group == rc->g[0] ? 1 : 0]);
+  return 1;
+}
+
 // (the behaviour run, here: its condition checked of what its cowns
 // hold, and where it holds, or there is none, its body run, given that,
 // and what it gives back written back; then let go of -- or, its
-// condition not holding, parked)
+// condition not holding, parked.  One that is an act awaited where no
+// worker was: the act given this worker)
 static void bc_run_behaviour(BcBehaviour *b) {
   BcPool *pl = b->pool;
+  if (b->act) {
+    bc_inboxed(pl, b->act);
+    b->act = NULL;
+    bc_behaviour_free(b);
+    bc_pool_less(pl);
+    return;
+  }
   bc_fuel = 0;
   bc_in_body = 1;
   // (the log's lists empty, its room for the first cowns' entries not
@@ -802,7 +1099,7 @@ static void *bc_worker(void *u) {
   free(s);
   bc_running = pl;
   bc_current = pl;
-  int row = 0;
+  int row = 0, since = 0;
   for (;;) {
     BcBehaviour *kept = bc_slot;
     if (kept) {
@@ -812,16 +1109,49 @@ static void *bc_worker(void *u) {
       else {
         row = row >= BC_BATCH ? 1 : row + 1;
         bc_run_behaviour(kept);
+        since++;
         continue;
       }
     }
     row = 0;
+    // (the acts the behaviours run here awaited started, outside them)
+    if (bc_inbox) {
+      bc_start_all(pl);
+      continue;
+    }
+    // (acts pending, looked at now and then: their rest run)
+    if (bc_holding && since >= BC_POLL_EVERY) {
+      since = 0;
+      bc_poll(pl, 0);
+      continue;
+    }
     // (a while looked at before sleeping: a behaviour readied soon after
-    // by another thread taken without a wake)
-    for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->front, __ATOMIC_RELAXED)
-                    && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++)
-      bc_relax();
+    // by another thread taken without a wake; not where acts are pending,
+    // which are waited for in the reactor instead)
+    if (!bc_holding)
+      for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->front, __ATOMIC_RELAXED)
+                      && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++)
+        bc_relax();
     pthread_mutex_lock(&pl->mu);
+    if (!pl->front && !pl->stopping && bc_holding) {
+      // (waiting in the reactor, said to be, so that a behaviour ready
+      // wakes it there; where too many are, not waiting)
+      int on = pl->npolling < BC_POLLERS;
+      if (on) pl->polling[pl->npolling++] = bc_group;
+      pthread_mutex_unlock(&pl->mu);
+      since = 0;
+      bc_poll(pl, on);
+      if (on) {
+        pthread_mutex_lock(&pl->mu);
+        for (int i = 0; i < pl->npolling; i++)
+          if (pl->polling[i] == bc_group) {
+            pl->polling[i] = pl->polling[--pl->npolling];
+            break;
+          }
+        pthread_mutex_unlock(&pl->mu);
+      } else sched_yield();
+      continue;
+    }
     while (!pl->front && !pl->stopping) {
       pl->sleeping++;
       pthread_cond_wait(&pl->work, &pl->mu);
@@ -836,6 +1166,13 @@ static void *bc_worker(void *u) {
     if (!pl->front) pl->back = NULL;
     pthread_mutex_unlock(&pl->mu);
     bc_run_behaviour(b);
+    since++;
+  }
+  // (its group closed: nothing of it is pending, or the pool would not
+  // have stopped)
+  if (bc_group) {
+    heff_reactor_close(bc_group);
+    bc_group = 0;
   }
   // (the behaviours' room this thread kept given back)
   while (bc_spare) {
@@ -863,6 +1200,7 @@ static BcPool *bc_pool(V failed) {
   pl->n = (int)n;
   pl->why = NULL;
   pl->parked = NULL;
+  pl->npolling = 0;
   pl->failed = heff_share(failed);
   pl->threads = heff_alloc((size_t)n * sizeof(pthread_t));
   for (int i = 0; i < pl->n; i++) {
@@ -900,7 +1238,12 @@ static char *bc_drain(BcPool *pl) {
   }
   __atomic_store_n(&pl->stopping, 1, __ATOMIC_RELAXED);
   pthread_cond_broadcast(&pl->work);
+  int np = pl->npolling;
+  int64_t woken[BC_POLLERS];
+  memcpy(woken, pl->polling, (size_t)np * sizeof(int64_t));
+  pl->npolling = 0;
   pthread_mutex_unlock(&pl->mu);
+  for (int i = 0; i < np; i++) heff_reactor_wake_group(woken[i]);
   for (int i = 0; i < pl->n; i++) pthread_join(pl->threads[i], NULL);
   while (dropped) {
     BcWait *next = dropped->next;
@@ -1026,6 +1369,28 @@ static V heff_provider_boc(V p, V k) {
     V v = heff_dup(heff_field(mk, 0)), g = heff_dup(heff_field(mk, 1));
     heff_drop(mk);
     x = heff_answer(g, heff_bocNew(v));
+    break;
+  }
+  case TAG_Awaits: {
+    V act = heff_carried_fn(heff_dup(heff_field(p, 0)));
+    x = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    bc_await(bc_here(), act, 0);
+    break;
+  }
+  case TAG_Races: {
+    V l = heff_carried_fn(heff_dup(heff_field(p, 0)));
+    V r = heff_carried_fn(heff_dup(heff_field(p, 1)));
+    x = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    bc_await(bc_here(), l, r);
+    break;
+  }
+  case TAG_Won: {
+    int first = bc_won(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    x = heff_answer(f, NTAG(first ? TAG_True : TAG_False));
     break;
   }
   case TAG_Scheduled: {
