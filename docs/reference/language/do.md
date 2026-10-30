@@ -341,18 +341,13 @@ serving l ch = do
 A boc behaviour is a user of a custodian too. It takes the custodian
 current where it is spawned, and its body runs with that one current:
 the things its `with`s hold are in its custody, and the behaviours it
-spawns take it as well. An act awaited by `BOC.await`, and the
-behaviour after it, take the one current at the `await`, and the act is
-one of its things: shut down while the act still waits, the custodian
-gives the act up, and the behaviour after it is never spawned.
-`BOC.awaitFirst a b` races two acts so, in a custodian of their own
-that the first to come to its value shuts down. A behaviour
-runs to its end without waiting, so a `with` of a custodian in its body
-is the body's own, for its extent. The custodian is the one of the
-scheduler's world, so `BOC.scheduled` asks for `custodian <: w`, and a
-`main` that runs it names `custodian` in its world. A behaviour spawned
-in a `contained` custodian loses only that custodian when its file
-fails to close:
+spawns take it as well. A behaviour runs to its end without waiting,
+so a `with` of a custodian in its body is the body's own, for its
+extent. The body is of the world the `when` is in, so where that world
+has the custodian's effect, so does the body, and a `main` that runs
+it names `custodian` in its world. A behaviour spawned in a
+`contained` custodian loses only that custodian when its file fails to
+close:
 
 ```haskell
 import boc as BOC
@@ -363,12 +358,11 @@ import std.file as File
 import std.filesystem
 import std.path
 
-saved : {e w : HFunctor}
-      -> {{bc : BOC.boc w <: e}}
+saved : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
       -> {{cu : Custodian.custodian <: e}}
-      -> {{disk : filesystem <: w}}
-      -> {{cw : Custodian.custodian <: w}}
-      -> BOC.Cown w Int
+      -> {{disk : filesystem <: e}}
+      -> BOC.Cown Int
       -> Path
       -> Co e Unit
 saved c path = do
@@ -398,10 +392,10 @@ it is whenever JavaScript's collector comes to it.
 ```haskell
 import boc as BOC
 
-paid : {e w : HFunctor}
-     -> {{bc : BOC.boc w <: e}}
-     -> BOC.Cown w Int
-     -> BOC.Cown w Int
+paid : {e : HFunctor}
+     -> {{bc : BOC.boc <: e}}
+     -> BOC.Cown Int
+     -> BOC.Cown Int
      -> Int
      -> Co e Unit
 paid from to n = do
@@ -418,8 +412,7 @@ which decides what the names are in the body, when and where the body
 runs, and what happens at its end: here one behaviour on both cowns, `a`
 and `b` what they hold, written back when it ends; with
 `std.file`'s `open path`, a file opened, the body run with it,
-and closed; with boc's `r := BOC.await act` last, `act` run outside
-every behaviour, and the body a behaviour once it has come to `r`; with
+and closed; with
 cml's `_ := CML.threads`, the body cml's main thread, in a world with
 cml, it and the threads it spawns scheduled on domains, and the `with`
 done once they are, no thread of it left running after it; with
@@ -435,12 +428,14 @@ spawned in `s` waited for at its end
   around, nor leaves it by `break`, `continue` or `return`; a `return`
   in it ends the body.
 - The world the body runs in is the binder's to say. A file's body is
-  in the block's world. A cown's body, or an await's, is a behaviour,
-  run later on another domain: it is in the scheduler's world,
-  `BOC.boc w <+> w`, and none of the handlers around the `with` (a
-  `try`, another `with`'s resource) is around it. What it needs, it
-  opens itself or is given as a value. cml's threads are the same: a
-  `CML.spawn` takes a computation of `CML.cml w <+> Custodian.custodian <+> w`.
+  in the block's world. A cown's body is a behaviour, run later on
+  another thread, and in the block's world too: the `with`'s operation
+  holds it, and the handlers between the `with` and the program's world
+  map it as they map any computation an operation holds, where the
+  `with` is, not where it runs. What it needs that the world does not
+  give, it is given as a value. cml's threads are a scheduler's: a
+  `CML.spawn` takes a computation of `CML.cml w <+> Custodian.custodian <+> w`,
+  closed, none of the handlers around it around it.
 - Its value is what the handler says: a file's `with` comes to what its
   body came to, a cown's to `()` (the behaviour runs later), cml's
   threads' to `Just` main's answer (`Nothing` where every thread
@@ -518,9 +513,9 @@ import boc as BOC
 
 -- | `n` taken from the stock once it has `n`: until then, the behaviour
 -- | lets go of the cown and waits for another to write it
-taken : {e w : HFunctor}
-      -> {{bc : BOC.boc w <: e}}
-      -> BOC.Cown w Int
+taken : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> BOC.Cown Int
       -> Int
       -> Co e Unit
 taken stock n = do
