@@ -59,8 +59,15 @@ lendingPrim _ = False
 -- then lent too, and so is what is set in it.  The caller keeps its reference; the callee counts none.  A
 -- parameter one of whose matches builds a tag of the matched one's size
 -- stays given (its cell is reused there), and so does one a loop (a call
--- of itself) would be given a value held.  Every parameter is lent at
--- first; what is not is taken away until nothing changes.
+-- of itself) would be given a value held.  A loop's parameter that
+-- every step of it is lent -- the loop holds the value from one step to
+-- the next -- is lent too, though a step gives it away: that step takes
+-- a reference of its own (heff.compile.refcount's dup of what is lent),
+-- where a given one would have the step before it take one for it, and
+-- the steps that do not give it away drop it.  (A cown a loop sends to,
+-- one of four each step: one count where it was four and three drops.)
+-- Every parameter is lent at first; what is not is taken away until
+-- nothing changes.
 
 isVar : String -> IR.Expr -> Bool
 isVar p (EVar x) = strEq p x
@@ -208,6 +215,17 @@ lentVars lp ds (ELet x a b) =
 lentVars lp ds (ESet _ a b) = List.append (lentVars lp ds a) (lentVars lp ds b)
 lentVars lp ds _ = Nil
 
+-- (what a step of a loop may give a parameter it is lent: one of `ds`,
+-- or a literal that counts no reference, as heff.compile.refcount's
+-- `uncounted` has them, nothing dropped after the call -- what a cycle gives the
+-- parameters of another of its functions, never read (heff.compile.cycles's
+-- pads))
+held : List String -> IR.Expr -> Bool
+held ds (EStr _) = True
+held ds (EInt n) = 0 - 1152921504606846976 < n && n < 1152921504606846976
+held ds (ETag _ [] _) = True
+held ds a = List.any (\d -> isVar d a) ds
+
 -- (each call of `key` given at `i` one of `ds` -- not under a lambda: a
 -- call there is the closure's, no step of the loop (no jump back to its
 -- start), and a value it holds given there it drops after the call, as
@@ -217,7 +235,7 @@ loopLent : String -> Int -> List String -> IR.Expr -> Bool
 loopLent key i ds (ECall g args) =
   (not (strEq g key)
    || List.all
-     (\pr -> not (snd pr == i) || List.any (\d -> isVar d (fst pr)) ds)
+     (\pr -> not (snd pr == i) || held ds (fst pr))
      (indexedE args))
   && List.all (loopLent key i ds) args
 loopLent key i ds (EMatch s arms) =
@@ -234,6 +252,23 @@ loopLent key i ds (EPrimCall _ args) = List.all (loopLent key i ds) args
 loopLent key i ds (ELam _ _) = True
 loopLent key i ds _ = True
 
+-- (whether a call of `key` is in it, not under a lambda: a step of the
+-- loop, as `loopLent` reads one)
+steps : String -> IR.Expr -> Bool
+steps key (ECall g args) = strEq g key || List.any (steps key) args
+steps key (EMatch s arms) =
+  steps key s || List.any (\a -> steps key (IR.armBody a)) arms
+steps key (ELet _ a b) = steps key a || steps key b
+steps key (ETag _ args _) = List.any (steps key) args
+steps key (EApp f args) = List.any (steps key) (f :: args)
+steps key (EBool c) = List.any (steps key) (IR.condParts c)
+steps key (ESet _ a b) = steps key a || steps key b
+steps key (EValues es) = List.any (steps key) es
+steps key (ERecord fs _) = List.any (\f -> steps key (snd f)) fs
+steps key (EProj e _ _ _) = steps key e
+steps key (EPrimCall _ args) = List.any (steps key) args
+steps key _ = False
+
 lentAt : OrdMap.OrdMap String (List Int)
        -> String
        -> List String
@@ -242,7 +277,10 @@ lentAt : OrdMap.OrdMap String (List Int)
        -> Int
        -> Bool
 lentAt bor key xs b ds i = case List.drop i xs of
-  p :: _ -> onlyLent bor p b && not (reuses p b) && loopLent key i ds b
+  p :: _ ->
+    (onlyLent bor p b || steps key b)
+    && not (reuses p b)
+    && loopLent key i ds b
   [] -> False
 
 borDef : OrdMap.OrdMap String (List Int)
