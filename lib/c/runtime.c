@@ -2032,9 +2032,19 @@ HEFF_FN V heff_bounce(V f, int n, V *a) {
   return (V)b;
 }
 
-// (a call last: counted, and every so often a bounce)
+// (a closure taking exactly the `n` arguments at `a`, not a thunk forced:
+// what `heff_apply` calls at once, as it is)
+static inline int heff_called_as(V f, int n, V *a) {
+  Clo *c = (Clo *)f;
+  return c->h.kind == K_CLO && c->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit));
+}
+
+// (a call last: counted, and every so often a bounce; a closure taking
+// exactly its arguments called where the call is, as `heff_apply` would
+// call it, without the call of it)
 static inline V heff_tail(V f, int n, V *a) {
   if (++heff_dep > 500) return heff_bounce(f, n, a);
+  if (HEFF_LIKELY(heff_called_as(f, n, a))) return ((Clo *)f)->fn(f, a);
   return heff_apply(f, n, a);
 }
 
@@ -2134,7 +2144,10 @@ HEFF_FN V heff_apply(V f, int n, V *a) {
   }
 }
 
-static inline V heff_app1(V f, V x) { return heff_apply(f, 1, &x); }
+static inline V heff_app1(V f, V x) {
+  if (HEFF_LIKELY(heff_called_as(f, 1, &x))) return ((Clo *)f)->fn(f, &x);
+  return heff_apply(f, 1, &x);
+}
 
 // (a call not last of an unknown function: a closure taking exactly the
 // arguments given, and not a thunk forced, called at once, where the
