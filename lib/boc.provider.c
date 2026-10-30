@@ -837,13 +837,19 @@ static HEFF_TLS BcAct *bc_inbox, *bc_inbox_last;
 static HEFF_TLS int64_t bc_group;
 static HEFF_TLS int bc_holding;
 
-// (the act given this worker, counted its pool's until it is started)
+// (the act given this worker, counted its pool's until it is started.
+// Given it by an act's rest, which runs as the worker looks at its
+// reactor, the look comes back, not waiting on, so that the act starts
+// now -- not once an act of the worker's is done)
 static void bc_inboxed(BcPool *pl, BcAct *a) {
   atomic_fetch_add_explicit(&pl->live, 1, memory_order_acq_rel);
   a->next = NULL;
   if (bc_inbox_last) bc_inbox_last->next = a;
   else bc_inbox = a;
   bc_inbox_last = a;
+#ifndef _WIN32
+  if (bc_polling) heff_woken = 1;
+#endif
 }
 
 // (an act awaited where no worker of its pool is: a behaviour on no
