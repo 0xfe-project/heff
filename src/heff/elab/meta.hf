@@ -65,7 +65,7 @@ blockedTy a0 = do
 type Unsolved = { name : String, span : Params.Span }
 
 keepUnsolved : List Unsolved -> Value.MetaEntry -> List Unsolved
-keepUnsolved acc e@{ sol = Nothing } = Cons { name = e.name, span = e.span } acc
+keepUnsolved acc e@{ sol = Nothing } = { name = e.name, span = e.span } :: acc
 keepUnsolved acc { sol = Just _ } = acc
 
 -- | the metavariables that were created and never solved
@@ -82,9 +82,8 @@ keepFailed p (Left _) =
   modify
     (\c ->
        setPostponed
-         (Cons
-            { shape = p.shape, left = p.left, right = p.right, failed = True }
-            c.postponed)
+         ({ shape = p.shape, left = p.left, right = p.right, failed = True }
+          :: c.postponed)
          c)
 keepFailed p (Right _) = pure MkUnit
 
@@ -120,8 +119,8 @@ attempt m = do
   undoIfFailed before waiting r
 
 retryEach : Globals.Globals -> List Postponed -> Elab Unit
-retryEach g Nil = pure MkUnit
-retryEach g (Cons p rest) = do
+retryEach g [] = pure MkUnit
+retryEach g (p :: rest) = do
   r <-
     attempt
       (liftU
@@ -156,13 +155,13 @@ delayedReady mc all (MkDelayed ty chk gs) =
   all || not (Unify.isFlexTy (Value.forceTy mc ty))
 
 anyDelayed : Value.MetaCtx -> List (Delayed ElabSt) -> Bool
-anyDelayed mc Nil = False
-anyDelayed mc (Cons d rest) = delayedReady mc False d || anyDelayed mc rest
+anyDelayed mc [] = False
+anyDelayed mc (d :: rest) = delayedReady mc False d || anyDelayed mc rest
 
 resolveKept : List (Pair Bool (Wanted ElabSt)) -> List (Wanted ElabSt)
-resolveKept Nil = Nil
-resolveKept (Cons (MkPair True _) rest) = resolveKept rest
-resolveKept (Cons (MkPair False w) rest) = Cons w (resolveKept rest)
+resolveKept [] = Nil
+resolveKept (MkPair True _ :: rest) = resolveKept rest
+resolveKept (MkPair False w :: rest) = w :: resolveKept rest
 
 resolveAny : List (Pair Bool (Wanted ElabSt)) -> Bool
 resolveAny rs = List.any (\(p : Pair Bool (Wanted ElabSt)) -> fst p) rs
@@ -194,8 +193,8 @@ catchStep h (MkPair (Right x) st) = MkPair (Right x) st
 
 -- (the delayed checks, oldest first)
 runEachS : List (Delayed ElabSt) -> Step Unit
-runEachS Nil = \st -> MkPair (Right MkUnit) st
-runEachS (Cons (MkDelayed ty chk gs) rest) = \st ->
+runEachS [] = \st -> MkPair (Right MkUnit) st
+runEachS (MkDelayed ty chk gs :: rest) = \st ->
     bindStep (chk st) (\u -> runEachS rest)
 
 readyIn : Bool -> ElabSt -> List (Delayed ElabSt)
@@ -227,8 +226,8 @@ guessOf mc (MkDelayed ty chk gs) =
 -- | the guess of the first of the delayed checks (oldest first) that has
 -- | one and still waits, made; if it is not made, the next one's
 guessS : List (Delayed ElabSt) -> Step Bool
-guessS Nil = \st -> MkPair (Right False) st
-guessS (Cons d rest) = \st -> case guessOf (core st).metas d of
+guessS [] = \st -> MkPair (Right False) st
+guessS (d :: rest) = \st -> case guessOf (core st).metas d of
   Just gs ->
     bindStep
       (gs st)
@@ -258,15 +257,14 @@ resolveListS : (Step Bool -> Step Bool)
              -> Bool
              -> List (Wanted ElabSt)
              -> Step (List (Pair Bool (Wanted ElabSt)))
-resolveListS tried final Nil = \st -> MkPair (Right Nil) st
-resolveListS tried final (Cons (MkWanted sp f) rest) = \st ->
+resolveListS tried final [] = \st -> MkPair (Right Nil) st
+resolveListS tried final (MkWanted sp f :: rest) = \st ->
     bindStep
       (tried (f final) st)
       (\done st2 ->
          bindStep
            (resolveListS tried final rest st2)
-           (\rs st3 ->
-              MkPair (Right (Cons (MkPair done (MkWanted sp f)) rs)) st3))
+           (\rs st3 -> MkPair (Right (MkPair done (MkWanted sp f) :: rs)) st3))
 
 -- | each wanted instance tried (as `tried` says); those found dropped
 resolveByS : (Step Bool -> Step Bool) -> Bool -> Step Bool
@@ -309,11 +307,11 @@ exceptionAlg (Catch c h) = \st -> catchStep h (c st)
 
 deferAlg : {a : Type} -> DeferF Step a -> Step a
 deferAlg (Delay ty c x) = \st ->
-    MkPair (Right x) (withDelayed (\ds -> Cons (MkDelayed ty c Nothing) ds) st)
+    MkPair (Right x) (withDelayed (\ds -> MkDelayed ty c Nothing :: ds) st)
 deferAlg (DelayGuessing ty c gs x) = \st ->
     MkPair
       (Right x)
-      (withDelayed (\ds -> Cons (MkDelayed ty c (Just gs)) ds) st)
+      (withDelayed (\ds -> MkDelayed ty c (Just gs) :: ds) st)
 deferAlg (Guess k) = \st ->
     bindStep
       (guessS (List.reverse (delayedOf st)) st)
@@ -323,7 +321,7 @@ deferAlg (CanGuess k) = \st ->
 deferAlg (Want sp f x) = \st ->
     MkPair
       (Right x)
-      (withWanted (\ws -> List.append ws (Cons (MkWanted sp f) Nil)) st)
+      (withWanted (\ws -> List.append ws [MkWanted sp f]) st)
 deferAlg (Wake all x) = \st ->
     bindStep (wakeResolveS all st) (\u st2 -> MkPair (Right x) st2)
 deferAlg (Resolve final k) = \st ->
@@ -397,8 +395,8 @@ approximated (Left _) = False
 -- | first-order approximation solves (`Unify.approximate`, #88), solved;
 -- | one that failed holds a contradiction, and is left as it is
 approximateFirst : Globals.Globals -> List Postponed -> Elab Bool
-approximateFirst g Nil = pure False
-approximateFirst g (Cons p rest) =
+approximateFirst g [] = pure False
+approximateFirst g (p :: rest) =
   if p.failed then approximateFirst g rest
   else do
     r <-

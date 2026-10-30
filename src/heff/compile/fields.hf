@@ -38,12 +38,12 @@ import heff.elab.primitive
 import std.ordmap as OrdMap
 
 elemS : String -> List String -> Bool
-elemS x Nil = False
-elemS x (Cons y ys) = strEq x y || elemS x ys
+elemS x [] = False
+elemS x (y :: ys) = strEq x y || elemS x ys
 
 sameLabels : List String -> List String -> Bool
-sameLabels Nil Nil = True
-sameLabels (Cons a xs) (Cons b ys) = strEq a b && sameLabels xs ys
+sameLabels [] [] = True
+sameLabels (a :: xs) (b :: ys) = strEq a b && sameLabels xs ys
 sameLabels _ _ = False
 
 -- What is read
@@ -61,38 +61,37 @@ type Read = { l : String, sh : List String, t : IR.FieldTy }
 
 -- (an arm's body, unless it binds `v` again)
 armOwn : String -> IR.Arm -> List IR.Expr -> List IR.Expr
-armOwn v (MkArm _ vs b) rest = if elemS v vs then rest else Cons b rest
+armOwn v (MkArm _ vs b) rest = if elemS v vs then rest else b :: rest
 
 -- (the fields of `v` the worklist reads, onto `acc`: none where it uses
 -- `v` whole, updates it, or reads it at no shape known; not under a
 -- binding of `v` again)
 readsW : String -> List Read -> List IR.Expr -> Maybe (List Read)
-readsW v acc Nil = Just acc
-readsW v acc (Cons (EProj (EVar y) l sh t) rest) =
+readsW v acc [] = Just acc
+readsW v acc (EProj (EVar y) l sh t :: rest) =
   if not (strEq y v) then readsW v acc rest
   else if List.null sh then Nothing
-  else readsW v (Cons { l = l, sh = sh, t = t } acc) rest
-readsW v acc (Cons (EVar y) rest) =
-  if strEq y v then Nothing else readsW v acc rest
-readsW v acc (Cons (ELam xs b) rest) =
-  readsW v acc (if elemS v xs then rest else Cons b rest)
-readsW v acc (Cons (ELet x a b) rest) =
-  readsW v acc (Cons a (if strEq x v then rest else Cons b rest))
-readsW v acc (Cons (ERecord fs _) rest) =
+  else readsW v ({ l = l, sh = sh, t = t } :: acc) rest
+readsW v acc (EVar y :: rest) = if strEq y v then Nothing else readsW v acc rest
+readsW v acc (ELam xs b :: rest) =
+  readsW v acc (if elemS v xs then rest else b :: rest)
+readsW v acc (ELet x a b :: rest) =
+  readsW v acc (a :: (if strEq x v then rest else b :: rest))
+readsW v acc (ERecord fs _ :: rest) =
   if List.any (keptOf v (List.map fst fs)) fs then Nothing
   else readsW v acc (IR.pushFields fs rest)
-readsW v acc (Cons (EMatch s arms) rest) =
-  readsW v acc (Cons s (List.foldr (armOwn v) rest arms))
-readsW v acc (Cons (ESet xs a b) rest) =
-  readsW v acc (Cons a (if elemS v xs then rest else Cons b rest))
-readsW v acc (Cons e rest) = readsW v acc (IR.partsOnto e rest)
+readsW v acc (EMatch s arms :: rest) =
+  readsW v acc (s :: List.foldr (armOwn v) rest arms)
+readsW v acc (ESet xs a b :: rest) =
+  readsW v acc (a :: (if elemS v xs then rest else b :: rest))
+readsW v acc (e :: rest) = readsW v acc (IR.partsOnto e rest)
 
 -- (each label once, in the order first read)
 labelsOnce : List Read -> List Read -> List Read
-labelsOnce acc Nil = List.reverse acc
-labelsOnce acc (Cons r rs) =
+labelsOnce acc [] = List.reverse acc
+labelsOnce acc (r :: rs) =
   if List.any (\(q : Read) -> strEq q.l r.l) acc then labelsOnce acc rs
-  else labelsOnce (Cons r acc) rs
+  else labelsOnce (r :: acc) rs
 
 -- (a type whose values a record may keep flat: a number)
 number : IR.FieldTy -> Bool
@@ -100,10 +99,10 @@ number t = not (Repr.isBoxed (Repr.flatOf t))
 
 -- (each label read once, the reads all of one shape)
 oneShape : List Read -> List Read
-oneShape Nil = Nil
-oneShape (Cons r rs) =
+oneShape [] = Nil
+oneShape (r :: rs) =
   if List.all (\(q : Read) -> sameLabels q.sh r.sh) rs
-  then labelsOnce Nil (List.reverse (Cons r rs))
+  then labelsOnce Nil (List.reverse (r :: rs))
   else Nil
 
 -- (the fields of `v` to read where it is bound, of those it reads: two
@@ -123,14 +122,14 @@ toRead rs =
 -- `acc`)
 numberOf : IR.Expr -> List String -> List String
 numberOf (EProj (EVar y) _ sh t) acc =
-  if number t && not (List.null sh) && not (elemS y acc) then Cons y acc
+  if number t && not (List.null sh) && not (elemS y acc) then y :: acc
   else acc
 numberOf e acc = acc
 
 -- (... the worklist reads)
 numbersW : List String -> List IR.Expr -> List String
-numbersW acc Nil = acc
-numbersW acc (Cons e rest) = numbersW (numberOf e acc) (IR.partsOnto e rest)
+numbersW acc [] = acc
+numbersW acc (e :: rest) = numbersW (numberOf e acc) (IR.partsOnto e rest)
 
 -- | how a variable held for more than its fields is used: the fields
 -- | read of it, those read after it is held -- used whole, updated, or
@@ -143,8 +142,8 @@ heldOf u = { reads = u.reads, late = u.late, holds = u.holds + 1, now = True }
 
 readOf : Read -> Uses -> Uses
 readOf r u =
-  { reads = Cons r u.reads
-  , late = if u.now then Cons r u.late else u.late
+  { reads = r :: u.reads
+  , late = if u.now then r :: u.late else u.late
   , holds = u.holds
   , now = u.now
   }
@@ -162,25 +161,24 @@ unkept v ls fs = List.map snd (List.keepIf (\f -> not (keptOf v ls f)) fs)
 -- would be held by the lambda.  Each arm is walked from where its match
 -- is.)
 usesW : String -> Uses -> List IR.Expr -> Uses
-usesW v u Nil = u
-usesW v u (Cons (EProj (EVar y) l sh t) rest) =
+usesW v u [] = u
+usesW v u (EProj (EVar y) l sh t :: rest) =
   if not (strEq y v) then usesW v u rest
   else if List.null sh then usesW v (heldOf u) rest
   else usesW v (readOf { l = l, sh = sh, t = t } u) rest
-usesW v u (Cons (EVar y) rest) =
-  usesW v (if strEq y v then heldOf u else u) rest
-usesW v u (Cons (ELam xs b) rest) =
+usesW v u (EVar y :: rest) = usesW v (if strEq y v then heldOf u else u) rest
+usesW v u (ELam xs b :: rest) =
   if elemS v xs then usesW v u rest
   else let r : Uses = usesW v (nowAs True u) [b]
        in usesW v (nowAs (u.now || r.holds > u.holds) r) rest
-usesW v u (Cons (ELet x a b) rest) =
-  usesW v u (Cons a (if strEq x v then rest else Cons b rest))
-usesW v u (Cons (ERecord fs _) rest) =
+usesW v u (ELet x a b :: rest) =
+  usesW v u (a :: (if strEq x v then rest else b :: rest))
+usesW v u (ERecord fs _ :: rest) =
   let ls = List.map fst fs
   in if List.any (keptOf v ls) fs
   then usesW v (heldOf (usesW v u (unkept v ls fs))) rest
   else usesW v u (IR.pushFields fs rest)
-usesW v u (Cons (EMatch s arms) rest) =
+usesW v u (EMatch s arms :: rest) =
   let at : Uses = usesW v u [s]
   in let after : Uses =
     List.foldl
@@ -190,9 +188,9 @@ usesW v u (Cons (EMatch s arms) rest) =
       (nowAs False at)
       arms
   in usesW v after rest
-usesW v u (Cons (ESet xs a b) rest) =
-  usesW v u (Cons a (if elemS v xs then rest else Cons b rest))
-usesW v u (Cons e rest) = usesW v u (IR.partsOnto e rest)
+usesW v u (ESet xs a b :: rest) =
+  usesW v u (a :: (if elemS v xs then rest else b :: rest))
+usesW v u (e :: rest) = usesW v u (IR.partsOnto e rest)
 
 -- (whether the label is read after the variable is held, and only as a
 -- number)
@@ -219,8 +217,8 @@ boundOf r = \n -> case IR.fresh r.l n of
   MkPair x n2 -> MkPair { r = r, x = x } n2
 
 boundAt : List Bound -> String -> Maybe String
-boundAt Nil l = Nothing
-boundAt (Cons b bs) l = if strEq b.r.l l then Just b.x else boundAt bs l
+boundAt [] l = Nothing
+boundAt (b :: bs) l = if strEq b.r.l l then Just b.x else boundAt bs l
 
 -- (`e`, each read of `v` the variable it is bound to; not under a
 -- binding of `v` again)
@@ -242,8 +240,8 @@ readIn v bs e = IR.mapParts (\xs p -> if elemS v xs then p else readIn v bs p) e
 
 -- (the reads, bound in front of `e`)
 letsOf : String -> List Bound -> IR.Expr -> IR.Expr
-letsOf v Nil e = e
-letsOf v (Cons b bs) e =
+letsOf v [] e = e
+letsOf v (b :: bs) e =
   ELet b.x (EProj (EVar v) b.r.l b.r.sh b.r.t) (letsOf v bs e)
 
 -- (the reads that `e` makes)
@@ -262,7 +260,7 @@ placed v bs e = letsOf v bs e
 -- (`b`, where `v` is bound: the fields `rs` read there, in front of it
 -- -- or, `held`, in the arms reading them of a match there)
 readsBy : Bool -> List Read -> String -> IR.Expr -> S IR.Expr
-readsBy held Nil v b = pure b
+readsBy held [] v b = pure b
 readsBy held rs v b = do
   bs <- traverseS boundOf rs
   pure
@@ -277,8 +275,8 @@ readAt b v = case readsW v Nil [b] of
 
 -- (... where the variables `xs` are bound)
 readsAt : List String -> IR.Expr -> S IR.Expr
-readsAt Nil b = pure b
-readsAt (Cons x xs) b = do
+readsAt [] b = pure b
+readsAt (x :: xs) b = do
   b2 <- readAt b x
   readsAt xs b2
 
@@ -301,8 +299,8 @@ lateAt ns b v =
   else pure b
 
 latesAt : List String -> List String -> IR.Expr -> S IR.Expr
-latesAt ns Nil b = pure b
-latesAt ns (Cons x xs) b = do
+latesAt ns [] b = pure b
+latesAt ns (x :: xs) b = do
   b2 <- lateAt ns b x
   latesAt ns xs b2
 
@@ -313,7 +311,7 @@ goLate ns e = IR.traverseParts (\xs p -> bind (goLate ns p) (latesAt ns xs)) e
 
 -- (... where numbers are read)
 lateIn : List String -> IR.Expr -> S IR.Expr
-lateIn Nil e = pure e
+lateIn [] e = pure e
 lateIn ns e = goLate ns e
 
 defOf : IR.Def -> S IR.Def

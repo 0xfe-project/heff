@@ -79,7 +79,7 @@ failingWith : {e : HFunctor}
             -> {{chk : check <: e}}
             -> List String
             -> Co e Unit
-failingWith Nil = pure MkUnit
+failingWith [] = pure MkUnit
 failingWith msgs = failure (joinWith "\n" msgs)
 
 -- | whether the environment variable is set, and not empty
@@ -160,7 +160,7 @@ buildC cs zig bin flags = do
             (List.append
                flags
                (List.append
-                  (Cons "-w" cs)
+                  ("-w" :: cs)
                   [bin ^ "-runtime.o", "-o", bin, "-lm", "-lpthread"]))
       , timeout = 300000
       }
@@ -190,17 +190,17 @@ wordStart s from i =
 droppedFrom : String -> String -> Int -> List String -> String
 droppedFrom tag s from pieces = case indexOf (" = " ^ tag) s from of
   Nothing ->
-    joinWith "" (List.reverse (Cons (strSlice s from (strLength s)) pieces))
+    joinWith "" (List.reverse (strSlice s from (strLength s) :: pieces))
   Just i ->
     if wordStart s from i == i
-    then droppedFrom tag s (i + 1) (Cons (strSlice s from (i + 1)) pieces)
+    then droppedFrom tag s (i + 1) (strSlice s from (i + 1) :: pieces)
     else droppedFrom
         tag
         s
         (if startsWith ", " (strSlice s (i + 3 + strLength tag) (strLength s))
          then i + 5 + strLength tag
          else i + 3 + strLength tag)
-        (Cons (strSlice s from (wordStart s from i)) pieces)
+        (strSlice s from (wordStart s from i) :: pieces)
 
 -- | each `x`, in `s`, `y`
 -- | >>> replaced ", }" " }" "{ a = 1, }"
@@ -248,25 +248,23 @@ entry l more = case indexOf " = " l 0 of
          " "
          (List.keepIf
             (\x -> not (strEq x ""))
-            (Cons
-               (trim (strSlice l (i + 3) (strLength l)))
-               (List.map trim more))))
+            (trim (strSlice l (i + 3) (strLength l)) :: List.map trim more)))
   Nothing -> MkPair l ""
 
 -- (the lines from a definition's, gathered, `more` backwards)
 entriesFrom : String -> List String -> List String -> List (Pair String String)
-entriesFrom l more Nil = [entry l (List.reverse more)]
-entriesFrom l more (Cons x rest) =
-  if begins x then Cons (entry l (List.reverse more)) (entriesFrom x Nil rest)
-  else entriesFrom l (Cons x more) rest
+entriesFrom l more [] = [entry l (List.reverse more)]
+entriesFrom l more (x :: rest) =
+  if begins x then entry l (List.reverse more) :: entriesFrom x Nil rest
+  else entriesFrom l (x :: more) rest
 
 -- | what `heff dump-eval` says, each definition's name and value
 -- | >>> evaluated "a = 1\nb = { x = 1,\n  y = 2 }\n"
 -- | [MkPair "a" "1", MkPair "b" "{ x = 1, y = 2 }"]
 evaluated : String -> List (Pair String String)
 evaluated out = case List.keepIf (\l -> not (strEq (trim l) "")) (lines out) of
-  Nil -> Nil
-  Cons l rest -> entriesFrom l Nil rest
+  [] -> Nil
+  l :: rest -> entriesFrom l Nil rest
 
 -- | a file's name, without its directory and its `.hf`
 -- | >>> baseName "test/programs/add.hf"
@@ -352,30 +350,29 @@ shownBy JavaScript file base wanted = do
   root <- given "HEFF_TEST_ROOT"
   r <- heffIn root ["compile", file, base ^ ".mjs", "--backend=esm"]
   if not (succeeded r) then pure (Left ("NOT COMPILED: " ^ said r))
-    else do
-      loaded <-
-        run
-          { command = "node"
-          , args =
-              List.append [root ^ "/test/load-js.mjs", base ^ ".mjs"] wanted
-          , timeout = 30000
-          }
-      pure
-          (if succeeded loaded then Right loaded.out
-           else Left ("LOAD FAILED: " ^ said loaded))
+  else do
+    loaded <-
+      run
+        { command = "node"
+        , args = List.append [root ^ "/test/load-js.mjs", base ^ ".mjs"] wanted
+        , timeout = 30000
+        }
+    pure
+        (if succeeded loaded then Right loaded.out
+         else Left ("LOAD FAILED: " ^ said loaded))
 shownBy C file base wanted = do
   root <- given "HEFF_TEST_ROOT"
   r <- heffIn root ["dump-c", file, base ^ ".c"]
   if not (succeeded r) then pure (Left ("NOT COMPILED: " ^ said r))
-    else do
-      b <- buildC [base ^ ".c"] (base ^ ".zig") base Nil
-      case b of
-        Just why -> pure (Left ("NOT BUILT: " ^ why))
-        Nothing -> do
-          loaded <- run { command = base, args = wanted, timeout = 30000 }
-          pure
-              (if succeeded loaded then Right loaded.out
-               else Left ("LOAD FAILED: " ^ said loaded))
+  else do
+    b <- buildC [base ^ ".c"] (base ^ ".zig") base Nil
+    case b of
+      Just why -> pure (Left ("NOT BUILT: " ^ why))
+      Nothing -> do
+        loaded <- run { command = base, args = wanted, timeout = 30000 }
+        pure
+            (if succeeded loaded then Right loaded.out
+             else Left ("LOAD FAILED: " ^ said loaded))
 
 -- | the program of the file compiled by the backend, each definition
 -- | held to the interpreter's value of it
@@ -394,32 +391,32 @@ heldTo file be = do
   bugs <-
     pure (List.keepIf (\l -> contains " = <compiler bug: " l) (lines ev.out))
   if not (List.null bugs) then failure ("COMPILER BUG:\n" ^ joinWith "\n" bugs)
-    else if not (succeeded ev) then failure ("NOT EVALUATED: " ^ said ev)
-    else do
-      interp <- pure (evaluated ev.out)
-      -- (what the interpreter found to diverge is not read: compiled,
-      -- with its loops as loops, it may run for ever)
-      wanted <-
-        pure
-          (List.map
-             (\p -> fst p)
-             (List.keepIf (\p -> not (strEq (snd p) "<diverged>")) interp))
-      working <- workingDir
-      let here = show working
-      -- (named by its file and its backend: the C compiler's
-      -- temporary files are named by what it makes, and many are made
-      -- at once)
-      shown <-
-        shownBy
-          be
-          file
-          (here ^ "/" ^ baseName file ^ "-" ^ backendName be)
-          wanted
-      case shown of
-        Left why -> failure why
-        Right out -> case JSON.parse out of
-          Left err -> failure ("not JSON: " ^ out)
-          Right j -> failingWith (diffs (backendName be) j interp)
+  else if not (succeeded ev) then failure ("NOT EVALUATED: " ^ said ev)
+  else do
+    interp <- pure (evaluated ev.out)
+    -- (what the interpreter found to diverge is not read: compiled,
+    -- with its loops as loops, it may run for ever)
+    wanted <-
+      pure
+        (List.map
+           (\p -> fst p)
+           (List.keepIf (\p -> not (strEq (snd p) "<diverged>")) interp))
+    working <- workingDir
+    let here = show working
+    -- (named by its file and its backend: the C compiler's
+    -- temporary files are named by what it makes, and many are made
+    -- at once)
+    shown <-
+      shownBy
+        be
+        file
+        (here ^ "/" ^ baseName file ^ "-" ^ backendName be)
+        wanted
+    case shown of
+      Left why -> failure why
+      Right out -> case JSON.parse out of
+        Left err -> failure ("not JSON: " ^ out)
+        Right j -> failingWith (diffs (backendName be) j interp)
 
 -- (the backends of a program: the browser's modules are JavaScript's, a
 -- C program refuses them)
@@ -436,8 +433,8 @@ eachBackend : {e : HFunctor}
             -> String
             -> List Backend
             -> Co e Unit
-eachBackend file Nil = pure MkUnit
-eachBackend file (Cons be rest) = do
+eachBackend file [] = pure MkUnit
+eachBackend file (be :: rest) = do
   subtest (backendName be) (heldTo file be)
   eachBackend file rest
 
@@ -450,8 +447,8 @@ eachProgram : {e : HFunctor}
             -> String
             -> List String
             -> Co e Unit
-eachProgram dir Nil = pure MkUnit
-eachProgram dir (Cons f rest) = do
+eachProgram dir [] = pure MkUnit
+eachProgram dir (f :: rest) = do
   subtest f (do
     src <- readFile (dir ^ "/" ^ f)
     eachBackend (dir ^ "/" ^ f) (backendsOf src))
@@ -555,11 +552,11 @@ genArgs : {e : HFunctor}
         -> Maybe Fn
         -> Int
         -> Co e (List String)
-genArgs ex Nil env depth self ind = pure Nil
-genArgs ex (Cons t rest) env depth self ind = do
+genArgs ex [] env depth self ind = pure Nil
+genArgs ex (t :: rest) env depth self ind = do
   x <- ex t env depth self ind
   xs <- genArgs ex rest env depth self ind
-  pure (Cons x xs)
+  pure (x :: xs)
 
 -- (a call of a function, its arguments made)
 called : {e : HFunctor}
@@ -586,8 +583,8 @@ genArms : {e : HFunctor}
         -> Maybe Fn
         -> Int
         -> Co e (List String)
-genArms ex ty s Nil i env depth self col = pure Nil
-genArms ex ty s (Cons c rest) i env depth self col = do
+genArms ex ty s [] i env depth self col = pure Nil
+genArms ex ty s (c :: rest) i env depth self col = do
   names <-
     pure
       (List.map
@@ -601,13 +598,12 @@ genArms ex ty s (Cons c rest) i env depth self col = do
   body <- ex ty env2 (depth - 1) self col
   others <- genArms ex ty s rest (i + 1) env depth self col
   pure
-      (Cons
-         (spaces col
-          ^ fst c
-          ^ joinWith "" (List.map (\n -> " " ^ n) names)
-          ^ " -> "
-          ^ body)
-         others)
+      ((spaces col
+        ^ fst c
+        ^ joinWith "" (List.map (\n -> " " ^ n) names)
+        ^ " -> "
+        ^ body)
+       :: others)
 
 -- (a `case` of a variable in scope: an alternative each of its
 -- constructors, its fields named, on lines of their own)
@@ -661,9 +657,9 @@ ctorOf : {e : HFunctor}
 ctorOf ex cs env depth self ind = do
   c <- pick (MkPair "abandon" Nil) cs
   if List.null (snd c) then pure (fst c)
-    else do
-      xs <- genArgs ex (snd c) env depth self ind
-      pure (fst c ^ " " ^ joinWith " " (List.map paren xs))
+  else do
+    xs <- genArgs ex (snd c) env depth self ind
+    pure (fst c ^ " " ^ joinWith " " (List.map paren xs))
 
 -- (a call of one of the functions)
 callOf : {e : HFunctor}
@@ -758,7 +754,7 @@ genArgTys choices n =
   else do
     t <- pick IntTy choices
     ts <- genArgTys choices (n - 1)
-    pure (Cons t ts)
+    pure (t :: ts)
 
 -- (constructors of the `i`th sum type, `C{i}{j}` from `j`)
 genCtors : {e : HFunctor}
@@ -774,7 +770,7 @@ genCtors choices i j n =
     k <- between 0 2
     argv <- genArgTys choices k
     rest <- genCtors choices i (j + 1) n
-    pure (Cons (MkPair ("C" ^ debug i ^ debug j) argv) rest)
+    pure (MkPair ("C" ^ debug i ^ debug j) argv :: rest)
 
 -- (the sum types from the `i`th, `n` of them, after these)
 genSums : {e : HFunctor}
@@ -835,39 +831,39 @@ genTheory : {e : HFunctor}
 genTheory sums = do
   has <- chance 70
   if not has then pure Nil
-    else do
-      carrier <- pick IntTy (List.map (\(s : SumTy) -> Sum s.name) sums)
-      env <- pure [{ name = "x", ty = carrier }, { name = "y", ty = carrier }]
-      op <- genExpr sums Nil carrier env 2 Nothing 2
-      picked <- genExpr sums Nil (Sum "Bool") (List.take 1 env) 2 Nothing 2
-      spec <- chance 50
-      use <- chance 60
-      used <- genExpr sums Nil carrier Nil 2 Nothing 2
-      pure
-          (List.append
-             [ "theory Th where\n  t : Type\n  op : t -> t -> t\n  pick : t -> Bool\n"
-             , "Inst : Th\nInst = { t = "
-             ^ tyStr carrier
-             ^ ", op = \\x y -> "
-             ^ op
-             ^ ", pick = \\x -> "
-             ^ picked
-             ^ " }\n"
-             ]
-             (List.append
-                (if spec
-                 then [ "Spec : Th @ { t = "
-                      ^ tyStr carrier
-                      ^ " }\nSpec = Inst\n"
-                      ]
-                 else Nil)
-                (if use
-                 then [ "useTh : (m : Th) -> m.t -> Bool\nuseTh m a = m.pick (m.op a a)\n"
-                      , "usedTh : Bool\nusedTh = useTh Inst "
-                      ^ paren used
-                      ^ "\n"
-                      ]
-                 else Nil)))
+  else do
+    carrier <- pick IntTy (List.map (\(s : SumTy) -> Sum s.name) sums)
+    env <- pure [{ name = "x", ty = carrier }, { name = "y", ty = carrier }]
+    op <- genExpr sums Nil carrier env 2 Nothing 2
+    picked <- genExpr sums Nil (Sum "Bool") (List.take 1 env) 2 Nothing 2
+    spec <- chance 50
+    use <- chance 60
+    used <- genExpr sums Nil carrier Nil 2 Nothing 2
+    pure
+        (List.append
+           [ "theory Th where\n  t : Type\n  op : t -> t -> t\n  pick : t -> Bool\n"
+           , "Inst : Th\nInst = { t = "
+           ^ tyStr carrier
+           ^ ", op = \\x y -> "
+           ^ op
+           ^ ", pick = \\x -> "
+           ^ picked
+           ^ " }\n"
+           ]
+           (List.append
+              (if spec
+               then [ "Spec : Th @ { t = "
+                    ^ tyStr carrier
+                    ^ " }\nSpec = Inst\n"
+                    ]
+               else Nil)
+              (if use
+               then [ "useTh : (m : Th) -> m.t -> Bool\nuseTh m a = m.pick (m.op a a)\n"
+                    , "usedTh : Bool\nusedTh = useTh Inst "
+                    ^ paren used
+                    ^ "\n"
+                    ]
+               else Nil)))
 
 -- (the functions from the `i`th, `n` of them, after these)
 genFns : {e : HFunctor}
@@ -898,18 +894,17 @@ genFns sums i n fns =
     rest <- genFns sums (i + 1) n (List.append fns [f])
     pure
         (MkPair
-           (Cons
-              (f.name
-               ^ " : "
-               ^ joinWith " -> " (List.map tyStr (List.append params [ret]))
-               ^ "\n"
-               ^ f.name
-               ^ " "
-               ^ joinWith " " names
-               ^ " = "
-               ^ body
-               ^ "\n")
-              (fst rest))
+           ((f.name
+             ^ " : "
+             ^ joinWith " -> " (List.map tyStr (List.append params [ret]))
+             ^ "\n"
+             ^ f.name
+             ^ " "
+             ^ joinWith " " names
+             ^ " = "
+             ^ body
+             ^ "\n")
+            :: fst rest)
            (snd rest))
 
 -- (the values from the `i`th, `n` of them)
@@ -927,17 +922,16 @@ genVals sums fns i n =
     body <- genExpr sums fns ty Nil 3 Nothing 0
     rest <- genVals sums fns (i + 1) n
     pure
-        (Cons
-           ("v"
-            ^ debug i
-            ^ " : "
-            ^ tyStr ty
-            ^ "\nv"
-            ^ debug i
-            ^ " = "
-            ^ body
-            ^ "\n")
-           rest)
+        (("v"
+          ^ debug i
+          ^ " : "
+          ^ tyStr ty
+          ^ "\nv"
+          ^ debug i
+          ^ " = "
+          ^ body
+          ^ "\n")
+         :: rest)
 
 -- | a program in heff's syntax, type-directed, so most of them are well
 -- | typed: sum types, a theory, functions and values
@@ -977,7 +971,7 @@ genPrograms n =
   else do
     p <- genProgram
     ps <- genPrograms (n - 1)
-    pure (Cons p ps)
+    pure (p :: ps)
 
 -- (the generator's state, the handler's monad a pure one)
 seeded : Handler (state Int)
@@ -993,8 +987,7 @@ seeded =
 
 -- | `n` programs generated from the seed
 generated : Int -> Int -> List String
-generated n seed =
-  fst (handle seeded (genPrograms (rng := _) n) seed)
+generated n seed = fst (handle seeded (genPrograms (rng := _) n) seed)
 
 -- (each generated program a subtest, `gen0` from `i`)
 eachGenerated : {e : HFunctor}
@@ -1005,8 +998,8 @@ eachGenerated : {e : HFunctor}
               -> Int
               -> List String
               -> Co e Unit
-eachGenerated i Nil = pure MkUnit
-eachGenerated i (Cons src rest) = do
+eachGenerated i [] = pure MkUnit
+eachGenerated i (src :: rest) = do
   subtest ("gen" ^ debug i) (do
     working <- workingDir
     let here = show working
@@ -1040,7 +1033,8 @@ programs = do
   names <- readDirectory (root ^ "/test/programs")
   eachProgram
       (root ^ "/test/programs")
-      (List.sort (List.keepIf (\n -> endsWith ".hf" n) (List.map Path.basename names)))
+      (List.sort
+         (List.keepIf (\n -> endsWith ".hf" n) (List.map Path.basename names)))
 
 -- | a module's definitions of a `mutual` block, used from another
 -- | module, held to the interpreter by each backend
@@ -1141,10 +1135,14 @@ fallbackOnce = do
   cCode <- readFile (here ^ "/fallback.c")
   failingWith
       (List.append
-         (if List.any (contains "case \"K3\":") (definitionsOf "const step = (" "\n};\n" jsCode)
+         (if List.any
+               (contains "case \"K3\":")
+               (definitionsOf "const step = (" "\n};\n" jsCode)
           then ["js: the default copied into the arm of each tag"]
           else Nil)
-         (if List.any (contains "case TAG_K3:") (definitionsOf "fallback_2estep(" "\n}\n" cCode)
+         (if List.any
+               (contains "case TAG_K3:")
+               (definitionsOf "fallback_2estep(" "\n}\n" cCode)
           then ["c: the default copied into the arm of each tag"]
           else Nil))
 
@@ -1198,7 +1196,11 @@ defunTags = do
   js <-
     heffIn
       root
-      ["compile", "test/programs/defun.hf", here ^ "/defun.mjs", "--backend=esm"]
+      [ "compile"
+      , "test/programs/defun.hf"
+      , here ^ "/defun.mjs"
+      , "--backend=esm"
+      ]
   c <-
     heffIn
       root
@@ -1206,22 +1208,30 @@ defunTags = do
   jsCode <- readFile (here ^ "/defun.mjs")
   cCode <- readFile (here ^ "/defun.c")
   failingWith
-      (List.concatMap (\ms -> ms)
-         [ if List.any (\f -> buildsLambda ("const " ^ f ^ "_s") jsCode) ["explore", "place"]
-           then ["js: a continuation of a copy built as a closure"]
-           else Nil
+      (List.concatMap
+         (\ms -> ms)
+         [ if List.any
+                (\f -> buildsLambda ("const " ^ f ^ "_s") jsCode)
+                ["explore", "place"]
+         then ["js: a continuation of a copy built as a closure"]
+         else Nil
          , if not (contains "_apply0 = (" jsCode)
-           then ["js: no apply"]
-           else Nil
+         then ["js: no apply"]
+         else Nil
          , if List.any (closuresIn cCode) ["explore", "place"]
-           then ["c: a continuation of a copy built as a closure"]
-           else Nil
-         , if not (List.all (\f -> buildsLambda ("const " ^ f ^ "_s") jsCode) ["keptK", "sumK", "pickK"])
-           then ["js: a continuation that escapes, or of a copy used as a value, made a tag"]
-           else Nil
+         then ["c: a continuation of a copy built as a closure"]
+         else Nil
+         , if not
+                (List.all
+                   (\f -> buildsLambda ("const " ^ f ^ "_s") jsCode)
+                   ["keptK", "sumK", "pickK"])
+         then [ "js: a continuation that escapes, or of a copy used as a value, made a tag"
+              ]
+         else Nil
          , if not (List.all (closuresIn cCode) ["keptK", "sumK", "pickK"])
-           then ["c: a continuation that escapes, or of a copy used as a value, made a tag"]
-           else Nil
+         then [ "c: a continuation that escapes, or of a copy used as a value, made a tag"
+              ]
+         else Nil
          ])
 
 -- (whether each of `defs` reads a rune and its width once, `decode`, and
@@ -1229,9 +1239,9 @@ defunTags = do
 readOnce : String -> List String -> List String -> Bool
 readOnce decode apart defs0 =
   let defs =
-        List.keepIf
-          (\d -> contains decode d || List.any (\a -> contains a d) apart)
-          defs0
+    List.keepIf
+      (\d -> contains decode d || List.any (\a -> contains a d) apart)
+      defs0
   in not (List.null defs)
   && List.all
     (\d -> contains decode d && not (List.any (\a -> contains a d) apart))
@@ -1254,7 +1264,11 @@ runesOnce = do
   js <-
     heffIn
       root
-      ["compile", "test/programs/runes.hf", here ^ "/runes.mjs", "--backend=esm"]
+      [ "compile"
+      , "test/programs/runes.hf"
+      , here ^ "/runes.mjs"
+      , "--backend=esm"
+      ]
   c <-
     heffIn
       root
@@ -1264,19 +1278,23 @@ runesOnce = do
   failingWith
       (List.append
          (if readOnce
-             "$strRuneDecode("
-             ["$strRuneAt(", "$strRuneWidth("]
-             (List.concatMap
-                (\f -> definitionsOf ("const " ^ f ^ " = (") "\n};\n" jsCode)
-                ["walkFrom", "goodFrom", "walkFrom_fuel", "goodFrom_fuel"])
+               "$strRuneDecode("
+               ["$strRuneAt(", "$strRuneWidth("]
+               (List.concatMap
+                  (\f -> definitionsOf ("const " ^ f ^ " = (") "\n};\n" jsCode)
+                  ["walkFrom", "goodFrom", "walkFrom_fuel", "goodFrom_fuel"])
           then Nil
           else ["js: a rune and its width read apart"])
          (if readOnce
-             "heff_strRuneDecode"
-             ["heff_strRuneAt", "heff_strRuneWidth"]
-             (List.concatMap
-                (\f -> definitionsOf ("runes_2e" ^ f ^ "(V ") "\n}\n" cCode)
-                ["walkFrom", "goodFrom", "walkFrom_24fuel", "goodFrom_24fuel"])
+               "heff_strRuneDecode"
+               ["heff_strRuneAt", "heff_strRuneWidth"]
+               (List.concatMap
+                  (\f -> definitionsOf ("runes_2e" ^ f ^ "(V ") "\n}\n" cCode)
+                  [ "walkFrom"
+                  , "goodFrom"
+                  , "walkFrom_24fuel"
+                  , "goodFrom_24fuel"
+                  ])
           then Nil
           else ["c: a rune and its width read apart"]))
 
@@ -1308,11 +1326,11 @@ programBy flags file name cflags tag = do
          ["compile", file, base ^ ".c", "--name", name, "--backend=c"]
          flags)
   if not (succeeded r) then pure (Left (said r))
-    else do
-      b <- buildC [base ^ ".c"] (base ^ ".zig") base cflags
-      pure (case b of
-        Just why -> Left why
-        Nothing -> Right base)
+  else do
+    b <- buildC [base ^ ".c"] (base ^ ".zig") base cflags
+    pure (case b of
+      Just why -> Left why
+      Nothing -> Right base)
 
 -- | ... compiled as `heff compile` alone does
 program : {e : HFunctor}
@@ -1369,7 +1387,9 @@ builtParts m name = do
     heffIn dir ["compile", m ^ ".hf", "parts/", "--name", name, "--backend=c"]
   names <- readDirectory (dir ^ "/parts")
   parts <-
-    pure (List.sort (List.keepIf (\n -> endsWith ".c" n) (List.map Path.basename names)))
+    pure
+      (List.sort
+         (List.keepIf (\n -> endsWith ".c" n) (List.map Path.basename names)))
   b <-
     if succeeded r
     then buildC
@@ -1409,10 +1429,10 @@ against what w r =
           if strEq o r.out then Nil
           else [what ^ ": out " ^ debug r.out ^ ", wanted " ^ debug o]
         Nothing -> Nil) (case w.err of
-     Just o ->
-       if strEq o r.err then Nil
-       else [what ^ ": err " ^ debug r.err ^ ", wanted " ^ debug o]
-     Nothing -> Nil))
+         Just o ->
+           if strEq o r.err then Nil
+           else [what ^ ": err " ^ debug r.err ^ ", wanted " ^ debug o]
+         Nothing -> Nil))
 
 -- | the program `name` of the file built and run as `how` says of it,
 -- | held to what it is to do
@@ -1489,14 +1509,14 @@ withPeer arguments body = do
   root <- given "HEFF_TEST_ROOT"
   withProcess
       { command = "node"
-      , args = Cons (root ^ "/test/peers.mjs") arguments
+      , args = (root ^ "/test/peers.mjs") :: arguments
       , input = Piped
       , output = Piped
       , timeout = 120000
       } (\p -> do
-    line <- readOutput p (Through "\n") 30000
-    first <- peerLine line
-    body p first)
+        line <- readOutput p (Through "\n") 30000
+        first <- peerLine line
+        body p first)
 
 -- (the first of a list, or "")
 firstOf : List String -> String
@@ -1513,32 +1533,32 @@ withTsan : {e : HFunctor}
 withTsan bin = do
   tsan <- isSet "HEFF_TSAN"
   if not tsan then pure [bin]
-    else do
-      z <-
-        zigRuntime
-          (bin ^ ".zig")
-          (bin ^ "-tsan-runtime.o")
-          ["-fsanitize-thread"]
-      b <-
-        run
-          { command = "clang"
-          , args =
-              [ "-O1"
-              , "-g"
-              , "-fsanitize=thread"
-              , "-w"
-              , bin ^ ".c"
-              , bin ^ "-tsan-runtime.o"
-              , "-o"
-              , bin ^ "-tsan"
-              , "-lm"
-              , "-lpthread"
-              ]
-          , timeout = 300000
-          }
-      if succeeded b then pure [bin, bin ^ "-tsan"]
-        else failure
-            ("not built under ThreadSanitizer: " ^ fromMaybe "" z ^ said b)
+  else do
+    z <-
+      zigRuntime
+        (bin ^ ".zig")
+        (bin ^ "-tsan-runtime.o")
+        ["-fsanitize-thread"]
+    b <-
+      run
+        { command = "clang"
+        , args =
+            [ "-O1"
+            , "-g"
+            , "-fsanitize=thread"
+            , "-w"
+            , bin ^ ".c"
+            , bin ^ "-tsan-runtime.o"
+            , "-o"
+            , bin ^ "-tsan"
+            , "-lm"
+            , "-lpthread"
+            ]
+        , timeout = 300000
+        }
+    if succeeded b then pure [bin, bin ^ "-tsan"]
+    else failure
+        ("not built under ThreadSanitizer: " ^ fromMaybe "" z ^ said b)
 
 -- (each of the programs run so, held to what they are to do)
 eachRan : {e : HFunctor}
@@ -1548,8 +1568,8 @@ eachRan : {e : HFunctor}
         -> (String -> Invocation)
         -> (Ran -> List String)
         -> Co e (List String)
-eachRan Nil how held = pure Nil
-eachRan (Cons bin rest) how held = do
+eachRan [] how held = pure Nil
+eachRan (bin :: rest) how held = do
   r <- run (how bin)
   others <- eachRan rest how held
   pure (List.append (held r) others)
@@ -1841,7 +1861,8 @@ binaryOut : {e : HFunctor}
           -> {{sys : process <: e}}
           -> Co e Unit
 binaryOut = do
-  let every = Bytes.asString (Bytes.fromList (List.map UInt8.fromInt (List.range 0 255)))
+  let every =
+    Bytes.asString (Bytes.fromList (List.map UInt8.fromInt (List.range 0 255)))
   ran "test/node/basics.hf" "main" ["binary"] { out = Just (every ^ every) }
 
 -- | a line printed and flushed, to a pipe: read while the program
@@ -1855,15 +1876,18 @@ flushedOut : {e : HFunctor}
 flushedOut = do
   bin <- built "test/node/basics.hf" "main" Nil ""
   withProcess
-      { command = bin, args = ["flushed"], output = Piped, timeout = 60000 }
-      (\p -> do
-    line <- readOutput p (Through "\n") 3000
-    kill p
-    case line of
-      Got b ->
-        if strEq (Bytes.asString b) "before the sleep\n" then pure MkUnit
-        else failure ("flushed: got " ^ debug (Bytes.asString b))
-      _ -> failure "flushed: nothing read within 3 s")
+      { command = bin
+      , args = ["flushed"]
+      , output = Piped
+      , timeout = 60000
+      } (\p -> do
+        line <- readOutput p (Through "\n") 3000
+        kill p
+        case line of
+          Got b ->
+            if strEq (Bytes.asString b) "before the sleep\n" then pure MkUnit
+            else failure ("flushed: got " ^ debug (Bytes.asString b))
+          _ -> failure "flushed: nothing read within 3 s")
 
 -- | a line of what the HTTP client says: as it is, or its start (curl's
 -- | to say the rest)
@@ -1871,19 +1895,16 @@ data Line = Exactly String | Starting String
 
 -- (the lines of `out`, by what is wanted: a text may have lines of its own)
 splitBy : List Line -> String -> List String
-splitBy Nil out = Nil
-splitBy (Cons (Exactly w) rest) out =
-  Cons
-    (strSlice out 0 (min (strLength w) (strLength out)))
-    (splitBy
-       rest
-       (strSlice out (min (strLength out) (strLength w + 1)) (strLength out)))
-splitBy (Cons (Starting w) rest) out = case indexOf "\n" out 0 of
+splitBy [] out = Nil
+splitBy (Exactly w :: rest) out =
+  strSlice out 0 (min (strLength w) (strLength out))
+  :: splitBy
+    rest
+    (strSlice out (min (strLength out) (strLength w + 1)) (strLength out))
+splitBy (Starting w :: rest) out = case indexOf "\n" out 0 of
   Just i ->
-    Cons
-      (strSlice out 0 i)
-      (splitBy rest (strSlice out (i + 1) (strLength out)))
-  Nothing -> Cons out (splitBy rest "")
+    strSlice out 0 i :: splitBy rest (strSlice out (i + 1) (strLength out))
+  Nothing -> out :: splitBy rest ""
 
 -- (is the line as wanted)
 lineHolds : Line -> String -> Bool
@@ -2324,42 +2345,42 @@ stdinLines = do
       , errors = Piped
       , timeout = 120000
       } (\s -> do
-    pid <- readErrors s (Through "\n") 30000
-    pinged <- writeInput s (Bytes.fromString "ping\n")
-    pong <- readOutput s (Through "\n") 30000
-    fed <-
-      writeTimes
-        s
-        (Bytes.fromString
-           (joinWith
-              ""
-              (List.replicate
-                 16384
-                 (joinWith "" (List.replicate 63 "x") ^ "\n"))))
-        64
-    rss <-
-      run
-        { command = "ps"
-        , args = ["-o", "rss=", "-p", trim (receivedText pid)]
-        }
-    closeInput s
-    r <- wait s
-    kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
-    failingWith
-        (List.append
-           (if strEq
-                 (receivedText pong ^ r.out)
-                 "pong\nlines 1048577 bytes 66060292\n"
-               && strEq r.err ""
-               && succeeded r
-            then Nil
-            else ["stdin a line at a time: " ^ receivedText pong ^ said r])
-           (if not sanitized && kib > 16384
-            then [ "stdin a line at a time: "
-                 ^ debug kib
-                 ^ " KiB held, 64 MiB in"
-                 ]
-            else Nil)))
+        pid <- readErrors s (Through "\n") 30000
+        pinged <- writeInput s (Bytes.fromString "ping\n")
+        pong <- readOutput s (Through "\n") 30000
+        fed <-
+          writeTimes
+            s
+            (Bytes.fromString
+               (joinWith
+                  ""
+                  (List.replicate
+                     16384
+                     (joinWith "" (List.replicate 63 "x") ^ "\n"))))
+            64
+        rss <-
+          run
+            { command = "ps"
+            , args = ["-o", "rss=", "-p", trim (receivedText pid)]
+            }
+        closeInput s
+        r <- wait s
+        kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
+        failingWith
+            (List.append
+               (if strEq
+                     (receivedText pong ^ r.out)
+                     "pong\nlines 1048577 bytes 66060292\n"
+                   && strEq r.err ""
+                   && succeeded r
+                then Nil
+                else ["stdin a line at a time: " ^ receivedText pong ^ said r])
+               (if not sanitized && kib > 16384
+                then [ "stdin a line at a time: "
+                     ^ debug kib
+                     ^ " KiB held, 64 MiB in"
+                     ]
+                else Nil)))
 
 -- | cml's threads, waiting on the world through the reactor, by C alone:
 -- | one reads the standard input, a pipe, a line at a time, while another
@@ -2367,12 +2388,12 @@ stdinLines = do
 -- | the count written before any input comes, as none is written until
 -- | it is (a read that held up the whole program would never let it be)
 threadedStdin : {e : HFunctor}
-           -> {{chk : check <: e}}
-           -> {{sys : process <: e}}
-           -> {{disk : filesystem <: e}}
-           -> {{ex : exception ProcessError <: e}}
-           -> {{cu : Custodian.custodian <: e}}
-           -> Co e Unit
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> {{ex : exception ProcessError <: e}}
+              -> {{cu : Custodian.custodian <: e}}
+              -> Co e Unit
 threadedStdin = do
   bin <- built "test/node/files.hf" "threaded" Nil ""
   withProcess
@@ -2381,18 +2402,18 @@ threadedStdin = do
       , output = Piped
       , timeout = 120000
       } (\s -> do
-    counted <-
-      readOutput s (Through "counted while the reader waits: 1000\n") 60000
-    written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
-    closeInput s
-    r <- wait s
-    if strEq
-         (receivedText counted ^ r.out)
-         "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
-       && strEq r.err ""
-       && succeeded r
-      then pure MkUnit
-      else failure (receivedText counted ^ said r))
+        counted <-
+          readOutput s (Through "counted while the reader waits: 1000\n") 60000
+        written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
+        closeInput s
+        r <- wait s
+        if strEq
+             (receivedText counted ^ r.out)
+             "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
+           && strEq r.err ""
+           && succeeded r
+        then pure MkUnit
+        else failure (receivedText counted ^ said r))
 
 -- | commands held by cml's threads, waiting on the world through the
 -- | reactor, by C alone: three sleeps of a second each, a `withProcess` in a thread of
@@ -2400,10 +2421,10 @@ threadedStdin = do
 -- | pending while the others go on; one after the other, they would take
 -- | three, past the time limit
 cmlProcess : {e : HFunctor}
-             -> {{chk : check <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : filesystem <: e}}
-             -> Co e Unit
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Unit
 cmlProcess = do
   bin <- built "test/node/cml-process.hf" "main" Nil ""
   r <- run { command = bin, timeout = 2500 }
@@ -2464,7 +2485,8 @@ cascadeMain = do
          { out =
              Just
                "connection 1 written\nclient 1 read: served 1\ncustodian 2 shut down\nthe one under 2 shut down\nconnection 2: EBADF\nclient 2 read: \nconnection 3 written\nclient 3 read: served 3\n"
-         , err = Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
+         , err =
+             Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
          }
          r)
 
@@ -2520,7 +2542,8 @@ cascadeConnections = do
          { out =
              Just
                "connection 1 written\nclient 1 read: served 1\nconnection 2: EBADF\nclient 2 read: \nconnection 3 written\nclient 3 read: served 3\ncustodian 2 shut down\n"
-         , err = Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
+         , err =
+             Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
          }
          r)
 
@@ -2538,7 +2561,8 @@ cascadeConnectionsWith = do
          { out =
              Just
                "connection 1 written\nclient 1 read: served 1\nconnection 2: EBADF\nclient 2 read: \nconnection 3 written\nclient 3 read: served 3\ncustodian 2 shut down\n"
-         , err = Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
+         , err =
+             Just "heff: flaky: thing 2 not ended (its custodian shut down)\n"
          }
          r)
 
@@ -2593,21 +2617,26 @@ signals : {e : HFunctor}
 signals = do
   bin <- built "test/node/signalled.hf" "main" Nil ""
   let started : String -> String = \mode ->
-        "o=\"$0." ^ mode ^ ".out\"; \"$0\" " ^ mode ^ " > \"$o\" 2>&1 & p=$!\n"
-        ^ "seen() { grep -q \"$1\" \"$o\"; }\n"
-        ^ "alive() { kill -0 $p 2>/dev/null; }\n"
-        ^ "until seen '^waiting$' || seen '^child ' || ! alive; do sleep 0.02; done\n"
-  let ended = "wait $p; s=$?; sed 's/^child .*/child/' \"$o\"; echo \"status $s\"\n"
+      "o=\"$0."
+      ^ mode
+      ^ ".out\"; \"$0\" "
+      ^ mode
+      ^ " > \"$o\" 2>&1 & p=$!\n"
+      ^ "seen() { grep -q \"$1\" \"$o\"; }\n"
+      ^ "alive() { kill -0 $p 2>/dev/null; }\n"
+      ^ "until seen '^waiting$' || seen '^child ' || ! alive; do sleep 0.02; done\n"
+  let ended =
+    "wait $p; s=$?; sed 's/^child .*/child/' \"$o\"; echo \"status $s\"\n"
   plain <-
     run
       { command = "sh"
       , args =
           [ "-c"
           , started "plain"
-            ^ "while ! seen '^got' && alive; do kill -WINCH $p; sleep 0.05; done\n"
-            ^ "until seen 'for SIGTERM' || ! alive; do sleep 0.02; done\n"
-            ^ "kill -TERM $p; "
-            ^ ended
+          ^ "while ! seen '^got' && alive; do kill -WINCH $p; sleep 0.05; done\n"
+          ^ "until seen 'for SIGTERM' || ! alive; do sleep 0.02; done\n"
+          ^ "kill -TERM $p; "
+          ^ ended
           , bin
           ]
       , timeout = 60000
@@ -2624,11 +2653,11 @@ signals = do
       , args =
           [ "-c"
           , started "unawaited"
-            ^ "c=$(sed -n 's/^child //p' \"$o\")\n"
-            ^ "kill -TERM $p; "
-            ^ ended
-            ^ "i=0; while kill -0 $c 2>/dev/null && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done\n"
-            ^ "if kill -0 $c 2>/dev/null; then echo 'the command runs still'; else echo 'the command ended'; fi\n"
+          ^ "c=$(sed -n 's/^child //p' \"$o\")\n"
+          ^ "kill -TERM $p; "
+          ^ ended
+          ^ "i=0; while kill -0 $c 2>/dev/null && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done\n"
+          ^ "if kill -0 $c 2>/dev/null; then echo 'the command runs still'; else echo 'the command ended'; fi\n"
           , bin
           ]
       , timeout = 60000
@@ -2652,7 +2681,8 @@ signals = do
          (List.append
             (against
                "in a choose of cml's"
-               { out = Just (linesOf ["waiting", "stopping on SIGINT", "status 0"])
+               { out =
+                   Just (linesOf ["waiting", "stopping on SIGINT", "status 0"])
                , err = Just ""
                }
                inCml)
@@ -2660,7 +2690,9 @@ signals = do
                "not waited for"
                -- (sh may say on its error stream that the program was
                -- terminated)
-               { out = Just (linesOf ["child", "status 143", "the command ended"]) }
+               { out =
+                   Just (linesOf ["child", "status 143", "the command ended"])
+               }
                unawaited)))
 
 -- | TCP sockets, by C alone (std.net): a connection to a listener of
@@ -2710,8 +2742,8 @@ sockets = do
               ["::1", "127.0.0.1"])
          ["ipv6, a port picked: yes\nipv6: ::1\n", "ipv6: none here\n"])
   if succeeded r && strEq r.err "" && List.any (\c -> strEq c r.out) candidates
-    then pure MkUnit
-    else failure (said r)
+  then pure MkUnit
+  else failure (said r)
 
 -- | cml's threads doing std.net's operations, waiting on the world
 -- | through the reactor, by C alone: a thread blocked on a read lets another run; fifty
@@ -2721,10 +2753,10 @@ sockets = do
 -- | one by its own socket closed; and main done while a thread waits to
 -- | accept
 cmlSockets : {e : HFunctor}
-             -> {{chk : check <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : filesystem <: e}}
-             -> Co e Unit
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Unit
 cmlSockets = do
   ports <- freePorts 1
   bin <- built "test/node/cml-sockets.hf" "main" Nil ""
@@ -2762,13 +2794,13 @@ cmlSockets = do
 -- the program's own server, each held to what it is to do; the peer
 -- ended after)
 cmlHttpTo : {e : HFunctor}
-            -> {s : Type}
-            -> {{chk : check <: e}}
-            -> {{sys : process <: e}}
-            -> {{disk : filesystem <: e}}
-            -> With s Started
-            -> String
-            -> Co e Unit
+          -> {s : Type}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> With s Started
+          -> String
+          -> Co e Unit
 cmlHttpTo started port = do
   ports <- freePorts 1
   bin <- built "test/node/cml-http.hf" "main" Nil ""
@@ -2816,12 +2848,12 @@ cmlHttpTo started port = do
 -- | one refused while they wait; and ten asked of the program's own
 -- | server, std.net's sockets and libcurl's waited on together
 cmlHttp : {e : HFunctor}
-          -> {{chk : check <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : filesystem <: e}}
-          -> {{ex : exception ProcessError <: e}}
-          -> {{cu : Custodian.custodian <: e}}
-          -> Co e Unit
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{ex : exception ProcessError <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> Co e Unit
 cmlHttp = withPeer ["slow", "500"] cmlHttpTo
 
 -- | time limits on what waits, by C alone: std.net's connection to an
@@ -2896,8 +2928,7 @@ httpTimeouts = do
          , "slow, connected in time: 200 \"item 1\\n\", past the time to connect: yes"
          ])
   withPeer
-      ["slow", "500"]
-      (\started port -> do
+      ["slow", "500"] (\started port -> do
         let base = "http://127.0.0.1:" ^ port
         a <- run { command = libcurl, args = [base], timeout = 60000 }
         b <- run { command = spawned, args = [base], timeout = 60000 }
@@ -2906,9 +2937,15 @@ httpTimeouts = do
         ended <- wait started
         failingWith
             (List.append
-               (against "http timeouts, libcurl" { out = Just want, err = Just "" } a)
+               (against
+                  "http timeouts, libcurl"
+                  { out = Just want, err = Just "" }
+                  a)
                (List.append
-                  (against "http timeouts, spawned" { out = Just want, err = Just "" } b)
+                  (against
+                     "http timeouts, spawned"
+                     { out = Just want, err = Just "" }
+                     b)
                   (against
                      "http timeouts, multi"
                      { out = Just (want ^ "scheduler done\n"), err = Just "" }
@@ -2919,10 +2956,10 @@ httpTimeouts = do
 -- | forty clients holding theirs open at once, each answered, then asked
 -- | again on the same connection
 cmlServer : {e : HFunctor}
-            -> {{chk : check <: e}}
-            -> {{sys : process <: e}}
-            -> {{disk : filesystem <: e}}
-            -> Co e Unit
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit
 cmlServer =
   ran
     "test/node/cml-served.hf"
@@ -2940,11 +2977,11 @@ cmlServer =
 -- | server accepts them as fast as they come, where the listener's queue
 -- | would otherwise overflow, connections reset
 cmlBurst : {e : HFunctor}
-           -> {{chk : check <: e}}
-           -> {{sys : process <: e}}
-           -> {{ex : exception ProcessError <: e}}
-           -> {{cu : Custodian.custodian <: e}}
-           -> Co e Unit
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{ex : exception ProcessError <: e}}
+         -> {{cu : Custodian.custodian <: e}}
+         -> Co e Unit
 cmlBurst = do
   root <- given "HEFF_TEST_ROOT"
   ports <- freePorts 1
@@ -2952,14 +2989,15 @@ cmlBurst = do
   both <-
     withProcess
       { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
-    client <-
-      run
-        { command = "node"
-        , args = [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
-        , timeout = 60000
-        }
-    server <- wait p
-    pure (MkPair client server))
+        client <-
+          run
+            { command = "node"
+            , args =
+                [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
+            , timeout = 60000
+            }
+        server <- wait p
+        pure (MkPair client server))
   failingWith
       (List.append
          (against
@@ -2996,14 +3034,14 @@ headLimited file before served = do
       , args = List.append (List.take 1 ports) (List.append before ["1000"])
       , timeout = 60000
       } (\p -> do
-    client <-
-      run
-        { command = "node"
-        , args = [root ^ "/test/peers.mjs", "head", firstOf ports, "1000"]
-        , timeout = 60000
-        }
-    server <- wait p
-    pure (MkPair client server))
+        client <-
+          run
+            { command = "node"
+            , args = [root ^ "/test/peers.mjs", "head", firstOf ports, "1000"]
+            , timeout = 60000
+            }
+        server <- wait p
+        pure (MkPair client server))
   failingWith
       (List.append
          (against
@@ -3030,11 +3068,11 @@ headLimited file before served = do
 -- | server, its connections closed, ends by itself, its count of them
 -- | the same
 bocBurst : {e : HFunctor}
-           -> {{chk : check <: e}}
-           -> {{sys : process <: e}}
-           -> {{ex : exception ProcessError <: e}}
-           -> {{cu : Custodian.custodian <: e}}
-           -> Co e Unit
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{ex : exception ProcessError <: e}}
+         -> {{cu : Custodian.custodian <: e}}
+         -> Co e Unit
 bocBurst = do
   root <- given "HEFF_TEST_ROOT"
   ports <- freePorts 1
@@ -3042,14 +3080,15 @@ bocBurst = do
   both <-
     withProcess
       { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
-    client <-
-      run
-        { command = "node"
-        , args = [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
-        , timeout = 60000
-        }
-    server <- wait p
-    pure (MkPair client server))
+        client <-
+          run
+            { command = "node"
+            , args =
+                [root ^ "/test/peers.mjs", "burst", firstOf ports, "300", "200"]
+            , timeout = 60000
+            }
+        server <- wait p
+        pure (MkPair client server))
   failingWith
       (List.append
          (against
@@ -3081,14 +3120,15 @@ bocIdle = do
   both <-
     withProcess
       { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
-    client <-
-      run
-        { command = "node"
-        , args = [root ^ "/test/peers.mjs", "idle", firstOf ports, "300", "500"]
-        , timeout = 60000
-        }
-    server <- wait p
-    pure (MkPair client server))
+        client <-
+          run
+            { command = "node"
+            , args =
+                [root ^ "/test/peers.mjs", "idle", firstOf ports, "300", "500"]
+            , timeout = 60000
+            }
+        server <- wait p
+        pure (MkPair client server))
   failingWith
       (List.append
          (against
@@ -3289,14 +3329,14 @@ httpServer = do
   both <-
     withProcess
       { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
-    client <-
-      run
-        { command = "node"
-        , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
-        , timeout = 120000
-        }
-    server <- wait p
-    pure (MkPair client server))
+        client <-
+          run
+            { command = "node"
+            , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
+            , timeout = 120000
+            }
+        server <- wait p
+        pure (MkPair client server))
   client <- pure (fst both)
   server <- pure (snd both)
   got <-
@@ -3397,7 +3437,9 @@ mainParts = do
       ["compile", "main.hf", "parts/", "--name", "main", "--backend=c"]
   names <- readDirectory (here ^ "/alone/parts")
   parts <-
-    pure (List.sort (List.keepIf (\n -> endsWith ".c" n) (List.map Path.basename names)))
+    pure
+      (List.sort
+         (List.keepIf (\n -> endsWith ".c" n) (List.map Path.basename names)))
   b <-
     buildC
       (List.map (\n -> here ^ "/alone/parts/" ^ n) parts)
@@ -3409,9 +3451,9 @@ mainParts = do
      && List.any (\n -> strEq n "main.c") parts
      && strEq out.out "main, a module of its own: 3 2 1\n"
      && succeeded out
-    then pure MkUnit
-    else failure
-        (joinWith " " parts ^ "\n" ^ said r ^ fromMaybe "" b ^ said out)
+  then pure MkUnit
+  else failure
+      (joinWith " " parts ^ "\n" ^ said r ^ fromMaybe "" b ^ said out)
 
 -- | an app is not a C program: refused at the import of the browser's
 -- | module, and why
@@ -3438,8 +3480,8 @@ appNotProgram = do
      && contains
        "examples/pages/app/counter/main.hf:9:1\nerror[E0351]: `browser.dom` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it"
        r.err
-    then pure MkUnit
-    else failure (said r)
+  then pure MkUnit
+  else failure (said r)
 
 -- | one world handled at home (a counter: state, peeled off in the
 -- | language), the rest handed to the backend's providers: the evidence
@@ -3609,7 +3651,10 @@ lentFirstThread = do
       (firstRan cflags "never" { out = Just "lent: 0, again: 1\nbye\n" })
   subtest
       "never returned, exited"
-      (firstRan cflags "neverExit" { out = Just "lent: 0\n", status = Exited 3 })
+      (firstRan
+         cflags
+         "neverExit"
+         { out = Just "lent: 0\n", status = Exited 3 })
   let stopped =
     "stopped, on the first thread: False\nthe loop returned, on the first thread: True\n"
   let begun = "lent: 0, begun on the first thread: True\n"
@@ -3837,7 +3882,10 @@ domains = do
          "test/node/domains.hf"
          "failing"
          Nil
-         { out = Just "spawned\n", err = Just "heff:abandon\n", status = Exited 1 })
+         { out = Just "spawned\n"
+         , err = Just "heff:abandon\n"
+         , status = Exited 1
+         })
   subtest
       "scopes"
       (threadedRun "test/node/scopes.hf" "main" Nil { out = Just scopesSaid })
@@ -3884,7 +3932,8 @@ fuelRun = do
   r <- heffIn root ["run", "--fuel", "test/node/unfueled.hf"]
   failingWith
       (List.append
-         (if contains "W0390" r.err then ["warned with fuel: " ^ r.err] else Nil)
+         (if contains "W0390" r.err then ["warned with fuel: " ^ r.err]
+          else Nil)
          (against
             "heff run --fuel"
             { out = Just "a pure loop: Nothing\noperations: Nothing\n" }
@@ -3905,9 +3954,13 @@ fuelAsync = do
       failingWith
           (against
              "main"
-             { out = Just ("a pure loop after a sleep: Nothing\na loop after a sleep within its fuel: Just 1000\n"
-  ^ "a pure loop after another domain's turn: Nothing\na domain spawned in a limit, with none: Just 500000500000\n"
-  ^ "the least fuel of a loop after a sleep: near its rounds\n"), err = Just "" }
+             { out =
+                 Just
+                   ("a pure loop after a sleep: Nothing\na loop after a sleep within its fuel: Just 1000\n"
+                    ^ "a pure loop after another domain's turn: Nothing\na domain spawned in a limit, with none: Just 500000500000\n"
+                    ^ "the least fuel of a loop after a sleep: near its rounds\n")
+             , err = Just ""
+             }
              r)
 
 -- | a computation an operation of the world holds, in a thread of cml's,
@@ -3966,7 +4019,9 @@ unfueled = do
             (maybe Nil (\why -> ["not built: " ^ why]) b)
             (against
                "main"
-               { out = Just "a pure loop: Just 5000050000\noperations: Nothing\n" }
+               { out =
+                   Just "a pure loop: Just 5000050000\noperations: Nothing\n"
+               }
                ran)))
 
 -- (a module of a big value of constants, `n` records in a list, its codes
@@ -4053,14 +4108,13 @@ statics = do
       Nil
       { out = Just "4501500 4498500 4501500 4498500 then 4498500 of 3000\n" }
   cCode <- readFile (here ^ "/big-main.c")
-  failingWith
-      (case definitionsOf "g_big_2etable_init(void)" "\n}\n" cCode of
-         [body] ->
-           if List.length (split "\n" body) == 2
-              && contains "return ((V)&g_big_2etable_lit" body
-           then Nil
-           else ["the table's init builds it:" ^ body]
-         ds -> ["the table's init, " ^ debug (List.length ds) ^ " of them"])
+  failingWith (case definitionsOf "g_big_2etable_init(void)" "\n}\n" cCode of
+    [body] ->
+      if List.length (split "\n" body) == 2
+         && contains "return ((V)&g_big_2etable_lit" body
+      then Nil
+      else ["the table's init builds it:" ^ body]
+    ds -> ["the table's init, " ^ debug (List.length ds) ^ " of them"])
 
 -- (what boc's program says, test/node/cowns-program.hf's: on threads
 -- here, and the same in JavaScript's one domain, test/apps.hf's)
@@ -4150,7 +4204,8 @@ bocCustody = do
                   , "the contained custodian shut down"
                   , "the program went on"
                   ])
-         , err = Just "heff: flaky: thing 1 not ended (its custodian shut down)\n"
+         , err =
+             Just "heff: flaky: thing 1 not ended (its custodian shut down)\n"
          }
          r)
   rooted <- built "test/node/boc-custody.hf" "rooted" Nil ""
@@ -4200,15 +4255,15 @@ cmlReactor : {e : HFunctor}
            -> Co e Unit
 cmlReactor =
   threadedRun
-      "test/node/cml-reactor.hf"
-      "main"
-      Nil
-      { out =
-          Just
-            ("slept: 2080, at once\ntimed out: timed out\n"
-             ^ "not timed out: sent, the sleep told, soon\n"
-             ^ "waiting on the world: 7\n")
-      }
+    "test/node/cml-reactor.hf"
+    "main"
+    Nil
+    { out =
+        Just
+          ("slept: 2080, at once\ntimed out: timed out\n"
+           ^ "not timed out: sent, the sleep told, soon\n"
+           ^ "waiting on the world: 7\n")
+    }
 
 -- (what the deep loops say)
 deepWant : String
@@ -4308,16 +4363,16 @@ stackOverflow = do
       (here ^ "/deeper.hf")
       "module deeper\n\nimport co\nimport std.io\n\nsumTo : Int -> Int\nsumTo n = if n == 0 then 0 else n + sumTo (n - 1)\n\nmain : Co stdio Unit\nmain = do\n  print (ev := _) \"before\"\n  print (ev := _) (show (sumTo 100000000))\n"
   if sanitized then skip "a sanitizer handles faults itself"
-    else ranAs
-        (here ^ "/deeper.hf")
-        "main"
-        ["-DHEFF_MAIN_STACK=8388608"]
-        ""
-        (\bin -> { command = bin, timeout = 60000 })
-        { out = Just "before\n"
-        , err = Just "heff: stack overflow\n"
-        , status = Exited 2
-        }
+  else ranAs
+      (here ^ "/deeper.hf")
+      "main"
+      ["-DHEFF_MAIN_STACK=8388608"]
+      ""
+      (\bin -> { command = bin, timeout = 60000 })
+      { out = Just "before\n"
+      , err = Just "heff: stack overflow\n"
+      , status = Exited 2
+      }
 
 -- | an array asked to be longer than memory holds, in C: the program
 -- | fails as memory running out does, not a block too small for it
@@ -4336,15 +4391,15 @@ hugeArray = do
       (here ^ "/huge.hf")
       "module huge\n\nimport co\nimport array as Array\nimport std.io\n\nn : Int\nn = 2305843009213693952\n\nmain : Co stdio Unit\nmain = do\n  print (ev := _) \"before\"\n  print (ev := _) (show (arrayIndex (Array.replicate n (7 : Int)) (n - 1)))\n"
   ranAs
-    (here ^ "/huge.hf")
-    "main"
-    Nil
-    ""
-    (\bin -> { command = bin, timeout = 60000 })
-    { out = Just "before\n"
-    , err = Just "heff: out of memory\n"
-    , status = Exited 1
-    }
+      (here ^ "/huge.hf")
+      "main"
+      Nil
+      ""
+      (\bin -> { command = bin, timeout = 60000 })
+      { out = Just "before\n"
+      , err = Just "heff: out of memory\n"
+      , status = Exited 1
+      }
 
 -- | each operation goes on at once: the stack must not overflow
 longLoop : {e : HFunctor}
@@ -4401,7 +4456,9 @@ loopBodies code =
        fromMaybe
          ""
          (List.head
-            (split "goto top;" (fromMaybe "" (List.head (split "\n}\n" piece))))))
+            (split
+               "goto top;"
+               (fromMaybe "" (List.head (split "\n}\n" piece))))))
     (List.drop 1 (split "top: ;" code))
 
 -- | a `do` block's `for` adding up `Float64`s, its total handed on to a
@@ -4482,9 +4539,19 @@ backends =
       , withinTime 180000 (integration "cascade" cascadeMain)
       , withinTime 180000 (integration "cascade, to the root" cascadeRooted)
       , withinTime 180000 (integration "cascade, threads" cascadeThreads)
-      , withinTime 180000 (integration "cascade, connections" cascadeConnections)
-      , withinTime 180000 (integration "cascade, connections of a with's threads" cascadeConnectionsWith)
-      , withinTime 180000 (integration "cascade, to the root from a with's threads" cascadeRootedWith)
+      , withinTime
+        180000
+        (integration "cascade, connections" cascadeConnections)
+      , withinTime
+        180000
+        (integration
+           "cascade, connections of a with's threads"
+           cascadeConnectionsWith)
+      , withinTime
+        180000
+        (integration
+           "cascade, to the root from a with's threads"
+           cascadeRootedWith)
       , integration "held" heldWiths
       , integration "sockets" sockets
       , withinTime 180000 (integration "signals" signals)
@@ -4497,21 +4564,21 @@ backends =
       , withinTime 180000 (integration "boc server, a burst" bocBurst)
       , withinTime 180000 (integration "boc server, idle connections" bocIdle)
       , withinTime
-          180000
-          (integration
-             "cml server, a head limit"
-             (headLimited
-                "test/node/cml-served.hf"
-                Nil
-                "answered 2\nmain done\n"))
+        180000
+        (integration
+           "cml server, a head limit"
+           (headLimited
+              "test/node/cml-served.hf"
+              Nil
+              "answered 2\nmain done\n"))
       , withinTime
-          180000
-          (integration
-             "boc server, a head limit"
-             (headLimited
-                "test/node/boc-served.hf"
-                ["30000"]
-                "answered 2\nmain done\n"))
+        180000
+        (integration
+           "boc server, a head limit"
+           (headLimited
+              "test/node/boc-served.hf"
+              ["30000"]
+              "answered 2\nmain done\n"))
       , withinTime 180000 (integration "boc server" bocServed)
       , withinTime 180000 (integration "remote" remote)
       , integration "http server" httpServer

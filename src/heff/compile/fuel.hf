@@ -48,8 +48,8 @@ numbered : OrdMap.OrdMap String Int
          -> Int
          -> List (List String)
          -> OrdMap.OrdMap String Int
-numbered m i Nil = m
-numbered m i (Cons g gs) =
+numbered m i [] = m
+numbered m i (g :: gs) =
   numbered (List.foldl (\acc k -> OrdMap.insert acc k i) m g) (i + 1) gs
 
 groupsBy : OrdMap.OrdMap String (List String)
@@ -84,13 +84,13 @@ calleeOf _ = Nothing
 -- | group (`inGroup`) or what is not known (an application of anything
 -- | but a global): a worklist of its parts
 closes : (String -> Bool) -> List IR.Expr -> Bool
-closes inGroup Nil = False
-closes inGroup (Cons (ELam _ _) rest) = closes inGroup rest
-closes inGroup (Cons (ECall g args) rest) =
+closes inGroup [] = False
+closes inGroup (ELam _ _ :: rest) = closes inGroup rest
+closes inGroup (ECall g args :: rest) =
   inGroup g || closes inGroup (IR.appendI args rest)
-closes inGroup (Cons (EApp f args) rest) =
+closes inGroup (EApp f args :: rest) =
   maybe True inGroup (calleeOf f) || closes inGroup (IR.appendI args rest)
-closes inGroup (Cons e rest) = closes inGroup (IR.partsOnto e rest)
+closes inGroup (e :: rest) = closes inGroup (IR.partsOnto e rest)
 
 -- The ticks
 --------------------------------------------------------------------------------
@@ -98,7 +98,7 @@ closes inGroup (Cons e rest) = closes inGroup (IR.partsOnto e rest)
 -- (a body, its tick first where it may close a loop)
 ticked : (String -> Bool) -> IR.Expr -> S IR.Expr
 ticked inGroup b =
-  if closes inGroup (Cons b Nil)
+  if closes inGroup [b]
   then do
     t <- freshS "fuel"
     pure (ELet t (EPrimCall FuelTick Nil) b)
@@ -174,13 +174,13 @@ callsOut _ = False
 -- | whether code, not the lambdas in it, calls nothing: no global, no
 -- | closure, no primitive that calls a function
 callsNothing : List IR.Expr -> Bool
-callsNothing Nil = True
-callsNothing (Cons (ELam _ _) rest) = callsNothing rest
-callsNothing (Cons (ECall _ _) rest) = False
-callsNothing (Cons (EApp _ _) rest) = False
-callsNothing (Cons (EPrimCall p args) rest) =
+callsNothing [] = True
+callsNothing (ELam _ _ :: rest) = callsNothing rest
+callsNothing (ECall _ _ :: rest) = False
+callsNothing (EApp _ _ :: rest) = False
+callsNothing (EPrimCall p args :: rest) =
   not (callsOut p) && callsNothing (IR.appendI args rest)
-callsNothing (Cons e rest) = callsNothing (IR.partsOnto e rest)
+callsNothing (e :: rest) = callsNothing (IR.partsOnto e rest)
 
 -- (whether a way out is a call of `k`)
 selfCall : String -> IR.Expr -> Bool
@@ -191,10 +191,10 @@ selfCall k _ = False
 -- | computed on the way to each way out, and the arguments of its calls
 -- | of itself (its other ways out are not of a round)
 roundCalls : String -> IR.Expr -> Bool
-roundCalls k (ELet _ a b) = not (callsNothing (Cons a Nil)) || roundCalls k b
-roundCalls k (ESet _ a b) = not (callsNothing (Cons a Nil)) || roundCalls k b
+roundCalls k (ELet _ a b) = not (callsNothing [a]) || roundCalls k b
+roundCalls k (ESet _ a b) = not (callsNothing [a]) || roundCalls k b
 roundCalls k (EMatch s arms) =
-  not (callsNothing (Cons s Nil))
+  not (callsNothing [s])
   || List.any (\a -> roundCalls k (IR.armBody a)) arms
 roundCalls k (ECall g args) = strEq g k && not (callsNothing args)
 roundCalls k e = False
@@ -225,7 +225,7 @@ given : List String
       -> OrdMap.OrdMap String IR.Expr
       -> IR.Expr
       -> IR.Expr
-given (Cons x xs) (Cons y ys) (Cons a args) m c =
+given (x :: xs) (y :: ys) (a :: args) m c =
   if atom a then given xs ys args (OrdMap.insert m x a) c
   else ELet y a (given xs ys args (OrdMap.insert m x (EVar y)) c)
 given _ _ _ m c = IR.subst m c
@@ -267,7 +267,7 @@ batched : String -> List String -> Int -> IR.Expr -> S IR.Expr
 batched k xs n b = do
   e <- unrolled k xs b (n - 1) b
   t <- freshS "fuel"
-  pure (ELet t (EPrimCall FuelTicks (Cons (EInt n) Nil)) e)
+  pure (ELet t (EPrimCall FuelTicks [EInt n]) e)
 
 -- Counted loops
 --------------------------------------------------------------------------------
@@ -312,18 +312,18 @@ keptBy again x = case OrdMap.lookup again x of
 invariant : OrdMap.OrdMap String IR.Expr -> IR.Expr -> Bool
 invariant again (EInt _) = True
 invariant again (EVar x) = keptBy again x
-invariant again (EPrimCall ArrayLength (Cons a Nil)) = invariant again a
-invariant again (EPrimCall StrLength (Cons a Nil)) = invariant again a
-invariant again (EPrimCall BytesLength (Cons a Nil)) = invariant again a
+invariant again (EPrimCall ArrayLength [a]) = invariant again a
+invariant again (EPrimCall StrLength [a]) = invariant again a
+invariant again (EPrimCall BytesLength [a]) = invariant again a
 invariant again _ = False
 
 -- (the constant step of `x`, of what the next round gives it)
 stepOf : String -> Maybe IR.Expr -> Maybe Int
-stepOf x (Just (EPrimCall IntAdd (Cons (EVar y) (Cons (EInt d) Nil)))) =
+stepOf x (Just (EPrimCall IntAdd [EVar y, EInt d])) =
   if strEq x y then Just d else Nothing
-stepOf x (Just (EPrimCall IntAdd (Cons (EInt d) (Cons (EVar y) Nil)))) =
+stepOf x (Just (EPrimCall IntAdd [EInt d, EVar y])) =
   if strEq x y then Just d else Nothing
-stepOf x (Just (EPrimCall IntSub (Cons (EVar y) (Cons (EInt d) Nil)))) =
+stepOf x (Just (EPrimCall IntSub [EVar y, EInt d])) =
   if strEq x y then Just (0 - d) else Nothing
 stepOf x _ = Nothing
 
@@ -357,13 +357,13 @@ indexOf2 xs again _ other = Nothing
 -- (the array whose length a test going round has the index below: where
 -- it is `i < length a`, going round where it holds, `i` stepping up)
 arrayBelow : Bool -> Prim -> String -> Int -> IR.Expr -> IR.Expr -> Maybe String
-arrayBelow True IntLt i d (EVar j) (EPrimCall ArrayLength (Cons (EVar a) Nil)) =
+arrayBelow True IntLt i d (EVar j) (EPrimCall ArrayLength [EVar a]) =
   if strEq i j && d > 0 then Just a else Nothing
 arrayBelow _ _ _ _ _ _ = Nothing
 
 -- (whether the ways out are one, a call of `k`)
 onlyRoundW : String -> List IR.Expr -> Bool
-onlyRoundW k (Cons (ECall g _) Nil) = strEq g k
+onlyRoundW k [ECall g _] = strEq g k
 onlyRoundW k _ = False
 
 -- (whether an arm's one way out is a call of the loop `k`)
@@ -413,7 +413,7 @@ countedAt xs p l r holds arm again = case indexOf2 xs again l r of
 -- (a test's arms: the one going round -- its one way out a call of the
 -- loop -- and whether it is where the test holds)
 roundArm : String -> List IR.Arm -> Maybe (Pair Bool IR.Expr)
-roundArm k (Cons (MkArm t1 _ b1) (Cons (MkArm t2 _ b2) Nil)) =
+roundArm k [MkArm t1 _ b1, MkArm t2 _ b2] =
   if strEq t1 "True" && onlyRound k b1 then Just (MkPair True b1)
   else if strEq t1 "False" && onlyRound k b1 then Just (MkPair False b1)
   else if strEq t2 "True" && onlyRound k b2 then Just (MkPair True b2)
@@ -439,10 +439,10 @@ counted k xs _ = Nothing
 
 -- (each read of the array `a` at the index `i` made one in range)
 inRange : String -> String -> IR.Expr -> IR.Expr
-inRange a i (EPrimCall ArrayIndex (Cons (EVar b) (Cons (EVar j) Nil))) =
+inRange a i (EPrimCall ArrayIndex [EVar b, EVar j]) =
   if strEq a b && strEq i j
-  then EPrimCall ArrayIndexIn (Cons (EVar b) (Cons (EVar j) Nil))
-  else EPrimCall ArrayIndex (Cons (EVar b) (Cons (EVar j) Nil))
+  then EPrimCall ArrayIndexIn [EVar b, EVar j]
+  else EPrimCall ArrayIndex [EVar b, EVar j]
 inRange a i e = IR.mapParts (\_ p -> inRange a i p) e
 
 -- (the round, its reads of the array in range, where there is one)
@@ -488,12 +488,12 @@ countedBatched k xs n c b = do
   first <- copied (roundIn c)
   fast <- unrolled k xs (roundIn c) (n - 1) first
   r <- freshS "fuel"
-  let slow : IR.Expr = ELet r (EPrimCall FuelTicks (Cons (EInt (1 - n)) Nil)) b
+  let slow : IR.Expr = ELet r (EPrimCall FuelTicks [EInt (1 - n)]) b
   t <- freshS "fuel"
   pure
       (ELet
          t
-         (EPrimCall FuelTicks (Cons (EInt n) Nil))
+         (EPrimCall FuelTicks [EInt n])
          (EMatch
             (EBool (allGo n c))
             [MkArm "True" Nil fast, MkArm "False" Nil slow]))
