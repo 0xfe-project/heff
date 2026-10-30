@@ -87,7 +87,9 @@ noKeep =
 
 -- (`safe`: the globals that cannot fail when used -- `safeGlobals`'s,
 -- then each definition and copy found so once simplified; `base`: the
--- same but for the definitions simplified -- see `markCopySafe`)
+-- same but for the definitions simplified -- see `markCopySafe`;
+-- `inlined`: how many inlinings tried were kept, and `shallow`, whether
+-- none is tried now -- see `attemptHeld`)
 type St =
   { supply : Int
   , fuel : Int
@@ -99,6 +101,8 @@ type St =
   , sp : Specs
   , kp : Keep
   , unrolled : OrdMap.OrdMap String Int
+  , inlined : Int
+  , shallow : Bool
   }
 
 withSp : Specs -> St -> St
@@ -113,6 +117,8 @@ withSp p s =
   , sp = p
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withSupply : Int -> St -> St
@@ -127,6 +133,8 @@ withSupply n s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withFuel : Int -> St -> St
@@ -141,6 +149,8 @@ withFuel f s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withSafe : String -> St -> St
@@ -155,6 +165,8 @@ withSafe k s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withBase : String -> St -> St
@@ -169,6 +181,8 @@ withBase k s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withPlain : String -> Plain -> St -> St
@@ -183,6 +197,8 @@ withPlain k p s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withDefs : OrdMap.OrdMap String IR.Expr -> St -> St
@@ -197,6 +213,8 @@ withDefs d s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withKp : Keep -> St -> St
@@ -211,6 +229,8 @@ withKp k s =
   , sp = s.sp
   , kp = k
   , unrolled = s.unrolled
+  , inlined = s.inlined
+  , shallow = s.shallow
   }
 
 withUnrolled : OrdMap.OrdMap String Int -> St -> St
@@ -225,6 +245,25 @@ withUnrolled u s =
   , sp = s.sp
   , kp = s.kp
   , unrolled = u
+  , inlined = s.inlined
+  , shallow = s.shallow
+  }
+
+-- (an inlining tried kept, or none tried from now on: `attemptHeld`)
+withTried : Int -> Bool -> St -> St
+withTried n sh s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , base = s.base
+  , total = s.total
+  , plain = s.plain
+  , sp = s.sp
+  , kp = s.kp
+  , unrolled = s.unrolled
+  , inlined = n
+  , shallow = sh
   }
 
 type M a = St -> Pair a St
@@ -285,6 +324,8 @@ restore saved st =
   , sp = st.sp
   , kp = st.kp
   , unrolled = st.unrolled
+  , inlined = saved.inlined
+  , shallow = saved.shallow
   }
 
 copyTake : St -> Pair IR.Expr Int -> Pair IR.Expr St
@@ -311,23 +352,67 @@ known g = do
   s <- get
   fueled (OrdMap.lookup s.defs g)
 
+-- (`e`, what was tried, kept if it comes to no more than `orig` and
+-- `more`: one more inlining kept, and those tried in it kept with it;
+-- else undone, as `restore` has it -- the names drawn stay drawn: no
+-- name is ever given out twice.  And the fuel burnt stays burnt: a
+-- speculation that did not pay is not free to try again inside every
+-- caller -- refunding it made the simplifier exponential on a file of
+-- record-tied definitions)
+keptIfSmall : St -> Int -> IR.Expr -> IR.Expr -> M IR.Expr
+keptIfSmall saved more orig e = do
+  st <- get
+  if not (IR.sizeAbove (IR.size orig + more) e)
+  then do
+    u <- put (withTried (st.inlined + 1) saved.shallow st)
+    pure e
+  else do
+    u <- put (restore saved st)
+    pure orig
+
+-- (`m` tried again, no inlining tried in it: neither `attemptBy`'s, nor
+-- a call found plain, `plainCall`)
+shallowly : Int -> IR.Expr -> M IR.Expr -> M IR.Expr
+shallowly more orig m = do
+  saved <- get
+  u <- put (withTried saved.inlined True saved)
+  e <- m
+  keptIfSmall saved more orig e
+
 -- | try an inlining: keep it if it is small enough (a copy asked for
 -- | in it is only named: it is made after the definition, if what it
--- | comes to calls it)
+-- | comes to calls it).  None is tried where none is to be (`shallowly`)
 attemptBy : Int -> IR.Expr -> M IR.Expr -> M IR.Expr
 attemptBy more orig m = do
   saved <- get
-  e <- m
-  if not (IR.sizeAbove (IR.size orig + more) e) then pure e
+  if saved.shallow then pure orig
   else do
-    -- (the names drawn stay drawn: no name is ever given out twice.
-    -- And the fuel burnt stays burnt: a speculation that did not pay
-    -- is not free to try again inside every caller -- refunding it
-    -- made the simplifier exponential on a file of record-tied
-    -- definitions)
+    e <- m
+    keptIfSmall saved more orig e
+
+-- | ... a field of a known record applied -- a handler's clause, an
+-- | effect's `hmap` -- whose own shape is what the code after it can
+-- | choose by: what it comes to is with what was inlined in it, each
+-- | inlining there judged on its own, so where those make it too big it
+-- | is tried again with none tried in it, and kept if that is small
+-- | enough.  (`co.op` made for `boc <+> stdio`: the sum's `hmap` given a
+-- | variable comes to a match on the side, each arm that side's `hmap`
+-- | -- `boc`'s, inlined in its arm, no bigger than its call and the
+-- | budget, and the match refused for that.  `co.op`'s copy given `InL
+-- | (When ...)` then chose no arm, and none of boc's operations was
+-- | done at once: as soon as `BocF` had a constructor less, its `hmap`
+-- | small enough to be inlined so)
+attemptHeld : Int -> IR.Expr -> M IR.Expr -> M IR.Expr
+attemptHeld more orig m = do
+  saved <- get
+  if saved.shallow then pure orig
+  else do
+    e <- m
     st <- get
-    u <- put (restore saved st)
-    pure orig
+    e2 <- keptIfSmall saved more orig e
+    if st.inlined > saved.inlined && IR.sizeAbove (IR.size orig + more) e
+    then shallowly more orig m
+    else pure e2
 
 attempt : IR.Expr -> M IR.Expr -> M IR.Expr
 attempt orig m = attemptBy budget orig m
@@ -1660,10 +1745,15 @@ remember k p = \s -> MkPair MkUnit (if s.fuel > 0 then withPlain k p s else s)
 -- | so it is found once -- for parameters of its own -- and kept, the
 -- | arguments put in for them where it is used again.  (Each such call
 -- | copied and simplified the body again, and most were thrown away.)
+-- | Not inlined where none is tried (`attemptBy`), nor found there:
+-- | what it would come to there is not what it comes to
 plainCall : SK -> IR.Expr -> String -> List IR.Expr -> M IR.Expr
 plainCall r f g argv = do
   s <- get
-  case OrdMap.lookup s.plain (plainKey g argv) of
+  if s.shallow then pure (mkApp f argv)
+  else case OrdMap.lookup
+      s.plain
+      (plainKey g argv) of
     Just NotInlined -> pure (mkApp f argv)
     Just (Inlined ps e) ->
       if s.fuel > 0
@@ -2310,6 +2400,8 @@ ownSt = \s ->
           }
       , kp = s.kp
       , unrolled = OrdMap.empty
+      , inlined = s.inlined
+      , shallow = False
       }
 
 -- (asking for copies off, or on again)
@@ -2353,6 +2445,8 @@ backTo saved = \s ->
           }
       , kp = s.kp
       , unrolled = saved.unrolled
+      , inlined = saved.inlined
+      , shallow = saved.shallow
       }
 
 -- The cache
@@ -3579,25 +3673,26 @@ applyToF r f argv =
       specAfter r g as1 e1
     -- (a field of a known record, applied: judged by what the
     -- application comes to, not by the size of the field -- a handler's
-    -- clause given an operation by the arm it chooses, as a copy's is)
+    -- clause given an operation by the arm it chooses, as a copy's is --
+    -- and not by what was inlined in it, `attemptHeld`)
     EProj (EGlobal g) l sh t -> do
       mb <- known g
       case mb of
         Just b ->
-          attemptBy (clauseBudget argv) (mkApp f argv) (do
+          attemptHeld (clauseBudget argv) (mkApp f argv) (do
             h <- r.project l sh t b
             r.applyTo (prunedCopy h argv) argv)
         Nothing -> do
           mv <- knownField g l
           case mv of
             Just v ->
-              attemptBy (clauseBudget argv) (mkApp f argv) (r.applyTo v argv)
+              attemptHeld (clauseBudget argv) (mkApp f argv) (r.applyTo v argv)
             Nothing -> pure (mkApp f argv)
     -- (... and of a handler built by a global, the same way)
     EProj (EApp (EGlobal g) bs) l sh t -> do
       s <- get
       if builtBy s.sp.all (EApp (EGlobal g) bs)
-      then attemptBy
+      then attemptHeld
           (clauseBudget argv)
           (mkApp f argv)
           (builtApplied r f l (EApp (EGlobal g) bs) argv)
@@ -4408,6 +4503,8 @@ initSt n0 sg kp =
       }
   , kp = kp
   , unrolled = OrdMap.empty
+  , inlined = 0
+  , shallow = False
   }
 
 -- | each definition, in order, simplified; what is inlined is taken
