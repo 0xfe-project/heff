@@ -3,15 +3,20 @@
 -- -- or why none came (the C backend's libcurl in
 -- the process held to the curl it spawns).  `main AT REFUSED`: the
 -- server's address, and an address where nothing listens.  `multi AT
--- REFUSED`: the same, awaited by boc, in a reactor.
+-- REFUSED`: the same, awaited by boc, in a reactor.  `crossed AT`:
+-- streamed responses begun in one behaviour and read, or let go of, in
+-- another.
 
 module test.node.fetched
 
 import bytes as Bytes
 import boc as BOC
 import co
+import exception
+import std.filesystem
 import std.http as HTTP
 import std.io
+import std.path as Path
 import std.process
 import stream as Stream
 import uint8 as UInt8
@@ -237,3 +242,175 @@ multi = do
          BOC.await
            (program : Co (BOC.boc <+> stdio <+> HTTP.http <+> process) Unit) do
     pure ()
+
+-- Responses handed from one behaviour to another
+--------------------------------------------------------------------------------
+
+-- (a response's body read whole, a piece at a time: 1 where it is
+-- `/big`'s, whole)
+readOut : {e : HFunctor} -> Maybe (HTTP.Streamed e) -> Co e Int
+readOut Nothing = pure 0
+readOut (Just s) = do
+  got <- piecesRead s.body
+  pure
+      (if strEq
+            (streamShown got s.status)
+            "200 262144 bytes, sum 32767058, in pieces, whole"
+       then 1
+       else 0)
+
+-- (how many were read, and how many as sent)
+type Read = { done : Int, sent : Int }
+
+-- (one more read, `r` whether as sent)
+readOne : Read -> Int -> Read
+readOne c r = { done = c.done + 1, sent = c.sent + r }
+
+-- (`u` streamed in a behaviour of a cown of its own, and its body read
+-- in the next, of that cown and `counts`: there, or by an act it
+-- awaits where `inAct`)
+handedOver : {e : HFunctor}
+           -> {{bc : BOC.boc <: e}}
+           -> {{web : HTTP.http <: e}}
+           -> String
+           -> Bool
+           -> BOC.Cown Read
+           -> Co e Unit
+handedOver u inAct counts = do
+  slot <- BOC.newCown (Nothing : Maybe (HTTP.Streamed e))
+  with s := slot do
+    r <- HTTP.stream { url = u }
+    s := either (\err -> Nothing) Just r
+  if inAct
+  then do
+    with s := slot do
+      let v = s
+      s := Nothing
+      with c := counts
+           r := BOC.await (readOut v) do
+        c := readOne c r
+  else do
+    with s := slot
+         c := counts do
+      r <- readOut s
+      s := Nothing
+      c := readOne c r
+
+-- (`n` responses handed over)
+handOvers : {e : HFunctor}
+          -> {{bc : BOC.boc <: e}}
+          -> {{web : HTTP.http <: e}}
+          -> String
+          -> Bool
+          -> BOC.Cown Read
+          -> Int
+          -> Co e Unit
+handOvers u inAct counts 0 = pure MkUnit
+handOvers u inAct counts n = do
+  handedOver u inAct counts
+  handOvers u inAct counts (n - 1)
+
+-- (how many descriptors the program has open; -1 where that is not to
+-- be known)
+openFds : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e Int
+openFds = do
+  r <-
+    attempt
+      FileError
+      (readDirectory
+         (ev := _)
+         (ex := _)
+         (Path.parse "/dev/fd"))
+  pure (either (\err -> 0 - 1) (\l -> List.length l) r)
+
+-- (the first piece of a body read, the rest not: 1 where there was one)
+firstPiece : {e : HFunctor} -> Maybe (HTTP.Streamed e) -> Co e Int
+firstPiece Nothing = pure 0
+firstPiece (Just s) = do
+  got <-
+    Stream.fold
+      (Stream.take 1 (Stream.source s.body))
+      0
+      (\n b -> pure (n + 1))
+  pure (fst got)
+
+-- (the descriptors open after the first round and after the last, and
+-- the rounds done, each a first piece read)
+type Rounds = { first : Int, last : Int, done : Int, pieces : Int }
+
+-- (one more round, `k` descriptors open after it)
+roundOne : Rounds -> Int -> Int -> Rounds
+roundOne f k p =
+  { first = if f.done == 0 then k else f.first
+  , last = k
+  , done = f.done + 1
+  , pieces = f.pieces + p
+  }
+
+-- (`n` rounds: `u` streamed in a behaviour of `slot`'s, its first piece
+-- read in the next, of `slot` and `rounds`, and the rest let go of
+-- there, the response with it)
+dropped : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{web : HTTP.http <: e}}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> BOC.Cown (Maybe (HTTP.Streamed e))
+        -> BOC.Cown Rounds
+        -> Int
+        -> Co e Unit
+dropped u slot rounds 0 = pure MkUnit
+dropped u slot rounds n = do
+  with s := slot do
+    r <- HTTP.stream { url = u }
+    s := either (\err -> Nothing) Just r
+  with s := slot
+       f := rounds do
+    p <- firstPiece s
+    s := Nothing
+    k <- openFds
+    f := roundOne f k p
+  dropped u slot rounds (n - 1)
+
+-- (the descriptors after the last round, held to those after the
+-- first: never more)
+fdsSaid : Rounds -> String
+fdsSaid f =
+  if f.first > 0 && f.last <= f.first
+  then "descriptors: no more than after the first"
+  else "descriptors: "
+    ^ debug f.first
+    ^ " after the first, "
+    ^ debug f.last
+    ^ " after the last"
+
+-- | Responses begun in one behaviour and read in another, each of a
+-- | cown of its own, which threads run them boc's to choose: `/big`
+-- | eight times read in a behaviour, eight times in an act awaited;
+-- | then, those done, twenty rounds of its first piece read and the
+-- | rest let go of in the behaviour after the one that began it.
+-- | `crossed AT`.
+crossed : Co
+          (BOC.boc <+> stdio <+> HTTP.http <+> process <+> filesystem)
+          Unit
+crossed = do
+  argv <- args
+  let at = fromMaybe "" (List.head argv)
+  inBehaviours <- BOC.newCown { done = 0, sent = 0 }
+  inActs <- BOC.newCown { done = 0, sent = 0 }
+  handOvers (at ^ "/big") False inBehaviours 8
+  handOvers (at ^ "/big") True inActs 8
+  slot <- BOC.newCown Nothing
+  rounds <- BOC.newCown { first = 0, last = 0, done = 0, pieces = 0 }
+  with b := inBehaviours
+       a := inActs
+       once b.done >= 8 && a.done >= 8 do
+    print ("read in another behaviour, as sent: " ^ debug b.sent ^ " of 8")
+    print ("read in an act it awaits, as sent: " ^ debug a.sent ^ " of 8")
+    dropped (at ^ "/big") slot rounds 20
+  with f := rounds once f.done >= 20 do
+    print
+        ("let go of in another behaviour, 20 times: "
+         ^ debug f.pieces
+         ^ " first pieces, "
+         ^ fdsSaid f)

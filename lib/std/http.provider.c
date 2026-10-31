@@ -470,6 +470,7 @@ static struct {
   int (*multi_action)(void *, int, int, int *);
   void *(*multi_info)(void *, int *);
   int (*easy_pause)(void *, int);    // (may be missing: no streamed responses then)
+  int (*multi_cleanup)(void *);       // (likewise)
 } http_lc;
 static int http_lc_ok;
 // (the user agent curl's tool says, `curl/VERSION`; "" where unknown)
@@ -530,6 +531,7 @@ static void http_load(void) {
   HTTP_SYM(multi_action, "curl_multi_socket_action");
   HTTP_SYM(multi_info, "curl_multi_info_read");
   HTTP_SYM(easy_pause, "curl_easy_pause");
+  HTTP_SYM(multi_cleanup, "curl_multi_cleanup");
 #undef HTTP_SYM
   if (!http_lc.global_init || !http_lc.easy_init || !http_lc.easy_cleanup || !http_lc.easy_reset
       || !http_lc.setopt || !http_lc.perform || !http_lc.strerror || !http_lc.slist_append
@@ -761,27 +763,33 @@ static int64_t http_now(void) {
 }
 
 // (libcurl's word on a socket: watched for these, or no longer)
+// (the sockets watched, `*n` of them at `*w`, room for `*cap`: `fd`
+// watched for what libcurl says, or no longer)
+static void http_watch(HttpWatched **w, int *n, int *cap, int fd, int what) {
+  int i = 0;
+  while (i < *n && (*w)[i].fd != fd) i++;
+  if (what == HTTP_POLL_REMOVE) {
+    if (i < *n) (*w)[i] = (*w)[--*n];
+    return;
+  }
+  if (i == *n) {
+    if (*n == *cap) {
+      int more = *cap ? *cap * 2 : 16;
+      HttpWatched *m = heff_alloc(sizeof *m * (size_t)more);
+      if (*n) memcpy(m, *w, sizeof *m * (size_t)*n);
+      free(*w);
+      *w = m;
+      *cap = more;
+    }
+    (*n)++;
+  }
+  (*w)[i].fd = fd;
+  (*w)[i].events = (short)(((what & HTTP_POLL_IN) ? POLLIN : 0) | ((what & HTTP_POLL_OUT) ? POLLOUT : 0));
+}
+
 static int http_socket_fn(void *easy, int fd, int what, void *u, void *sp) {
   (void)easy; (void)u; (void)sp;
-  int i = 0;
-  while (i < http_m.nwatched && http_m.watched[i].fd != fd) i++;
-  if (what == HTTP_POLL_REMOVE) {
-    if (i < http_m.nwatched) http_m.watched[i] = http_m.watched[--http_m.nwatched];
-    return 0;
-  }
-  if (i == http_m.nwatched) {
-    if (http_m.nwatched == http_m.capwatched) {
-      int cap = http_m.capwatched ? http_m.capwatched * 2 : 16;
-      HttpWatched *m = heff_alloc(sizeof *m * (size_t)cap);
-      if (http_m.nwatched) memcpy(m, http_m.watched, sizeof *m * (size_t)http_m.nwatched);
-      free(http_m.watched);
-      http_m.watched = m;
-      http_m.capwatched = cap;
-    }
-    http_m.nwatched++;
-  }
-  http_m.watched[i].fd = fd;
-  http_m.watched[i].events = (short)(((what & HTTP_POLL_IN) ? POLLIN : 0) | ((what & HTTP_POLL_OUT) ? POLLOUT : 0));
+  http_watch(&http_m.watched, &http_m.nwatched, &http_m.capwatched, fd, what);
   return 0;
 }
 
@@ -806,11 +814,7 @@ static int http_fds(struct pollfd *p, int room, int *ms) {
   return http_m.nwatched;
 }
 
-// (a streamed response's transfer done, libcurl's code `result`)
-static void http_stream_finished(void *s, int result);
-
-// (the transfers libcurl is done with: their waits done -- a streamed
-// response's, its private pointer one past it, told so)
+// (the transfers libcurl is done with: their waits done)
 static void http_finished(void) {
   int left;
   int *m;
@@ -821,10 +825,6 @@ static void http_finished(void) {
     HttpTransfer *t = NULL;
     http_lc.getinfo(msg->easy, HTTP_INFO_PRIVATE, &t);
     if (!t) continue;
-    if ((uintptr_t)t & 1) {
-      http_stream_finished((char *)t - 1, msg->data.result);
-      continue;
-    }
     t->result = msg->data.result;
     http_lc.multi_remove(http_m.multi, t->h);
     heff_wait_done(&t->w);
@@ -956,28 +956,36 @@ static V http_transfer(HttpReq *q, V p, V f, V k) { (void)q; (void)p; (void)f; (
 // ---------------------------------------------------------------------
 //
 // A request whose response is read a piece at a time (`Open`, then
-// `Piece` after `Piece`) is a transfer of this thread's multi, the same
-// one a request pending in the reactor is a transfer of, with an easy
-// handle of its own: its head gathered as it comes, whole at its blank
-// line, unless curl goes on to another (an interim `1xx`, a redirect it
-// follows) -- or at the body's first piece, or the transfer's end.  A
-// piece of the body is kept until the program asks for it; once a
-// piece's worth is kept, what comes next pauses the transfer
-// (`CURL_WRITEFUNC_PAUSE`: libcurl keeps what it was given, the server
-// no longer read from), and asking for the next piece goes on with it.
-// So what is held of a body at once is about a piece, whatever its
-// length.
+// `Piece` after `Piece`) is a transfer of a multi handle of its own, a
+// pair of a multi and an easy handle: no thread's, driven by whichever
+// thread asks for its next piece, as libcurl allows a handle to be used
+// by one thread after another, never by two at once.  Its head is
+// gathered as it comes, whole at its blank line unless curl goes on to
+// another (an interim `1xx`, a redirect it follows), or at the body's
+// first piece, or the transfer's end.  A piece of the body is kept until
+// the program asks for it; once a piece's worth is kept, what comes next
+// pauses the transfer (`CURL_WRITEFUNC_PAUSE`: libcurl keeps what it was
+// given, the server no longer read from), and asking for the next piece
+// goes on with it.  So what is held of a body at once is about a piece,
+// whatever its length.
 //
 // Asked for where no group is being started in, the head or the next
-// piece is waited for there: the multi's sockets polled, and libcurl
-// told of each ready, until it has come.  In a group, it is a wait of
-// the reactor's, done when the multi, a source of the reactor's, has it
-// come.  Either way, `idle` bounds that wait: past it, the transfer is
-// ended, curl's code 28.  A response is a foreign value: let go of, its
-// transfer is ended.  Its multi is the thread's that sent it; another
-// thread asking for its pieces is told so, an error, and one letting go
-// of it leaves it be, paused (another thread's multi is not its to
-// touch).
+// piece is waited for there: the pair's sockets polled, and libcurl told
+// of each ready, until it has come.  In a group, it is a wait of the
+// reactor's, done when it has come: each thread's waits for pieces are a
+// source of its reactor's, the sockets of their pairs polled with the
+// reactor's others.  Either way, `idle` bounds that wait: past it, the
+// transfer is ended, curl's code 28.
+//
+// A response is read by one at a time: whoever asks for a piece while
+// another is being waited for -- another thread, holding the response
+// too -- is told so, an error, and the read goes on.  It is a foreign
+// value, let go of by whichever thread drops it last: never while a
+// piece is asked for, as the asking holds it.  Its transfer is ended
+// then, and the pair kept, a few of them, for the next response, its
+// connections with it: a multi keeps its connections for the next
+// transfer.  A pair a process was forked with is its parent's, left as
+// it is.
 //
 // Where libcurl is not to be used, the spawned curl writes the body to
 // a temporary file, and its pieces are read from that: never all of it
@@ -988,14 +996,13 @@ static V http_transfer(HttpReq *q, V p, V f, V k) { (void)q; (void)p; (void)f; (
 #define HTTP_PIECE ((size_t)1 << 16)
 
 typedef struct HttpPull HttpPull;
+typedef struct HttpPair HttpPair;
 
 typedef struct {
-  void *h;              // (its easy handle, libcurl's; NULL, curl spawned)
+  HttpPair *pair;       // (its multi and easy handle, libcurl's; NULL, curl spawned)
   void *list;
   HttpReq q;
   V rq;                 // (the request: its body's bytes the transfer's to send)
-  long pid;             // (the process that sent it)
-  void *m;              // (the multi of the thread that sent it)
   Buf head;             // (its headers' text, as they come)
   Buf got;              // (what came of the body, not yet asked for)
   int paused;
@@ -1004,22 +1011,21 @@ typedef struct {
   int64_t code;         // (once ended, curl's code: 0, the body whole)
   Buf why;
   char err[HTTP_ERROR_SIZE];
+  int busy;             // (being read, by a thread: atomic)
   HttpPull *waiting;    // (a wait of the reactor's for it)
   FILE *file;           // (curl spawned: the body as curl wrote it)
   char bodyf[4096];
 } HttpStream;
 
-// (a wait of the reactor's for a streamed response's head, or for its
-// next piece)
-struct HttpPull {
-  HeffWait w;           // (first: the pull is its wait)
-  HttpStream *s;
-  V held;               // (the head's: the response, a foreign value; a
-                        //  piece's: the operation)
-  int head;
-};
-
 static uint32_t http_opened_shape[3] = { LBL_status, LBL_headers, LBL_transfer };
+
+// (the response taken to be read: 0 where it is being read already)
+static int http_stream_take(HttpStream *s) {
+  return !__atomic_exchange_n(&s->busy, 1, __ATOMIC_ACQ_REL);
+}
+
+// (the response read, for the next to read)
+static void http_stream_give(HttpStream *s) { __atomic_store_n(&s->busy, 0, __ATOMIC_RELEASE); }
 
 // (an error of the response's: curl's code `code`, and why)
 static V http_stream_error(HttpStream *s, int64_t code, const char *why, size_t n) {
@@ -1092,9 +1098,113 @@ static void http_stream_spawned(HttpStream *s) {
 }
 
 #ifdef HTTP_CURL
+// (a wait of the reactor's for a streamed response's head, or for its
+// next piece; among its thread's, while it waits)
+struct HttpPull {
+  HeffWait w;           // (first: the pull is its wait)
+  HttpStream *s;
+  V held;               // (the head's: the response, a foreign value; a
+                        //  piece's: the operation)
+  int head;
+  int at, n;            // (where its pair's sockets are among the source's polled)
+  HttpPull *prev, *next;
+};
+
+// (a response's multi and easy handle, the sockets libcurl asks to be
+// watched and when it is to be told the time is up; the response it is
+// carrying)
+struct HttpPair {
+  void *multi, *easy;
+  long pid;
+  HttpWatched *watched;
+  int nwatched, capwatched;
+  int64_t deadline;     // (ms of the monotonic clock; -1, none)
+  HttpStream *s;
+};
+
+// (pairs let go of, kept for the next response, by any thread)
+#define HTTP_PAIRS_KEPT 8
+static HttpPair *http_pairs[HTTP_PAIRS_KEPT];
+static int http_npairs;
+#ifdef HEFF_THREADS
+static pthread_mutex_t http_pairs_mu = PTHREAD_MUTEX_INITIALIZER;
+#define HTTP_PAIRS_LOCK() pthread_mutex_lock(&http_pairs_mu)
+#define HTTP_PAIRS_UNLOCK() pthread_mutex_unlock(&http_pairs_mu)
+#else
+#define HTTP_PAIRS_LOCK() ((void)0)
+#define HTTP_PAIRS_UNLOCK() ((void)0)
+#endif
+
 // (whether what is waited for -- the head, or the next piece -- has come)
 static int http_stream_has(HttpStream *s, int head) {
   return s->done || (head ? s->head_done : s->got.n > 0);
+}
+
+// (libcurl's word on a socket of the pair's: watched for these, or no
+// longer)
+static int http_pair_socket(void *easy, int fd, int what, void *u, void *sp) {
+  (void)easy; (void)sp;
+  HttpPair *p = u;
+  http_watch(&p->watched, &p->nwatched, &p->capwatched, fd, what);
+  return 0;
+}
+
+// (libcurl's word on the pair's time: to be told in `ms`, or never, -1)
+static int http_pair_timer(void *multi, long ms, void *u) {
+  (void)multi;
+  HttpPair *p = u;
+  p->deadline = ms < 0 ? -1 : http_now() + ms;
+  return 0;
+}
+
+// (a pair, kept or made: NULL where libcurl has not what it takes)
+static HttpPair *http_pair_get(void) {
+  if (!http_loaded() || !http_lc.multi_init || !http_lc.multi_setopt || !http_lc.multi_add
+      || !http_lc.multi_remove || !http_lc.multi_action || !http_lc.multi_info || !http_lc.multi_cleanup
+      || !http_lc.easy_pause)
+    return NULL;
+  long me = (long)getpid();
+  HttpPair *p = NULL;
+  HTTP_PAIRS_LOCK();
+  // (those a process was forked with are its parent's: left as they are)
+  while (http_npairs && !p) {
+    p = http_pairs[--http_npairs];
+    if (p->pid != me) p = NULL;
+  }
+  HTTP_PAIRS_UNLOCK();
+  if (p) return p;
+  p = heff_alloc(sizeof *p);
+  memset(p, 0, sizeof *p);
+  p->multi = http_lc.multi_init();
+  p->easy = http_lc.easy_init();
+  if (!p->multi || !p->easy) {
+    if (p->multi) http_lc.multi_cleanup(p->multi);
+    if (p->easy) http_lc.easy_cleanup(p->easy);
+    free(p);
+    return NULL;
+  }
+  p->pid = me;
+  p->deadline = -1;
+  http_lc.multi_setopt(p->multi, HTTP_MOPT_SOCKETFUNCTION, http_pair_socket);
+  http_lc.multi_setopt(p->multi, HTTP_MOPT_SOCKETDATA, p);
+  http_lc.multi_setopt(p->multi, HTTP_MOPT_TIMERFUNCTION, http_pair_timer);
+  http_lc.multi_setopt(p->multi, HTTP_MOPT_TIMERDATA, p);
+  return p;
+}
+
+// (a pair let go of: kept for the next, or cleaned up)
+static void http_pair_put(HttpPair *p) {
+  http_lc.easy_reset(p->easy);
+  p->s = NULL;
+  HTTP_PAIRS_LOCK();
+  int kept = http_npairs < HTTP_PAIRS_KEPT;
+  if (kept) http_pairs[http_npairs++] = p;
+  HTTP_PAIRS_UNLOCK();
+  if (kept) return;
+  http_lc.multi_cleanup(p->multi);
+  http_lc.easy_cleanup(p->easy);
+  free(p->watched);
+  free(p);
 }
 
 // (a piece of the body come: kept -- or, a piece's worth kept already,
@@ -1126,26 +1236,15 @@ static size_t http_stream_head(char *p, size_t size, size_t n, void *u) {
   return len;
 }
 
-static void http_stream_finished(void *p, int result) {
-  HttpStream *s = p;
-  http_lc.multi_remove(http_m.multi, s->h);
-  s->done = 1;
-  s->code = result;
-  if (result) {
-    const char *why = s->err[0] ? s->err : http_lc.strerror(result);
-    buf_str(&s->why, why ? why : "");
-  }
-  if (s->waiting) heff_wait_done(&s->waiting->w);
-}
-
-// (the transfer ended here, before libcurl was done with it: curl's
-// code `code`, and why)
+// (the transfer ended, before libcurl was done with it or as it was:
+// curl's code `code`, and why)
 static void http_stream_cut(HttpStream *s, int64_t code, const char *why) {
   if (s->done) return;
-  http_lc.multi_remove(http_m.multi, s->h);
+  http_lc.multi_remove(s->pair->multi, s->pair->easy);
   s->done = 1;
   s->code = code;
-  buf_str(&s->why, why);
+  if (code) buf_str(&s->why, why);
+  if (s->waiting) heff_wait_done(&s->waiting->w);
 }
 
 // (the transfer ended, waited for longer than `idle`: curl's code 28)
@@ -1155,51 +1254,81 @@ static void http_stream_silent(HttpStream *s) {
   http_stream_cut(s, 28, why);
 }
 
-// (the response's transfer, of this thread's multi: 1, begun; 0, nothing
+// (libcurl told of the pair's sockets ready, `n` of them at `fds`, as
+// polled, and of its time; the transfer done, where libcurl is done)
+static void http_pair_act(HttpPair *p, struct pollfd *fds, int n) {
+  int running;
+  for (int i = 0; i < n; i++) {
+    if (!fds[i].revents) continue;
+    int ev = ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) ? HTTP_CSELECT_IN : 0)
+      | ((fds[i].revents & (POLLOUT | POLLERR)) ? HTTP_CSELECT_OUT : 0)
+      | ((fds[i].revents & POLLNVAL) ? HTTP_CSELECT_ERR : 0);
+    http_lc.multi_action(p->multi, fds[i].fd, ev, &running);
+  }
+  if (p->deadline >= 0 && http_now() >= p->deadline) {
+    p->deadline = -1;
+    http_lc.multi_action(p->multi, HTTP_SOCKET_TIMEOUT, 0, &running);
+  }
+  int left;
+  int *m;
+  while ((m = http_lc.multi_info(p->multi, &left))) {
+    struct { int msg; void *easy; union { void *p; int result; } data; } *msg = (void *)m;
+    if (msg->msg != HTTP_MSG_DONE || !p->s) continue;
+    HttpStream *s = p->s;
+    const char *why = s->err[0] ? s->err : http_lc.strerror(msg->data.result);
+    http_stream_cut(s, msg->data.result, why ? why : "");
+  }
+}
+
+// (the response's transfer, of a pair of its own: 1, begun; 0, nothing
 // done, where libcurl is not to be used)
 static int http_stream_curl(HttpStream *s) {
-  if (http_multi_mine() < 0 || !http_lc.easy_pause) return 0;
-  void *h = http_m.nidle ? http_m.idle[--http_m.nidle] : http_lc.easy_init();
-  if (!h) return 0;
+  HttpPair *p = http_pair_get();
+  if (!p) return 0;
   int ok;
   void *list = http_list(&s->q, &ok);
-  if (!ok || http_setup(h, &s->q, http_stream_sink, s, http_stream_head, s, list, s->err)
-      || http_lc.setopt(h, HTTP_OPT_PRIVATE, (void *)((char *)s + 1)) != 0) {
+  if (!ok || http_setup(p->easy, &s->q, http_stream_sink, s, http_stream_head, s, list, s->err)) {
     if (list) http_lc.slist_free_all(list);
-    http_lc.easy_reset(h);
-    if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = h;
-    else http_lc.easy_cleanup(h);
+    http_pair_put(p);
     return 0;
   }
   // (a proxy's answer to `CONNECT` is not the response's head)
-  http_lc.setopt(h, HTTP_OPT_SUPPRESS_CONNECT_HEADERS, 1L);
-  if (http_lc.multi_add(http_m.multi, h) != 0) {
+  http_lc.setopt(p->easy, HTTP_OPT_SUPPRESS_CONNECT_HEADERS, 1L);
+  p->s = s;
+  if (http_lc.multi_add(p->multi, p->easy) != 0) {
     http_lc.slist_free_all(list);
-    http_lc.easy_reset(h);
-    http_lc.easy_cleanup(h);
+    http_pair_put(p);
     return 0;
   }
-  s->h = h;
+  s->pair = p;
   s->list = list;
-  s->m = &http_m;
-  s->pid = (long)getpid();
   return 1;
 }
 
 // (the head, or the next piece, waited for here, no group being started
-// in: the multi's sockets polled, and libcurl told of each ready)
+// in: the pair's sockets polled, and libcurl told of each ready)
 static void http_stream_drive(HttpStream *s, int head) {
+  HttpPair *pr = s->pair;
   int64_t until = s->q.idle > 0 ? http_now() + s->q.idle : 0;
   struct pollfd *p = NULL;
   int room = 0;
   while (!http_stream_has(s, head)) {
-    if (room < http_m.nwatched + 1) {
+    if (room < pr->nwatched + 1) {
       free(p);
-      room = http_m.nwatched + 16;
+      room = pr->nwatched + 16;
       p = heff_alloc(sizeof *p * (size_t)room);
     }
+    int n = pr->nwatched;
+    for (int i = 0; i < n; i++) {
+      p[i].fd = pr->watched[i].fd;
+      p[i].events = pr->watched[i].events;
+      p[i].revents = 0;
+    }
     int ms = -1;
-    int n = http_fds(p, room, &ms);
+    if (pr->deadline >= 0) {
+      int64_t left = pr->deadline - http_now();
+      ms = left < 0 ? 0 : left > 1000000 ? 1000000 : (int)left;
+    }
     if (until) {
       int64_t left = until - http_now();
       if (left <= 0) {
@@ -1214,20 +1343,69 @@ static void http_stream_drive(HttpStream *s, int head) {
       http_stream_cut(s, HTTP_FAILED_INIT, strerror(errno));
       break;
     }
-    http_ready(p, n);
+    http_pair_act(pr, p, n);
   }
   free(p);
+}
+
+// (this thread's waits for responses' pieces, and the source of its
+// reactor's that has their pairs' sockets polled)
+static HEFF_TLS HttpPull *http_pulls;
+static HEFF_TLS HeffSource http_pull_source;
+
+static int http_pulls_fds(struct pollfd *p, int room, int *ms) {
+  int n = 0;
+  for (HttpPull *u = http_pulls; u; u = u->next) {
+    u->at = n;
+    u->n = 0;
+    if (u->w.done) continue;
+    HttpPair *pr = u->s->pair;
+    if (p && n + pr->nwatched <= room) {
+      for (int i = 0; i < pr->nwatched; i++) {
+        p[n + i].fd = pr->watched[i].fd;
+        p[n + i].events = pr->watched[i].events;
+      }
+      u->n = pr->nwatched;
+    }
+    n += pr->nwatched;
+    if (pr->deadline >= 0) {
+      int64_t left = pr->deadline - http_now();
+      int t = left < 0 ? 0 : left > 1000000 ? 1000000 : (int)left;
+      if (*ms < 0 || t < *ms) *ms = t;
+    }
+  }
+  return n;
+}
+
+static void http_pulls_ready(struct pollfd *p, int n) {
+  for (HttpPull *u = http_pulls; u; u = u->next) {
+    if (u->w.done || u->at + u->n > n) continue;
+    http_pair_act(u->s->pair, p + u->at, u->n);
+    if (http_stream_has(u->s, u->head)) heff_wait_done(&u->w);
+  }
+}
+
+// (the pull no longer among its thread's, its response free to be read)
+static void http_pull_off(HttpPull *u) {
+  if (u->prev) u->prev->next = u->next;
+  else http_pulls = u->next;
+  if (u->next) u->next->prev = u->prev;
+  u->s->waiting = NULL;
+  http_stream_give(u->s);
 }
 
 static V http_pull_answer(HeffWait *w) {
   HttpPull *u = (HttpPull *)w;
   HttpStream *s = u->s;
-  s->waiting = NULL;
   if (w->err == ETIMEDOUT && !http_stream_has(s, u->head)) http_stream_silent(s);
   V r;
-  if (u->head) r = http_opened(s, u->held);
-  else {
+  if (u->head) {
+    // (the response, not yet the program's, may be let go of here)
+    http_pull_off(u);
+    r = http_opened(s, u->held);
+  } else {
     r = http_piece(s);
+    http_pull_off(u);
     heff_drop(u->held);
   }
   free(u);
@@ -1236,7 +1414,7 @@ static V http_pull_answer(HeffWait *w) {
 
 static void http_pull_cancel(HeffWait *w) {
   HttpPull *u = (HttpPull *)w;
-  u->s->waiting = NULL;
+  http_pull_off(u);
   V held = u->held;
   free(u);
   heff_drop(held);
@@ -1245,6 +1423,11 @@ static void http_pull_cancel(HeffWait *w) {
 // (the head, or the next piece, of `s` pending in the reactor, its wait
 // holding `held`)
 static V http_pull(HttpStream *s, int head, V held, V f, V k) {
+  if (!http_pull_source.on) {
+    http_pull_source.fds = http_pulls_fds;
+    http_pull_source.ready = http_pulls_ready;
+    heff_reactor_source(&http_pull_source);
+  }
   HttpPull *u = heff_alloc(sizeof *u);
   memset(u, 0, sizeof *u);
   u->w.fd = -1;
@@ -1255,22 +1438,21 @@ static V http_pull(HttpStream *s, int head, V held, V f, V k) {
   u->s = s;
   u->held = held;
   u->head = head;
+  u->next = http_pulls;
+  if (http_pulls) http_pulls->prev = u;
+  http_pulls = u;
   s->waiting = u;
   return heff_outside(&u->w, f, k);
 }
 
-// (whether `s` is this thread's to read: sent by it)
-static int http_stream_here(HttpStream *s) {
-  return !s->h || (s->m == (void *)&http_m && s->pid == (long)getpid());
-}
-
 // (what is asked for of `s` -- its head, or its next piece -- come, or
-// waited for here: 0; else the operation, pending in the reactor)
+// waited for here: 0; else the operation, pending in the reactor, `s`
+// read until its wait is answered)
 static V http_stream_wait(HttpStream *s, int head, V held, V f, V k) {
-  if (!s->h) return 0;
+  if (!s->pair) return 0;
   if (!head && s->got.n == 0 && s->paused && !s->done) {
     s->paused = 0;
-    http_lc.easy_pause(s->h, HTTP_PAUSE_CONT);
+    http_lc.easy_pause(s->pair->easy, HTTP_PAUSE_CONT);
   }
   if (http_stream_has(s, head)) return 0;
   if (heff_group) return http_pull(s, head, held, f, k);
@@ -1278,31 +1460,27 @@ static V http_stream_wait(HttpStream *s, int head, V held, V f, V k) {
   return 0;
 }
 
-// (the transfer let go of, its handle kept for the next: 1; 0, where it
-// is another thread's, left be)
-static int http_stream_release(HttpStream *s) {
-  if (!s->h || s->pid != (long)getpid()) return 1;
-  if (s->m != (void *)&http_m) return 0;
-  if (!s->done) http_lc.multi_remove(http_m.multi, s->h);
-  http_lc.easy_reset(s->h);
-  if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = s->h;
-  else http_lc.easy_cleanup(s->h);
+// (the transfer ended and its pair kept, by whichever thread lets go of
+// the response; one a process was forked with left as it is)
+static void http_stream_release(HttpStream *s) {
+  HttpPair *p = s->pair;
+  if (!p || p->pid != (long)getpid()) return;
+  if (!s->done) http_lc.multi_remove(p->multi, p->easy);
+  http_pair_put(p);
   if (s->list) http_lc.slist_free_all(s->list);
-  return 1;
 }
 #else
 static int http_stream_curl(HttpStream *s) { (void)s; return 0; }
-static int http_stream_here(HttpStream *s) { (void)s; return 1; }
 static V http_stream_wait(HttpStream *s, int head, V held, V f, V k) {
   (void)s; (void)head; (void)held; (void)f; (void)k;
   return 0;
 }
-static int http_stream_release(HttpStream *s) { (void)s; return 1; }
+static void http_stream_release(HttpStream *s) { (void)s; }
 #endif
 
 static void http_stream_let_go(void *p) {
   HttpStream *s = p;
-  if (!http_stream_release(s)) return;
+  http_stream_release(s);
   if (s->file) fclose(s->file);
   if (s->bodyf[0]) remove(s->bodyf);
   http_req_free(&s->q);
@@ -1365,13 +1543,14 @@ static V heff_provider_http(V p, V k) {
     V f = heff_dup(heff_field(p, 1));
     HttpStream *s = heff_foreign_ptr(heff_field(p, 0));
     V r;
-    if (!http_stream_here(s)) {
-      const char *why = "A streamed response is read by the thread that sent it";
+    if (!http_stream_take(s)) {
+      const char *why = "A streamed response's next piece is asked for while it is being read";
       r = http_stream_error(s, HTTP_FAILED_INIT, why, strlen(why));
     } else {
       V pending = http_stream_wait(s, 0, p, f, k);
       if (pending) return pending;
       r = http_piece(s);
+      http_stream_give(s);
     }
     heff_drop(p);
     V x = heff_answer(f, r);
