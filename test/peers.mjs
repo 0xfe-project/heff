@@ -97,6 +97,10 @@ if (mode === "ports") console.log((await freePorts(Number(arg))).join("\n"));
 
 if (mode === "routes") {
   const big = Buffer.from(Array.from({ length: 1 << 18 }, (_, i) => (i * 7) % 251));
+  // (the `/paced` responses waiting for a `/go` to send the rest, and
+  // the connections they came on)
+  const paced = [];
+  const pacedOn = new Set();
   const server = createServer((q, r) => {
     const say = (status, body, headers = {}) => { r.writeHead(status, headers); r.end(body); };
     switch (q.url) {
@@ -125,6 +129,19 @@ if (mode === "routes") {
       case "/short": r.writeHead(200, { "Content-Length": 100 }); r.write("cut"); return setTimeout(() => r.socket.destroy(), 50);
       // (a head, and then nothing, for a while)
       case "/silent": r.writeHead(200, { "Content-Length": 10 }); r.flushHeaders(); return setTimeout(() => r.socket.destroy(), 10000).unref();
+      // (a piece, then the rest once `/go` is asked for, or 10 s on)
+      case "/paced": {
+        pacedOn.add(r.socket);
+        r.writeHead(200, { "Content-Length": 12 });
+        r.write("first,");
+        const rest = () => r.end("second");
+        const t = setTimeout(rest, 10000);
+        t.unref();
+        return paced.push(() => { clearTimeout(t); rest(); });
+      }
+      case "/go": paced.splice(0).forEach((f) => f()); return say(200, "gone", { Connection: "close" });
+      // (how many connections `/paced` came on since this was last asked)
+      case "/paced-connections": { const n = pacedOn.size; pacedOn.clear(); return say(200, String(n), { Connection: "close" }); }
       default: return say(500);
     }
   });

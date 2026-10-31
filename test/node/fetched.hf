@@ -414,3 +414,100 @@ crossed = do
          ^ debug f.pieces
          ^ " first pieces, "
          ^ fdsSaid f)
+
+-- One response read by two at once
+--------------------------------------------------------------------------------
+
+-- (what a reader came to, said)
+restSaid : {e : HFunctor}
+         -> {{web : HTTP.http <: e}}
+         -> String
+         -> List Bytes
+         -> Either HTTP.HttpError Unit
+         -> Co e String
+restSaid go pieces (Left err) = do
+  gone <- HTTP.get go
+  pure (codeOf err)
+restSaid go pieces (Right u) =
+  pure (showBody (Bytes.concat (List.reverse pieces)) ^ ", whole")
+
+-- (the rest of a body read, by one of two readers at once: what it came
+-- to; where it came to an error, `go` asked for, so that the server
+-- sends the rest to the other, waiting for it)
+readRest : {e : HFunctor}
+         -> {{web : HTTP.http <: e}}
+         -> String
+         -> Stream.Source e Bytes (Either HTTP.HttpError Unit)
+         -> Co e String
+readRest go rest = do
+  got <- Stream.fold rest Nil (\acc b -> pure (b :: acc))
+  restSaid go (fst got) (snd got)
+
+-- (the two readers' ends, the error first)
+bothSaid : String -> String -> String
+bothSaid a b = if startsWith "code" b then b ^ "; " ^ a else a ^ "; " ^ b
+
+-- (`/paced` streamed and its first piece read; its rest read by two
+-- behaviours at once, each of a cown of its own: one waits for the rest,
+-- which the server sends only once `/go` is asked for, which the other
+-- asks for once it is told the response is being read -- so the other
+-- reads while the one waits, whichever is first.  `n` rounds, one after
+-- another, what each came to on `said`; after the last, how many
+-- connections the server had them on said too: the response let go of,
+-- its connection is used again)
+together : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> {{io : stdio <: e}}
+         -> {{web : HTTP.http <: e}}
+         -> String
+         -> BOC.Cown (List String)
+         -> Int
+         -> Int
+         -> Co e Unit
+together at said rounds 0 = do
+  with l := said do
+    print ("read by two at once: " ^ joinWith " | " (List.reverse l))
+    c <- HTTP.getText (at ^ "/paced-connections")
+    let n = either (\err -> 0) (\t -> fromMaybe 0 (parseInt t)) c
+    print
+        (if 0 < n && n < rounds then "connections: fewer than the rounds"
+         else "connections: " ^ debug n ^ ", for " ^ debug rounds ^ " rounds")
+together at said rounds n = do
+  r <- HTTP.stream { url = at ^ "/paced" }
+  case r of
+    Left err -> do
+      with l := said do
+        l := codeOf err :: l
+      together at said rounds (n - 1)
+    Right s -> do
+      first <- Stream.source s.body
+      case first of
+        Done x -> do
+          with l := said do
+            l := "no first piece" :: l
+          together at said rounds (n - 1)
+        Next b rest -> do
+          one <- BOC.newCown ""
+          two <- BOC.newCown ""
+          with o := one do
+            o := (<- readRest (at ^ "/go") rest)
+          with w := two do
+            w := (<- readRest (at ^ "/go") rest)
+          with o := one
+               w := two
+               l := said
+               once not (strEq o "") && not (strEq w "") do
+            l := (debug b ^ ", then " ^ bothSaid o w) :: l
+            together at said rounds (n - 1)
+
+-- | One response read by two behaviours at once, six times: the one
+-- | that asks for its next piece while the other waits for it told so,
+-- | code 2, the other reading it to its end; each let go of after, its
+-- | connection used again by the next.  Two of boc's workers, at
+-- | least, as the one waiting holds one.  `atOnce AT`.
+atOnce : Co (BOC.boc <+> stdio <+> HTTP.http <+> process) Unit
+atOnce = do
+  argv <- args
+  let at = fromMaybe "" (List.head argv)
+  said <- BOC.newCown Nil
+  together at said 6 6
