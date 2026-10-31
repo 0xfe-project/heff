@@ -3200,6 +3200,12 @@ refusal status size body =
   ^ "\r\nConnection: close\r\n\r\n"
   ^ body
 
+-- (the head of a WebSocket's handshake answered, its key RFC 6455's
+-- example's)
+upgraded : String
+upgraded =
+  "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+
 -- | what the server is to answer Node.js's client, each what it is
 -- | asked and what it then says it was asked
 servedWant : List (Pair String (Pair String (List String)))
@@ -3292,6 +3298,51 @@ servedWant =
        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nrest: early\necho: late\n"
        ["GET /upgrade HTTP/1.1, b[]", "taken over, Upgrade: echo"])
   , MkPair
+    "websocket, echoed"
+    (MkPair
+       (upgraded ^ "text hello, binary 010203, close 1000")
+       [ "GET /ws HTTP/1.1, b[]"
+       , "websocket: text \"hello\""
+       , "websocket: binary b[1, 2, 3]"
+       , "websocket: ended 1000 \"done\""
+       ])
+  , MkPair
+    "websocket, a ping"
+    (MkPair
+       (upgraded ^ "pong 6869, close 1001")
+       ["GET /ws HTTP/1.1, b[]", "websocket: ended 1001 \"\""])
+  , MkPair
+    "websocket, in pieces"
+    (MkPair
+       (upgraded ^ "pong 3f, text Hello, close")
+       [ "GET /ws HTTP/1.1, b[]"
+       , "websocket: text \"Hello\""
+       , "websocket: ended 1005 \"\""
+       ])
+  , MkPair
+    "websocket, closed by the server"
+    (MkPair
+       (upgraded ^ "close 1000 bye")
+       [ "GET /ws HTTP/1.1, b[]"
+       , "websocket: text \"bye\""
+       , "websocket: closed by the server"
+       ])
+  , MkPair
+    "websocket, a frame not masked"
+    (MkPair
+       (upgraded ^ "close 1002 a client's frame not masked")
+       [ "GET /ws HTTP/1.1, b[]"
+       , "websocket: ended 1002 \"a client's frame not masked\""
+       ])
+  , MkPair
+    "websocket, refused"
+    (MkPair
+       (refusal
+          "400 Bad Request"
+          "33"
+          "no Sec-WebSocket-Key of 16 bytes\n")
+       ["GET /ws HTTP/1.1, b[]"])
+  , MkPair
     "a stream, its client gone"
     (MkPair
        "HTTP/1.1 200 OK"
@@ -3311,7 +3362,10 @@ servedWant =
 -- | HTTP/1.0, `Expect: 100-continue`, a chunked body, a body refused
 -- | that the client sends on after the response, no request at all;
 -- | replies streamed, in chunks, to HTTP/1.0 and to a `HEAD`, events,
--- | a connection taken over, and a stream whose client goes, its `with`
+-- | a connection taken over, by itself and as a WebSocket's (messages
+-- | echoed, a ping, a message in pieces, a close of either side's, a
+-- | frame not masked, a handshake refused), and a stream whose client
+-- | goes, its `with`
 -- | letting go as it stops) and curl (where there is one), two requests
 -- | on one connection -- each
 -- | request said by the server as it answers it, until it is asked for
@@ -3593,7 +3647,8 @@ describedBytes =
 -- | libcrypto as the module says (pkg-config's): keys read from PEM and
 -- | made of a JWK's fields, each algorithm's signature made and
 -- | verified, openssl's verified, what is changed or of another kind not,
--- | and what is no key refused
+-- | and what is no key, or a key too short or of no algorithm's kind,
+-- | refused by its error
 signatures : {e : HFunctor}
            -> {{chk : check <: e}}
            -> {{sys : process <: e}}
@@ -3641,17 +3696,29 @@ signatures = do
                   , "a JWK's RSA key as PEM, the public PEM: True"
                   , "a JWK's P-256 key as PEM, the public PEM: True"
                   , "a JWK's Ed25519 key as PEM, the public PEM: True"
-                  , "ES256 by an RSA key: refused, the key is not of the algorithm's kind"
+                  , "ES256 by an RSA key: refused, WrongKey ES256"
                   , "EdDSA's signature by an RSA key: False"
                   , "RS256, no signature: False"
                   , "ES256, 63 bytes: False"
-                  , "a private key of no PEM: refused, not a private key in PEM"
-                  , "a private key of a public PEM: refused, not a private key in PEM"
-                  , "a public key of a PEM cut short: refused, not a public key in PEM"
-                  , "a P-256 key, x of 31 bytes: refused, not a P-256 public key"
-                  , "a P-256 key off the curve: refused, not a P-256 public key"
-                  , "an Ed25519 key of 31 bytes: refused, not an Ed25519 public key"
-                  , "an RSA key of no modulus: refused, not an RSA public key"
+                  , "a private key of no PEM: refused, Unreadable"
+                  , "a private key of a public PEM: refused, Unreadable"
+                  , "a public key of a PEM cut short: refused, Unreadable"
+                  , "a P-256 key, x of 31 bytes: refused, InvalidKey \"a coordinate not of 32 bytes\""
+                  , "a P-256 key off the curve: refused, InvalidKey \"a point not on the curve\""
+                  , "an Ed25519 key of 31 bytes: refused, InvalidKey \"a key not of 32 bytes\""
+                  , "an RSA key of no modulus: refused, InvalidKey \"no modulus\""
+                  , "an RSA key of no exponent: refused, InvalidKey \"no exponent\""
+                  , "an RSA key of an even exponent: refused, InvalidKey \"an exponent even or less than 3\""
+                  , "an RSA key of the exponent 1: refused, InvalidKey \"an exponent even or less than 3\""
+                  , "a 1024-bit RSA key: refused, TooShort 1024"
+                  , "a 1024-bit RSA key, shown: an RSA key of 1024 bits, fewer than 2048"
+                  , "a 1024-bit RSA public key: refused, TooShort 1024"
+                  , "a 1024-bit RSA public key, RSA's own PEM: refused, TooShort 1024"
+                  , "a 1024-bit RSA key of a JWK: refused, TooShort 1024"
+                  , "a P-384 key: refused, Unsupported \"EC, secp384r1\""
+                  , "a P-384 public key: refused, Unsupported \"EC, secp384r1\""
+                  , "an X25519 key: refused, Unsupported \"X25519\""
+                  , "an encrypted key: refused, Encrypted"
                   , ""
                   ])
          }

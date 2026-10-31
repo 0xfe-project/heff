@@ -231,6 +231,53 @@ if (mode === "client") {
     ["taken over",
       [[0, "GET /upgrade HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nearly"], ["rest: early\n", "late"]]],
   ]) said(what, await raw(parts));
+  // (a WebSocket's frame, as a client sends it: masked, unless `mask`
+  // is false, by a key of its own)
+  const frame = (op, payload, { fin = true, mask = true } = {}) => {
+    const p = Buffer.from(payload), key = Buffer.from([0x37, 0xfa, 0x21, 0x3d]);
+    const head = p.length < 126 ? Buffer.from([(fin ? 128 : 0) | op, (mask ? 128 : 0) | p.length])
+      : Buffer.from([(fin ? 128 : 0) | op, (mask ? 128 : 0) | 126, p.length >> 8, p.length & 255]);
+    return Buffer.concat([head, mask ? key : Buffer.alloc(0), mask ? Buffer.from(p.map((c, i) => c ^ key[i % 4])) : p]);
+  };
+  const closeOf = (code, why = "") => Buffer.concat([Buffer.from([code >> 8, code & 255]), Buffer.from(why)]);
+  const upgrade = (target = "/ws", more = "") => Buffer.from(`GET ${target} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
+    + `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n${more}\r\n`);
+  // (what a server's WebSocket sent back: its head, then each frame, a
+  // text's as it is, a close's code and why, any other's in hex)
+  const frames = (got) => {
+    const h = got.indexOf("\r\n\r\n");
+    if (!got.startsWith("HTTP/1.1 101 ") || h < 0) return got;
+    let b = Buffer.from(got.slice(h + 4), "latin1");
+    const out = [];
+    while (b.length >= 2) {
+      const op = b[0] & 15, masked = b[1] & 128 ? "masked " : "";
+      let n = b[1] & 127, at = 2;
+      if (n === 126) { n = b.readUInt16BE(2); at = 4; } else if (n === 127) { n = Number(b.readBigUInt64BE(2)); at = 10; }
+      if (b.length < at + n) break;
+      const p = b.subarray(at, at + n), fin = b[0] & 128 ? "" : " (not the last)";
+      const name = { 0: "continuation", 1: "text", 2: "binary", 8: "close", 9: "ping", 10: "pong" }[op] ?? `opcode ${op}`;
+      out.push(`${masked}${name}${fin}` + (op === 1 ? ` ${p}` : op === 8 && p.length >= 2 ? ` ${p.readUInt16BE(0)}${p.length > 2 ? ` ${p.subarray(2)}` : ""}` : p.length ? ` ${p.toString("hex")}` : ""));
+      b = b.subarray(at + n);
+    }
+    if (b.length) out.push(`${b.toString("latin1")}`);
+    return `${got.slice(0, h + 4)}${out.join(", ")}`;
+  };
+  // (a WebSocket's, each frame of the client's masked but one: messages
+  // echoed, the first sent with the handshake; a ping answered; a message
+  // in pieces, a ping between them; a close the server sends; a frame not
+  // masked; a handshake refused)
+  for (const [what, parts] of [
+    ["websocket, echoed",
+      [[0, Buffer.concat([upgrade(), frame(1, "hello")])], [50, frame(2, [1, 2, 3])], [50, frame(8, closeOf(1000, "done"))]]],
+    ["websocket, a ping", [[0, upgrade()], [50, frame(9, "hi")], [50, frame(8, closeOf(1001))]]],
+    ["websocket, in pieces",
+      [[0, Buffer.concat([upgrade(), frame(1, "Hel", { fin: false }), frame(9, "?")])], [50, frame(0, "l", { fin: false })], [50, frame(0, "o")],
+        [50, frame(8, "")]]],
+    ["websocket, closed by the server",
+      [[0, Buffer.concat([upgrade(), frame(1, "bye")])], ["\x88\x05\x03\xe8bye", frame(8, closeOf(1000))]]],
+    ["websocket, a frame not masked", [[0, Buffer.concat([upgrade(), frame(1, "hello", { mask: false })])]]],
+    ["websocket, refused", [[0, Buffer.from("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\nSec-WebSocket-Version: 13\r\n\r\n")]]],
+  ]) said(what, frames(await raw(parts)));
   // (a stream whose client goes after its first piece: the server, its
   // writes failing, goes on to the next connection)
   said("a stream, its client gone", await new Promise((ok) => {

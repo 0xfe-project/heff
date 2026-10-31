@@ -3,7 +3,7 @@
 -- `/stop`.  `main PORT`: served to the test's clients (node:http, curl,
 -- a socket's bytes), each request said on a line as it is answered --
 -- with a reply each: whole, streamed, events, or the connection taken
--- over.
+-- over, by itself or as a WebSocket's.
 -- `self`: served, at a port the system picked, to std.http's client in
 -- the same program, each side an act boc awaits, what the client got
 -- said.  `crowded`, run with few descriptors: connected to until
@@ -21,6 +21,7 @@ import exception
 import std.http as HTTP
 import std.http.server as Server
 import std.http.sse as SSE
+import std.http.websocket as WebSocket
 import std.io
 import std.net as Net
 import std.process
@@ -137,9 +138,44 @@ echoed t = do
       pure MkUnit
     Left err -> pure MkUnit
 
+-- (whether a message is the text `bye`)
+isBye : WebSocket.Message -> Bool
+isBye (TextMessage t) = strEq t "bye"
+isBye m = False
+
+-- (a WebSocket's message, said)
+messageSaid : WebSocket.Message -> String
+messageSaid (TextMessage t) = "text " ^ debug t
+messageSaid (BinaryMessage b) = "binary " ^ debug b
+messageSaid m = "another"
+
+-- (a WebSocket's messages each said and sent back, until its end, said
+-- too; `bye` answered by a close of the server's)
+echoing : {e : HFunctor}
+        -> {s : Type}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> WebSocket.Connection s
+        -> Co e Unit
+echoing ws = bind (WebSocket.receive ws) echoed
+  where
+  echoed : WebSocket.Received s -> Co e Unit
+  echoed (Arrived m next) = do
+    print ("websocket: " ^ messageSaid m)
+    if isBye m then do
+      WebSocket.close next 1000 "bye"
+      print "websocket: closed by the server"
+    else do
+      WebSocket.send next m
+      echoing next
+  echoed (Ended code why) =
+    print ("websocket: ended " ^ debug code ^ " " ^ debug why)
+
 replyOf : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
         -> {{cu : Custodian.custodian <: e}}
         -> Server.Request
         -> Server.Reply e
@@ -153,12 +189,14 @@ replyOf r =
       101
       [MkPair "Connection" "Upgrade", MkPair "Upgrade" "echo"]
       echoed
+  else if strEq r.target "/ws" then WebSocket.accept r echoing
   else Whole (routed r)
 
 -- (each request said, as it is answered)
 said : {e : HFunctor}
      -> {{io : stdio <: e}}
      -> {{nt : Net.net <: e}}
+     -> {{ex : exception Net.NetError <: e}}
      -> {{cu : Custodian.custodian <: e}}
      -> Server.Request
      -> Co e (Server.Reply e)
