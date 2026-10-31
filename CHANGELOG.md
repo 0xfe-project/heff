@@ -5,6 +5,7 @@
 ### Standard library
 
 - std.http.websocket: WebSocket (RFC 6455), its pure part, no socket read or written. `handshake` checks a std.http.server `Request` -- a `GET` of HTTP/1.1, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a key -- and comes to its accept key (`acceptKey`, for `upgradeHeaders`, the `101`'s), or the response refusing it, `400`, or `426` with `Sec-WebSocket-Version: 13`. `decodeFrame` reads a frame from the bytes read so far, or says how many more it wants, or refuses it with its close code (a client's frame not masked, an RSV bit set, an opcode not known, a control frame in pieces or over 125 bytes: 1002; over `most` bytes, 16 MiB by default: 1009); `encodeFrame` writes a server's, `encodeMasked` a client's. `feed` is a reader's state machine: bytes in, the messages they finish out -- pieces put together, a control frame between them a message of its own, text and a close's reason checked as UTF-8 (1007) -- and the reader to read on by.
+- std.crypto: public-key signatures as JWS has them, RS256, PS256, ES256 (its `r` and `s`, 64 bytes) and EdDSA (Ed25519), signed and verified by OpenSSL's libcrypto in a C program (linked by pkg-config's `libcrypto`; no page's): private and public keys read from PEM (PKCS#8, SubjectPublicKeyInfo, RSA's and EC's own), public ones made of a JWK's fields; a private key's public one (`publicOf`), a public key written as PEM (`publicKeyToPem`); a key that cannot be read is `Left` of why, a signature that is not the key's `False`.
 
 ## 0.6.1
 

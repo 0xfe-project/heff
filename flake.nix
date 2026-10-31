@@ -88,7 +88,10 @@
             pkgs.nodejs
             pkgs.git
             pkgs.xz
+            pkgs.pkg-config
           ];
+          # (OpenSSL's libcrypto, which std.crypto links by pkg-config)
+          buildInputs = [ pkgs.openssl ];
         };
       });
     };

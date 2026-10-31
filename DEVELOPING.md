@@ -23,7 +23,8 @@ with is `lib/` (its [API](https://dannypsnl.github.io/heff/api/)).
 With [zig](https://ziglang.org/download/) and GNU make (3.81, macOS's,
 or newer): building and bootstrapping need nothing else; the tests are
 heff's own, run by `heff test`.  Node.js runs the JavaScript some of
-the tests check, the benchmarks and the editors' targets.  `make` lists
+the tests check, the benchmarks and the editors' targets; pkg-config and
+OpenSSL's libcrypto (its headers), std.crypto's test.  `make` lists
 every target and the variables they take; each runs a step of
 `build.zig`, `heff test` on files of `test/`, or a script of `bench/`
 or `editors/`, and its line in the `Makefile` says which.
