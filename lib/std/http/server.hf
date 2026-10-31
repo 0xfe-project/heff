@@ -37,6 +37,55 @@
 --   either throw pure r
 -- ```
 --
+-- A handler given to `serveReplies` (`serveRepliesUntil`,
+-- `serveConnectionReplies`) answers with a `Reply`, which is one of
+-- three: a response whole (`Whole`), as `serve`'s handler gives; a head
+-- -- a status and headers -- and a body given a piece at a time
+-- (`Streamed`); or a head, after which the connection is the handler's
+-- (`TakenOver`).
+--
+-- A streamed body is a computation that yields each piece, stream's
+-- `yield` of `Bytes`, and the server writes each piece as it is
+-- yielded: a chunk of `Transfer-Encoding: chunked` to an HTTP/1.1
+-- request, the connection kept for the next request after the last
+-- chunk; to an HTTP/1.0 request, no length, the connection closed after
+-- the last piece.  To a `HEAD`, and for a status with no body (204,
+-- 304), the head is written alone and the body not run.  Should a piece
+-- not be written -- the client gone, or not reading within `idle` -- the
+-- write's `NetError` is thrown in the body, at its `yield`: a `try` there
+-- hears it, and its `with`s let go of what they hold, as a throw leaves
+-- them.  The server hears what the body throws of `NetError` itself, and
+-- closes the connection; what it throws of another type is not the
+-- server's.  So `serveReplies` asks for `exception Net.NetError`, as
+-- `serve` does, and so does `serveConnectionReplies`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import co
+-- import std.http.server as Server
+-- import stream as Stream
+--
+-- -- | lines `i` to `n`, a piece each
+-- counted : {e : HFunctor} -> {{ys : Stream.yielding Bytes <: e}} -> Int -> Int -> Co e Unit
+-- counted i n =
+--   if i > n then pure MkUnit
+--   else do
+--     Stream.yield (Bytes.fromString ("line " ^ debug i ^ "\n"))
+--     counted (i + 1) n
+--
+-- numbered : {e : HFunctor} -> Server.Request -> Co e (Server.Reply e)
+-- numbered r = pure (Streamed 200 [MkPair "Content-Type" "text/plain"] (counted 1 100))
+-- ```
+--
+-- A connection taken over is written the head the handler gave -- its
+-- status and its headers as they are, no length, no `Connection` of the
+-- server's: `101 Switching Protocols`, `Connection: Upgrade`, say --
+-- and then given to the handler's function, a `Taken`: the request, the
+-- connection, and what was read of it after the request.  The server
+-- reads no more of it, nor writes; once the function is done, the
+-- connection is closed by the `with` holding it.  How long the other
+-- side may be silent is then the function's to say.
+--
 -- A request whose body is sent in chunks (`Transfer-Encoding`) is answered
 -- `501 Not Implemented`, and its connection closed; a head longer than 64
 -- KiB, `431`; a body longer than 64 MiB, `413`; a request that is no
@@ -50,7 +99,9 @@
 -- := 5000) l handle`; 0 for no limit -- is closed: between requests,
 -- within a request's head or its body, and while what it still sends is
 -- read before its connection is closed.  A response is written within the
--- same limit.  So a client that holds a connection and is silent holds
+-- same limit, each piece of a streamed body within it too; while a
+-- response is written, the client is not read, and its silence closes
+-- nothing.  So a client that holds a connection and is silent holds
 -- it no longer than that, by a scheduler that waits on the world through
 -- std.reactor or by none.  A client that is not silent, but sends a
 -- request's head a little at a time, is held to a limit of its own: the
@@ -71,11 +122,19 @@ module std.http.server
   , requestIn
   , reason
   , responseBytes
+  , chunk
+  , streamedHead
+  , takeoverHead
   , keptAlive
   , After(..)
+  , Taken
+  , Reply(..)
   , serveConnection
   , serveUntil
   , serve
+  , serveConnectionReplies
+  , serveRepliesUntil
+  , serveReplies
   )
 import bytes as Bytes
 import co
@@ -85,6 +144,7 @@ import std.duration as Duration
 import std.http as HTTP
 import std.net as Net
 import std.time as Time
+import stream as Stream
 import uint8 as UInt8
 import resource
 
@@ -519,6 +579,24 @@ ownHeader (MkPair n v) =
 headerText : String -> Pair String String -> String
 headerText acc (MkPair n v) = acc ^ n ^ ": " ^ v ^ "\r\n"
 
+-- (a status line)
+statusLine : Int -> String
+statusLine status = "HTTP/1.1 " ^ debug status ^ " " ^ reason status ^ "\r\n"
+
+-- (a head: its status line, its headers but the server's own, the
+-- server's own lines, `own`, and the blank line after them)
+headWith : Int -> List (Pair String String) -> String -> String
+headWith status headers own =
+  statusLine status
+  ^ List.foldl headerText "" (List.keepIf (\h -> not (ownHeader h)) headers)
+  ^ own
+  ^ "\r\n"
+
+-- (`Connection: connection`, where that is not empty)
+connectionLine : String -> String
+connectionLine "" = ""
+connectionLine connection = "Connection: " ^ connection ^ "\r\n"
+
 -- | A response as it is written: its status line, its headers but its
 -- | own length and connection, its length (`Content-Length`, where its
 -- | status has a body), `Connection: connection` where that is not
@@ -531,22 +609,61 @@ responseBytes : String -> Bool -> HTTP.Response -> Bytes
 responseBytes connection withBody res =
   let none = bodiless res.status
   in let head =
-    "HTTP/1.1 "
-    ^ debug res.status
-    ^ " "
-    ^ reason res.status
-    ^ "\r\n"
-    ^ List.foldl
-      headerText
-      ""
-      (List.keepIf (\h -> not (ownHeader h)) res.headers)
-    ^ (if none then ""
-       else "Content-Length: " ^ debug (Bytes.length res.body) ^ "\r\n")
-    ^ (if strLength connection == 0 then ""
-       else "Connection: " ^ connection ^ "\r\n")
-    ^ "\r\n"
+    headWith
+      res.status
+      res.headers
+      ((if none then ""
+        else "Content-Length: " ^ debug (Bytes.length res.body) ^ "\r\n")
+       ^ connectionLine connection)
   in if withBody && not none then Bytes.append (Bytes.fromString head) res.body
   else Bytes.fromString head
+
+-- (a digit of hexadecimal, 0 to 15)
+hexDigit : Int -> String
+hexDigit d = strSlice "0123456789abcdef" d (d + 1)
+
+-- (`n`, not negative, in hexadecimal)
+hexOf : Int -> String
+hexOf n = if n < 16 then hexDigit n else hexOf (n / 16) ^ hexDigit (n % 16)
+
+-- | A piece of a streamed body as it is written to an HTTP/1.1 request,
+-- | a chunk of `Transfer-Encoding: chunked`: its length in hexadecimal,
+-- | then the piece, each ended by a line's end.  (A piece of no bytes is
+-- | the last chunk, which ends the body: the server writes none of the
+-- | body's so.)
+-- | >>> debug (chunk b["hello, world, and the rest"])
+-- | "b[\"1a\", 13, 10, \"hello, world, and the rest\", 13, 10]"
+chunk : Bytes -> Bytes
+chunk b =
+  Bytes.concat
+    [Bytes.fromString (hexOf (Bytes.length b) ^ "\r\n"), b, b["\r\n"]]
+
+-- | A streamed reply's head as it is written: its status line, its
+-- | headers but its own length and connection, `Transfer-Encoding:
+-- | chunked` where `chunked`, and `Connection: connection` where that is
+-- | not empty.
+-- | >>> debug (streamedHead "" True 200 [MkPair "Content-Type" "text/event-stream", MkPair "Content-Length" "3"])
+-- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Content-Type: text/event-stream\", 13, 10, \"Transfer-Encoding: chunked\", 13, 10, 13, 10]"
+-- | >>> debug (streamedHead "close" False 200 Nil)
+-- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Connection: close\", 13, 10, 13, 10]"
+streamedHead : String -> Bool -> Int -> List (Pair String String) -> Bytes
+streamedHead connection chunked status headers =
+  Bytes.fromString
+    (headWith
+       status
+       headers
+       ((if chunked then "Transfer-Encoding: chunked\r\n" else "")
+        ^ connectionLine connection))
+
+-- | The head written before a connection is taken over: its status line
+-- | and its headers, all as they are given, `Connection` too -- no
+-- | length, nothing of the server's.
+-- | >>> debug (takeoverHead 101 [MkPair "Connection" "Upgrade", MkPair "Upgrade" "websocket"])
+-- | "b[\"HTTP/1.1 101 Switching Protocols\", 13, 10, \"Connection: Upgrade\", 13, 10, \"Upgrade: websocket\", 13, 10, 13, 10]"
+takeoverHead : Int -> List (Pair String String) -> Bytes
+takeoverHead status headers =
+  Bytes.fromString
+    (statusLine status ^ List.foldl headerText "" headers ^ "\r\n")
 
 -- (whether a `Connection` header of these has the token, its case not
 -- minded)
@@ -623,26 +740,233 @@ lingered : {e : HFunctor}
 lingered idle c (Left err) = pure MkUnit
 lingered idle c (Right _) = bind (Net.shutdown c) (\s -> drain idle c 0)
 
--- (what was read, answered)
-answered : {e : HFunctor}
+-- (whether a request's connection is closed after its reply, whose
+-- headers are these: as the request asks, as the reply says, or as
+-- `last` says the server stops)
+closes : (Request -> Bool) -> Request -> List (Pair String String) -> Bool
+closes last r headers =
+  last r || not (keptAlive r) || connectionSays "close" headers
+
+-- (a response, whole, written)
+wholeOut : {e : HFunctor}
          -> {s : Type}
          -> {{nt : Net.net <: e}}
          -> Int
          -> With s Net.TcpStream
          -> (Request -> Bool)
-         -> (Request -> Co e HTTP.Response)
-         -> Got
+         -> Request
+         -> Bytes
+         -> HTTP.Response
          -> Co e After
-answered idle c last handle (Asked r rest) = do
-  res <- handle r
-  let close = last r || not (keptAlive r) || connectionSays "close" res.headers
+wholeOut idle c last r rest res = do
+  let close = closes last r res.headers
   w <-
     Net.write
       (timeout := idle)
       c
       (responseBytes (connectionWord r close) (not (strEq r.method "HEAD")) res)
   pure (afterWrite rest close (last r) w)
-answered idle c last handle (Refused status) = do
+
+-- | What a handler answers a request with, its connection `taken over`:
+-- | the request, the connection, and what was read of it after the
+-- | request -- the start of what the other side sent next, which the
+-- | server read with the request and did not use.
+type Taken s =
+  { request : Request
+  , connection : With s Net.TcpStream
+  , rest : Bytes
+  }
+
+-- | What a handler answers a request with: a response, whole
+-- | (`Whole`); a status, headers and a body that yields its pieces
+-- | (`Streamed`), each written as it is yielded; or a status and
+-- | headers, after which the connection is the function's (`TakenOver`),
+-- | given the request, the connection and what was read after the
+-- | request.  A streamed reply's headers and a whole one's give no
+-- | length, `Transfer-Encoding` or `Connection` of their own -- the
+-- | server writes those -- but `Connection: close`, which closes the
+-- | connection after the reply; a connection taken over is written its
+-- | headers as they are.
+data Reply (e : HFunctor)
+  = Whole HTTP.Response
+  | Streamed Int (List (Pair String String)) (Co
+                                                (Stream.yielding Bytes <+> e)
+                                                Unit)
+  | TakenOver Int (List (Pair String String)) ({s : Type}
+                                               -> Taken s
+                                               -> Co e Unit)
+
+-- (a piece of a streamed body written, a chunk where `chunked`: none of
+-- no bytes, which would end the chunks; where it is not written, why
+-- thrown)
+pieceOut : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
+         -> Int
+         -> With s Net.TcpStream
+         -> Bool
+         -> Bytes
+         -> Co e Unit
+pieceOut idle c chunked b =
+  if Bytes.length b == 0 then pure MkUnit
+  else bind
+      (Net.write (timeout := idle) c (if chunked then chunk b else b))
+      (either throw pure)
+
+-- (a streamed body's `yield`: its piece written)
+pieceWritten : {e : HFunctor}
+             -> {s : Type}
+             -> {{nt : Net.net <: e}}
+             -> {{ex : exception Net.NetError <: e}}
+             -> Int
+             -> With s Net.TcpStream
+             -> Bool
+             -> {a : Type}
+             -> Stream.YieldF Bytes (Co e) a
+             -> Co e a
+pieceWritten idle c chunked (Yield b x) =
+  bind (pieceOut idle c chunked b) (\u -> pure x)
+
+-- (whether the last chunk is written, where there is one)
+endWritten : Either Net.NetError Unit -> Bool
+endWritten (Left err) = False
+endWritten (Right u) = True
+
+-- (a streamed body run, each piece written as it is yielded, and the
+-- last chunk after them where `chunked`: whether all of it was written;
+-- not where a write failed, or the body threw a `NetError` of its own)
+bodyOut : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> With s Net.TcpStream
+        -> Bool
+        -> Co (Stream.yielding Bytes <+> e) Unit
+        -> Co e Bool
+bodyOut idle c chunked body = do
+  try
+    handle
+        (through (Stream.yielding Bytes) e (pieceWritten idle c chunked))
+        body
+    ended <-
+      (if chunked then Net.write (timeout := idle) c b["0\r\n\r\n"]
+       else pure (Right MkUnit))
+    pure (endWritten ended)
+  catch (err : Net.NetError) ->
+    pure False
+
+-- (what a streamed reply came to, its body written, `written` whether
+-- all of it was)
+afterBody : Bytes -> Bool -> Bool -> Bool -> After
+afterBody rest close stop written =
+  if written && not close then Next rest else Done stop
+
+-- (a streamed reply's head written, `w`: its body after it, where it is
+-- `sent`)
+headOut : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> With s Net.TcpStream
+        -> Bool
+        -> Bool
+        -> Co (Stream.yielding Bytes <+> e) Unit
+        -> Bytes
+        -> Bool
+        -> Bool
+        -> Either Net.NetError Unit
+        -> Co e After
+headOut idle c chunked sent body rest close stop (Left err) = pure (Done stop)
+headOut idle c chunked False body rest close stop (Right u) =
+  pure (afterBody rest close stop True)
+headOut idle c chunked True body rest close stop (Right u) =
+  bind (bodyOut idle c chunked body) (\w -> pure (afterBody rest close stop w))
+
+-- (a streamed reply written: in chunks to HTTP/1.1, the connection
+-- closed after it to HTTP/1.0, which has no other end of it; to a
+-- `HEAD`, or of a status with no body, its head alone)
+streamedOut : {e : HFunctor}
+            -> {s : Type}
+            -> {{nt : Net.net <: e}}
+            -> {{ex : exception Net.NetError <: e}}
+            -> Int
+            -> With s Net.TcpStream
+            -> (Request -> Bool)
+            -> Request
+            -> Bytes
+            -> Int
+            -> List (Pair String String)
+            -> Co (Stream.yielding Bytes <+> e) Unit
+            -> Co e After
+streamedOut idle c last r rest status headers body = do
+  let chunked = strEq r.version "HTTP/1.1"
+  let close = not chunked || closes last r headers
+  let none = bodiless status
+  w <-
+    Net.write
+      (timeout := idle)
+      c
+      (streamedHead
+         (connectionWord r close)
+         (chunked && not none)
+         status
+         headers)
+  headOut
+      idle
+      c
+      chunked
+      (not none && not (strEq r.method "HEAD"))
+      body
+      rest
+      close
+      (last r)
+      w
+
+-- (the head written, `w`: the connection handed over, the server done
+-- with it after)
+handedOver : {e : HFunctor}
+           -> Co e Unit
+           -> Bool
+           -> Either Net.NetError Unit
+           -> Co e After
+handedOver taken stop (Left err) = pure (Done stop)
+handedOver taken stop (Right u) = bind taken (\v -> pure (Done stop))
+
+-- (what a handler replied, written)
+replied : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> With s Net.TcpStream
+        -> (Request -> Bool)
+        -> Request
+        -> Bytes
+        -> Reply e
+        -> Co e After
+replied idle c last r rest (Whole res) = wholeOut idle c last r rest res
+replied idle c last r rest (Streamed status headers body) =
+  streamedOut idle c last r rest status headers body
+replied idle c last r rest (TakenOver status headers f) =
+  bind
+    (Net.write (timeout := idle) c (takeoverHead status headers))
+    (handedOver (f { request = r, connection = c, rest = rest }) (last r))
+
+-- (what was read, answered: a request by `answer`, given what was read
+-- after it)
+answered : {e : HFunctor}
+         -> {s : Type}
+         -> {{nt : Net.net <: e}}
+         -> Int
+         -> With s Net.TcpStream
+         -> (Request -> Bytes -> Co e After)
+         -> Got
+         -> Co e After
+answered idle c answer (Asked r rest) = answer r rest
+answered idle c answer (Refused status) = do
   w <-
     Net.write
       (timeout := idle)
@@ -650,7 +974,7 @@ answered idle c last handle (Refused status) = do
       (responseBytes "close" True (plain status (reason status ^ "\n")))
   lingered idle c w
   pure (Done False)
-answered idle c last handle Ended = pure (Done False)
+answered idle c answer Ended = pure (Done False)
 
 -- (the connection's next request, `again`; or it is done: whether the
 -- server stops)
@@ -664,19 +988,18 @@ closedWith : {e : HFunctor}
            -> {{clock : Time.time <: e}}
            -> Int
            -> Int
-           -> (Request -> Bool)
-           -> (Request -> Co e HTTP.Response)
+           -> (Request -> Bytes -> Co e After)
            -> With s Net.TcpStream
            -> Either Net.NetError Net.Address
            -> Co e Bool
-closedWith idle within last handle c (Left err) = pure False
-closedWith idle within last handle c (Right peer) = serveFrom Bytes.empty
+closedWith idle within answer c (Left err) = pure False
+closedWith idle within answer c (Right peer) = serveFrom Bytes.empty
   where
   -- (the connection's requests answered, `buf` read of them already)
   serveFrom : Bytes -> Co e Bool
   serveFrom buf = do
     got <- readRequest idle within c peer buf
-    after <- answered idle c last handle got
+    after <- answered idle c answer got
     goOn serveFrom after
 
 -- | A connection's requests answered by `handle`, one after another,
@@ -699,7 +1022,36 @@ serveConnection : {e : HFunctor}
                 -> With s Net.TcpStream
                 -> Co e Bool
 serveConnection last handle c =
-  bind (Net.peer c) (closedWith idle headerWithin last handle c)
+  bind
+    (Net.peer c)
+    (closedWith
+       idle
+       headerWithin
+       (\r rest -> bind (handle r) (wholeOut idle c last r rest))
+       c)
+
+-- | `serveConnection`, its requests answered by `handle` with a `Reply`
+-- | each: a response whole, one streamed, or the connection taken over
+-- | -- the server done with it once the function it is given is.
+serveConnectionReplies : {e : HFunctor}
+                       -> {s : Type}
+                       -> {idle : Int := 30000}
+                       -> {headerWithin : Int := 30000}
+                       -> {{nt : Net.net <: e}}
+                       -> {{clock : Time.time <: e}}
+                       -> {{ex : exception Net.NetError <: e}}
+                       -> (Request -> Bool)
+                       -> (Request -> Co e (Reply e))
+                       -> With s Net.TcpStream
+                       -> Co e Bool
+serveConnectionReplies last handle c =
+  bind
+    (Net.peer c)
+    (closedWith
+       idle
+       headerWithin
+       (\r rest -> bind (handle r) (replied idle c last r rest))
+       c)
 
 -- (the next connection, `again`; or the server done, `last` said so)
 nextOr : {e : HFunctor} -> (Unit -> Co e Unit) -> Bool -> Co e Unit
@@ -766,3 +1118,60 @@ serve l handle =
           (\r -> False)
           handle))
     (\stop -> serve (idle := idle) (headerWithin := headerWithin) l handle)
+
+-- | `serveUntil`, each request answered with a `Reply`
+-- | (`serveConnectionReplies`).
+serveRepliesUntil : {e : HFunctor}
+                  -> {s : Type}
+                  -> {idle : Int := 30000}
+                  -> {headerWithin : Int := 30000}
+                  -> {{nt : Net.net <: e}}
+                  -> {{clock : Time.time <: e}}
+                  -> {{ex : exception Net.NetError <: e}}
+                  -> {{cu : Custodian.custodian <: e}}
+                  -> (Request -> Bool)
+                  -> With s Net.TcpListener
+                  -> (Request -> Co e (Reply e))
+                  -> Co e Unit
+serveRepliesUntil last l handle =
+  bind
+    (Net.accept
+       l
+       (serveConnectionReplies
+          (idle := idle)
+          (headerWithin := headerWithin)
+          last
+          handle))
+    (nextOr
+       (\u ->
+          serveRepliesUntil
+            (idle := idle)
+            (headerWithin := headerWithin)
+            last
+            l
+            handle))
+
+-- | `serve`, each request answered with a `Reply`
+-- | (`serveConnectionReplies`).
+serveReplies : {e : HFunctor}
+             -> {s : Type}
+             -> {idle : Int := 30000}
+             -> {headerWithin : Int := 30000}
+             -> {{nt : Net.net <: e}}
+             -> {{clock : Time.time <: e}}
+             -> {{ex : exception Net.NetError <: e}}
+             -> {{cu : Custodian.custodian <: e}}
+             -> With s Net.TcpListener
+             -> (Request -> Co e (Reply e))
+             -> Co e Unit
+serveReplies l handle =
+  bind
+    (Net.accept
+       l
+       (serveConnectionReplies
+          (idle := idle)
+          (headerWithin := headerWithin)
+          (\r -> False)
+          handle))
+    (\stop ->
+       serveReplies (idle := idle) (headerWithin := headerWithin) l handle)

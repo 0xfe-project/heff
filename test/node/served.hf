@@ -1,7 +1,9 @@
 -- An HTTP server of std.http.server's, by C alone,
 -- on 127.0.0.1 at the port the test picked, until it is asked for
 -- `/stop`.  `main PORT`: served to the test's clients (node:http, curl,
--- a socket's bytes), each request said on a line as it is answered.
+-- a socket's bytes), each request said on a line as it is answered --
+-- with a reply each: whole, streamed, events, or the connection taken
+-- over.
 -- `self`: served, at a port the system picked, to std.http's client in
 -- the same program, each side an act boc awaits, what the client got
 -- said.  `crowded`, run with few descriptors: connected to until
@@ -18,9 +20,11 @@ import custodian as Custodian
 import exception
 import std.http as HTTP
 import std.http.server as Server
+import std.http.sse as SSE
 import std.io
 import std.net as Net
 import std.process
+import stream as Stream
 import uint8 as UInt8
 import std.time
 import resource
@@ -73,14 +77,94 @@ routed r =
   else if strEq r.target "/stop" then Server.plain 200 "stopping\n"
   else Server.plain 404 "no such thing\n"
 
+-- (what `/stream` yields: a piece of no bytes among them, not written)
+pieces : {e : HFunctor} -> {{ys : Stream.yielding Bytes <: e}} -> Co e Unit
+pieces = do
+  Stream.yield b["one\n"]
+  Stream.yield Bytes.empty
+  Stream.yield b["two\n"]
+  Stream.yield b["three\n"]
+
+-- (what `/events` sends)
+events : {e : HFunctor} -> {{ys : Stream.yielding Bytes <: e}} -> Co e Unit
+events = do
+  SSE.send [Comment "hello"]
+  SSE.send [Event "tick", Data "1\n2", EventId "1"]
+  SSE.send [Retry 500, Data "end"]
+
+-- (`n` ticks)
+ticking : {e : HFunctor}
+        -> {{ys : Stream.yielding Bytes <: e}}
+        -> Int
+        -> Co e Unit
+ticking 0 = pure MkUnit
+ticking n = do
+  Stream.yield b["tick\n"]
+  ticking (n - 1)
+
+-- (what `/forever` yields, inside a `with` that says when it lets go:
+-- more ticks than a client gone after the first reads, so that it is
+-- stopped, never all written)
+forever : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> {{ys : Stream.yielding Bytes <: e}}
+        -> Co e Unit
+forever = do
+  held
+      (pure (MkUnit : Unit))
+      (\(u : Unit) -> print "forever: let go")
+      (\h -> ticking 1000000)
+  print "forever: all written"
+
+-- (what was sent after the request, said back; then what is sent next,
+-- once, said back too)
+echoed : {e : HFunctor}
+       -> {s : Type}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Server.Taken s
+       -> Co e Unit
+echoed t = do
+  print
+      ("taken over, Upgrade: "
+       ^ fromMaybe "-" (Server.header "upgrade" t.request))
+  w <- Net.write t.connection (Bytes.concat [b["rest: "], t.rest, b["\n"]])
+  got <- Net.read (timeout := 5000) t.connection 100
+  case got of
+    Right next -> do
+      w2 <- Net.write t.connection (Bytes.concat [b["echo: "], next, b["\n"]])
+      pure MkUnit
+    Left err -> pure MkUnit
+
+replyOf : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{cu : Custodian.custodian <: e}}
+        -> Server.Request
+        -> Server.Reply e
+replyOf r =
+  if strEq r.target "/stream"
+  then Streamed 200 [MkPair "Content-Type" "text/plain"] pieces
+  else if strEq r.target "/events" then SSE.reply Nil events
+  else if strEq r.target "/forever" then Streamed 200 Nil forever
+  else if strEq r.target "/upgrade"
+  then TakenOver
+      101
+      [MkPair "Connection" "Upgrade", MkPair "Upgrade" "echo"]
+      echoed
+  else Whole (routed r)
+
 -- (each request said, as it is answered)
 said : {e : HFunctor}
      -> {{io : stdio <: e}}
+     -> {{nt : Net.net <: e}}
+     -> {{cu : Custodian.custodian <: e}}
      -> Server.Request
-     -> Co e HTTP.Response
+     -> Co e (Server.Reply e)
 said r = do
   print (r.method ^ " " ^ r.target ^ " " ^ r.version ^ ", " ^ showBody r.body)
-  pure (routed r)
+  pure (replyOf r)
 
 isStop : Server.Request -> Bool
 isStop r = strEq r.target "/stop"
@@ -108,7 +192,10 @@ serveAt : {e : HFunctor}
         -> Co e Unit
 serveAt port =
   bind
-    (Net.withListener (here port) 16 (\l -> Server.serveUntil isStop l said))
+    (Net.withListener
+       (here port)
+       16
+       (\l -> Server.serveRepliesUntil isStop l said))
     (either throw pure)
 
 -- Out of descriptors --------------------------------------------------------------

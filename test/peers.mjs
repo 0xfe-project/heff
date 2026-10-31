@@ -210,7 +210,28 @@ if (mode === "client") {
     ["a chunked body, sent on",
       [[0, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8000\r\n" + "x".repeat(32768)], ["Not Implemented\n", "y".repeat(524288)]]],
     ["no request", [[0, "NONSENSE\r\n\r\n"]]],
+    // (replies of std.http.server's other than whole: streamed in
+    // chunks, the connection kept after them; streamed to HTTP/1.0, its
+    // end the connection's; a head alone; events; and the connection
+    // taken over, what was sent with the request given to it)
+    ["streamed, then another",
+      [[0, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]]],
+    ["streamed, HTTP/1.0", [[0, "GET /stream HTTP/1.0\r\n\r\n"]]],
+    ["streamed, HEAD", [[0, "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]]],
+    ["events", [[0, "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]]],
+    ["taken over",
+      [[0, "GET /upgrade HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nearly"], ["rest: early\n", "late"]]],
   ]) said(what, await raw(parts));
+  // (a stream whose client goes after its first piece: the server, its
+  // writes failing, goes on to the next connection)
+  said("a stream, its client gone", await new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    const timer = setTimeout(() => { s.destroy(); ok("(no piece)"); }, 10000);
+    s.setEncoding("latin1");
+    s.on("connect", () => s.write("GET /forever HTTP/1.1\r\nHost: x\r\n\r\n"));
+    s.once("data", (d) => { clearTimeout(timer); s.destroy(); ok(d.split("\r\n")[0]); });
+    s.on("error", (e) => { clearTimeout(timer); ok(`(${e.code})`); });
+  }));
   if (spawnSync("curl", ["--version"]).status === 0) {
     const at = `http://127.0.0.1:${port}`;
     const c = spawnSync("curl", ["-sS", "--http1.1", "-o", "/dev/null", "-o", "/dev/null", "-w", "%{http_code} %{num_connects} %{size_download}\n",

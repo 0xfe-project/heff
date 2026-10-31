@@ -1,0 +1,116 @@
+-- Server-sent events, `text/event-stream`, as a browser's `EventSource`
+-- reads them: a reply of std.http.server's, streamed, each piece of its
+-- body an event.  Import it by a name, `import std.http.sse as SSE`,
+-- beside `import std.http.server as Server`, whose `serveReplies` serves
+-- it.
+--
+-- ```haskell
+-- import co
+-- import std.http.server as Server
+-- import std.http.sse as SSE
+-- import stream as Stream
+--
+-- -- | a tick each, `i` to `n`, its number its id
+-- ticks : {e : HFunctor} -> {{ys : Stream.yielding Bytes <: e}} -> Int -> Int -> Co e Unit
+-- ticks i n =
+--   if i > n then pure MkUnit
+--   else do
+--     SSE.send [Event "tick", Data (debug i), EventId (debug i)]
+--     ticks (i + 1) n
+--
+-- -- | the ticks, to whoever asks
+-- ticking : {e : HFunctor} -> Server.Request -> Co e (Server.Reply e)
+-- ticking r = pure (SSE.reply Nil (ticks 1 10))
+-- ```
+--
+-- An event is its fields, a line each, and a blank line after them: its
+-- type (`Event`), a client's listener for it called with its data
+-- (`Data`, a line of the stream each line of it); its id (`EventId`), which a
+-- client reconnecting sends back as `Last-Event-ID`; how long a client
+-- waits to reconnect, in milliseconds (`Retry`); and comments
+-- (`Comment`), read by no one.  A comment sent alone, now and then, keeps
+-- a connection that has nothing to say from being taken for a dead one
+-- by what is between, and tells the server soon after the client has
+-- gone, as its write fails: a heartbeat.
+
+module std.http.sse (Field(..), text, event, send, reply)
+
+import bytes as Bytes
+import co
+import std.http.server as Server
+import stream as Stream
+
+-- | A field of an event: its type, its data, its id, how long to wait
+-- | to reconnect (in milliseconds), or a comment.
+data Field
+  = Event String
+  | Data String
+  | EventId String
+  | Retry Int
+  | Comment String
+
+-- (the lines of `s`, each ended by `\r\n`, `\r` or `\n`)
+linesOf : String -> List String
+linesOf s =
+  List.concatMap
+    (split "\n")
+    (List.concatMap (split "\r") (split "\r\n" s))
+
+-- (`s` with no line's end in it, its lines joined)
+oneLine : String -> String
+oneLine s = joinWith "" (linesOf s)
+
+-- (each line of `s`, after `name: `)
+fieldLines : String -> String -> String
+fieldLines name s =
+  List.foldl (\acc l -> acc ^ name ^ ": " ^ l ^ "\n") "" (linesOf s)
+
+-- (a field, as it is written)
+fieldText : Field -> String
+fieldText (Event t) = "event: " ^ oneLine t ^ "\n"
+fieldText (Data d) = fieldLines "data" d
+fieldText (EventId i) = "id: " ^ oneLine i ^ "\n"
+fieldText (Retry ms) = "retry: " ^ debug ms ^ "\n"
+fieldText (Comment c) = fieldLines "" c
+
+-- | An event as it is written: its fields in their order, a line each
+-- | -- data and comments a line each line of them -- and the blank line
+-- | that ends it.  A type or an id is one line, its lines' ends left
+-- | out.
+-- | >>> text [Event "tick", Data "one\ntwo", EventId "7"]
+-- | "event: tick\ndata: one\ndata: two\nid: 7\n\n"
+-- | >>> text [Retry 3000, Data "a\r\nb\rc"]
+-- | "retry: 3000\ndata: a\ndata: b\ndata: c\n\n"
+-- | >>> text [Comment "still here"]
+-- | ": still here\n\n"
+text : List Field -> String
+text fields = List.foldl (\acc f -> acc ^ fieldText f) "" fields ^ "\n"
+
+-- | An event, as the bytes a streamed body yields.
+-- | >>> debug (event [Data "hi"])
+-- | "b[\"data: hi\", 10, 10]"
+event : List Field -> Bytes
+event fields = Bytes.fromString (text fields)
+
+-- | An event sent: yielded, by a streamed body, to be written as it is.
+send : {e : HFunctor}
+     -> {{ys : Stream.yielding Bytes <: e}}
+     -> List Field
+     -> Co e Unit
+send fields = Stream.yield (event fields)
+
+-- | A reply of events: `200`, `Content-Type: text/event-stream` and
+-- | `Cache-Control: no-cache`, then `headers`, and `body`, which sends
+-- | them (`send`).
+reply : {e : HFunctor}
+      -> List (Pair String String)
+      -> Co (Stream.yielding Bytes <+> e) Unit
+      -> Server.Reply e
+reply headers body =
+  Streamed
+    200
+    ([ MkPair "Content-Type" "text/event-stream"
+     , MkPair "Cache-Control" "no-cache"
+     ]
+     ++ headers)
+    body

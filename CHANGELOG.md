@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Standard library
+
+- std.http.server's handler may answer with a `Reply` (`serveReplies`, `serveRepliesUntil`, `serveConnectionReplies`; `serve` and its kin as they were): a response whole (`Whole`); a status, headers and a body that yields its pieces, stream's `yield` of `Bytes` (`Streamed`), each written as it is yielded -- a chunk of `Transfer-Encoding: chunked` to HTTP/1.1, the connection closed after it to HTTP/1.0, the head alone to a `HEAD`; or a head, after which the connection is the handler's function's (`TakenOver`), given the request, the connection and what was read after the request -- for an upgrade, a WebSocket's. A piece not written, the client gone, is the write's `NetError` thrown in the body at its `yield`, so its `with`s let go as a throw leaves them; the server hears it and closes the connection. std.http.sse: server-sent events, each event its fields (`Event`, `Data`, `EventId`, `Retry`, `Comment`), sent by a streamed body (`send`), in a reply that says `text/event-stream` (`reply`).
+
 ## 0.6.1
 
 Released 2026-10-31.
