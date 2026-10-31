@@ -7,7 +7,7 @@
 -- closed by the `with` holding it when it is done.  So it is the C
 -- backend's alone, as std.net is.  Import it by a name, `import
 -- std.http.server as Server`, beside `import std.http as HTTP`, whose
--- `Response` a handler gives.  A server of many connections at once is
+-- `Response` a handler gives, whole, in a `Reply`.  A server of many connections at once is
 -- a module of its own: std.http.bocserver's reads each a piece at a
 -- time, by `requestIn`, every wait an act boc's behaviours await.
 --
@@ -20,8 +20,8 @@
 -- import std.net as Net
 -- import std.time as Time
 --
--- hello : {e : HFunctor} -> Server.Request -> Co e HTTP.Response
--- hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
+-- hello : {e : HFunctor} -> Server.Request -> Co e (Server.Reply e)
+-- hello r = pure (Whole (Server.plain 200 ("hello, " ^ r.target ^ "\n")))
 --
 -- -- | `hello` served on the port, until a connection cannot be accepted,
 -- -- | or the port not listened on: then that is thrown
@@ -37,12 +37,10 @@
 --   either throw pure r
 -- ```
 --
--- A handler given to `serveReplies` (`serveRepliesUntil`,
--- `serveConnectionReplies`) answers with a `Reply`, which is one of
--- three: a response whole (`Whole`), as `serve`'s handler gives; a head
--- -- a status and headers -- and a body given a piece at a time
--- (`Streamed`); or a head, after which the connection is the handler's
--- (`TakenOver`).
+-- A handler answers with a `Reply`, which is one of three: a response
+-- whole (`Whole`); a head -- a status and headers -- and a body given a
+-- piece at a time (`Streamed`); or a head, after which the connection
+-- is the handler's (`TakenOver`).
 --
 -- A streamed body is a computation that yields each piece, stream's
 -- `yield` of `Bytes`, and the server writes each piece as it is
@@ -56,8 +54,8 @@
 -- hears it, and its `with`s let go of what they hold, as a throw leaves
 -- them.  The server hears what the body throws of `NetError` itself, and
 -- closes the connection; what it throws of another type is not the
--- server's.  So `serveReplies` asks for `exception Net.NetError`, as
--- `serve` does, and so does `serveConnectionReplies`.
+-- server's.  So `serveConnection` asks for `exception Net.NetError`, as
+-- `serve` and `serveUntil` do.
 --
 -- ```haskell
 -- import bytes as Bytes
@@ -132,9 +130,6 @@ module std.http.server
   , serveConnection
   , serveUntil
   , serve
-  , serveConnectionReplies
-  , serveRepliesUntil
-  , serveReplies
   )
 import bytes as Bytes
 import co
@@ -1003,48 +998,28 @@ closedWith idle within answer c (Right peer) = serveFrom Bytes.empty
     goOn serveFrom after
 
 -- | A connection's requests answered by `handle`, one after another,
--- | until it ends, a request asks for it to be closed, or `last` says
--- | the request is the last the server answers: whether `last` said so.
--- | The connection is closed by the `with` holding it, `Net.accept`'s
--- | or `Net.withConnection`'s, when its body ends.  Where the client
--- | sends nothing for `idle` milliseconds, it ends there (0: no limit);
--- | where a request's head is not all read within `headerWithin`
--- | milliseconds of the connection's start, or of the response before
--- | it, too (0: no limit).
+-- | each with a `Reply` -- a response whole, one streamed, or the
+-- | connection taken over, the server done with it once the function it
+-- | is given is -- until it ends, a request asks for it to be closed, or
+-- | `last` says the request is the last the server answers: whether
+-- | `last` said so.  The connection is closed by the `with` holding it,
+-- | `Net.accept`'s or `Net.withConnection`'s, when its body ends.  Where
+-- | the client sends nothing for `idle` milliseconds, it ends there (0:
+-- | no limit); where a request's head is not all read within
+-- | `headerWithin` milliseconds of the connection's start, or of the
+-- | response before it, too (0: no limit).
 serveConnection : {e : HFunctor}
                 -> {s : Type}
                 -> {idle : Int := 30000}
                 -> {headerWithin : Int := 30000}
                 -> {{nt : Net.net <: e}}
                 -> {{clock : Time.time <: e}}
+                -> {{ex : exception Net.NetError <: e}}
                 -> (Request -> Bool)
-                -> (Request -> Co e HTTP.Response)
+                -> (Request -> Co e (Reply e))
                 -> With s Net.TcpStream
                 -> Co e Bool
 serveConnection last handle c =
-  bind
-    (Net.peer c)
-    (closedWith
-       idle
-       headerWithin
-       (\r rest -> bind (handle r) (wholeOut idle c last r rest))
-       c)
-
--- | `serveConnection`, its requests answered by `handle` with a `Reply`
--- | each: a response whole, one streamed, or the connection taken over
--- | -- the server done with it once the function it is given is.
-serveConnectionReplies : {e : HFunctor}
-                       -> {s : Type}
-                       -> {idle : Int := 30000}
-                       -> {headerWithin : Int := 30000}
-                       -> {{nt : Net.net <: e}}
-                       -> {{clock : Time.time <: e}}
-                       -> {{ex : exception Net.NetError <: e}}
-                       -> (Request -> Bool)
-                       -> (Request -> Co e (Reply e))
-                       -> With s Net.TcpStream
-                       -> Co e Bool
-serveConnectionReplies last handle c =
   bind
     (Net.peer c)
     (closedWith
@@ -1075,7 +1050,7 @@ serveUntil : {e : HFunctor}
            -> {{cu : Custodian.custodian <: e}}
            -> (Request -> Bool)
            -> With s Net.TcpListener
-           -> (Request -> Co e HTTP.Response)
+           -> (Request -> Co e (Reply e))
            -> Co e Unit
 serveUntil last l handle =
   bind
@@ -1106,7 +1081,7 @@ serve : {e : HFunctor}
       -> {{ex : exception Net.NetError <: e}}
       -> {{cu : Custodian.custodian <: e}}
       -> With s Net.TcpListener
-      -> (Request -> Co e HTTP.Response)
+      -> (Request -> Co e (Reply e))
       -> Co e Unit
 serve l handle =
   bind
@@ -1118,60 +1093,3 @@ serve l handle =
           (\r -> False)
           handle))
     (\stop -> serve (idle := idle) (headerWithin := headerWithin) l handle)
-
--- | `serveUntil`, each request answered with a `Reply`
--- | (`serveConnectionReplies`).
-serveRepliesUntil : {e : HFunctor}
-                  -> {s : Type}
-                  -> {idle : Int := 30000}
-                  -> {headerWithin : Int := 30000}
-                  -> {{nt : Net.net <: e}}
-                  -> {{clock : Time.time <: e}}
-                  -> {{ex : exception Net.NetError <: e}}
-                  -> {{cu : Custodian.custodian <: e}}
-                  -> (Request -> Bool)
-                  -> With s Net.TcpListener
-                  -> (Request -> Co e (Reply e))
-                  -> Co e Unit
-serveRepliesUntil last l handle =
-  bind
-    (Net.accept
-       l
-       (serveConnectionReplies
-          (idle := idle)
-          (headerWithin := headerWithin)
-          last
-          handle))
-    (nextOr
-       (\u ->
-          serveRepliesUntil
-            (idle := idle)
-            (headerWithin := headerWithin)
-            last
-            l
-            handle))
-
--- | `serve`, each request answered with a `Reply`
--- | (`serveConnectionReplies`).
-serveReplies : {e : HFunctor}
-             -> {s : Type}
-             -> {idle : Int := 30000}
-             -> {headerWithin : Int := 30000}
-             -> {{nt : Net.net <: e}}
-             -> {{clock : Time.time <: e}}
-             -> {{ex : exception Net.NetError <: e}}
-             -> {{cu : Custodian.custodian <: e}}
-             -> With s Net.TcpListener
-             -> (Request -> Co e (Reply e))
-             -> Co e Unit
-serveReplies l handle =
-  bind
-    (Net.accept
-       l
-       (serveConnectionReplies
-          (idle := idle)
-          (headerWithin := headerWithin)
-          (\r -> False)
-          handle))
-    (\stop ->
-       serveReplies (idle := idle) (headerWithin := headerWithin) l handle)
