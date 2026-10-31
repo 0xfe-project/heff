@@ -50,6 +50,7 @@
 
 module std.crypto
 
+import bytes as Bytes
 import co
 import ffi as FFI
 
@@ -71,11 +72,14 @@ data Algorithm = RS256 | PS256 | ES256 | EdDSA
 -- |   signs with (`"DSA"`; `"EC, secp384r1"`, a curve not P-256);
 -- | - `InvalidKey why`, a JWK's fields are no key (a coordinate not of 32
 -- |   bytes, a point not on the curve, no modulus, an exponent even or
--- |   less than 3);
+-- |   less than 3), or a private key's numbers are none (a P-256
+-- |   key's scalar 0 or the curve's order or more; an RSA key's modulus
+-- |   or prime even, found as it signs);
 -- | - `TooShort bits`, an RSA key's modulus of fewer than `minRsaBits`
 -- |   bits, its own;
 -- | - `WrongKey a`, a key not of the kind the algorithm signs with;
--- | - `Failed why`, OpenSSL failed of itself, and said why.
+-- | - `Failed why`, OpenSSL failed of itself, where it had no room, and
+-- |   said why.
 data Error
   = Unreadable String
   | Encrypted
@@ -90,19 +94,28 @@ data Error
 minRsaBits : Int
 minRsaBits = 2048
 
+-- (what reading or making a key, or signing, came to, the host's: the
+-- key or the signature, or why not, each taken of it by an operation;
+-- why is the outcome's own, not left where another operation's
+-- failure could be found in its place)
+data Outcome
+
 data CryptoF (m : Type -> Type) x
-  = PrivatePem String Int (Either FFI.Errno PrivateKey -> x)
-  | PublicPem String Int (Either FFI.Errno PublicKey -> x)
-  | RsaJwk Bytes Bytes Int (Either FFI.Errno PublicKey -> x)
-  | P256Jwk Bytes Bytes (Either FFI.Errno PublicKey -> x)
-  | Ed25519Jwk Bytes (Either FFI.Errno PublicKey -> x)
+  = PrivatePem Bytes Int (Outcome -> x)
+  | PublicPem Bytes Int (Outcome -> x)
+  | RsaJwk Bytes Bytes Int (Outcome -> x)
+  | P256Jwk Bytes Bytes (Outcome -> x)
+  | Ed25519Jwk Bytes (Outcome -> x)
   | PublicOf PrivateKey (PublicKey -> x)
   | PublicPemOf PublicKey (String -> x)
-  | Sign Int PrivateKey Bytes (Either FFI.Errno Bytes -> x)
+  | Sign Int PrivateKey Bytes (Outcome -> x)
   | Verify Int PublicKey Bytes Bytes (Bool -> x)
-  | Why (String -> x)
-  | WhyKind (Int -> x)
-  | WhyBits (Int -> x)
+  | PrivateKeyOf Outcome (Either FFI.Errno PrivateKey -> x)
+  | PublicKeyOf Outcome (Either FFI.Errno PublicKey -> x)
+  | SignatureOf Outcome (Either FFI.Errno Bytes -> x)
+  | KindOf Outcome (Int -> x)
+  | BitsOf Outcome (Int -> x)
+  | WhyOf Outcome (String -> x)
 
 -- | Signatures: keys read and made, messages signed and verified.
 crypto : HFunctor
@@ -118,9 +131,12 @@ crypto =
       PublicPemOf key k -> PublicPemOf key (\r -> g (k r))
       Sign a key msg k -> Sign a key msg (\r -> g (k r))
       Verify a key msg sig k -> Verify a key msg sig (\r -> g (k r))
-      Why k -> Why (\r -> g (k r))
-      WhyKind k -> WhyKind (\r -> g (k r))
-      WhyBits k -> WhyBits (\r -> g (k r))
+      PrivateKeyOf o k -> PrivateKeyOf o (\r -> g (k r))
+      PublicKeyOf o k -> PublicKeyOf o (\r -> g (k r))
+      SignatureOf o k -> SignatureOf o (\r -> g (k r))
+      KindOf o k -> KindOf o (\r -> g (k r))
+      BitsOf o k -> BitsOf o (\r -> g (k r))
+      WhyOf o k -> WhyOf o (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       PrivatePem pem b k -> PrivatePem pem b k
       PublicPem pem b k -> PublicPem pem b k
@@ -131,14 +147,21 @@ crypto =
       PublicPemOf key k -> PublicPemOf key k
       Sign a key msg k -> Sign a key msg k
       Verify a key msg sig k -> Verify a key msg sig k
-      Why k -> Why k
-      WhyKind k -> WhyKind k
-      WhyBits k -> WhyBits k
+      PrivateKeyOf o k -> PrivateKeyOf o k
+      PublicKeyOf o k -> PublicKeyOf o k
+      SignatureOf o k -> SignatureOf o k
+      KindOf o k -> KindOf o k
+      BitsOf o k -> BitsOf o k
+      WhyOf o k -> WhyOf o k
   }
 
 -- (a key, as C has it: an `EVP_PKEY`, `EVP_PKEY_free` letting it go)
 key : FFI.CType
 key = FFI.pointer "EVP_PKEY" "EVP_PKEY_free"
+
+-- (an outcome, as C has it: the module's C's `CrOutcome`)
+outcome : FFI.CType
+outcome = FFI.pointer "CrOutcome" "cr_outcome_free"
 
 -- | The operations, each a function of the module's C, on OpenSSL's.
 cryptoInC : FFI.Described
@@ -147,22 +170,22 @@ cryptoInC =
     ["<openssl/evp.h>"]
     [ FFI.operation
       "PrivatePem"
-      (FFI.fun "cr_private_pem" [FFI.string, FFI.int] (FFI.givesOrErrno key))
+      (FFI.fun "cr_private_pem" [FFI.bytes, FFI.int] (FFI.gives outcome))
     , FFI.operation
       "PublicPem"
-      (FFI.fun "cr_public_pem" [FFI.string, FFI.int] (FFI.givesOrErrno key))
+      (FFI.fun "cr_public_pem" [FFI.bytes, FFI.int] (FFI.gives outcome))
     , FFI.operation
       "RsaJwk"
       (FFI.fun
          "cr_rsa_jwk"
          [FFI.bytes, FFI.bytes, FFI.int]
-         (FFI.givesOrErrno key))
+         (FFI.gives outcome))
     , FFI.operation
       "P256Jwk"
-      (FFI.fun "cr_p256_jwk" [FFI.bytes, FFI.bytes] (FFI.givesOrErrno key))
+      (FFI.fun "cr_p256_jwk" [FFI.bytes, FFI.bytes] (FFI.gives outcome))
     , FFI.operation
       "Ed25519Jwk"
-      (FFI.fun "cr_ed25519_jwk" [FFI.bytes] (FFI.givesOrErrno key))
+      (FFI.fun "cr_ed25519_jwk" [FFI.bytes] (FFI.gives outcome))
     , FFI.operation "PublicOf" (FFI.fun "cr_public_of" [key] (FFI.gives key))
     , FFI.operation
       "PublicPemOf"
@@ -172,16 +195,31 @@ cryptoInC =
       (FFI.fun
          "cr_sign"
          [FFI.int, key, FFI.bytes]
-         (FFI.givesOrErrno FFI.ownedBytes))
+         (FFI.gives outcome))
     , FFI.operation
       "Verify"
       (FFI.fun
          "cr_verify"
          [FFI.int, key, FFI.bytes, FFI.bytes]
          (FFI.gives FFI.bool))
-    , FFI.operation "Why" (FFI.fun "cr_why_of" [] (FFI.gives FFI.string))
-    , FFI.operation "WhyKind" (FFI.fun "cr_why_kind" [] (FFI.gives FFI.int))
-    , FFI.operation "WhyBits" (FFI.fun "cr_why_bits" [] (FFI.gives FFI.int))
+    , FFI.operation
+      "PrivateKeyOf"
+      (FFI.fun "cr_outcome_key" [outcome] (FFI.givesOrErrno key))
+    , FFI.operation
+      "PublicKeyOf"
+      (FFI.fun "cr_outcome_key" [outcome] (FFI.givesOrErrno key))
+    , FFI.operation
+      "SignatureOf"
+      (FFI.fun "cr_outcome_signature" [outcome] (FFI.givesOrErrno FFI.bytes))
+    , FFI.operation
+      "KindOf"
+      (FFI.fun "cr_outcome_kind" [outcome] (FFI.gives FFI.int))
+    , FFI.operation
+      "BitsOf"
+      (FFI.fun "cr_outcome_bits" [outcome] (FFI.gives FFI.int))
+    , FFI.operation
+      "WhyOf"
+      (FFI.fun "cr_outcome_why" [outcome] (FFI.gives FFI.string))
     ]
 
 -- | What the module's C is linked with: libcrypto.
@@ -264,20 +302,39 @@ signFailure : Algorithm -> Int -> Int -> String -> Error
 signFailure a 6 _ _ = WrongKey a
 signFailure _ kind bits why = failure kind bits why
 
--- (what C gave, a failure said as an error, of the kind, the bits and why
--- C said)
+-- (what was taken of the outcome, or, nothing there, an error of the
+-- kind, the bits and why the outcome says)
 said : {e : HFunctor}
      -> {a : Type}
      -> {{ev : crypto <: e}}
      -> (Int -> Int -> String -> Error)
+     -> Outcome
      -> Either FFI.Errno a
      -> Co e (Either Error a)
-said _ (Right x) = pure (Right x)
-said f (Left _) = do
-  kind <- op (ev (WhyKind (\n -> n))) val
-  bits <- op (ev (WhyBits (\n -> n))) val
-  why <- op (ev (Why (\s -> s))) val
+said _ _ (Right x) = pure (Right x)
+said f o (Left _) = do
+  kind <- op (ev (KindOf o (\n -> n))) val
+  bits <- op (ev (BitsOf o (\n -> n))) val
+  why <- op (ev (WhyOf o (\s -> s))) val
   pure (Left (f kind bits why))
+
+-- (the private key of the outcome, or why not)
+privateKeyIn : {e : HFunctor}
+             -> {{ev : crypto <: e}}
+             -> Outcome
+             -> Co e (Either Error PrivateKey)
+privateKeyIn o = do
+  r <- op (ev (PrivateKeyOf o (\r -> r))) val
+  said failure o r
+
+-- (the public key of the outcome, or why not)
+publicKeyIn : {e : HFunctor}
+            -> {{ev : crypto <: e}}
+            -> Outcome
+            -> Co e (Either Error PublicKey)
+publicKeyIn o = do
+  r <- op (ev (PublicKeyOf o (\r -> r))) val
+  said failure o r
 
 -- | The private key a PEM holds: PKCS#8 (`BEGIN PRIVATE KEY`), or RSA's
 -- | or EC's own (`BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`); not
@@ -288,8 +345,8 @@ privateKeyFromPem : {e : HFunctor}
                   -> String
                   -> Co e (Either Error PrivateKey)
 privateKeyFromPem pem = do
-  r <- op (ev (PrivatePem pem minRsaBits (\r -> r))) val
-  said failure r
+  o <- op (ev (PrivatePem (Bytes.fromString pem) minRsaBits (\o -> o))) val
+  privateKeyIn o
 
 -- | The public key a PEM holds: SubjectPublicKeyInfo
 -- | (`BEGIN PUBLIC KEY`), or RSA's own (`BEGIN RSA PUBLIC KEY`); not one
@@ -299,8 +356,8 @@ publicKeyFromPem : {e : HFunctor}
                  -> String
                  -> Co e (Either Error PublicKey)
 publicKeyFromPem pem = do
-  r <- op (ev (PublicPem pem minRsaBits (\r -> r))) val
-  said failure r
+  o <- op (ev (PublicPem (Bytes.fromString pem) minRsaBits (\o -> o))) val
+  publicKeyIn o
 
 -- | An RSA public key, of a JWK's `n` and `e`: the modulus, of
 -- | `minRsaBits` bits or more (else `TooShort`), and the exponent, odd
@@ -311,8 +368,8 @@ rsaPublicKey : {e : HFunctor}
              -> Bytes
              -> Co e (Either Error PublicKey)
 rsaPublicKey n x = do
-  r <- op (ev (RsaJwk n x minRsaBits (\r -> r))) val
-  said failure r
+  o <- op (ev (RsaJwk n x minRsaBits (\o -> o))) val
+  publicKeyIn o
 
 -- | A P-256 public key, of a JWK's `x` and `y` (its `crv` `P-256`): the
 -- | point's coordinates, 32 bytes each, a point of the curve (else
@@ -323,8 +380,8 @@ p256PublicKey : {e : HFunctor}
               -> Bytes
               -> Co e (Either Error PublicKey)
 p256PublicKey x y = do
-  r <- op (ev (P256Jwk x y (\r -> r))) val
-  said failure r
+  o <- op (ev (P256Jwk x y (\o -> o))) val
+  publicKeyIn o
 
 -- | An Ed25519 public key, of a JWK's `x` (its `crv` `Ed25519`): 32
 -- | bytes (else `InvalidKey`).
@@ -333,8 +390,8 @@ ed25519PublicKey : {e : HFunctor}
                  -> Bytes
                  -> Co e (Either Error PublicKey)
 ed25519PublicKey x = do
-  r <- op (ev (Ed25519Jwk x (\r -> r))) val
-  said failure r
+  o <- op (ev (Ed25519Jwk x (\o -> o))) val
+  publicKeyIn o
 
 -- | The public key of a private one, a key of its own, nothing private
 -- | in it: what verifies what it signs.
@@ -353,8 +410,9 @@ sign : {e : HFunctor}
      -> Bytes
      -> Co e (Either Error Bytes)
 sign a k msg = do
-  r <- op (ev (Sign (codeOf a) k msg (\r -> r))) val
-  said (signFailure a) r
+  o <- op (ev (Sign (codeOf a) k msg (\o -> o))) val
+  r <- op (ev (SignatureOf o (\r -> r))) val
+  said (signFailure a) o r
 
 -- | `verify a key message signature`: whether the signature is the
 -- | key's of the message, by the algorithm.
