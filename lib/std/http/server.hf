@@ -38,9 +38,9 @@
 -- ```
 --
 -- A handler answers with a `Reply`, which is one of three: a response
--- whole (`Whole`); a head -- a status and headers -- and a body given a
--- piece at a time (`Streamed`); or a head, after which the connection
--- is the handler's (`TakenOver`).
+-- whole (`Whole`); a head -- a status and headers, a `Head` -- and a body
+-- given a piece at a time (`Streamed`); or a head, after which the
+-- connection is the handler's (`TakenOver`).
 --
 -- A streamed body is a computation that yields each piece, stream's
 -- `yield` of `Bytes`, and the server writes each piece as it is
@@ -72,7 +72,11 @@
 --     counted (i + 1) n
 --
 -- numbered : {e : HFunctor} -> Server.Request -> Co e (Server.Reply e)
--- numbered r = pure (Streamed 200 [MkPair "Content-Type" "text/plain"] (counted 1 100))
+-- numbered r =
+--   pure
+--     (Streamed
+--        { status = 200, headers = [MkPair "Content-Type" "text/plain"] }
+--        (counted 1 100))
 -- ```
 --
 -- A connection taken over is written the head the handler gave -- its
@@ -115,12 +119,13 @@ module std.http.server
   , plain
   , parseHead
   , BodyIs(..)
-  , Head(..)
+  , HeadRead(..)
   , Got(..)
   , requestIn
   , reason
   , responseBytes
   , chunk
+  , Head
   , streamedHead
   , takeoverHead
   , keptAlive
@@ -315,7 +320,7 @@ moreBytes again ended buf (Right b) =
   if Bytes.length b == 0 then pure ended else again (Bytes.append buf b)
 
 -- (a head read: the bytes read, and where its blank line starts)
-data Head = HeadAt Bytes Int | HeadTooLong | HeadEnded
+data HeadRead = HeadAt Bytes Int | HeadTooLong | HeadEnded
 
 -- (the monotonic clock, in milliseconds)
 millisecondsNow : {e : HFunctor} -> {{clock : Time.time <: e}} -> Co e Int
@@ -368,7 +373,7 @@ readHead : {e : HFunctor}
          -> With s Net.TcpStream
          -> Bytes
          -> Int
-         -> Co e Head
+         -> Co e HeadRead
 readHead idle by c buf from =
   let i = headEnd buf from
   in if i >= 0 then pure (HeadAt buf i)
@@ -494,7 +499,7 @@ headed : {e : HFunctor}
        -> Int
        -> With s Net.TcpStream
        -> Net.Address
-       -> Head
+       -> HeadRead
        -> Co e Got
 headed idle c peer (HeadAt buf i) =
   parsed idle c buf i (parseHead peer (show (Bytes.slice buf 0 i)))
@@ -633,32 +638,36 @@ chunk b =
   Bytes.concat
     [Bytes.fromString (hexOf (Bytes.length b) ^ "\r\n"), b, b["\r\n"]]
 
+-- | What a reply that is not whole begins with, before its body or the
+-- | connection taken over: its status, and its headers.
+type Head = { status : Int, headers : List (Pair String String) }
+
 -- | A streamed reply's head as it is written: its status line, its
 -- | headers but its own length and connection, `Transfer-Encoding:
 -- | chunked` where `chunked`, and `Connection: connection` where that is
 -- | not empty.
--- | >>> debug (streamedHead "" True 200 [MkPair "Content-Type" "text/event-stream", MkPair "Content-Length" "3"])
+-- | >>> debug (streamedHead "" True { status = 200, headers = [MkPair "Content-Type" "text/event-stream", MkPair "Content-Length" "3"] })
 -- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Content-Type: text/event-stream\", 13, 10, \"Transfer-Encoding: chunked\", 13, 10, 13, 10]"
--- | >>> debug (streamedHead "close" False 200 Nil)
+-- | >>> debug (streamedHead "close" False { status = 200, headers = Nil })
 -- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Connection: close\", 13, 10, 13, 10]"
-streamedHead : String -> Bool -> Int -> List (Pair String String) -> Bytes
-streamedHead connection chunked status headers =
+streamedHead : String -> Bool -> Head -> Bytes
+streamedHead connection chunked head =
   Bytes.fromString
     (headWith
-       status
-       headers
+       head.status
+       head.headers
        ((if chunked then "Transfer-Encoding: chunked\r\n" else "")
         ^ connectionLine connection))
 
 -- | The head written before a connection is taken over: its status line
 -- | and its headers, all as they are given, `Connection` too -- no
 -- | length, nothing of the server's.
--- | >>> debug (takeoverHead 101 [MkPair "Connection" "Upgrade", MkPair "Upgrade" "websocket"])
+-- | >>> debug (takeoverHead { status = 101, headers = [MkPair "Connection" "Upgrade", MkPair "Upgrade" "websocket"] })
 -- | "b[\"HTTP/1.1 101 Switching Protocols\", 13, 10, \"Connection: Upgrade\", 13, 10, \"Upgrade: websocket\", 13, 10, 13, 10]"
-takeoverHead : Int -> List (Pair String String) -> Bytes
-takeoverHead status headers =
+takeoverHead : Head -> Bytes
+takeoverHead head =
   Bytes.fromString
-    (statusLine status ^ List.foldl headerText "" headers ^ "\r\n")
+    (statusLine head.status ^ List.foldl headerText "" head.headers ^ "\r\n")
 
 -- (whether a `Connection` header of these has the token, its case not
 -- minded)
@@ -773,9 +782,9 @@ type Taken s =
   }
 
 -- | What a handler answers a request with: a response, whole
--- | (`Whole`); a status, headers and a body that yields its pieces
--- | (`Streamed`), each written as it is yielded; or a status and
--- | headers, after which the connection is the function's (`TakenOver`),
+-- | (`Whole`); a head (a status and headers) and a body that yields its
+-- | pieces (`Streamed`), each written as it is yielded; or a head, after
+-- | which the connection is the function's (`TakenOver`),
 -- | given the request, the connection and what was read after the
 -- | request.  A streamed reply's headers and a whole one's give no
 -- | length, `Transfer-Encoding` or `Connection` of their own -- the
@@ -784,12 +793,8 @@ type Taken s =
 -- | headers as they are.
 data Reply (e : HFunctor)
   = Whole HTTP.Response
-  | Streamed Int (List (Pair String String)) (Co
-                                                (Stream.yielding Bytes <+> e)
-                                                Unit)
-  | TakenOver Int (List (Pair String String)) ({s : Type}
-                                               -> Taken s
-                                               -> Co e Unit)
+  | Streamed Head (Co (Stream.yielding Bytes <+> e) Unit)
+  | TakenOver Head ({s : Type} -> Taken s -> Co e Unit)
 
 -- (a piece of a streamed body written, a chunk where `chunked`: none of
 -- no bytes, which would end the chunks; where it is not written, why
@@ -892,23 +897,18 @@ streamedOut : {e : HFunctor}
             -> (Request -> Bool)
             -> Request
             -> Bytes
-            -> Int
-            -> List (Pair String String)
+            -> Head
             -> Co (Stream.yielding Bytes <+> e) Unit
             -> Co e After
-streamedOut idle c last r rest status headers body = do
+streamedOut idle c last r rest head body = do
   let chunked = strEq r.version "HTTP/1.1"
-  let close = not chunked || closes last r headers
-  let none = bodiless status
+  let close = not chunked || closes last r head.headers
+  let none = bodiless head.status
   w <-
     Net.write
       (timeout := idle)
       c
-      (streamedHead
-         (connectionWord r close)
-         (chunked && not none)
-         status
-         headers)
+      (streamedHead (connectionWord r close) (chunked && not none) head)
   headOut
       idle
       c
@@ -943,11 +943,11 @@ replied : {e : HFunctor}
         -> Reply e
         -> Co e After
 replied idle c last r rest (Whole res) = wholeOut idle c last r rest res
-replied idle c last r rest (Streamed status headers body) =
-  streamedOut idle c last r rest status headers body
-replied idle c last r rest (TakenOver status headers f) =
+replied idle c last r rest (Streamed head body) =
+  streamedOut idle c last r rest head body
+replied idle c last r rest (TakenOver head f) =
   bind
-    (Net.write (timeout := idle) c (takeoverHead status headers))
+    (Net.write (timeout := idle) c (takeoverHead head))
     (handedOver (f { request = r, connection = c, rest = rest }) (last r))
 
 -- (what was read, answered: a request by `answer`, given what was read

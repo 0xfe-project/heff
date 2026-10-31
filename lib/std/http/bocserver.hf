@@ -157,7 +157,10 @@
 --      -> Co (exception Empty <+> e) Unit
 -- chat hub r respond =
 --   if r.target == "/events"
---   then respond (Streamed 200 SSE.headers { opened = joined hub, gone = left hub })
+--   then respond
+--       (Streamed
+--          { status = 200, headers = SSE.headers }
+--          { opened = joined hub, gone = left hub })
 --   else if r.target == "/say"
 --   then do
 --     with h := hub do
@@ -370,15 +373,15 @@ type Socket (e : HFunctor) (err : Type) =
   }
 
 -- | What a handler answers its request with: a response, whole
--- | (`Whole`); a status and headers, then a body sent a piece at a time
--- | (`Streamed`); or the connection taken for WebSocket, where the
+-- | (`Whole`); a head (std.http.server's, a status and headers), then a
+-- | body sent a piece at a time (`Streamed`); or the connection taken for WebSocket, where the
 -- | request is a handshake (`Upgraded`).  A stream's headers give no
 -- | length, `Transfer-Encoding` or `Connection` of their own -- the
 -- | server writes those -- but `Connection: close`, which closes the
 -- | connection after the stream.
 data Answer (e : HFunctor) (err : Type)
   = Whole HTTP.Response
-  | Streamed Int (List (Pair String String)) (Streaming e err)
+  | Streamed Server.Head (Streaming e err)
   | Upgraded (Socket e err)
 
 -- | How a handler answers its request: in whichever world has boc's
@@ -1548,8 +1551,7 @@ mutual
         -> Answer e err
         -> Co e (Conn e err)
   taken sg cn r st (Whole res) = wholeOut sg cn r st res
-  taken sg cn r st (Streamed status headers s) =
-    streamStart sg cn r st status headers s
+  taken sg cn r st (Streamed head s) = streamStart sg cn r st head s
   taken sg cn r st (Upgraded s) =
     socketStart sg cn r st s (WebSocket.handshake r)
 
@@ -1594,24 +1596,22 @@ mutual
               -> Connection e rg err
               -> Server.Request
               -> Conn e err
-              -> Int
-              -> List (Pair String String)
+              -> Server.Head
               -> Streaming e err
               -> Co e (Conn e err)
-  streamStart sg cn r st status headers s = do
+  streamStart sg cn r st h s = do
     let chunked = strEq r.version "HTTP/1.1"
     let close =
       st.stopping
       || not chunked
       || not (Server.keptAlive r)
-      || connectionSays "close" headers
+      || connectionSays "close" h.headers
     let head =
       Server.streamedHead
         (connectionWord r close)
-        (chunked && not (bodiless status))
-        status
-        headers
-    if bodiless status || strEq r.method "HEAD"
+        (chunked && not (bodiless h.status))
+        h
+    if bodiless h.status || strEq r.method "HEAD"
     then do
       writing sg cn close head
       pure { st | phase = Writing }
@@ -1628,7 +1628,7 @@ mutual
         , ending = False
         , chunked = chunked
         , closeAfter = close
-        , beat = beatOf headers
+        , beat = beatOf h.headers
         , quiet = True
         , live = Streams s
         }
@@ -1676,7 +1676,9 @@ mutual
               -> Co e (Conn e err)
   socketStart sg cn r st s (Refuse res) = wholeOut sg cn r st res
   socketStart sg cn r st s (Accept key) = do
-    let head = Server.takeoverHead 101 (WebSocket.upgradeHeaders key)
+    let head =
+      Server.takeoverHead
+        { status = 101, headers = WebSocket.upgradeHeaders key }
     let upgraded =
       { st
       | phase = InSocket
