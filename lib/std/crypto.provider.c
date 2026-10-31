@@ -4,17 +4,28 @@
 // the compiler makes the provider; these are the functions.
 //
 // A key is an `EVP_PKEY`, let go of by `EVP_PKEY_free` when the program
-// drops its last reference.  A function that fails says, in variables of
-// its thread's, what kind of failure it was (as the module numbers the
-// kinds), why, and an RSA key's bits where it has too few; it sets
-// `errno` and gives `NULL`, and the operations `Why`, `WhyKind` and
-// `WhyBits` read what it said.  OpenSSL's queue of errors is emptied
-// after every operation, so that one never reads another's.
+// drops its last reference.  What reads or makes a key, or signs, gives
+// an outcome (`CrOutcome`), a foreign value of its own: the key or the
+// signature, or what kind of failure it was (as the module numbers the
+// kinds), why, and an RSA key's bits where it has too few.  The module
+// takes the key or the signature out of it, or, there being none, asks
+// it why, each an operation of its own.  Why is the outcome's, not the
+// thread's: between two operations of the module's another of the
+// program's may run on the same thread -- a release due, run before
+// the next operation; a handler's own, between what it hands on -- and
+// fail too, so what a thread was last told would not be this one's.
+// OpenSSL's queue of errors is emptied after every operation, so that
+// one never reads another's.  A PEM is given as bytes, NULs and all: a
+// string with a NUL in it is not given C at all, and a PEM with one is
+// OpenSSL's to refuse, as any other text that holds no key.
 //
 // A key read or made is one an algorithm signs or verifies with: RSA's
 // of as many bits as the module gives (`min`) or more, P-256's,
 // Ed25519's.  Any other is refused as it is read, so that signing and
-// verifying need not ask.
+// verifying need not ask.  A private key's numbers are not checked as
+// it is read (to check an RSA key's is to test its primes, tens of
+// milliseconds); one whose numbers cannot sign -- an even modulus, an
+// even prime -- is found so as it signs, an invalid key.
 //
 // The algorithms are JWS's (RFC 7518): RS256, RSASSA-PKCS1-v1_5 with
 // SHA-256; PS256, RSASSA-PSS with SHA-256, MGF1 of SHA-256 and a salt as
@@ -25,6 +36,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
@@ -50,19 +62,31 @@ enum {
   CR_WRONG_KEY = 6
 };
 
-// (the thread's last failure: its kind, why, and an RSA key's bits)
-static _Thread_local char cr_why[256];
-static _Thread_local int cr_kind;
-static _Thread_local int cr_bits;
+// (what an operation came to: a key, or a signature and its length; or,
+// neither, the failure's kind, an RSA key's bits and why)
+typedef struct {
+  EVP_PKEY *key;
+  unsigned char *sig;
+  size_t n;
+  int kind, bits;
+  char why[256];
+} CrOutcome;
 
-// (a failure of the kind, said so; OpenSSL's errors forgotten, errno
-// EINVAL)
-static void cr_failed(int kind, int bits, const char *what) {
-  snprintf(cr_why, sizeof cr_why, "%s", what);
-  cr_kind = kind;
-  cr_bits = bits;
+static void cr_outcome_free(CrOutcome *o) {
+  EVP_PKEY_free(o->key);
+  free(o->sig);
+  free(o);
+}
+
+// (an outcome, of nothing yet; NULL where there is no room for one)
+static CrOutcome *cr_outcome(void) { return calloc(1, sizeof(CrOutcome)); }
+
+// (a failure of the kind, said so; OpenSSL's errors forgotten)
+static void cr_failed(CrOutcome *o, int kind, int bits, const char *what) {
+  snprintf(o->why, sizeof o->why, "%s", what);
+  o->kind = kind;
+  o->bits = bits;
   ERR_clear_error();
-  errno = EINVAL;
 }
 
 // (what OpenSSL said of its last error, or `otherwise`)
@@ -72,28 +96,53 @@ static const char *cr_reason(const char *otherwise) {
   return reason ? reason : otherwise;
 }
 
-// (a failure of no kind of the module's: what, and what OpenSSL said of
-// it)
-static void cr_fail(const char *what) {
-  char w[sizeof cr_why];
+// (a failure of the kind: what, and what OpenSSL said of it)
+static void cr_failed_said(CrOutcome *o, int kind, const char *what) {
+  char w[sizeof o->why];
   unsigned long e = ERR_peek_last_error();
   const char *reason = e ? ERR_reason_error_string(e) : NULL;
   if (reason)
     snprintf(w, sizeof w, "%s (%s)", what, reason);
   else
     snprintf(w, sizeof w, "%s", what);
-  cr_failed(CR_FAILED, 0, w);
+  cr_failed(o, kind, 0, w);
 }
 
-static const char *cr_why_of(void) { return cr_why; }
+// (a failure of no kind of the module's: OpenSSL's own, where it has no
+// room)
+static void cr_fail(CrOutcome *o, const char *what) { cr_failed_said(o, CR_FAILED, what); }
 
-static int cr_why_kind(void) { return cr_kind; }
+// (the outcome's key, one more reference to it; NULL, errno EINVAL,
+// where it has none)
+static EVP_PKEY *cr_outcome_key(CrOutcome *o) {
+  if (!o->key) {
+    errno = EINVAL;
+    return NULL;
+  }
+  EVP_PKEY_up_ref(o->key);
+  return o->key;
+}
 
-static int cr_why_bits(void) { return cr_bits; }
+// (the outcome's signature, its length in `n`; NULL, errno EINVAL, where
+// it has none)
+static const unsigned char *cr_outcome_signature(CrOutcome *o, size_t *n) {
+  if (!o->sig) {
+    errno = EINVAL;
+    return NULL;
+  }
+  *n = o->n;
+  return o->sig;
+}
+
+static int cr_outcome_kind(CrOutcome *o) { return o->kind; }
+
+static int cr_outcome_bits(CrOutcome *o) { return o->bits; }
+
+static const char *cr_outcome_why(CrOutcome *o) { return o->why; }
 
 // (the key, if an algorithm signs or verifies with it, an RSA key's of
 // `min` bits or more; else let go of, the failure said, and NULL)
-static EVP_PKEY *cr_usable(EVP_PKEY *k, int min) {
+static EVP_PKEY *cr_usable(CrOutcome *o, EVP_PKEY *k, int min) {
   char what[96];
   if (EVP_PKEY_is_a(k, "RSA")) {
     int bits = EVP_PKEY_get_bits(k);
@@ -102,7 +151,7 @@ static EVP_PKEY *cr_usable(EVP_PKEY *k, int min) {
       return k;
     }
     EVP_PKEY_free(k);
-    cr_failed(CR_TOO_SHORT, bits, "an RSA key too short");
+    cr_failed(o, CR_TOO_SHORT, bits, "an RSA key too short");
     return NULL;
   }
   if (EVP_PKEY_is_a(k, "EC")) {
@@ -117,7 +166,7 @@ static EVP_PKEY *cr_usable(EVP_PKEY *k, int min) {
     } else
       snprintf(what, sizeof what, "EC, a curve of no name");
     EVP_PKEY_free(k);
-    cr_failed(CR_UNSUPPORTED, 0, what);
+    cr_failed(o, CR_UNSUPPORTED, 0, what);
     return NULL;
   }
   if (EVP_PKEY_is_a(k, "ED25519")) {
@@ -127,7 +176,7 @@ static EVP_PKEY *cr_usable(EVP_PKEY *k, int min) {
   const char *type = EVP_PKEY_get0_type_name(k);
   snprintf(what, sizeof what, "%s", type ? type : "a key of no name");
   EVP_PKEY_free(k);
-  cr_failed(CR_UNSUPPORTED, 0, what);
+  cr_failed(o, CR_UNSUPPORTED, 0, what);
   return NULL;
 }
 
@@ -139,39 +188,45 @@ static int cr_no_passphrase(char *buf, int size, int rw, void *asked) {
   return -1;
 }
 
-// (a private key of a PEM: PKCS#8, or RSA's or EC's own; RSA's of `min`
-// bits or more)
-static EVP_PKEY *cr_private_pem(const char *pem, int min) {
+// (a private key of a PEM, its `n` bytes: PKCS#8, or RSA's or EC's own;
+// RSA's of `min` bits or more)
+static CrOutcome *cr_private_pem(const unsigned char *pem, size_t n, int min) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
   bool asked = false;
-  BIO *b = BIO_new_mem_buf(pem, -1);
+  BIO *b = BIO_new_mem_buf(pem, (int)n);
   EVP_PKEY *k = b ? PEM_read_bio_PrivateKey(b, NULL, cr_no_passphrase, &asked) : NULL;
   BIO_free(b);
   if (!k) {
     if (asked)
-      cr_failed(CR_ENCRYPTED, 0, "an encrypted key");
+      cr_failed(o, CR_ENCRYPTED, 0, "an encrypted key");
     else
-      cr_failed(CR_UNREADABLE, 0, cr_reason("not a private key in PEM"));
-    return NULL;
+      cr_failed(o, CR_UNREADABLE, 0, cr_reason("not a private key in PEM"));
+    return o;
   }
-  return cr_usable(k, min);
+  o->key = cr_usable(o, k, min);
+  return o;
 }
 
-// (a public key of a PEM: SubjectPublicKeyInfo, or RSA's own; RSA's of
-// `min` bits or more)
-static EVP_PKEY *cr_public_pem(const char *pem, int min) {
+// (a public key of a PEM, its `n` bytes: SubjectPublicKeyInfo, or RSA's
+// own; RSA's of `min` bits or more)
+static CrOutcome *cr_public_pem(const unsigned char *pem, size_t n, int min) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
   EVP_PKEY *k = NULL;
   OSSL_DECODER_CTX *d = OSSL_DECODER_CTX_new_for_pkey(
       &k, "PEM", NULL, NULL, EVP_PKEY_PUBLIC_KEY, NULL, NULL);
-  const unsigned char *p = (const unsigned char *)pem;
-  size_t n = strlen(pem);
-  int ok = d && OSSL_DECODER_from_data(d, &p, &n) > 0 && k;
+  const unsigned char *p = pem;
+  size_t left = n;
+  int ok = d && OSSL_DECODER_from_data(d, &p, &left) > 0 && k;
   OSSL_DECODER_CTX_free(d);
   if (!ok) {
     EVP_PKEY_free(k);
-    cr_failed(CR_UNREADABLE, 0, cr_reason("not a public key in PEM"));
-    return NULL;
+    cr_failed(o, CR_UNREADABLE, 0, cr_reason("not a public key in PEM"));
+    return o;
   }
-  return cr_usable(k, min);
+  o->key = cr_usable(o, k, min);
+  return o;
 }
 
 // (a public key of the type named, made of its parameters)
@@ -191,42 +246,48 @@ static EVP_PKEY *cr_from_params(const char *type, OSSL_PARAM_BLD *bld) {
 
 // (an RSA public key of its modulus and exponent, big-endian, as a JWK's
 // `n` and `e` are: the exponent odd and 3 or more, the modulus of `min`
-// bits or more)
-static EVP_PKEY *cr_rsa_jwk(const unsigned char *n, size_t nn,
-                            const unsigned char *e, size_t en, int min) {
+// bits or more.  OpenSSL makes a key of any such numbers, so that it
+// fails only where it has no room)
+static CrOutcome *cr_rsa_jwk(const unsigned char *n, size_t nn,
+                             const unsigned char *e, size_t en, int min) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
   if (nn == 0 || en == 0) {
-    cr_failed(CR_INVALID, 0, nn == 0 ? "no modulus" : "no exponent");
-    return NULL;
+    cr_failed(o, CR_INVALID, 0, nn == 0 ? "no modulus" : "no exponent");
+    return o;
   }
   BIGNUM *bn = BN_bin2bn(n, (int)nn, NULL);
   BIGNUM *be = BN_bin2bn(e, (int)en, NULL);
   OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
   EVP_PKEY *k = NULL;
   if (!bn || !be || !bld)
-    cr_fail("not an RSA public key");
+    cr_fail(o, "not an RSA public key");
   else if (!BN_is_odd(be) || BN_num_bits(be) < 2)
-    cr_failed(CR_INVALID, 0, "an exponent even or less than 3");
+    cr_failed(o, CR_INVALID, 0, "an exponent even or less than 3");
   else if (BN_num_bits(bn) < min)
-    cr_failed(CR_TOO_SHORT, BN_num_bits(bn), "an RSA key too short");
+    cr_failed(o, CR_TOO_SHORT, BN_num_bits(bn), "an RSA key too short");
   else if (OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, bn)
            && OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, be)
            && (k = cr_from_params("RSA", bld)))
     ERR_clear_error();
   else
-    cr_fail("not an RSA public key");
+    cr_fail(o, "not an RSA public key");
   OSSL_PARAM_BLD_free(bld);
   BN_free(bn);
   BN_free(be);
-  return k;
+  o->key = k;
+  return o;
 }
 
 // (a P-256 public key of its point's coordinates, 32 bytes each, as a
 // JWK's `x` and `y` are: a point on the curve)
-static EVP_PKEY *cr_p256_jwk(const unsigned char *x, size_t xn,
-                             const unsigned char *y, size_t yn) {
+static CrOutcome *cr_p256_jwk(const unsigned char *x, size_t xn,
+                              const unsigned char *y, size_t yn) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
   if (xn != 32 || yn != 32) {
-    cr_failed(CR_INVALID, 0, "a coordinate not of 32 bytes");
-    return NULL;
+    cr_failed(o, CR_INVALID, 0, "a coordinate not of 32 bytes");
+    return o;
   }
   unsigned char point[65];
   point[0] = 4;
@@ -245,29 +306,32 @@ static EVP_PKEY *cr_p256_jwk(const unsigned char *x, size_t xn,
     EVP_PKEY_CTX_free(c);
     if (on) {
       ERR_clear_error();
-      return k;
+      o->key = k;
+      return o;
     }
     EVP_PKEY_free(k);
   }
   // (OpenSSL makes no key of a point off the curve, or does and finds it
   // so: either way, a point not on it)
-  cr_failed(CR_INVALID, 0, "a point not on the curve");
-  return NULL;
+  cr_failed(o, CR_INVALID, 0, "a point not on the curve");
+  return o;
 }
 
-// (an Ed25519 public key of its 32 bytes, as a JWK's `x` is)
-static EVP_PKEY *cr_ed25519_jwk(const unsigned char *x, size_t xn) {
+// (an Ed25519 public key of its 32 bytes, as a JWK's `x` is.  OpenSSL
+// makes one of any 32 bytes, so that it fails only where it has no room)
+static CrOutcome *cr_ed25519_jwk(const unsigned char *x, size_t xn) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
   if (xn != 32) {
-    cr_failed(CR_INVALID, 0, "a key not of 32 bytes");
-    return NULL;
+    cr_failed(o, CR_INVALID, 0, "a key not of 32 bytes");
+    return o;
   }
-  EVP_PKEY *k = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, x, xn);
-  if (!k) {
-    cr_fail("not an Ed25519 public key");
-    return NULL;
-  }
-  ERR_clear_error();
-  return k;
+  o->key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, x, xn);
+  if (!o->key)
+    cr_fail(o, "not an Ed25519 public key");
+  else
+    ERR_clear_error();
+  return o;
 }
 
 // (the public part of a key, a key of its own: its SubjectPublicKeyInfo
@@ -375,30 +439,42 @@ static unsigned char *cr_raw_to_der(const unsigned char *raw, size_t n, size_t *
   return der;
 }
 
-// (the message signed by the algorithm with the key, malloc'd: ES256's
-// signature `r` and `s`)
-static unsigned char *cr_sign(int alg, EVP_PKEY *k, const unsigned char *msg, size_t n,
-                              size_t *out) {
+// (the message signed by the algorithm with the key, the signature
+// malloc'd, ES256's `r` and `s`; else the failure said, and NULL.  With
+// a key of the algorithm's kind, read as a key the algorithm signs with,
+// OpenSSL fails to sign only of the key's numbers, or where it has no
+// room: a key that does not sign)
+static unsigned char *cr_signed(CrOutcome *o, int alg, EVP_PKEY *k,
+                                const unsigned char *msg, size_t n, size_t *out) {
   if (!cr_fits(alg, k)) {
-    cr_failed(CR_WRONG_KEY, 0, "the key is not of the algorithm's kind");
+    cr_failed(o, CR_WRONG_KEY, 0, "the key is not of the algorithm's kind");
     return NULL;
   }
   EVP_MD_CTX *m = cr_digest(alg, k, true);
-  size_t len = 0;
-  unsigned char *s = NULL;
-  if (!m || EVP_DigestSign(m, NULL, &len, msg, n) <= 0 || !(s = malloc(len ? len : 1))
-      || EVP_DigestSign(m, s, &len, msg, n) <= 0) {
-    free(s);
-    EVP_MD_CTX_free(m);
-    cr_fail("not signed");
+  if (!m) {
+    cr_fail(o, "not signed");
     return NULL;
   }
+  size_t len = 0;
+  unsigned char *s = NULL;
+  bool room = true;
+  bool done = EVP_DigestSign(m, NULL, &len, msg, n) > 0
+              && (room = (s = malloc(len ? len : 1)) != NULL)
+              && EVP_DigestSign(m, s, &len, msg, n) > 0;
   EVP_MD_CTX_free(m);
+  if (!done) {
+    if (room)
+      cr_failed_said(o, CR_INVALID, "a key that does not sign");
+    else
+      cr_fail(o, "not signed");
+    free(s);
+    return NULL;
+  }
   if (alg == CR_ES256) {
     unsigned char *raw = cr_der_to_raw(s, len);
     free(s);
     if (!raw) {
-      cr_fail("not signed");
+      cr_fail(o, "not signed");
       return NULL;
     }
     s = raw;
@@ -407,6 +483,14 @@ static unsigned char *cr_sign(int alg, EVP_PKEY *k, const unsigned char *msg, si
   ERR_clear_error();
   *out = len;
   return s;
+}
+
+// (... as an outcome)
+static CrOutcome *cr_sign(int alg, EVP_PKEY *k, const unsigned char *msg, size_t n) {
+  CrOutcome *o = cr_outcome();
+  if (!o) return NULL;
+  o->sig = cr_signed(o, alg, k, msg, n, &o->n);
+  return o;
 }
 
 // (whether the signature is the key's of the message by the algorithm: a
