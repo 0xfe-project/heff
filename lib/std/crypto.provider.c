@@ -22,9 +22,10 @@
 // A key read or made is one an algorithm signs or verifies with: RSA's
 // of as many bits as the module gives (`min`) or more, P-256's,
 // Ed25519's.  Any other is refused as it is read, so that signing and
-// verifying need not ask.  A private key's numbers are not checked as
-// it is read (to check an RSA key's is to test its primes, tens of
-// milliseconds); one whose numbers cannot sign -- an even modulus, an
+// verifying need not ask.  A P-256 private key's scalar is checked as
+// it is read, in the curve's range.  An RSA private key's numbers are
+// not (to check them is to test its primes, tens of milliseconds); one
+// whose numbers cannot sign -- an even modulus, an
 // even prime -- is found so as it signs, an invalid key.
 //
 // The algorithms are JWS's (RFC 7518): RS256, RSASSA-PKCS1-v1_5 with
@@ -204,7 +205,21 @@ static CrOutcome *cr_private_pem(const unsigned char *pem, size_t n, int min) {
       cr_failed(o, CR_UNREADABLE, 0, cr_reason("not a private key in PEM"));
     return o;
   }
-  o->key = cr_usable(o, k, min);
+  k = cr_usable(o, k, min);
+  // (a P-256 key's scalar from 1 to the curve's order less 1, else no
+  // key: OpenSSL reads one of 0 or of the order, and signs by it)
+  if (k && EVP_PKEY_is_a(k, "EC")) {
+    EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_from_pkey(NULL, k, NULL);
+    bool in = c && EVP_PKEY_private_check(c) == 1;
+    EVP_PKEY_CTX_free(c);
+    if (!in) {
+      EVP_PKEY_free(k);
+      cr_failed(o, CR_INVALID, 0, "a scalar not of the curve's");
+      return o;
+    }
+    ERR_clear_error();
+  }
+  o->key = k;
   return o;
 }
 
