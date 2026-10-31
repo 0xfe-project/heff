@@ -4,7 +4,7 @@
 #define HEFF_THREADS 1
 // A cown is a foreign value: a turnstile (the last request queued at
 // it), the value it holds, and the behaviours waiting for it to be
-// written (`where`), each read and written by the one behaviour holding
+// written (`once`), each read and written by the one behaviour holding
 // it, once it is first at the turnstile.  A behaviour is queued and run
 // as the paper has it (Cheeseman et al., OOPSLA 2023, as Verona keeps
 // it): a request at each of its cowns, in the order of their addresses,
@@ -41,7 +41,7 @@
 // what it gave apart the same way, writing back each cown its bit of
 // the behaviour's `ws` says.  No operation of the program's for any of
 // it, and nothing built at run time between the body and the runtime.
-// A condition (`where`) is checked of the tuple first: where it does
+// A condition (`once`) is checked of the tuple first: where it does
 // not hold, the behaviour lets go of its cowns, untouched, and waits,
 // parked on those its `rs` says, until a body writes one; then it is
 // queued again, behind that one, on all of them.  One still waiting
@@ -510,7 +510,7 @@ static void bc_behaved_all(BcBehaviour *b) {
   }
 }
 
-// Waiting (`where`) ---------------------------------------------------------
+// Waiting (`once`) ---------------------------------------------------------
 
 // (the behaviour, its condition not holding, parked on the cowns `rs`
 // says, the `i`th of the tuple `cs` from `*i`: it holds them, so their

@@ -259,9 +259,10 @@ data Stmt e
 -- | statements, a block's or an arm's
 type Stmts e = List (Params.Spanned (Stmt e))
 
--- | `x := M`, a binding of a `with`: the name (`_` for none), where it
--- | is, what it is bound to
-data Binding e = MkBinding String Params.Span e
+-- | `x := M`, a binding of a `with`: the pattern -- a name (`_` for
+-- | none), or one taking what it is bound to apart, `(a, b) := M` -- and
+-- | what it is bound to
+data Binding e = MkBinding Pat e
 
 -- | a `try` statement's `catch` arm: its binder (`x`, `(x : T)`), its
 -- | statements
@@ -395,7 +396,7 @@ data ExprF
   -- | statements, its body
   | EWith (Params.Spanned ExprF) String Params.Span (Stmts
                                                        (Params.Spanned ExprF))
-  -- | `with x := M where p do ...`: the bindings, its condition, if it
+  -- | `with x := M once p do ...`: the bindings, its condition, if it
   -- | has one (of the names), the statements, its body (a block of its
   -- | own: the names its variables, nothing of the block around set or
   -- | left from it)
@@ -965,8 +966,8 @@ bindingAcc : {s : Type}
            -> s
            -> Params.Spanned (Binding Expr)
            -> Pair s (Params.Spanned (Binding Expr))
-bindingAcc f st (At (MkBinding x xsp e) sp) =
-  pairK (f st e) (\st1 e' -> MkPair st1 (At (MkBinding x xsp e') sp))
+bindingAcc f st (At (MkBinding p e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (MkBinding p e') sp))
 
 -- (the expression there is, by `f`)
 maybeAcc : {s : Type}
@@ -1123,14 +1124,14 @@ declaredMuts (_ :: rest) = declaredMuts rest
 bindingBy : (Expr -> Expr)
           -> Params.Spanned (Binding Expr)
           -> Params.Spanned (Binding Expr)
-bindingBy f (At (MkBinding x xsp e) sp) = At (MkBinding x xsp (f e)) sp
+bindingBy f (At (MkBinding p e) sp) = At (MkBinding p (f e)) sp
 
--- | the names a `with` binds, `_` too
+-- | the names a `with` binds
 boundNames : List (Params.Spanned (Binding Expr)) -> List String
 boundNames bs =
-  List.map
+  List.concatMap
     (\b -> case b of
-     At (MkBinding x _ _) _ -> x)
+     At (MkBinding p _) _ -> patNames p)
     bs
 
 guardE : Guard -> Expr -> Expr
@@ -2479,12 +2480,51 @@ mentions : String -> Expr -> Bool
 mentions x (At (EVar y) _) = strEq x y
 mentions x e = fst (childrenAcc (\b c -> MkPair (b || mentions x c) c) False e)
 
+-- (each `_` in it named, by where it is: so that what it matches is
+-- given back where the pattern is built again)
+unnamedNamed : Pat -> Pat
+unnamedNamed (At (PatVar x) psp) =
+  if strEq x "_" then At (PatVar (madeName "unbound" psp)) psp
+  else At (PatVar x) psp
+unnamedNamed (At (PatTag t tsp ps) psp) =
+  At (PatTag t tsp (List.map unnamedNamed ps)) psp
+unnamedNamed (At (PatOp o osp ps) psp) =
+  At (PatOp o osp (List.map unnamedNamed ps)) psp
+unnamedNamed (At (PatAs x xsp q) psp) = At (PatAs x xsp (unnamedNamed q)) psp
+unnamedNamed p = p
+
+-- (a pattern that is no name named as a whole too, `with#whole@p`)
+wholeOf : Pat -> Pat
+wholeOf (At (PatVar x) psp) = At (PatVar x) psp
+wholeOf (At q psp) = At (PatAs (madeName "whole" psp) psp (At q psp)) psp
+
+mutual
+  -- | what a pattern matches built back from its names: a name, or a
+  -- | tag of such (a tuple's too); `Nothing` where it holds what is not
+  -- | (a literal, a record's fields, an operator's)
+  patValue : Pat -> Maybe Expr
+  patValue (At (PatVar x) psp) = Just (At (EVar x) psp)
+  patValue (At (PatAs x xsp _) psp) = Just (At (EVar x) xsp)
+  patValue (At (PatTag t tsp ps) psp) = case patValues ps of
+    Just [] -> Just (At (ETag t) tsp)
+    Just es -> Just (app (At (ETag t) tsp) es)
+    Nothing -> Nothing
+  patValue p = Nothing
+
+  patValues : List Pat -> Maybe (List Expr)
+  patValues [] = Just Nil
+  patValues (p :: ps) = case patValue p of
+    Just e -> case patValues ps of
+      Just es -> Just (e :: es)
+      Nothing -> Nothing
+    Nothing -> Nothing
+
 -- | `with x := M ... do ss`: co's `holding` of what the names are bound
 -- | to (`M`, or a pair of the first and the rest's, nesting to the
 -- | right), which of them `ss` sets (a `Bool` each), and its body: `ss`
 -- | a block of its own, the names its variables, given what they are
 -- | bound to and giving back its value beside what they are at its end.
--- | With a condition, `with x := M ... where p do ss`: co's
+-- | With a condition, `with x := M ... once p do ss`: co's
 -- | `holdingWhere`, given, after which names `ss` sets, which `p` reads
 -- | (a `Bool` each) and `p` over the names
 withBoundOf : Params.Span
@@ -2504,67 +2544,75 @@ withBoundOf sp bs w body =
          sp
          (List.map
             (\b -> case b of
-             At (MkBinding _ _ m) _ -> m)
+             At (MkBinding _ m) _ -> m)
             bs)
-       , flags (\x -> List.elem x (assignedIn body))
+       , flags (\vs -> List.any (\x -> List.elem x (assignedIn body)) vs)
        ]
        (List.append
           (case w of
-           Just p -> [flags (\x -> mentions x p), namesLam p]
+           Just p -> [flags (\vs -> List.any (\x -> mentions x p) vs), patsLam p]
            Nothing -> Nil)
-          [ namesLam
+          [ patsLam
             (doT.stmts
                { names = coNames
-               , muts = names
+               , muts = List.concat varsOf
                , loop = Nothing
                , sp = sp
                , depth = 0
                , giving = Nothing
-               , bound =
-                   Just (rightTuple sp (List.map (\x -> At (EVar x) sp) names))
+               , bound = Just (rightTuple sp (List.map given pats))
                }
                body
                EndValue)
           ]))
   where
-  -- (`_` named, by where it is)
-  nameOf : Params.Spanned (Binding Expr) -> String
-  nameOf (At (MkBinding x xsp _) _) =
-    if strEq x "_" then madeName "unbound" xsp else x
-  names : List String
-  names = List.map nameOf bs
-  -- (a `Bool` a name, in order: whether `has` says it is)
-  flags : (String -> Bool) -> Expr
+  -- (each binding's pattern: its `_`s named, by where they are; one
+  -- that is no name named as a whole besides, `with#whole@p`)
+  pats : List Pat
+  pats =
+    List.map
+      (\b -> case b of
+       At (MkBinding p _) _ -> wholeOf (unnamedNamed p))
+      bs
+  -- (the names each binds, in order)
+  varsOf : List (List String)
+  varsOf = List.map patNames pats
+  -- (a `Bool` a binding, in order: whether `has` says it is, of the
+  -- names it binds)
+  flags : (List String -> Bool) -> Expr
   flags has =
     listOfE
       sp
       (List.map
-         (\x -> boolOf (At (ETag (if has x then "True" else "False")) sp))
-         names)
-  spans : List Params.Span
-  spans =
-    List.map
-      (\b -> case b of
-       At (MkBinding _ xsp _) _ -> xsp)
-      bs
-  -- (the body over the names: one, the lambda's; more, its pair taken
-  -- apart)
-  namesLam : Expr -> Expr
-  namesLam inner = case List.zip names spans of
-    [MkPair x xsp] -> At (ELam (LamName x xsp) inner) sp
-    nsps ->
+         (\vs -> boolOf (At (ETag (if has vs then "True" else "False")) sp))
+         varsOf)
+  -- (what a binding gives back: its name; of a pattern, what its names
+  -- now build where the body sets one of them, else what it was bound
+  -- to, as a whole)
+  given : Pat -> Expr
+  given (At (PatAs whole wsp q) psp) =
+    if List.any (\x -> List.elem x (assignedIn body)) (patNames q)
+    then fromMaybe
+        (badE
+           psp
+           "a pattern a `with` binds whose names are set is one its value is built back from: names, tuples and tags")
+        (patValue q)
+    else At (EVar whole) wsp
+  given (At (PatVar x) psp) = At (EVar x) psp
+  given p = At (EVar "_") sp
+  -- (the body over the patterns: one name, the lambda's; else the
+  -- tuple of them taken apart)
+  patsLam : Expr -> Expr
+  patsLam inner = case pats of
+    [At (PatVar x) xsp] -> At (ELam (LamName x xsp) inner) sp
+    ps ->
       At
         (ELam
            (LamName (madeName "bound" sp) sp)
            (matchOf
               sp
               (At (EVar (madeName "bound" sp)) sp)
-              [ alt
-                (rightTupleP
-                   sp
-                   (List.map (\n -> At (PatVar (fst n)) (snd n)) nsps))
-                inner
-              ]))
+              [alt (rightTupleP sp ps) inner]))
         sp
 
 -- | `run do ...`: the block through the identity monad's names

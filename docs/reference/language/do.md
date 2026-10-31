@@ -364,6 +364,13 @@ behaviour, and the body a behaviour once it has come to `r`.
   The handler is told which ones the body sets, and is given what they
   are at its end beside the body's value.
 - `_ := M` binds no name.
+- A binding may be a pattern, `(bytes, count) := total`: what it is bound
+  to taken apart, its names the body's variables. Where the body sets
+  one of them, the value is built back from them, and the handler told
+  it is set; where it sets none, the value is given back as it was. A
+  pattern built back is of names, tuples and tags (a `_` in it gives
+  back what it matched); one that may fail to match is non-exhaustive
+  (E0317).
 - The body is a block of its own: it sets no variable of the block
   around, nor leaves it by `break`, `continue` or `return`; a `return`
   in it ends the body.
@@ -441,7 +448,7 @@ is `e`'s `stdio`, through the `io` in scope, with nothing written. A
 world `\w -> stdio <+> w` makes a `with` whose holder sends what its
 body prints elsewhere, to a file or a buffer.
 
-### with, where a condition holds
+### with, once a condition holds
 
 ```haskell
 import boc as BOC
@@ -454,16 +461,14 @@ taken : {e : HFunctor}
       -> Int
       -> Co e Unit
 taken stock n = do
-  with s := stock
-    where s >= n
-  do
+  with s := stock once s >= n do
     s := s - n
 ```
 
-`with x := M where p do` is a `with` of bindings with a condition:
-`where p` on a line of its own under the bindings, indented, and `do`
-on the next, under `with`. What the names are bound to is taken, as
-without it, and `p` is checked of them. Where `p` holds, the body runs.
+`with x := M once p do` is a `with` of bindings with a condition:
+`once p` after the last binding, on its line, or on a line of its own
+under the bindings, and `do` at its end. What the names are bound to
+is taken, as without it, and `p` is checked of them. Where `p` holds, the body runs.
 Where it does not, everything is let go of, untouched, and taken again
 later, `p` checked again, until it holds.
 
@@ -483,8 +488,8 @@ later, `p` checked again, until it holds.
 - Only a handler that can let go and take again has the clause. Beside
   its `Holder`, it is an instance of co's `Waiter`, whose `heldWhere` is
   given what `held` is, which names `p` reads (a `Bool` each) and `p`.
-  A `with ... where` of a handler without one, a file or a custodian's
+  A `with ... once` of a handler without one, a file or a custodian's
   custody, is a type error (E0341).
 
-`with` and `as` are [keywords](definitions.md#keywords): neither is a
-name.
+`with`, `as` and `once` are [keywords](definitions.md#keywords): none
+is a name.

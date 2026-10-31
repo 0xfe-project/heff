@@ -4,6 +4,8 @@
 
 ### Language
 
+- A `with`'s condition is `once p`, not `where p`: after the last binding, on its line (`with s := stock once s >= n do`), or on a line of its own under more bindings, `do` at its end. `once` is a keyword. `where` is an equation's local definitions alone again.
+- A binding of a `with` may be a pattern, `with (bytes, count) := total do`: what it is bound to taken apart, its names the body's variables; where the body sets one of them, the value is built back from them and written, else given back as it was.
 - An act a `with` awaits, `with r := BOC.await act do`, needs no annotation of its world: the `with`'s `Holder` decides it, in a concrete `main` as in a polymorphic function, and in a world a handler adds to (`attempt`'s, `recover`'s). Generally, where the end of a definition would refuse evidence whose world is not known (E0357), each instance argument still waiting that is not evidence is taken first by its one candidate, though that decides its goal's metavariables, and settling goes on; only where that does not settle the definition is E0357 said, as before.
 
 ### Standard library

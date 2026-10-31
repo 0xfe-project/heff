@@ -135,11 +135,14 @@ data E
   | EWith T E T Pat T (List E)
   -- | `with x := M do` and its statements, each other binding on a line
   -- | of its own under the first: `with`, the bindings (each an
-  -- | `EBinding`), its condition (`where` and what it says), `do`
+  -- | `EBinding`), its condition (`once` and what it says), `do`
   | EWithBound T (List E) (Maybe (Pair T E)) T (List E)
   -- | `x := M`, a binding of a `with`: the name (or `_`), `:=`, what it
   -- | is bound to
   | EBinding T T E
+  -- | `(a, b) := M`, a binding of a `with` by a pattern: the pattern,
+  -- | `:=`, what it is bound to
+  | EBindingP Pat T E
 
 -- | a theory's field, `x : A`, and its default, `= d`, if it has one:
 -- | the names (`x, y : A` declares two, the commas between them), `:`,
@@ -390,10 +393,15 @@ expectKind k what = do
   else throwP (diag (spanOf t) ("expected " ^ what ^ ", not " ^ shown t))
 
 -- | the token starts the block's next item (a line starting `where` ends
--- | the block: the `where` of an equation)
+-- | the block: the `where` of an equation; and one starting `once`, a
+-- | `with`'s bindings, its condition next)
 continuesBlock : T -> Int -> Bool
 continuesBlock t col =
-  not (isKind t "eof") && t.first && t.col == col && not (isKw t "where")
+  not (isKind t "eof")
+  && t.first
+  && t.col == col
+  && not (isKw t "where")
+  && not (isKw t "once")
 
 blockGo : {a : Type} -> P a -> Int -> List a -> P (List a)
 blockGo item col acc = do
@@ -1252,6 +1260,27 @@ tryF g = do
   c <- tryPartF (catchF g)
   tryCaught kw ty body c
 
+-- (the index past the bracket the one at `i` opens closes, `depth`
+-- brackets open before it)
+closeAfter : Array T -> Int -> Int -> Int
+closeAfter toks i depth = case Array.index toks i of
+  Nothing -> i
+  Just t ->
+    if isKind t "eof" then i
+    else if isKind t "punct" && List.elem t.text ["(", "[", "b[", "{"]
+    then closeAfter toks (i + 1) (depth + 1)
+    else if isKind t "punct" && List.elem t.text [")", "]", "}"]
+    then (if depth <= 1 then i + 1 else closeAfter toks (i + 1) (depth - 1))
+    else closeAfter toks (i + 1) depth
+
+-- | the parentheses here are followed by `:=`: a binding of a `with`,
+-- | `(a, b) := M`
+parenSets : P Bool
+parenSets =
+  pGets (\s -> case Array.index s.toks (closeAfter s.toks s.i 0) of
+    Just u -> isKind u "sym" && isText u ":="
+    Nothing -> False)
+
 -- | `as` after a `with` statement's head
 expectAs : P T
 expectAs = do
@@ -1263,13 +1292,21 @@ expectAs = do
          ("a `with` statement names what it holds: `with e as x do`, not "
           ^ shown t))
 
--- | `x := M`, a binding of a `with`
+-- | `x := M`, a binding of a `with`, or `(a, b) := M`, by a pattern
 bindingF : Gram -> P E
 bindingF g = do
-  x <- expectKind "var" "the name a `with` binds"
-  k <- expectSym ":="
-  e <- g.head
-  pure (EBinding x k e)
+  t <- peek
+  if isKind t "punct" && isText t "("
+  then do
+    p <- g.patAtom
+    k <- expectSym ":="
+    e <- g.head
+    pure (EBindingP p k e)
+  else do
+    x <- expectKind "var" "the name a `with` binds"
+    k <- expectSym ":="
+    e <- g.head
+    pure (EBinding x k e)
 
 -- | `with e as p do` and its statements, past the `with`
 withAsF : Gram -> T -> P E
@@ -1289,12 +1326,13 @@ withAsF g kw = do
   body <- block g.stmt
   pure (EWith kw e a x d body)
 
--- | `where p`, the condition of a `with` of bindings, under them: read
--- | up to its `do`, which may start a line at the `with`'s column
-whereClauseF : Gram -> T -> P (Maybe (Pair T E))
-whereClauseF g kw = do
+-- | `once p`, the condition of a `with` of bindings, after the last
+-- | (on its line, or on one of its own under them): read up to its
+-- | `do`, which may start a line at the `with`'s column
+onceClauseF : Gram -> T -> P (Maybe (Pair T E))
+onceClauseF g kw = do
   t <- peek
-  if isKw t "where"
+  if isKw t "once"
   then do
     w <- next
     pModify (\s -> setStack (kw.col :: s.stack) s)
@@ -1304,17 +1342,19 @@ whereClauseF g kw = do
   else pure Nothing
 
 -- | `with x := M do` (bindings each on a line of its own, under the
--- | first, perhaps `where p` under them) or `with e as p do`, and its
+-- | first, perhaps `once p` after them) or `with e as p do`, and its
 -- | statements
 withF : Gram -> P E
 withF g = do
   kw <- next
   t <- peek
   t2 <- peekAt 1
-  if isKind t "var" && isKind t2 "sym" && isText t2 ":="
+  set <- parenSets
+  if (isKind t "var" && isKind t2 "sym" && isText t2 ":=")
+     || (isKind t "punct" && isText t "(" && set)
   then do
     bs <- block (bindingF g)
-    w <- whereClauseF g kw
+    w <- onceClauseF g kw
     d <- expectKw "do"
     body <- block g.stmt
     pure (EWithBound kw bs w d body)
@@ -1333,19 +1373,6 @@ armF g = do
   else if isKind t "var" && isKind t2 "sym" && isText t2 ":=" then assignF g
   else if isKw t "with" then withF g
   else g.expr
-
--- (the index past the bracket the one at `i` opens closes, `depth`
--- brackets open before it)
-closeAfter : Array T -> Int -> Int -> Int
-closeAfter toks i depth = case Array.index toks i of
-  Nothing -> i
-  Just t ->
-    if isKind t "eof" then i
-    else if isKind t "punct" && List.elem t.text ["(", "[", "b[", "{"]
-    then closeAfter toks (i + 1) (depth + 1)
-    else if isKind t "punct" && List.elem t.text [")", "]", "}"]
-    then (if depth <= 1 then i + 1 else closeAfter toks (i + 1) (depth - 1))
-    else closeAfter toks (i + 1) depth
 
 -- | the parentheses here are followed by `<-`: a statement `(a, b) <- e`
 parenBinds : P Bool
@@ -2026,6 +2053,7 @@ firstE (ECatch kw b arrow body) = kw
 firstE (EWith kw e a x d body) = kw
 firstE (EWithBound kw bs w d body) = kw
 firstE (EBinding x k e) = x
+firstE (EBindingP p k e) = firstP p
 
 lastE : E -> T
 lastE (Atom t) = t
@@ -2111,6 +2139,7 @@ lastE (EWithBound kw bs w d body) =
    Just s -> lastE s
    Nothing -> d)
 lastE (EBinding x k e) = lastE e
+lastE (EBindingP p k e) = lastE e
 
 -- (`lastE` of the element, if there is one; the fallback otherwise)
 lastEOr : T -> Maybe E -> T
