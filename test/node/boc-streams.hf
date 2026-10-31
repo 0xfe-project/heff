@@ -1,0 +1,207 @@
+-- std.http.bocserver's streams and sockets, by C alone, driven by
+-- Node.js (the tests' peers, `streams`).
+--
+--   main PORT PENDING HEARTBEAT PING: served there, a connection's
+--        unwritten bytes at most PENDING, a stream of events sent a
+--        heartbeat after HEARTBEAT ms of silence, a socket a ping after
+--        PING ms; until asked for `/stop`
+--
+-- `/stream`, three pieces, then finished; `/events`, a stream of events
+-- kept in a hub, `/publish` its body an event to each; `/flood`, a
+-- stream kept in another, `/pump` 64 KiB to each; `/ws`, a socket, each
+-- message sent back; `/log`, each `gone` called so far, a line each.
+
+module test.node.boc-streams
+
+import boc as BOC
+import bytes as Bytes
+import co
+import custodian as Custodian
+import exception
+import std.http as HTTP
+import std.http.bocserver as BocServer
+import std.http.server as Server
+import std.http.sse as SSE
+import std.http.websocket as WebSocket
+import std.io
+import std.net as Net
+import std.ordmap as OrdMap
+import std.process
+import std.time
+import resource
+
+-- | What a handler throws.
+data Thrown = MkThrown
+
+-- | Senders kept by their numbers.
+type Hub = BOC.Cown (OrdMap.OrdMap Int (BocServer.Sender Bytes))
+
+-- | What the server keeps: two hubs, and what was gone, the last first.
+type Kept = { events : Hub, floods : Hub, log : BOC.Cown (List String) }
+
+-- (`b` sent by each sender)
+told : {f : HFunctor}
+     -> {{bc : BOC.boc <: f}}
+     -> Bytes
+     -> List (Pair Int (BocServer.Sender Bytes))
+     -> Co f Unit
+told b [] = pure ()
+told b (MkPair n out :: rest) = do
+  BocServer.send out b
+  told b rest
+
+-- (a sender kept in the hub)
+joined : {f : HFunctor}
+       -> {{bc : BOC.boc <: f}}
+       -> Hub
+       -> BocServer.Sender Bytes
+       -> Co f Unit
+joined hub out = do
+  with h := hub do
+    h := OrdMap.insert h (BocServer.senderNumber out) out
+
+-- (a sender gone: taken out of the hub, and said in the log)
+left : {f : HFunctor}
+     -> {a : Type}
+     -> {{bc : BOC.boc <: f}}
+     -> Hub
+     -> BOC.Cown (List String)
+     -> String
+     -> BocServer.Sender a
+     -> Co f Unit
+left hub log what out = do
+  with h := hub
+       l := log do
+    h := OrdMap.delete h (BocServer.senderNumber out)
+    l := ("gone " ^ what) :: l
+
+-- (three pieces, then the stream finished)
+counted : {f : HFunctor}
+        -> {{bc : BOC.boc <: f}}
+        -> BocServer.Sender Bytes
+        -> Co f Unit
+counted out = do
+  BocServer.send out b["one\n"]
+  BocServer.send out b["two\n"]
+  BocServer.send out b["three\n"]
+  BocServer.finish out
+
+-- (a socket's message sent back)
+echoed : {f : HFunctor}
+       -> {{bc : BOC.boc <: f}}
+       -> BocServer.Sender WebSocket.Message
+       -> WebSocket.Message
+       -> Co f Unit
+echoed out m = BocServer.send out m
+
+-- (64 KiB)
+lump : Bytes
+lump =
+  Bytes.concat
+    (List.replicate
+       1024
+       b["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"])
+
+-- (each request answered)
+answering : {e : HFunctor}
+          -> {rg : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Kept
+          -> With rg Net.TcpListener
+          -> Server.Request
+          -> BocServer.Responder e Thrown
+          -> Co (exception Thrown <+> e) Unit
+answering k l r respond =
+  if r.target == "/stream"
+  then respond
+      (Streamed
+         200
+         [MkPair "Content-Type" "text/plain"]
+         { opened = counted, gone = left k.events k.log "stream" })
+  else if r.target == "/events"
+  then respond
+      (Streamed
+         200
+         SSE.headers
+         { opened = joined k.events, gone = left k.events k.log "events" })
+  else if r.target == "/publish"
+  then do
+    with h := k.events do
+      told (SSE.event [Data (Bytes.asString r.body)]) (OrdMap.toList h)
+      respond
+          (Whole (Server.plain 200 ("sent to " ^ debug (OrdMap.size h))))
+  else if r.target == "/flood"
+  then respond
+      (Streamed
+         200
+         [MkPair "Content-Type" "application/octet-stream"]
+         { opened = joined k.floods, gone = left k.floods k.log "flood" })
+  else if r.target == "/pump"
+  then do
+    with h := k.floods do
+      told lump (OrdMap.toList h)
+      respond (Whole (Server.plain 200 ("pumped " ^ debug (OrdMap.size h))))
+  else if r.target == "/ws"
+  then respond
+      (Upgraded
+         { opened = \out -> pure ()
+         , received = echoed
+         , gone = left k.events k.log "socket"
+         })
+  else if r.target == "/log"
+  then do
+    with l := k.log do
+      respond (Whole (Server.plain 200 (joinWith "," (List.reverse l))))
+  else if r.target == "/stop"
+  then do
+    respond (Whole (Server.plain 200 "stopping"))
+    _ <- Net.closeListener l
+    pure ()
+  else respond (Whole (Server.plain 200 r.target))
+
+-- (the n-th argument, a number, or `fallback`)
+argument : List String -> Int -> Int -> Int
+argument argv n fallback =
+  fromMaybe fallback (parseInt (fromMaybe "" (List.head (List.drop n argv))))
+
+program : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{io : stdio <: e}}
+        -> {{clock : time <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{sys : process <: e}}
+        -> Co e Unit
+program = do
+  argv <- args
+  events <- BOC.newCown OrdMap.empty
+  floods <- BOC.newCown OrdMap.empty
+  log <- BOC.newCown Nil
+  let k : Kept = { events = events, floods = floods, log = log }
+  r <-
+    Net.withListener
+      { host = "127.0.0.1", port = argument argv 0 0 }
+      128
+      (\l ->
+         BocServer.serve
+           (pending := argument argv 1 1048576)
+           (heartbeat := argument argv 2 15000)
+           (ping := argument argv 3 30000)
+           Thrown
+           l
+           (answering (e := e) k l))
+  case r of
+    Left err -> print (show err)
+    Right u -> pure ()
+
+-- | served until asked for `/stop`
+main : Co
+       (BOC.boc
+        <+> Custodian.custodian
+        <+> stdio
+        <+> time
+        <+> Net.net
+        <+> process)
+       Unit
+main = program

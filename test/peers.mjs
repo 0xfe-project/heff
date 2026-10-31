@@ -43,6 +43,15 @@
 //                                   silent client; SIGTERM with a
 //                                   request in flight; says what each
 //                                   came to, and what the server said
+//   node test/peers.mjs streams PORT
+//                                   std.http.bocserver's streams and
+//                                   sockets (its heartbeat 200 ms, its
+//                                   ping 300 ms): streams finished and
+//                                   the connection read on; events
+//                                   published to two, each client gone;
+//                                   a client that reads nothing; a
+//                                   socket echoing, pinged, closed; then
+//                                   /stop; says what each came to
 import { spawn, spawnSync } from "node:child_process";
 import { Agent, createServer, request } from "node:http";
 import { connect } from "node:net";
@@ -459,4 +468,180 @@ if (mode === "boc") {
   await exited;
   process.stdout.write(said.split("\n").filter((l) => l).map((l) => `the server said: ${l}\n`).join(""));
   if (saidErr) process.stdout.write(`the server's errors: ${saidErr}`);
+}
+
+if (mode === "streams") {
+  const port = Number(arg);
+  const wait = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  const said = (what, got) => console.log(`${what}: ${got}`);
+  for (let i = 0; i < 600 && !(await new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    s.on("connect", () => { s.destroy(); ok(true); });
+    s.on("error", () => ok(false));
+  })); i++) await wait(50);
+  // (a connection: what came back so far, `until` what is waited for
+  // has come -- or 5 s passed -- and `ended` once it is closed)
+  const opened = async () => {
+    const s = await reached(port);
+    s.setNoDelay(true);
+    let got = Buffer.alloc(0), closed = false;
+    const ended = new Promise((ok) => s.on("close", () => { closed = true; ok(); }));
+    s.on("data", (d) => { got = Buffer.concat([got, d]); });
+    s.on("error", () => {});
+    const until = async (p, ms = 5000) => {
+      for (let t = 0; t < ms && !p(got) && !closed; t += 10) await wait(10);
+      return p(got);
+    };
+    const text = () => got.toString("latin1");
+    return { s, until, text, bytes: () => got, ended, isClosed: () => closed, end: () => s.end() };
+  };
+  // (a whole response's body, on a connection of its own)
+  const asked = async (method, target, body = "") => {
+    const c = await opened();
+    c.s.write(`${method} ${target} HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
+    await Promise.race([c.ended, wait(5000)]);
+    const t = c.text();
+    return t.slice(t.indexOf("\r\n\r\n") + 4);
+  };
+  const ended = async (c, ms) => (await Promise.race([c.ended.then(() => true), wait(ms).then(() => false)]));
+  const goneCount = (log, what) => log.split(",").filter((l) => l === `gone ${what}`).length;
+
+  // (a stream, finished, then another request on the connection: one
+  // after the other, and both in one write)
+  {
+    const c = await opened();
+    c.s.write("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n");
+    await c.until((b) => b.toString("latin1").endsWith("0\r\n\r\n"));
+    c.s.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    await Promise.race([c.ended, wait(5000)]);
+    said("a stream, then another request", JSON.stringify(c.text()));
+  }
+  {
+    const c = await opened();
+    c.s.write("GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    await Promise.race([c.ended, wait(5000)]);
+    said("a stream and another request, in one write", JSON.stringify(c.text().replace(/\r\n\r\n4\r\none[^]*0\r\n\r\n/, "\r\n\r\n(the stream)")));
+  }
+  {
+    const c = await opened();
+    c.s.write("GET /stream HTTP/1.0\r\n\r\n");
+    await Promise.race([c.ended, wait(5000)]);
+    said("a stream, HTTP/1.0", JSON.stringify(c.text()));
+    const h = await opened();
+    h.s.write("HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    await Promise.race([h.ended, wait(5000)]);
+    said("a stream, HEAD", JSON.stringify(h.text()));
+  }
+  // (two streams of events, each sent what is published; one closed by
+  // its client, gone once; the other sent heartbeats while nothing is
+  // published)
+  {
+    const a = await opened(), b = await opened();
+    for (const c of [a, b]) c.s.write("GET /events HTTP/1.1\r\nHost: x\r\n\r\n");
+    await a.until((g) => g.includes("\r\n\r\n"));
+    await b.until((g) => g.includes("\r\n\r\n"));
+    await wait(50);
+    const sent = await asked("POST", "/publish", "hello");
+    const both = await Promise.all([a, b].map((c) => c.until((g) => g.includes("data: hello\n\n"))));
+    said("published to two streams", `${sent}, received: ${both.join(" ")}`);
+    a.s.destroy();
+    await wait(300);
+    const afterOne = await asked("POST", "/publish", "again");
+    await asked("POST", "/publish", "and again");
+    await wait(300);
+    said("one stream's client gone", `${afterOne}, gone called ${goneCount(await asked("GET", "/log"), "events")} time(s)`);
+    const beats = (t) => t.split("2\r\n:\n\r\n").length - 1 + t.split(": \n\n").length - 1;
+    const before = beats(b.text());
+    await wait(700);
+    said("the other, nothing published for 700 ms", beats(b.text()) - before >= 2 ? "heartbeats sent" : `${beats(b.text()) - before} heartbeats`);
+    b.s.destroy();
+    await wait(300);
+    said("both gone", `gone called ${goneCount(await asked("GET", "/log"), "events")} time(s)`);
+  }
+  // (a stream whose client reads nothing: closed once more than the
+  // most is waiting to be written, its `gone` called)
+  {
+    const c = await opened();
+    c.s.write("GET /flood HTTP/1.1\r\nHost: x\r\n\r\n");
+    await c.until((g) => g.includes("\r\n\r\n"));
+    c.s.pause();
+    let pumps = 0, last = "";
+    for (; pumps < 2000; pumps++) {
+      last = await asked("GET", "/pump");
+      if (last === "pumped 0") break;
+    }
+    c.s.resume();
+    const closed = await ended(c, 5000);
+    said("a client that reads nothing", `${last === "pumped 0" ? "dropped from the hub" : last}, ${closed ? "closed" : "still open"}, gone called ${goneCount(await asked("GET", "/log"), "flood")} time(s)`);
+  }
+  // (WebSocket: the handshake, a message echoed, a ping answered, a
+  // close answered and the connection closed; a ping sent by the server
+  // to a silent client, which is closed when it does not answer)
+  const masked = (op, payload) => {
+    const p = Buffer.from(payload), m = Buffer.from([1, 2, 3, 4]);
+    return Buffer.concat([Buffer.from([0x80 | op, 0x80 | p.length]), m, Buffer.from(p.map((x, i) => x ^ m[i % 4]))]);
+  };
+  const frames = (b) => {
+    const out = [];
+    for (let i = 0; i + 2 <= b.length;) {
+      const n = b[i + 1] & 127;
+      if (i + 2 + n > b.length) break;
+      const op = b[i] & 15, p = b.slice(i + 2, i + 2 + n);
+      out.push(op === 8 && n >= 2 ? `close ${p.readUInt16BE(0)} ${p.slice(2).toString("latin1")}` : `${op}:${p.toString("latin1")}`);
+      i += 2 + n;
+    }
+    return out;
+  };
+  const upgrade = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+  const afterHead = (c) => { const g = c.bytes(); const i = g.indexOf("\r\n\r\n"); return i < 0 ? Buffer.alloc(0) : g.slice(i + 4); };
+  {
+    const c = await opened();
+    c.s.write(upgrade);
+    await c.until((g) => g.includes("\r\n\r\n"));
+    const head = c.text().split("\r\n")[0];
+    const accept = /Sec-WebSocket-Accept: (\S+)/.exec(c.text());
+    c.s.write(masked(1, "hello"));
+    await c.until(() => frames(afterHead(c)).length >= 1);
+    c.s.write(masked(9, "p"));
+    await c.until(() => frames(afterHead(c)).length >= 2);
+    c.s.write(masked(8, Buffer.from([3, 232])));
+    const closed = await ended(c, 5000);
+    said("a socket", `${head}, ${accept ? accept[1] : "no accept"}; ${JSON.stringify(frames(afterHead(c)))}; ${closed ? "closed" : "still open"}`);
+  }
+  {
+    const c = await opened();
+    c.s.write(Buffer.concat([Buffer.from(upgrade), masked(1, "early")]));
+    await c.until(() => frames(afterHead(c)).length >= 1);
+    const t0 = Date.now();
+    await c.until(() => frames(afterHead(c)).length >= 2, 3000);
+    const pinged = Date.now() - t0;
+    const closed = await ended(c, 3000);
+    const ms = Date.now() - t0;
+    said("a silent socket", `${JSON.stringify(frames(afterHead(c)))}, pinged in time: ${pinged >= 200 && pinged < 1500}, closed unanswered: ${closed && ms >= 400 && ms < 2500}`);
+  }
+  {
+    const c = await opened();
+    c.s.write(upgrade.replace("Sec-WebSocket-Version: 13", "Sec-WebSocket-Version: 8") .replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"));
+    await Promise.race([c.ended, wait(5000)]);
+    said("a handshake refused", c.text().split("\r\n")[0]);
+  }
+  {
+    const c = await opened();
+    c.s.write(Buffer.concat([Buffer.from(upgrade), Buffer.from([0x81, 0x02, 0x68, 0x69])]));
+    const closed = await ended(c, 5000);
+    said("a frame not masked", `${JSON.stringify(frames(afterHead(c)))}, ${closed ? "closed" : "still open"}`);
+  }
+  await wait(200);
+  said("gone, sockets", `${goneCount(await asked("GET", "/log"), "socket")} time(s)`);
+  // (the server stopped, a stream and a socket open: the stream ended,
+  // the socket closed, 1001)
+  const ev = await opened(), ws = await opened();
+  ev.s.write("GET /events HTTP/1.1\r\nHost: x\r\n\r\n");
+  ws.s.write(upgrade);
+  await ev.until((g) => g.includes("\r\n\r\n"));
+  await ws.until((g) => g.includes("\r\n\r\n"));
+  await asked("GET", "/stop");
+  const evClosed = await ended(ev, 5000), wsClosed = await ended(ws, 5000);
+  said("stopped, a stream open", `${ev.text().endsWith("0\r\n\r\n") ? "its last chunk" : JSON.stringify(ev.text())}, ${evClosed ? "closed" : "still open"}`);
+  said("stopped, a socket open", `${JSON.stringify(frames(afterHead(ws)).filter((f) => f.startsWith("close")))}, ${wsClosed ? "closed" : "still open"}`);
 }
