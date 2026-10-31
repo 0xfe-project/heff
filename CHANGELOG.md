@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Standard library
+
+- std.http.websocket: WebSocket (RFC 6455), its pure part, no socket read or written. `handshake` checks a std.http.server `Request` -- a `GET` of HTTP/1.1, `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13`, a key -- and comes to its accept key (`acceptKey`, for `upgradeHeaders`, the `101`'s), or the response refusing it, `400`, or `426` with `Sec-WebSocket-Version: 13`. `decodeFrame` reads a frame from the bytes read so far, or says how many more it wants, or refuses it with its close code (a client's frame not masked, an RSV bit set, an opcode not known, a control frame in pieces or over 125 bytes: 1002; over `most` bytes, 16 MiB by default: 1009); `encodeFrame` writes a server's, `encodeMasked` a client's. `feed` is a reader's state machine: bytes in, the messages they finish out -- pieces put together, a control frame between them a message of its own, text and a close's reason checked as UTF-8 (1007) -- and the reader to read on by.
+
 ## 0.6.1
 
 Released 2026-10-31.
