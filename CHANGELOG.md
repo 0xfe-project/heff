@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.1
+
+Released 2026-10-31.
 
 ### Language
 
