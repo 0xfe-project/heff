@@ -172,10 +172,34 @@ static EVP_PKEY *cr_ed25519_jwk(const unsigned char *x, size_t xn) {
   return k;
 }
 
-// (the key, which verifies what it signs: one more reference to it)
+// (the public part of a key, a key of its own: its SubjectPublicKeyInfo
+// written and read back, nothing private kept)
 static EVP_PKEY *cr_public_of(EVP_PKEY *k) {
-  EVP_PKEY_up_ref(k);
-  return k;
+  unsigned char *der = NULL;
+  int n = i2d_PUBKEY(k, &der);
+  const unsigned char *p = der;
+  EVP_PKEY *pub = n > 0 ? d2i_PUBKEY(NULL, &p, n) : NULL;
+  OPENSSL_free(der);
+  ERR_clear_error();
+  return pub;
+}
+
+// (a public key as PEM, SubjectPublicKeyInfo, malloc'd)
+static char *cr_public_pem_of(EVP_PKEY *k) {
+  BIO *b = BIO_new(BIO_s_mem());
+  char *text = NULL;
+  if (b && PEM_write_bio_PUBKEY(b, k)) {
+    char *data = NULL;
+    long n = BIO_get_mem_data(b, &data);
+    text = malloc((size_t)n + 1);
+    if (text) {
+      memcpy(text, data, (size_t)n);
+      text[n] = 0;
+    }
+  }
+  BIO_free(b);
+  ERR_clear_error();
+  return text;
 }
 
 // (whether the key is of the algorithm's kind: RSA's, P-256's, Ed25519's)

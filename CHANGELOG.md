@@ -4,7 +4,7 @@
 
 ### Standard library
 
-- std.crypto: public-key signatures as JWS has them, RS256, PS256, ES256 (its `r` and `s`, 64 bytes) and EdDSA (Ed25519), signed and verified by OpenSSL's libcrypto in a C program (linked by pkg-config's `libcrypto`; no page's): private and public keys read from PEM (PKCS#8, SubjectPublicKeyInfo, RSA's and EC's own), public ones made of a JWK's fields; a key that cannot be read is `Left` of why, a signature that is not the key's `False`.
+- std.crypto: public-key signatures as JWS has them, RS256, PS256, ES256 (its `r` and `s`, 64 bytes) and EdDSA (Ed25519), signed and verified by OpenSSL's libcrypto in a C program (linked by pkg-config's `libcrypto`; no page's): private and public keys read from PEM (PKCS#8, SubjectPublicKeyInfo, RSA's and EC's own), public ones made of a JWK's fields; a private key's public one (`publicOf`), a public key written as PEM (`publicKeyToPem`); a key that cannot be read is `Left` of why, a signature that is not the key's `False`.
 
 ## 0.6.1
 
