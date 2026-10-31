@@ -104,10 +104,11 @@
 -- cown of the handler's beside others, and sent by from any behaviour
 -- (`send`), each piece a behaviour on the connection's cown, queued
 -- there in the order sent, and written by the server after the ones
--- before it, never waited for by the sender.  `finish` ends a stream:
--- its last chunk written, the connection is read on for the next
--- request.  A socket's sender sends messages, each written as a frame;
--- its `finish` closes it, `1000`.
+-- before it -- what the socket takes at once, in the server's
+-- behaviour, the rest by a write it awaits -- never waited for by the
+-- sender.  `finish` ends a stream: its last chunk written, the
+-- connection is read on for the next request.  A socket's sender sends
+-- messages, each written as a frame; its `finish` closes it, `1000`.
 --
 -- ```haskell
 -- import boc as BOC
@@ -1852,9 +1853,10 @@ mutual
   pumpedOn sg cn g st = if onAnswer g st then pumped sg cn g st else pure st
 
   -- (answer `g`'s writer, its turn come: past the most, the connection
-  -- closed; what is queued written, all at once, and the writer waiting
-  -- again -- for the most passed, too, while the write is waited for;
-  -- once it is ending, its end; else waiting again)
+  -- closed; what is queued written, all at once -- as much as the
+  -- socket takes now, here, the rest by a write waited for -- and the
+  -- writer waiting again, for the most passed, too, while the write is
+  -- waited for; once it is ending, its end; else waiting again)
   pumped : {e : HFunctor}
          -> {rg : Type}
          -> {err : Type}
@@ -1870,13 +1872,39 @@ mutual
     if st.over then ended sg cn st
     else if not (List.null st.out)
     then do
-      wroteOut sg cn g (leftOf st.out)
-      awaitingOut sg cn g
-      pure { st | out = Nil, busy = True }
+      let bytes = leftOf st.out
+      now <- Net.writeNow cn.socket bytes
+      writtenNow sg cn g { st | out = Nil } bytes now
     else if st.ending then finishedOut sg cn st st.phase
     else do
       awaitingOut sg cn g
       pure st
+
+  -- (what writing `bytes` of answer `g` at once came to: all of them
+  -- written, the writer on, its end next where it is ending; some, the
+  -- rest written by a write waited for, the writer waiting; or, not
+  -- written, the connection closed)
+  writtenNow : {e : HFunctor}
+             -> {rg : Type}
+             -> {err : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> {{nt : Net.net <: e}}
+             -> {{clock : Time.time <: e}}
+             -> Serving e rg err
+             -> Connection e rg err
+             -> Int
+             -> Conn e err
+             -> Bytes
+             -> Either Net.NetError Int
+             -> Co e (Conn e err)
+  writtenNow sg cn g st bytes (Right n) =
+    if n == Bytes.length bytes
+    then pumped sg cn g { st | pending = st.pending - n }
+    else do
+      wroteOut sg cn g (Bytes.slice bytes n (Bytes.length bytes))
+      awaitingOut sg cn g
+      pure { st | busy = True, pending = st.pending - n }
+  writtenNow sg cn g st bytes (Left why) = ended sg cn st
 
   -- (bytes of answer `g` written, a write waited for no longer; where
   -- they are not, the connection closed)

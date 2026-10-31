@@ -699,6 +699,30 @@ static V heff_provider_net(V p, V k) {
     o->w.step = net_write_step;
     return net_go(o, f, k);
   }
+  // (as many of the bytes as the socket takes now, never waited for:
+  // how many, 0 where it takes none)
+  case TAG_WriteNow: {
+    NetSock *s = net_sock(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 2));
+    if (s->fd < 0) return net_closed(p, s, f, k);
+    int64_t n, done = 0;
+    const uint8_t *data = heff_bytes_data(heff_field(p, 1), &n);
+    int err = 0;
+    while (done < n) {
+      ssize_t r = send(s->fd, data + done, (size_t)(n - done), NET_SEND_FLAGS);
+      if (r > 0) {
+        done += r;
+        continue;
+      }
+      if (r < 0 && errno == EINTR) continue;
+      if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) err = errno;
+      break;
+    }
+    V r = err ? net_left(err, 0, s->address) : net_right(MK_INT(done));
+    heff_drop(p);
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
   case TAG_Shutdown: {
     NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));

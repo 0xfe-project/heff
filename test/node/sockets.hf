@@ -1,11 +1,12 @@
 -- TCP sockets (std.net), by C alone: a connection to a listener of the
 -- program's own, on 127.0.0.1 at the port the test picked, each had by
 -- a `with`, each side echoing what the other wrote, one side shut down
--- and then the other's `with` ended; a port the system picks, on IPv4,
--- on IPv6 where the host has it, and by a name; and what fails, thrown
--- by its `with` and heard: a port already in use, a connection refused,
--- a port out of range, a name not resolved.  `main PORT REFUSED`: a
--- port to listen on, and one where nothing listens.
+-- and then the other's `with` ended; another, written to at once
+-- (`writeNow`), more than the other side reads; a port the system
+-- picks, on IPv4, on IPv6 where the host has it, and by a name; and
+-- what fails, thrown by its `with` and heard: a port already in use, a
+-- connection refused, a port out of range, a name not resolved.  `main
+-- PORT REFUSED`: a port to listen on, and one where nothing listens.
 
 module test.node.sockets
 
@@ -111,6 +112,49 @@ showPeer (Right p) (Right mine) =
   p.host
   ^ ", the client's port: "
   ^ (if p.port == mine.port then "yes" else "no")
+
+-- (`n` bytes of `b`'s, doubled until there are as many)
+lots : Bytes -> Int -> Bytes
+lots b n =
+  if Bytes.length b >= n then Bytes.slice b 0 n else lots (Bytes.append b b) n
+
+-- (what writing `n` bytes at once came to: all of them, some, none)
+showNow : Int -> Either Net.NetError Int -> String
+showNow n (Left err) = err.name
+showNow n (Right k) = if k == n then "all" else if k > 0 then "some" else "none"
+
+-- (how many a write at once took)
+tookNow : Either Net.NetError Int -> Int
+tookNow (Left err) = 0
+tookNow (Right k) = k
+
+-- (the client `c` and the server's side `s` of another connection, the
+-- client writing at once: a little, all of it taken; 16 MiB the server
+-- does not read yet, some; then what was taken read)
+atOnce : {e : HFunctor}
+       -> {s t : Type}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> With s Net.TcpStream
+       -> With t Net.TcpStream
+       -> Co e Unit
+atOnce c s = do
+  little <- Net.writeNow c sent
+  print ("written at once, a little: " ^ showNow (Bytes.length sent) little)
+  again <- readAll s (Bytes.length sent) Bytes.empty
+  print ("server read: " ^ showRead again)
+  let big = lots sent 16777216
+  most <- Net.writeNow c big
+  print ("written at once, 16 MiB unread: " ^ showNow (Bytes.length big) most)
+  taken <- readAll s (tookNow most) Bytes.empty
+  print
+      ("server read them: "
+       ^ (if either
+               (\_ -> False)
+               (\b -> b == Bytes.slice big 0 (tookNow most))
+               taken
+          then "yes"
+          else "no"))
 
 -- (the client `c` and the server's side `s` of one connection: each
 -- echoing the other, the client shut down; then the server's side's
@@ -237,6 +281,7 @@ sockets port l = do
          (Net.withListener (here port) 8 (\l2 -> (pure MkUnit : Co e Unit)))
          (either throw pure))
   print ("listening again on the port: " ^ again)
+  Net.withConnection (here port) (\c -> Net.accept l (\s -> atOnce c s))
 
 -- (what fails, thrown and heard; then ports picked, on IPv4, on IPv6
 -- and by a name)
