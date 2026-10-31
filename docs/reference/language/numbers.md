@@ -67,7 +67,7 @@ after an operand with no space. So:
 | `-128` as an `Int8` | its least value |
 
 A `-` right before a name or `(` negates it: `-p.x`, `-(f y)`. It is the
-`neg` in scope, so it works for any type with a `Negation`. `f -x` is
+prelude's `neg`, so it works for any type with a `Negation`. `f -x` is
 `f (-x)`; `- x`, with a space, is not a negation.
 
 ## Operations
