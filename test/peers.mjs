@@ -123,6 +123,8 @@ if (mode === "routes") {
       case "/big": return say(200, big, { "Content-Length": big.length });
       case "/chunked": r.write("one,"); r.write("two,"); return r.end("three");
       case "/short": r.writeHead(200, { "Content-Length": 100 }); r.write("cut"); return setTimeout(() => r.socket.destroy(), 50);
+      // (a head, and then nothing, for a while)
+      case "/silent": r.writeHead(200, { "Content-Length": 10 }); r.flushHeaders(); return setTimeout(() => r.socket.destroy(), 10000).unref();
       default: return say(500);
     }
   });

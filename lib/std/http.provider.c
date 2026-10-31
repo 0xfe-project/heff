@@ -22,6 +22,8 @@
 // (an operation's strings that are not a C string: as curl calls them)
 #define HTTP_BAD_ARGUMENT 43
 #define HTTP_FAILED_INIT 2
+// (room for why libcurl says a request failed)
+#define HTTP_ERROR_SIZE 256
 
 // (a request, as both ways have it)
 typedef struct {
@@ -33,6 +35,7 @@ typedef struct {
   int64_t nbody;
   int64_t timeout;    // (milliseconds; 0, none)
   int64_t connect;    // (the connection's, milliseconds; 0, curl's own)
+  int64_t idle;       // (a wait for the head or a piece, milliseconds; 0, none)
   int follow;
   int head;           // (a `HEAD`)
   int send_body;      // (`--data-binary`)
@@ -92,14 +95,14 @@ static void http_req_free(HttpReq *q) {
 }
 
 // (the request `rq`, a `Request` (its fields in its type's order: url,
-// method, headers, body, timeout, connectTimeout, follow), as curl is to be given it,
+// method, headers, body, timeout, connectTimeout, follow, idle), as curl is to be given it,
 // its body where `rq` keeps it, so `rq` held while it is used: 0 where
 // a string of it has a NUL in it)
 static int http_req(V rq, HttpReq *q) {
   memset(q, 0, sizeof *q);
   V url = heff_rget_v(rq, 0), method = heff_rget_v(rq, 1), hl = heff_rget_v(rq, 2);
   V body = heff_rget_v(rq, 3), timeout = heff_rget_v(rq, 4), connect = heff_rget_v(rq, 5);
-  V follow = heff_rget_v(rq, 6);
+  V follow = heff_rget_v(rq, 6), idle = heff_rget_v(rq, 7);
   int ok = 1;
   q->url = heff_cstr_text(url);
   q->method = heff_cstr(method);
@@ -116,6 +119,7 @@ static int http_req(V rq, HttpReq *q) {
   q->body = heff_bytes_data(body, &q->nbody);
   q->timeout = IS_INT(timeout) && INT_OF(timeout) > 0 ? INT_OF(timeout) : 0;
   q->connect = IS_INT(connect) && INT_OF(connect) > 0 ? INT_OF(connect) : 0;
+  q->idle = IS_INT(idle) && INT_OF(idle) > 0 ? INT_OF(idle) : 0;
   q->follow = follow == NTAG(TAG_True);
   if (ok) {
     q->head = strcmp(q->method, "HEAD") == 0;
@@ -135,6 +139,7 @@ static int http_req(V rq, HttpReq *q) {
   heff_drop(timeout);
   heff_drop(connect);
   heff_drop(follow);
+  heff_drop(idle);
   return ok;
 }
 
@@ -190,6 +195,36 @@ static V http_headers(const char *s, size_t n, int64_t *status) {
   return l;
 }
 
+// (whether headers' text, `n` bytes at `s`, is a whole head that ends
+// with its blank line and is the last: not an interim `1xx`, nor, where
+// redirects are followed, a `3xx` saying where to go, which curl
+// follows)
+static int http_head_complete(const char *s, size_t n, int follow) {
+  if (!(n >= 2 && s[n - 1] == '\n' && (s[n - 2] == '\n' || (n >= 3 && s[n - 2] == '\r' && s[n - 3] == '\n'))))
+    return 0;
+  size_t start = n;
+  for (size_t i = 0; i < n;) {
+    size_t e = i;
+    while (e < n && s[e] != '\n') e++;
+    if (e - i >= 5 && memcmp(s + i, "HTTP/", 5) == 0) start = i;
+    i = e < n ? e + 1 : e;
+  }
+  if (start == n) return 0;
+  const char *sp = memchr(s + start, ' ', n - start);
+  long status = sp ? strtol(sp + 1, NULL, 10) : 0;
+  if (status >= 100 && status < 200) return 0;
+  if (!follow || status < 300 || status >= 400) return 1;
+  for (size_t i = start; i < n;) {
+    size_t e = i;
+    while (e < n && s[e] != '\n') e++;
+    size_t k = 0;
+    while (k < 9 && i + k < e && (s[i + k] | 0x20) == "location:"[k]) k++;
+    if (k == 9) return 0;
+    i = e < n ? e + 1 : e;
+  }
+  return 1;
+}
+
 static uint32_t http_response_shape[3] = { LBL_status, LBL_headers, LBL_body };
 static uint32_t http_error_shape[3] = { LBL_code, LBL_message, LBL_url };
 
@@ -239,9 +274,11 @@ static int http_temp(char *path, size_t room) {
 #define http_close close
 #endif
 
-// (the request, by a `curl` spawned)
-static void http_spawned(HttpReq *q, HttpGot *g) {
-  char headf[4096], bodyf[4096], secs[32], csecs[32];
+// (the request, by a `curl` spawned: its body to `g`, or, where `out`
+// is given, to that file, its head read whether or not curl failed,
+// as what came before it did)
+static void http_spawned(HttpReq *q, HttpGot *g, const char *out) {
+  char headf[4096], bodyf[4096], secs[32], csecs[32], idles[32];
   int hd = http_temp(headf, sizeof headf), bd = -1;
   if (hd >= 0) http_close(hd);
   int ok = hd >= 0;
@@ -280,6 +317,19 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
     as[n++] = "--connect-timeout";
     as[n++] = csecs;
   }
+  if (q->idle > 0) {
+    // (curl's tool has no limit of its own on a silence: what is slower
+    // than a byte a second for as many seconds, the nearest it has)
+    snprintf(idles, sizeof idles, "%lld", (long long)((q->idle + 999) / 1000));
+    as[n++] = "--speed-limit";
+    as[n++] = "1";
+    as[n++] = "--speed-time";
+    as[n++] = idles;
+  }
+  if (out) {
+    as[n++] = "-o";
+    as[n++] = (char *)out;
+  }
   as[n++] = "-D";
   as[n++] = headf;
   as[n++] = "--";
@@ -287,9 +337,7 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
   as[n] = NULL;
   Buf err = {0};
   int64_t status = ok ? heff_capture(as, &g->body, &err) : -1;
-  if (status == 0) {
-    g->ok = 1;
-    if (q->head) g->body.n = 0;
+  if (status == 0 || (ok && out)) {
     FILE *f = fopen(headf, "rb");
     if (f) {
       char chunk[65536];
@@ -297,6 +345,10 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
       while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&g->head, chunk, got);
       fclose(f);
     }
+  }
+  if (status == 0) {
+    g->ok = 1;
+    if (q->head) g->body.n = 0;
   } else {
     // (what curl said last: `curl: (CODE) why`)
     g->body.n = 0;
@@ -376,6 +428,9 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
 #define HTTP_OPT_POSTFIELDSIZE_LARGE 30120
 #define HTTP_INFO_CONTENT_LENGTH_DOWNLOAD_T (0x600000 + 15)
 #define HTTP_OPT_PRIVATE 10103
+#define HTTP_OPT_SUPPRESS_CONNECT_HEADERS 265
+#define HTTP_WRITEFUNC_PAUSE 0x10000001
+#define HTTP_PAUSE_CONT 0
 #define HTTP_INFO_PRIVATE (0x100000 + 21)
 #define HTTP_MOPT_SOCKETFUNCTION 20001
 #define HTTP_MOPT_SOCKETDATA 10002
@@ -389,7 +444,6 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
 #define HTTP_CSELECT_ERR 4
 #define HTTP_SOCKET_TIMEOUT (-1)
 #define HTTP_MSG_DONE 1
-#define HTTP_ERROR_SIZE 256
 
 // (a body said to be no longer than this is given room for all of it at
 // once; a longer one grows as it comes, so that a length a server only
@@ -415,6 +469,7 @@ static struct {
   int (*multi_remove)(void *, void *);
   int (*multi_action)(void *, int, int, int *);
   void *(*multi_info)(void *, int *);
+  int (*easy_pause)(void *, int);    // (may be missing: no streamed responses then)
 } http_lc;
 static int http_lc_ok;
 // (the user agent curl's tool says, `curl/VERSION`; "" where unknown)
@@ -474,6 +529,7 @@ static void http_load(void) {
   HTTP_SYM(multi_remove, "curl_multi_remove_handle");
   HTTP_SYM(multi_action, "curl_multi_socket_action");
   HTTP_SYM(multi_info, "curl_multi_info_read");
+  HTTP_SYM(easy_pause, "curl_easy_pause");
 #undef HTTP_SYM
   if (!http_lc.global_init || !http_lc.easy_init || !http_lc.easy_cleanup || !http_lc.easy_reset
       || !http_lc.setopt || !http_lc.perform || !http_lc.strerror || !http_lc.slist_append
@@ -561,17 +617,21 @@ static size_t http_head_sink(char *p, size_t size, size_t n, void *u) {
   return size * n;
 }
 
+typedef size_t (*HttpWriteFn)(char *, size_t, size_t, void *);
+
 // (the handle `h` set up for the request, as the tool sets its own --
-// its body to `sink`, its headers to `g`, its headers sent `list`, why
-// it failed to `err` -- from reset: 0, or 1 where libcurl refused it)
-static int http_setup(void *h, HttpReq *q, HttpGot *g, HttpSink *sink, void *list, char *err) {
+// its body to `body` (given `bodyto`), its headers to `head` (given
+// `headto`), its headers sent `list`, why it failed to `err` -- from
+// reset: 0, or 1 where libcurl refused it)
+static int http_setup(void *h, HttpReq *q, HttpWriteFn body, void *bodyto, HttpWriteFn head, void *headto,
+                      void *list, char *err) {
   http_lc.easy_reset(h);
   int bad = http_lc.setopt(h, HTTP_OPT_ERRORBUFFER, err) != 0
     || http_lc.setopt(h, HTTP_OPT_URL, q->url) != 0
-    || http_lc.setopt(h, HTTP_OPT_WRITEFUNCTION, http_sink) != 0
-    || http_lc.setopt(h, HTTP_OPT_WRITEDATA, sink) != 0
-    || http_lc.setopt(h, HTTP_OPT_HEADERFUNCTION, http_head_sink) != 0
-    || http_lc.setopt(h, HTTP_OPT_HEADERDATA, &g->head) != 0
+    || http_lc.setopt(h, HTTP_OPT_WRITEFUNCTION, body) != 0
+    || http_lc.setopt(h, HTTP_OPT_WRITEDATA, bodyto) != 0
+    || http_lc.setopt(h, HTTP_OPT_HEADERFUNCTION, head) != 0
+    || http_lc.setopt(h, HTTP_OPT_HEADERDATA, headto) != 0
     || http_lc.setopt(h, HTTP_OPT_HTTPHEADER, list) != 0
     || (q->follow && (http_lc.setopt(h, HTTP_OPT_FOLLOWLOCATION, 1L) != 0
                       || http_lc.setopt(h, HTTP_OPT_MAXREDIRS, 50L) != 0))
@@ -633,7 +693,7 @@ static int http_curl(HttpReq *q, HttpGot *g) {
   void *list = http_list(q, &ok);
   if (!ok) return 0;
   HttpSink sink = { &g->body, h, 0 };
-  if (http_setup(h, q, g, &sink, list, e->err)) {
+  if (http_setup(h, q, http_sink, &sink, http_head_sink, &g->head, list, e->err)) {
     http_lc.slist_free_all(list);
     return 0;
   }
@@ -746,7 +806,11 @@ static int http_fds(struct pollfd *p, int room, int *ms) {
   return http_m.nwatched;
 }
 
-// (the transfers libcurl is done with: their waits done)
+// (a streamed response's transfer done, libcurl's code `result`)
+static void http_stream_finished(void *s, int result);
+
+// (the transfers libcurl is done with: their waits done -- a streamed
+// response's, its private pointer one past it, told so)
 static void http_finished(void) {
   int left;
   int *m;
@@ -757,6 +821,10 @@ static void http_finished(void) {
     HttpTransfer *t = NULL;
     http_lc.getinfo(msg->easy, HTTP_INFO_PRIVATE, &t);
     if (!t) continue;
+    if ((uintptr_t)t & 1) {
+      http_stream_finished((char *)t - 1, msg->data.result);
+      continue;
+    }
     t->result = msg->data.result;
     http_lc.multi_remove(http_m.multi, t->h);
     heff_wait_done(&t->w);
@@ -863,7 +931,7 @@ static V http_transfer(HttpReq *q, V p, V f, V k) {
   t->list = http_list(q, &ok);
   t->sink.b = &t->g.body;
   t->sink.h = h;
-  if (!ok || http_setup(h, q, &t->g, &t->sink, t->list, t->err)
+  if (!ok || http_setup(h, q, http_sink, &t->sink, http_head_sink, &t->g.head, t->list, t->err)
       || http_lc.setopt(h, HTTP_OPT_PRIVATE, (void *)t) != 0
       || http_lc.multi_add(http_m.multi, h) != 0) {
     if (t->list) http_lc.slist_free_all(t->list);
@@ -884,6 +952,367 @@ static int http_curl(HttpReq *q, HttpGot *g) { (void)q; (void)g; return 0; }
 static V http_transfer(HttpReq *q, V p, V f, V k) { (void)q; (void)p; (void)f; (void)k; return 0; }
 #endif
 
+// Streamed responses
+// ---------------------------------------------------------------------
+//
+// A request whose response is read a piece at a time (`Open`, then
+// `Piece` after `Piece`) is a transfer of this thread's multi, the same
+// one a request pending in the reactor is a transfer of, with an easy
+// handle of its own: its head gathered as it comes, whole at its blank
+// line, unless curl goes on to another (an interim `1xx`, a redirect it
+// follows) -- or at the body's first piece, or the transfer's end.  A
+// piece of the body is kept until the program asks for it; once a
+// piece's worth is kept, what comes next pauses the transfer
+// (`CURL_WRITEFUNC_PAUSE`: libcurl keeps what it was given, the server
+// no longer read from), and asking for the next piece goes on with it.
+// So what is held of a body at once is about a piece, whatever its
+// length.
+//
+// Asked for where no group is being started in, the head or the next
+// piece is waited for there: the multi's sockets polled, and libcurl
+// told of each ready, until it has come.  In a group, it is a wait of
+// the reactor's, done when the multi, a source of the reactor's, has it
+// come.  Either way, `idle` bounds that wait: past it, the transfer is
+// ended, curl's code 28.  A response is a foreign value: let go of, its
+// transfer is ended.  Its multi is the thread's that sent it; another
+// thread asking for its pieces is told so, an error, and one letting go
+// of it leaves it be, paused (another thread's multi is not its to
+// touch).
+//
+// Where libcurl is not to be used, the spawned curl writes the body to
+// a temporary file, and its pieces are read from that: never all of it
+// in memory, but none of it before curl is done.  Its silence is
+// bounded as the tool's own bound is, in whole seconds (`--speed-time`).
+
+// (a piece's worth: once this much is kept, the transfer pauses)
+#define HTTP_PIECE ((size_t)1 << 16)
+
+typedef struct HttpPull HttpPull;
+
+typedef struct {
+  void *h;              // (its easy handle, libcurl's; NULL, curl spawned)
+  void *list;
+  HttpReq q;
+  V rq;                 // (the request: its body's bytes the transfer's to send)
+  long pid;             // (the process that sent it)
+  void *m;              // (the multi of the thread that sent it)
+  Buf head;             // (its headers' text, as they come)
+  Buf got;              // (what came of the body, not yet asked for)
+  int paused;
+  int head_done;        // (its head whole)
+  int done;             // (its transfer ended)
+  int64_t code;         // (once ended, curl's code: 0, the body whole)
+  Buf why;
+  char err[HTTP_ERROR_SIZE];
+  HttpPull *waiting;    // (a wait of the reactor's for it)
+  FILE *file;           // (curl spawned: the body as curl wrote it)
+  char bodyf[4096];
+} HttpStream;
+
+// (a wait of the reactor's for a streamed response's head, or for its
+// next piece)
+struct HttpPull {
+  HeffWait w;           // (first: the pull is its wait)
+  HttpStream *s;
+  V held;               // (the head's: the response, a foreign value; a
+                        //  piece's: the operation)
+  int head;
+};
+
+static uint32_t http_opened_shape[3] = { LBL_status, LBL_headers, LBL_transfer };
+
+// (an error of the response's: curl's code `code`, and why)
+static V http_stream_error(HttpStream *s, int64_t code, const char *why, size_t n) {
+  V f[3] = { heff_int(code), heff_str_text_n(why, (int64_t)n), heff_str_text(s->q.url ? s->q.url : "") };
+  V x = heff_rec(3, http_error_shape, f);
+  return heff_tag_n(TAG_Left, 1, &x);
+}
+
+// (the head come, an `Either HttpError Opened`, `v` -- the response, a
+// foreign value -- kept in it; or, the transfer ended with no head, why,
+// `v` let go of)
+static V http_opened(HttpStream *s, V v) {
+  if (!s->head_done && s->code != 0) {
+    V r = http_stream_error(s, s->code, s->why.s ? s->why.s : "", s->why.n);
+    heff_drop(v);
+    return r;
+  }
+  int64_t status;
+  V hs = http_headers(s->head.s ? s->head.s : "", s->head.n, &status);
+  V f[3] = { heff_int(status), hs, v };
+  V x = heff_rec(3, http_opened_shape, f);
+  return heff_tag_n(TAG_Right, 1, &x);
+}
+
+// (the next piece, an `Either HttpError Bytes`: what came of the body;
+// at its end, no bytes, or why it did not end whole)
+static V http_piece(HttpStream *s) {
+  if (s->file) {
+    static HEFF_TLS char chunk[HTTP_PIECE];
+    size_t n = fread(chunk, 1, sizeof chunk, s->file);
+    if (n > 0) {
+      V b = heff_bytes_in(chunk, (int64_t)n);
+      return heff_tag_n(TAG_Right, 1, &b);
+    }
+    fclose(s->file);
+    s->file = NULL;
+  }
+  if (s->got.n > 0) {
+    V b = heff_bytes_in(s->got.s, (int64_t)s->got.n);
+    s->got.n = 0;
+    return heff_tag_n(TAG_Right, 1, &b);
+  }
+  if (s->code != 0) return http_stream_error(s, s->code, s->why.s ? s->why.s : "", s->why.n);
+  V b = heff_bytes_in("", 0);
+  return heff_tag_n(TAG_Right, 1, &b);
+}
+
+// (the response, by a `curl` spawned, its body to a file of its own)
+static void http_stream_spawned(HttpStream *s) {
+  HttpGot g = {0};
+  s->done = 1;
+  int fd = http_temp(s->bodyf, sizeof s->bodyf);
+  if (fd < 0) {
+    s->bodyf[0] = 0;
+    s->code = HTTP_FAILED_INIT;
+    buf_str(&s->why, "a file for curl could not be written");
+    return;
+  }
+  http_close(fd);
+  http_spawned(&s->q, &g, s->bodyf);
+  s->head = g.head;
+  s->head_done = g.head.n && (g.ok || http_head_complete(g.head.s, g.head.n, s->q.follow));
+  if (!g.ok) {
+    s->code = g.code;
+    s->why = g.why;
+  } else
+    free(g.why.s);
+  free(g.body.s);
+  if (s->head_done && !s->q.head) s->file = fopen(s->bodyf, "rb");
+}
+
+#ifdef HTTP_CURL
+// (whether what is waited for -- the head, or the next piece -- has come)
+static int http_stream_has(HttpStream *s, int head) {
+  return s->done || (head ? s->head_done : s->got.n > 0);
+}
+
+// (a piece of the body come: kept -- or, a piece's worth kept already,
+// the transfer paused)
+static size_t http_stream_sink(char *p, size_t size, size_t n, void *u) {
+  HttpStream *s = u;
+  size_t len = size * n;
+  if (s->got.n >= HTTP_PIECE) {
+    s->paused = 1;
+    return HTTP_WRITEFUNC_PAUSE;
+  }
+  s->head_done = 1;
+  buf_put(&s->got, p, len);
+  if (s->waiting) heff_wait_done(&s->waiting->w);
+  return len;
+}
+
+// (a header line come: the head whole at its blank line, where it is
+// the last)
+static size_t http_stream_head(char *p, size_t size, size_t n, void *u) {
+  HttpStream *s = u;
+  size_t len = size * n;
+  buf_put(&s->head, p, len);
+  if ((len == 1 || (len == 2 && p[0] == '\r')) && p[len - 1] == '\n'
+      && http_head_complete(s->head.s, s->head.n, s->q.follow)) {
+    s->head_done = 1;
+    if (s->waiting && s->waiting->head) heff_wait_done(&s->waiting->w);
+  }
+  return len;
+}
+
+static void http_stream_finished(void *p, int result) {
+  HttpStream *s = p;
+  http_lc.multi_remove(http_m.multi, s->h);
+  s->done = 1;
+  s->code = result;
+  if (result) {
+    const char *why = s->err[0] ? s->err : http_lc.strerror(result);
+    buf_str(&s->why, why ? why : "");
+  }
+  if (s->waiting) heff_wait_done(&s->waiting->w);
+}
+
+// (the transfer ended here, before libcurl was done with it: curl's
+// code `code`, and why)
+static void http_stream_cut(HttpStream *s, int64_t code, const char *why) {
+  if (s->done) return;
+  http_lc.multi_remove(http_m.multi, s->h);
+  s->done = 1;
+  s->code = code;
+  buf_str(&s->why, why);
+}
+
+// (the transfer ended, waited for longer than `idle`: curl's code 28)
+static void http_stream_silent(HttpStream *s) {
+  char why[128];
+  snprintf(why, sizeof why, "Operation timed out after %lld milliseconds with no data received", (long long)s->q.idle);
+  http_stream_cut(s, 28, why);
+}
+
+// (the response's transfer, of this thread's multi: 1, begun; 0, nothing
+// done, where libcurl is not to be used)
+static int http_stream_curl(HttpStream *s) {
+  if (http_multi_mine() < 0 || !http_lc.easy_pause) return 0;
+  void *h = http_m.nidle ? http_m.idle[--http_m.nidle] : http_lc.easy_init();
+  if (!h) return 0;
+  int ok;
+  void *list = http_list(&s->q, &ok);
+  if (!ok || http_setup(h, &s->q, http_stream_sink, s, http_stream_head, s, list, s->err)
+      || http_lc.setopt(h, HTTP_OPT_PRIVATE, (void *)((char *)s + 1)) != 0) {
+    if (list) http_lc.slist_free_all(list);
+    http_lc.easy_reset(h);
+    if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = h;
+    else http_lc.easy_cleanup(h);
+    return 0;
+  }
+  // (a proxy's answer to `CONNECT` is not the response's head)
+  http_lc.setopt(h, HTTP_OPT_SUPPRESS_CONNECT_HEADERS, 1L);
+  if (http_lc.multi_add(http_m.multi, h) != 0) {
+    http_lc.slist_free_all(list);
+    http_lc.easy_reset(h);
+    http_lc.easy_cleanup(h);
+    return 0;
+  }
+  s->h = h;
+  s->list = list;
+  s->m = &http_m;
+  s->pid = (long)getpid();
+  return 1;
+}
+
+// (the head, or the next piece, waited for here, no group being started
+// in: the multi's sockets polled, and libcurl told of each ready)
+static void http_stream_drive(HttpStream *s, int head) {
+  int64_t until = s->q.idle > 0 ? http_now() + s->q.idle : 0;
+  struct pollfd *p = NULL;
+  int room = 0;
+  while (!http_stream_has(s, head)) {
+    if (room < http_m.nwatched + 1) {
+      free(p);
+      room = http_m.nwatched + 16;
+      p = heff_alloc(sizeof *p * (size_t)room);
+    }
+    int ms = -1;
+    int n = http_fds(p, room, &ms);
+    if (until) {
+      int64_t left = until - http_now();
+      if (left <= 0) {
+        http_stream_silent(s);
+        break;
+      }
+      if (ms < 0 || ms > left) ms = (int)left;
+    }
+    if (n == 0 && ms < 0) ms = 1000;
+    if (poll(p, (nfds_t)n, ms) < 0) {
+      if (errno == EINTR) continue;
+      http_stream_cut(s, HTTP_FAILED_INIT, strerror(errno));
+      break;
+    }
+    http_ready(p, n);
+  }
+  free(p);
+}
+
+static V http_pull_answer(HeffWait *w) {
+  HttpPull *u = (HttpPull *)w;
+  HttpStream *s = u->s;
+  s->waiting = NULL;
+  if (w->err == ETIMEDOUT && !http_stream_has(s, u->head)) http_stream_silent(s);
+  V r;
+  if (u->head) r = http_opened(s, u->held);
+  else {
+    r = http_piece(s);
+    heff_drop(u->held);
+  }
+  free(u);
+  return r;
+}
+
+static void http_pull_cancel(HeffWait *w) {
+  HttpPull *u = (HttpPull *)w;
+  u->s->waiting = NULL;
+  V held = u->held;
+  free(u);
+  heff_drop(held);
+}
+
+// (the head, or the next piece, of `s` pending in the reactor, its wait
+// holding `held`)
+static V http_pull(HttpStream *s, int head, V held, V f, V k) {
+  HttpPull *u = heff_alloc(sizeof *u);
+  memset(u, 0, sizeof *u);
+  u->w.fd = -1;
+  u->w.until = s->q.idle > 0 ? heff_now_ms() + s->q.idle : 0;
+  u->w.step = http_transfer_step;
+  u->w.answer = http_pull_answer;
+  u->w.cancel = http_pull_cancel;
+  u->s = s;
+  u->held = held;
+  u->head = head;
+  s->waiting = u;
+  return heff_outside(&u->w, f, k);
+}
+
+// (whether `s` is this thread's to read: sent by it)
+static int http_stream_here(HttpStream *s) {
+  return !s->h || (s->m == (void *)&http_m && s->pid == (long)getpid());
+}
+
+// (what is asked for of `s` -- its head, or its next piece -- come, or
+// waited for here: 0; else the operation, pending in the reactor)
+static V http_stream_wait(HttpStream *s, int head, V held, V f, V k) {
+  if (!s->h) return 0;
+  if (!head && s->got.n == 0 && s->paused && !s->done) {
+    s->paused = 0;
+    http_lc.easy_pause(s->h, HTTP_PAUSE_CONT);
+  }
+  if (http_stream_has(s, head)) return 0;
+  if (heff_group) return http_pull(s, head, held, f, k);
+  http_stream_drive(s, head);
+  return 0;
+}
+
+// (the transfer let go of, its handle kept for the next: 1; 0, where it
+// is another thread's, left be)
+static int http_stream_release(HttpStream *s) {
+  if (!s->h || s->pid != (long)getpid()) return 1;
+  if (s->m != (void *)&http_m) return 0;
+  if (!s->done) http_lc.multi_remove(http_m.multi, s->h);
+  http_lc.easy_reset(s->h);
+  if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = s->h;
+  else http_lc.easy_cleanup(s->h);
+  if (s->list) http_lc.slist_free_all(s->list);
+  return 1;
+}
+#else
+static int http_stream_curl(HttpStream *s) { (void)s; return 0; }
+static int http_stream_here(HttpStream *s) { (void)s; return 1; }
+static V http_stream_wait(HttpStream *s, int head, V held, V f, V k) {
+  (void)s; (void)head; (void)held; (void)f; (void)k;
+  return 0;
+}
+static int http_stream_release(HttpStream *s) { (void)s; return 1; }
+#endif
+
+static void http_stream_let_go(void *p) {
+  HttpStream *s = p;
+  if (!http_stream_release(s)) return;
+  if (s->file) fclose(s->file);
+  if (s->bodyf[0]) remove(s->bodyf);
+  http_req_free(&s->q);
+  heff_drop(s->rq);
+  free(s->head.s);
+  free(s->got.s);
+  free(s->why.s);
+  free(s);
+}
+
 static V heff_provider_http(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Send: {
@@ -901,11 +1330,49 @@ static V heff_provider_http(V p, V k) {
       buf_str(&g.why, "A libcurl function was given a bad argument");
     } else if (!http_curl(&q, &g)) {
       g.head.n = g.body.n = g.why.n = 0;
-      http_spawned(&q, &g);
+      http_spawned(&q, &g, NULL);
     }
     V r = http_answer(&g, q.url);
     http_req_free(&q);
     // (the request's body read: let go of)
+    heff_drop(p);
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Open: {
+    V f = heff_dup(heff_field(p, 1));
+    V rq = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+    HttpStream *s = heff_alloc(sizeof *s);
+    memset(s, 0, sizeof *s);
+    s->rq = rq;
+    V r;
+    if (!http_req(rq, &s->q)) {
+      const char *why = "A libcurl function was given a bad argument";
+      r = http_stream_error(s, HTTP_BAD_ARGUMENT, why, strlen(why));
+      http_stream_let_go(s);
+    } else {
+      if (!http_stream_curl(s)) http_stream_spawned(s);
+      V v = heff_foreign(s, http_stream_let_go);
+      V pending = http_stream_wait(s, 1, v, f, k);
+      if (pending) return pending;
+      r = http_opened(s, v);
+    }
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Piece: {
+    V f = heff_dup(heff_field(p, 1));
+    HttpStream *s = heff_foreign_ptr(heff_field(p, 0));
+    V r;
+    if (!http_stream_here(s)) {
+      const char *why = "A streamed response is read by the thread that sent it";
+      r = http_stream_error(s, HTTP_FAILED_INIT, why, strlen(why));
+    } else {
+      V pending = http_stream_wait(s, 0, p, f, k);
+      if (pending) return pending;
+      r = http_piece(s);
+    }
     heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);

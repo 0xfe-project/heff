@@ -3,7 +3,7 @@
 -- the first request, or a `curl` spawned where there is none, with the
 -- same answers; a page's `fetch` is browser.http's.  Import it by a name,
 -- `import std.http as HTTP`, as its names are common ones: `HTTP.get`,
--- `HTTP.send`.
+-- `HTTP.send`, `HTTP.stream`.
 --
 -- ```haskell
 -- import co
@@ -19,28 +19,81 @@
 --          , timeout = 5000
 --          , connectTimeout = 1000
 --          }
---   pure (either (\err -> 0) (\(res : Http.Response) -> res.status) r)
+--   pure (either (\err -> 0) (\(res : HTTP.Response) -> res.status) r)
 -- ```
 --
 -- A response is whatever the server answered, a 404 or a 500 too; an
 -- error is that no response came -- the connection refused, the name not
 -- found, TLS, the time up -- with curl's code, what it says, and the
 -- URL.
+--
+-- `send` reads a response's body whole, into memory.  `stream` gives the
+-- response's head as soon as it has come, and its body as a computation
+-- that yields each piece as it comes -- stream's `yield` of `Bytes`, as
+-- the body of a streamed reply of std.http.server's is -- read from the
+-- server only as the program asks for the next: a body of any length is
+-- held a piece at a time, and a program can say how far it has come.
+-- `Stream.source` makes it pieces to pull, `Stream.fold` goes through
+-- them; what it comes to is how the body ended, whole or why not.  A
+-- download to a file:
+--
+-- ```haskell
+-- import co
+-- import exception
+-- import std.file as File
+-- import std.filesystem
+-- import std.http as HTTP
+-- import std.path
+-- import stream as Stream
+--
+-- -- | the URL's body written to `path` a piece at a time, as it comes:
+-- -- | its status, or why no response came, or why it was cut short
+-- download : {e : HFunctor}
+--          -> {{web : HTTP.http <: e}}
+--          -> {{disk : filesystem <: e}}
+--          -> {{ex : exception FileError <: e}}
+--          -> String
+--          -> Path
+--          -> Co e (Either HTTP.HttpError Int)
+-- download u path = do
+--   r <- HTTP.stream { url = u, idle = 30000 }
+--   case r of
+--     Left err -> pure (Left err)
+--     Right s -> do
+--       f <- File.open (access := Write {}) path
+--       ended <- Stream.fold (Stream.source s.body) () (\x b -> File.writeBytes f b)
+--       File.close f
+--       pure (either Left (\x -> Right s.status) (snd ended))
+-- ```
+--
+-- A request's time is bounded three ways, each curl's code 28 where it
+-- is up: `timeout`, its time in all, a body's included however long it
+-- takes to read, so it is best 0 for a long download; `connectTimeout`,
+-- the time its connection takes to be made; and `idle`, how long it may
+-- wait for what comes next -- the response's head, or the next piece of
+-- its body -- once asked for, a server gone silent given up on, a long
+-- download, while it goes on, never.  The time a program takes over a
+-- piece, before it asks for the next, is not counted.  Where curl is
+-- spawned, `idle` is as its tool has it, in whole seconds: what comes
+-- slower than a byte a second for that long.
 
 module std.http
 
 import bytes as Bytes
 import co
+import stream as Stream
 
 -- | A request: where it goes, its method, its headers (a name and a
 -- | value each, sent in their order), its body, how long it may take
 -- | in all in milliseconds (0: as long as it takes), how long its
 -- | connection may take to be made (0: as long as curl's default, five
 -- | minutes) -- a server that does not answer given up on soon, a long
--- | download, once connected, not cut -- and whether a redirect is
--- | followed (up to 50 of them) or is the response.  A body is sent with
--- | a `POST`, or with any method where it is not empty, and with no
--- | `Content-Type` but the one in its headers.  Either time up is curl's
+-- | download, once connected, not cut -- whether a redirect is
+-- | followed (up to 50 of them) or is the response, and how long it may
+-- | wait for the response's head, or for the next piece of its body, in
+-- | milliseconds (0: as long as it takes).  A body is sent with a
+-- | `POST`, or with any method where it is not empty, and with no
+-- | `Content-Type` but the one in its headers.  Any time up is curl's
 -- | code 28.
 type Request =
   { url : String
@@ -50,6 +103,7 @@ type Request =
   , timeout : Int = 0
   , connectTimeout : Int = 0
   , follow : Bool = True
+  , idle : Int = 0
   }
 
 -- | A response: its status, its headers (a name and a value each, as the
@@ -64,7 +118,18 @@ type Response =
 -- | it).
 type HttpError = { code : Int, message : String, url : String }
 
-data HttpF (m : Type -> Type) x = Send Request (Either HttpError Response -> x)
+-- | A response coming, the host's own (a foreign value; no value of
+-- | the program has it): its body's pieces not yet read.
+data Transfer
+
+-- | A response's head, come, and its transfer, its body to read.
+type Opened =
+  { status : Int, headers : List (Pair String String), transfer : Transfer }
+
+data HttpF (m : Type -> Type) x
+  = Send Request (Either HttpError Response -> x)
+  | Open Request (Either HttpError Opened -> x)
+  | Piece Transfer (Either HttpError Bytes -> x)
 
 -- | For HTTP requests sent, and their responses, by libcurl.
 http : HFunctor
@@ -72,16 +137,109 @@ http =
   { f = HttpF
   , hfmap = \m g p -> case p of
       Send rq k -> Send rq (\r -> g (k r))
+      Open rq k -> Open rq (\r -> g (k r))
+      Piece t k -> Piece t (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       Send rq k -> Send rq k
+      Open rq k -> Open rq k
+      Piece t k -> Piece t k
   }
 
--- | The request sent: its response, or why none came.
+-- | A response as it comes: its status and its headers, and its body, a
+-- | computation that yields each piece of it as it comes (stream's
+-- | `yield` of `Bytes`, as a streamed reply of std.http.server's body
+-- | does) and comes to how the body ended: whole, or why not.
+type Streamed (e : HFunctor) =
+  { status : Int
+  , headers : List (Pair String String)
+  , body : Co (Stream.yielding Bytes <+> e) (Either HttpError Unit)
+  }
+
+-- (the next piece of the transfer's body: none, its end)
+piece : {e : HFunctor}
+      -> {{ev : http <: e}}
+      -> Transfer
+      -> Co e (Either HttpError Bytes)
+piece t = op (ev (Piece t (\r -> r))) val
+
+-- (each piece of the transfer's body yielded, to its end)
+piecesOf : {e : HFunctor}
+         -> {{ev : http <: e}}
+         -> Transfer
+         -> Co (Stream.yielding Bytes <+> e) (Either HttpError Unit)
+piecesOf t =
+  bind (piece t) (\r -> case r of
+    Left err -> pure (Left err)
+    Right b ->
+      if Bytes.length b == 0 then pure (Right MkUnit)
+      else bind (Stream.yield b) (\u -> piecesOf (e := e) t))
+
+-- (a head come, as the program has it: its body the transfer's pieces)
+streamedOf : {e : HFunctor}
+           -> {{ev : http <: e}}
+           -> Either HttpError Opened
+           -> Either HttpError (Streamed e)
+streamedOf (Left err) = Left err
+streamedOf (Right o) =
+  Right
+    { status = o.status
+    , headers = o.headers
+    , body = piecesOf (e := e) o.transfer
+    }
+
+-- | The request sent: its response's head as soon as it has come (its
+-- | status and headers, of the last response where a redirect was
+-- | followed), and its body, read a piece at a time as the program asks
+-- | for it -- or why no head came.  The body is not read ahead: while
+-- | the program does not ask for its next piece, the server is not read
+-- | from, and waits, so a body of any length is never all in memory.
+-- | Where it is cut short after its head -- the connection gone, the
+-- | time up -- its pieces until then are yielded, and then it comes to
+-- | why.  A body left unread is let go of where the program drops it,
+-- | its connection closed.  It is read in the thread that sent it;
+-- | read in another, it comes to an error, code 2.
+stream : {e : HFunctor}
+       -> {{ev : http <: e}}
+       -> Request
+       -> Co e (Either HttpError (Streamed e))
+stream rq = bind (op (ev (Open rq (\r -> r))) val) (\r -> pure (streamedOf r))
+
+-- (a body read whole: its pieces, the last first, and how it ended)
+gathered : {e : HFunctor}
+         -> Co (Stream.yielding Bytes <+> e) (Either HttpError Unit)
+         -> Co e (Pair (List Bytes) (Either HttpError Unit))
+gathered body = Stream.fold (Stream.source body) Nil (\acc b -> pure (b :: acc))
+
+-- (a response of a head and its body read whole)
+wholeOf : {e : HFunctor}
+        -> Streamed e
+        -> Pair (List Bytes) (Either HttpError Unit)
+        -> Either HttpError Response
+wholeOf s (MkPair pieces (Left err)) = Left err
+wholeOf s (MkPair pieces (Right u)) =
+  Right
+    { status = s.status
+    , headers = s.headers
+    , body = Bytes.concat (List.reverse pieces)
+    }
+
+-- (a response streamed, then read whole)
+readWhole : {e : HFunctor}
+          -> Either HttpError (Streamed e)
+          -> Co e (Either HttpError Response)
+readWhole (Left err) = pure (Left err)
+readWhole (Right s) = bind (gathered s.body) (\p -> pure (wholeOf s p))
+
+-- | The request sent: its response, or why none came.  Its body is read
+-- | whole, into memory -- `stream` reads it a piece at a time -- and,
+-- | where the request has an `idle`, by `stream`, which bounds it.
 send : {e : HFunctor}
      -> {{ev : http <: e}}
      -> Request
      -> Co e (Either HttpError Response)
-send rq = op (ev (Send rq (\r -> r))) val
+send rq =
+  if rq.idle > 0 then bind (stream rq) readWhole
+  else op (ev (Send rq (\r -> r))) val
 
 -- | A `GET` of the URL.
 get : {e : HFunctor}

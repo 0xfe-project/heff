@@ -13,6 +13,7 @@ import co
 import std.http as HTTP
 import std.io
 import std.process
+import stream as Stream
 import uint8 as UInt8
 
 -- (every byte, 0 to 255, twice)
@@ -132,6 +133,79 @@ texts at refused = do
          (\x -> fromMaybe "none" (HTTP.header "x-method" x))
          r)
 
+-- (a body read a piece at a time: its pieces, the last first, and how
+-- it ended)
+piecesRead : {e : HFunctor}
+           -> Co (Stream.yielding Bytes <+> e) (Either HTTP.HttpError Unit)
+           -> Co e (Pair (List Bytes) (Either HTTP.HttpError Unit))
+piecesRead body =
+  Stream.fold (Stream.source body) Nil (\acc b -> pure (b :: acc))
+
+endOf : Either HTTP.HttpError Unit -> String
+endOf (Left err) = codeOf err
+endOf (Right u) = "whole"
+
+-- (whether a body longer than a piece came in pieces)
+inPieces : Bytes -> List Bytes -> String
+inPieces b pieces =
+  if Bytes.length b <= 65536 then ""
+  else if List.length pieces > 1 then ", in pieces"
+  else ", in one piece"
+
+-- (a response streamed: its status, its body's pieces put together, and
+-- how it ended)
+streamShown : Pair (List Bytes) (Either HTTP.HttpError Unit) -> Int -> String
+streamShown (MkPair pieces ended) status =
+  let b = Bytes.concat (List.reverse pieces)
+  in debug status ^ " " ^ showBody b ^ inPieces b pieces ^ ", " ^ endOf ended
+
+-- (`stream`, each response's body read a piece at a time)
+streams : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{web : HTTP.http <: e}}
+        -> List (Pair String HTTP.Request)
+        -> Co e Unit
+streams [] = pure MkUnit
+streams (MkPair what rq :: rest) = do
+  r <- HTTP.stream rq
+  case r of
+    Left err -> print ("stream " ^ what ^ ": " ^ codeOf err)
+    Right s -> do
+      got <- piecesRead s.body
+      print ("stream " ^ what ^ ": " ^ streamShown got s.status)
+  streams rest
+
+streamed : String -> String -> List (Pair String HTTP.Request)
+streamed at refused =
+  [ MkPair "get" { url = at ^ "/item" }
+  , MkPair "big" { url = at ^ "/big" }
+  , MkPair "chunked" { url = at ^ "/chunked" }
+  , MkPair "404" { url = at ^ "/nope" }
+  , MkPair "followed" { url = at ^ "/moved" }
+  , MkPair "not followed" { url = at ^ "/moved", follow = False }
+  , MkPair "redirects for ever" { url = at ^ "/loop" }
+  , MkPair "head" { url = at ^ "/echo", method = "HEAD" }
+  , MkPair
+    "post"
+    { url = at ^ "/echo", method = "POST", body = Bytes.fromString "posted" }
+  , MkPair "cut short" { url = at ^ "/short" }
+  , MkPair "refused" { url = refused }
+  , MkPair "silent" { url = at ^ "/silent", idle = 300 }
+  ]
+
+-- (`send` given a limit on a silence: its body read a piece at a time,
+-- put together)
+idleSends : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{web : HTTP.http <: e}}
+          -> String
+          -> Co e Unit
+idleSends at = do
+  r <- HTTP.send { url = at ^ "/big", idle = 1000 }
+  print ("send, idle: " ^ showGot (at ^ "/big") r)
+  s <- HTTP.send { url = at ^ "/silent", idle = 300 }
+  print ("send, silent: " ^ either codeOf (\x -> "answered") s)
+
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{web : HTTP.http <: e}}
@@ -143,6 +217,8 @@ program = do
     (at :: refused :: _) -> do
       each (requests at refused)
       texts at refused
+      streams (streamed at refused)
+      idleSends at
     _ -> printErr "main AT REFUSED"
 
 main : Co (stdio <+> HTTP.http <+> process) Unit
