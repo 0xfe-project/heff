@@ -1,0 +1,619 @@
+-- WebSocket (RFC 6455), as a server speaks it, its pure part: a
+-- handshake checked and answered, frames read and written, and the
+-- frames a client sends put together into its messages.  Nothing here
+-- reads or writes a socket: a server that has answered a handshake by
+-- `101 Switching Protocols`, with `upgradeHeaders`, gives what it reads
+-- to `feed`, which says the messages it finishes and the reader to read
+-- on by, and writes `encodeFrame` of what it answers.  Import it by a
+-- name, `import std.http.websocket as WebSocket`, beside `import
+-- std.http.server as Server`, whose `Request` a handshake is.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import std.http.websocket as WebSocket
+--
+-- -- | what a server writes back for a client's message: text and bytes
+-- -- | echoed, a ping answered by a pong, a close by a close
+-- answer : WebSocket.Message -> Bytes
+-- answer (PingMessage p) =
+--   WebSocket.encodeFrame (WebSocket.frameOf (PongMessage p))
+-- answer (PongMessage p) = Bytes.empty
+-- answer m = WebSocket.encodeFrame (WebSocket.frameOf m)
+-- ```
+--
+-- A client's frame is masked, or it is refused (a client's reader,
+-- `masked := False`, refuses a masked one); a server's is not masked,
+-- and `encodeMasked` writes a client's.  No extension is negotiated, so
+-- a frame with an RSV bit set is refused.  A frame, and a message of
+-- many, is at most `most` bytes -- 16 MiB unless another is given, by
+-- name, `WebSocket.feed (most := 65536) r bytes` -- or refused, 1009.
+-- Text that is not UTF-8, in a message or in a close's reason, is
+-- refused, 1007; any other breach of the protocol, 1002.  What is
+-- refused is `Failing`, the code and why: a server sends them in a close
+-- frame, `frameOf (CloseMessage code why)`, and closes the connection.
+
+module std.http.websocket
+  ( acceptKey
+  , Handshake(..)
+  , handshake
+  , upgradeHeaders
+  , Opcode(..)
+  , Frame
+  , Decoded(..)
+  , decodeFrame
+  , encodeFrame
+  , encodeMasked
+  , Message(..)
+  , frameOf
+  , Reader
+  , reader
+  , Fed(..)
+  , feed
+  )
+
+import bytes as Bytes
+import int as Int
+import rune as Rune
+import std.base64 as Base64
+import std.http as HTTP
+import std.http.server as Server
+import std.sha1 as SHA1
+import uint8 as UInt8
+
+-- The handshake
+--------------------------------------------------------------------------------
+
+-- (what RFC 6455 adds to a key before it is hashed)
+keyGUID : String
+keyGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+-- | The `Sec-WebSocket-Accept` that answers a client's
+-- | `Sec-WebSocket-Key`: the key and RFC 6455's GUID, hashed by SHA-1, in
+-- | Base64.
+-- | >>> acceptKey "dGhlIHNhbXBsZSBub25jZQ=="
+-- | "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+acceptKey : String -> String
+acceptKey key = Base64.encode (SHA1.digest (Bytes.fromString (key ^ keyGUID)))
+
+-- | The headers of the `101 Switching Protocols` that takes a connection
+-- | over, given the accept key (`Accept`'s).
+-- | >>> upgradeHeaders "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+-- | [MkPair "Upgrade" "websocket", MkPair "Connection" "Upgrade", MkPair "Sec-WebSocket-Accept" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="]
+upgradeHeaders : String -> List (Pair String String)
+upgradeHeaders key =
+  [ MkPair "Upgrade" "websocket"
+  , MkPair "Connection" "Upgrade"
+  , MkPair "Sec-WebSocket-Accept" key
+  ]
+
+-- | What a request asking for WebSocket comes to: accepted, the accept
+-- | key its `101` says (`upgradeHeaders`); or refused, by the response
+-- | given, `400`, or `426` where its version is not 13.
+data Handshake = Accept String | Refuse HTTP.Response
+
+-- (the value of a header, if it is of that name)
+valueIf : String -> Pair String String -> Maybe String
+valueIf name (MkPair n v) = if HTTP.sameName name n then Just v else Nothing
+
+-- (whether the headers of that name, each a list split at its commas,
+-- say `token` among their values, ASCII's case not minded)
+says : String -> String -> Server.Request -> Bool
+says name token r =
+  List.any
+    (\t -> HTTP.sameName token (trim t))
+    (List.concatMap (split ",") (List.mapMaybe (valueIf name) r.headers))
+
+-- (refused by `status`, why in its body)
+refused : Int -> String -> Handshake
+refused status why = Refuse (Server.plain status (why ^ "\n"))
+
+-- (refused for its version, the one there is said)
+versionRefused : Handshake
+versionRefused =
+  Refuse
+    { status = 426
+    , headers =
+        [ MkPair "Sec-WebSocket-Version" "13"
+        , MkPair "Content-Type" "text/plain; charset=utf-8"
+        ]
+    , body = Bytes.fromString "WebSocket's version 13 only\n"
+    }
+
+-- (whether a key is one: 16 bytes in Base64)
+isKey : String -> Bool
+isKey k = maybe False (\b -> Bytes.length b == 16) (Base64.decode k)
+
+-- (accepted by the key, if it is one)
+keyed : Maybe String -> Handshake
+keyed (Just k) = if isKey k then Accept (acceptKey k) else keyed Nothing
+keyed Nothing = refused 400 "no Sec-WebSocket-Key of 16 bytes"
+
+-- (its version checked, then its key)
+versioned : Server.Request -> Maybe String -> Handshake
+versioned r Nothing = refused 400 "no Sec-WebSocket-Version"
+versioned r (Just v) =
+  if strEq v "13" then keyed (Server.header "sec-websocket-key" r)
+  else versionRefused
+
+-- (for the examples: a request's head, what `check` makes of it, as a
+-- line -- the accept key, or the status refused with and the version
+-- said)
+tried : (Server.Request -> Handshake) -> String -> String
+tried check text =
+  maybe
+    "no request"
+    (\r -> said (check r))
+    (Server.parseHead { host = "::1", port = 1 } text)
+  where
+  said : Handshake -> String
+  said (Accept key) = "accept " ^ key
+  said (Refuse res) =
+    "refuse "
+    ^ debug res.status
+    ^ maybe "" (\v -> " " ^ v) (HTTP.header "sec-websocket-version" res)
+
+-- | A request checked as a WebSocket handshake: a `GET` of HTTP/1.1,
+-- | its `Upgrade` saying `websocket` and its `Connection` `upgrade` (in
+-- | any case, among others, by commas), its `Sec-WebSocket-Version` 13
+-- | and a `Sec-WebSocket-Key` of 16 bytes.  Accepted, its accept key;
+-- | else refused, `400`, or `426` for a version not 13, with
+-- | `Sec-WebSocket-Version: 13`.
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "accept s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nUpgrade: WebSocket\r\nConnection: keep-alive, upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "accept s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+-- | >>> tried handshake "POST /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.0\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: c2hvcnQ=\r\nSec-WebSocket-Version: 13"
+-- | "refuse 400"
+-- | >>> tried handshake "GET /chat HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8"
+-- | "refuse 426 13"
+handshake : Server.Request -> Handshake
+handshake r =
+  if not (strEq r.method "GET")
+  then refused 400 "a WebSocket handshake is a GET"
+  else if not (strEq r.version "HTTP/1.1")
+  then refused 400 "a WebSocket handshake is HTTP/1.1"
+  else if not (says "upgrade" "websocket" r)
+  then refused 400 "no Upgrade: websocket"
+  else if not (says "connection" "upgrade" r)
+  then refused 400 "no Connection: Upgrade"
+  else versioned r (Server.header "sec-websocket-version" r)
+
+-- Frames
+--------------------------------------------------------------------------------
+
+-- | What a frame is: a piece of a message of text or of bytes (the
+-- | pieces after the first `Continuation`), or a control frame, a close,
+-- | a ping or a pong.
+data Opcode = Continuation | Text | Binary | Close | Ping | Pong
+
+-- (its code, on the wire)
+opcodeCode : Opcode -> Int
+opcodeCode Continuation = 0
+opcodeCode Text = 1
+opcodeCode Binary = 2
+opcodeCode Close = 8
+opcodeCode Ping = 9
+opcodeCode Pong = 10
+
+-- (the opcode of a code, if there is one)
+opcodeOf : Int -> Maybe Opcode
+opcodeOf 0 = Just Continuation
+opcodeOf 1 = Just Text
+opcodeOf 2 = Just Binary
+opcodeOf 8 = Just Close
+opcodeOf 9 = Just Ping
+opcodeOf 10 = Just Pong
+opcodeOf _ = Nothing
+
+-- (whether it is a control frame's: never in pieces, 125 bytes at most)
+isControl : Opcode -> Bool
+isControl Close = True
+isControl Ping = True
+isControl Pong = True
+isControl _ = False
+
+-- | A frame: whether it is its message's last (`fin`), what it is, and
+-- | its payload, not masked.
+type Frame = { fin : Bool, opcode : Opcode, payload : Bytes }
+
+-- | What the bytes read so far come to: not yet a frame, at least so
+-- | many bytes more wanted; a frame, and the bytes after it; or a breach
+-- | of the protocol, the close code it is refused with and why.
+data Decoded = More Int | Got Frame Bytes | Broken Int String
+
+-- (the bytes, each xor'd with the key's byte at its place modulo 4: so
+-- a payload is masked, and unmasked)
+masking : Bytes -> Bytes -> Bytes
+masking key p = Bytes.fromList (from (Bytes.length p - 1) Nil)
+  where
+  -- (the bytes from `i` down, before `acc`)
+  from : Int -> List UInt8 -> List UInt8
+  from i acc =
+    if i < 0 then acc
+    else from
+        (i - 1)
+        (xor (Bytes.bytesAt p i) (Bytes.bytesAt key (i % 4)) :: acc)
+
+-- (the frame of `n` bytes in `rest`, after its mask's 4 where it is
+-- masked, and the bytes after it)
+payloadOf : Bool -> Opcode -> Bool -> Int -> Bytes -> Decoded
+payloadOf fin op m n rest =
+  let k : Int = if m then 4 else 0
+  in if Bytes.length rest < k + n then More (k + n - Bytes.length rest)
+  else Got
+      { fin = fin
+      , opcode = op
+      , payload =
+          if m then masking (Bytes.slice rest 0 4) (Bytes.slice rest 4 (4 + n))
+          else Bytes.slice rest 0 n
+      }
+      (Bytes.slice rest (k + n) (Bytes.length rest))
+
+-- (a payload's length checked, `most` bytes at most)
+sized : Int -> Bool -> Opcode -> Bool -> Int -> Bytes -> Decoded
+sized most fin op m n rest =
+  if n > most
+  then Broken 1009 ("a frame of more than " ^ debug most ^ " bytes")
+  else payloadOf fin op m n rest
+
+-- (the payload's length, of its 7 bits, or of the 16 or the 64 after
+-- them, the first of the 64 0)
+lengthOf : Int -> Bool -> Opcode -> Bool -> Int -> Bytes -> Decoded
+lengthOf most fin op m 126 b[n::16, rest::binary] = sized most fin op m n rest
+lengthOf most fin op m 126 rest = More (2 - Bytes.length rest)
+lengthOf most fin op m 127 b[0::1, n::63, rest::binary] =
+  sized most fin op m n rest
+lengthOf most fin op m 127 b[1::1, _::63, rest::binary] =
+  Broken 1002 "a length of 64 bits, its first set"
+lengthOf most fin op m 127 rest = More (8 - Bytes.length rest)
+lengthOf most fin op m n rest = sized most fin op m n rest
+
+-- (a frame's first two bytes checked, then its length read)
+opened : Int
+       -> Bool
+       -> Bool
+       -> Int
+       -> Maybe Opcode
+       -> Bool
+       -> Int
+       -> Bytes
+       -> Decoded
+opened most masked fin rsv Nothing m short rest =
+  Broken 1002 "an opcode not known"
+opened most masked fin rsv (Just op) m short rest =
+  if rsv /= 0 then Broken 1002 "an RSV bit set, no extension negotiated"
+  else if isControl op && not fin
+  then Broken 1002 "a control frame in pieces"
+  else if isControl op && short > 125
+  then Broken 1002 "a control frame of more than 125 bytes"
+  else if masked && not m then Broken 1002 "a client's frame not masked"
+  else if m && not masked then Broken 1002 "a server's frame masked"
+  else lengthOf most fin op m short rest
+
+-- | The first frame of the bytes read so far, a client's, masked, if
+-- | they have one.  Not masked, with an RSV bit set, of an opcode not
+-- | known, or a control frame in pieces or of more than 125 bytes, it is
+-- | refused, 1002; of more than `most` bytes, 1009 (16 MiB unless
+-- | another is given, by name).  `masked := False` reads a server's
+-- | frames, a client's reader, refusing a masked one.  Where the head
+-- | says what it is, it is refused, or not, before the payload comes.
+-- | >>> decodeFrame b[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]
+-- | Got { fin = True, opcode = Text, payload = b["Hello"] } b[]
+-- | >>> decodeFrame b[0x81, 0x85, 0x37, 0xfa]
+-- | More 7
+-- | >>> List.map (\n -> decodeFrame (Bytes.slice b[0x82, 0x83, 1, 2, 3, 4, 5, 6, 7] 0 n)) [0, 1, 2, 6, 8]
+-- | [More 2, More 1, More 7, More 3, More 1]
+-- | >>> decodeFrame b[0x01, 0x83, 0, 0, 0, 0, "Hel", 0x80, 0x82]
+-- | Got { fin = False, opcode = Text, payload = b["Hel"] } b[128, 130]
+-- | >>> decodeFrame b[0x81, 0x05, "Hello"]
+-- | Broken 1002 "a client's frame not masked"
+-- | >>> decodeFrame (masked := False) b[0x81, 0x05, "Hello"]
+-- | Got { fin = True, opcode = Text, payload = b["Hello"] } b[]
+-- | >>> decodeFrame (masked := False) b[0x81, 0x80, 0, 0, 0, 0]
+-- | Broken 1002 "a server's frame masked"
+-- | >>> List.map decodeFrame [b[0xc1, 0x80], b[0x83, 0x80], b[0x09, 0x80], b[0x89, 0xfe, 0, 126]]
+-- | [Broken 1002 "an RSV bit set, no extension negotiated", Broken 1002 "an opcode not known", Broken 1002 "a control frame in pieces", Broken 1002 "a control frame of more than 125 bytes"]
+-- | >>> decodeFrame b[0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 0]
+-- | Broken 1002 "a length of 64 bits, its first set"
+-- | >>> decodeFrame b[0x82, 0xff, 0, 0, 0, 1, 0, 0, 0, 0]
+-- | Broken 1009 "a frame of more than 16777216 bytes"
+-- | >>> decodeFrame (most := 100) b[0x82, 0xfe, 0, 101]
+-- | Broken 1009 "a frame of more than 100 bytes"
+-- | >>> decodeFrame b[0x82, 0xfe, 0, 200, 1, 2, 3, 4]
+-- | More 200
+decodeFrame : {most : Int := 16777216}
+            -> {masked : Bool := True}
+            -> Bytes
+            -> Decoded
+decodeFrame bs = first bs
+  where
+  -- (its first two bytes, if they have come)
+  first : Bytes -> Decoded
+  first b[fin::1, rsv::3, code::4, m::1, short::7, rest::binary] =
+    opened most masked (fin == 1) rsv (opcodeOf code) (m == 1) short rest
+  first b = More (2 - Bytes.length b)
+
+-- (1 for true, 0 for false)
+bit : Bool -> Int
+bit True = 1
+bit False = 0
+
+-- (a frame's head: its first byte, then its mask bit `m` and its length,
+-- in as few bytes as hold it)
+headOf : Frame -> Int -> Bytes
+headOf f m =
+  let n : Int = Bytes.length f.payload
+  in let first : Int = bit f.fin * 128 + opcodeCode f.opcode
+  in if n < 126 then b[first, m::1, n::7]
+  else if n < 65536 then b[first, m::1, 126::7, n::16]
+  else b[first, m::1, 127::7, n::64]
+
+-- (for the examples: whether a frame of `n` bytes, of any value, is
+-- read back whole by `decodeFrame`, after `write` wrote it, masked or
+-- not)
+readBack : (Frame -> Bytes) -> Bool -> Int -> Bool
+readBack write masked n =
+  back
+    (decodeFrame
+       (masked := masked)
+       (write { fin = True, opcode = Binary, payload = sent }))
+  where
+  sent : Bytes
+  sent =
+    Bytes.fromList
+      (List.map (\i -> UInt8.fromInt (i % 251)) (List.range 1 n))
+  back : Decoded -> Bool
+  back (Got f rest) = f.fin && Bytes.length rest == 0 && Bytes.eq f.payload sent
+  back d = False
+
+-- | A frame's bytes, as a server sends it, not masked, its length in as
+-- | few bytes as hold it.
+-- | >>> encodeFrame { fin = True, opcode = Text, payload = b["Hello"] }
+-- | b[129, 5, "Hello"]
+-- | >>> encodeFrame { fin = False, opcode = Binary, payload = Bytes.empty }
+-- | b[2, 0]
+-- | >>> List.map (\n -> Bytes.slice (encodeFrame { fin = True, opcode = Binary, payload = Bytes.fromList (List.replicate n 7) }) 0 10) [125, 126, 65535, 65536]
+-- | [b[130, "}", 7, 7, 7, 7, 7, 7, 7, 7], b[130, "~", 0, "~", 7, 7, 7, 7, 7, 7], b[130, "~", 255, 255, 7, 7, 7, 7, 7, 7], b[130, 127, 0, 0, 0, 0, 0, 1, 0, 0]]
+-- | >>> List.map (readBack encodeFrame False) [0, 125, 126, 65535, 65536]
+-- | [True, True, True, True, True]
+encodeFrame : Frame -> Bytes
+encodeFrame f = Bytes.append (headOf f 0) f.payload
+
+-- | A frame's bytes, as a client sends it, masked by `key`, 32 bits (its
+-- | low 32 bits taken): a client's key is to be new, and not to be
+-- | guessed, for each frame.
+-- | >>> encodeMasked 0x37fa213d { fin = True, opcode = Text, payload = b["Hello"] }
+-- | b[129, 133, "7", 250, "!=", 127, 159, "MQX"]
+-- | >>> List.map (readBack (encodeMasked (0 - 1)) True) [0, 125, 126, 65535, 65536]
+-- | [True, True, True, True, True]
+-- | >>> List.map (readBack (encodeMasked 0x9a0b1c2d) True) [3, 300, 70000]
+-- | [True, True, True]
+encodeMasked : Int -> Frame -> Bytes
+encodeMasked key f =
+  let k : Bytes = b[(and key 4294967295)::32]
+  in Bytes.concat [headOf f 1, k, masking k f.payload]
+
+-- Messages
+--------------------------------------------------------------------------------
+
+-- | A message, whole: text, bytes, a ping or a pong and its payload, or
+-- | a close, its code (1005 where it says none) and why.
+data Message
+  = TextMessage String
+  | BinaryMessage Bytes
+  | PingMessage Bytes
+  | PongMessage Bytes
+  | CloseMessage Int String
+
+-- (a frame of one piece)
+whole : Opcode -> Bytes -> Frame
+whole op p = { fin = True, opcode = op, payload = p }
+
+-- | The frame a message is sent in, whole, in one piece; a close's
+-- | payload its code and why, none for 1005.  A control frame's payload
+-- | is 125 bytes at most: a ping's or a pong's, a close's reason 123.
+-- | >>> List.map (\m -> encodeFrame (frameOf m)) [TextMessage "hi", PingMessage b[1], CloseMessage 1000 "bye", CloseMessage 1005 ""]
+-- | [b[129, 2, "hi"], b[137, 1, 1], b[136, 5, 3, 232, "bye"], b[136, 0]]
+frameOf : Message -> Frame
+frameOf (TextMessage t) = whole Text (Bytes.fromString t)
+frameOf (BinaryMessage p) = whole Binary p
+frameOf (PingMessage p) = whole Ping p
+frameOf (PongMessage p) = whole Pong p
+frameOf (CloseMessage 1005 why) = whole Close Bytes.empty
+frameOf (CloseMessage code why) =
+  whole Close b[code::16, Bytes.fromString why::binary]
+
+-- | Where a client's messages are read up to: the bytes read and not
+-- | yet a whole frame; the pieces of a message begun, its opcode, and
+-- | their bytes, the last first; and whether its close has come, after
+-- | which nothing more is read.
+type Reader =
+  { buffer : Bytes
+  , begun : Maybe Opcode
+  , pieces : List Bytes
+  , size : Int
+  , closed : Bool
+  }
+
+-- | Nothing read.
+reader : Reader
+reader =
+  { buffer = Bytes.empty
+  , begun = Nothing
+  , pieces = Nil
+  , size = 0
+  , closed = False
+  }
+
+-- | What bytes fed to a reader come to: the messages they finish, in
+-- | order, and the reader to read on by; or the messages before a breach
+-- | of the protocol, and the close code it is refused with and why.
+data Fed = Going (List Message) Reader | Failing (List Message) Int String
+
+-- (what a frame comes to: a message, or none yet, and the reader after
+-- it; no whole frame yet; or a breach)
+data Took = Taken (Maybe Message) Reader | Waits Reader | Fails Int String
+
+-- (whether a close may say it: RFC 6455's codes to be sent, the
+-- registered ones after them, and those of 3000 to 4999)
+sendable : Int -> Bool
+sendable c =
+  1000 <= c && c <= 1003 || 1007 <= c && c <= 1014 || 3000 <= c && c <= 4999
+
+-- (the reader once a close has come)
+ended : Reader
+ended = { reader | closed = True }
+
+-- (whether the bytes are UTF-8)
+isUTF8 : Bytes -> Bool
+isUTF8 p = Rune.validString (Bytes.asString p)
+
+-- (a close's payload: none, 1005; else its code, one that may be sent,
+-- and why, in UTF-8)
+closing : Bytes -> Took
+closing b[code::16, why::binary] =
+  if not (sendable code)
+  then Fails 1002 ("a close of code " ^ debug code)
+  else if not (isUTF8 why) then Fails 1007 "a close's reason not UTF-8"
+  else Taken (Just (CloseMessage code (Bytes.asString why))) ended
+closing p =
+  if Bytes.length p == 0 then Taken (Just (CloseMessage 1005 "")) ended
+  else Fails 1002 "a close of one byte"
+
+-- (a message of text or of bytes, whole)
+finished : Reader -> Opcode -> Bytes -> Took
+finished r Text p =
+  if isUTF8 p then Taken (Just (TextMessage (Bytes.asString p))) r
+  else Fails 1007 "text not UTF-8"
+finished r op p = Taken (Just (BinaryMessage p)) r
+
+-- (the first frame of a message of text or of bytes)
+beginning : Reader -> Maybe Opcode -> Opcode -> Frame -> Took
+beginning r (Just _) op f =
+  Fails 1002 "a message begun before the one before it ended"
+beginning r Nothing op f =
+  if f.fin then finished r op f.payload
+  else Taken
+      Nothing
+      { r
+      | begun = Just op
+      , pieces = [f.payload]
+      , size = Bytes.length f.payload
+      }
+
+-- (a piece of the message begun, of `most` bytes at most in all)
+continuing : Int -> Reader -> Maybe Opcode -> Frame -> Took
+continuing most r Nothing f = Fails 1002 "a continuation of no message"
+continuing most r (Just op) f =
+  let size : Int = r.size + Bytes.length f.payload
+  in if size > most
+  then Fails 1009 ("a message of more than " ^ debug most ^ " bytes")
+  else if f.fin
+  then finished
+      { r | begun = Nothing, pieces = Nil, size = 0 }
+      op
+      (Bytes.concat (List.reverse (f.payload :: r.pieces)))
+  else Taken Nothing { r | pieces = f.payload :: r.pieces, size = size }
+
+-- (a frame read, by its opcode)
+applied : Int -> Reader -> Opcode -> Frame -> Took
+applied most r Ping f = Taken (Just (PingMessage f.payload)) r
+applied most r Pong f = Taken (Just (PongMessage f.payload)) r
+applied most r Close f = closing f.payload
+applied most r Continuation f = continuing most r r.begun f
+applied most r op f = beginning r r.begun op f
+
+-- (what the frame decoded comes to)
+framed : Int -> Reader -> Decoded -> Took
+framed most r (More n) = Waits r
+framed most r (Broken code why) = Fails code why
+framed most r (Got f rest) = applied most { r | buffer = rest } f.opcode f
+
+-- (for the examples: what bytes fed come to -- the messages, then how
+-- many bytes are left in the reader and whether it is closed, or the
+-- code and why it broke)
+fed : Fed -> Pair (List Message) String
+fed (Going ms r) =
+  MkPair
+    ms
+    (debug (Bytes.length r.buffer)
+     ^ " left"
+     ^ (if r.closed then ", closed" else ""))
+fed (Failing ms code why) = MkPair ms (debug code ^ ": " ^ why)
+
+-- (for the examples: the reader to read on by)
+feedOn : Fed -> Reader
+feedOn (Going ms r) = r
+feedOn (Failing ms code why) = reader
+
+-- | The bytes read next given to a reader: the messages they finish, and
+-- | the reader to read on by; or, where they break the protocol, the
+-- | messages before, and the close code and why.  A message in pieces is
+-- | put together, and a ping, a pong or a close between its pieces is a
+-- | message of its own.  A close is the last: what comes after it is not
+-- | read.  `most` and `masked` are `decodeFrame`'s, `most` a message's
+-- | too.
+-- | >>> fed (feed reader b[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58])
+-- | MkPair [TextMessage "Hello"] "0 left"
+-- | >>> fed (feed reader (Bytes.concat [encodeMasked 5 (whole Ping b["a"]), encodeMasked 6 (whole Binary b[1, 2])]))
+-- | MkPair [PingMessage b["a"], BinaryMessage b[1, 2]] "0 left"
+-- | >>> fed (feed reader (Bytes.slice (encodeMasked 5 (whole Text b["hi"])) 0 5))
+-- | MkPair [] "5 left"
+-- | >>> fed (feed (feedOn (feed reader (Bytes.slice (encodeMasked 5 (whole Text b["hi"])) 0 5))) (Bytes.slice (encodeMasked 5 (whole Text b["hi"])) 5 8))
+-- | MkPair [TextMessage "hi"] "0 left"
+-- | >>> feed reader (Bytes.concat [encodeMasked 1 { fin = False, opcode = Text, payload = b["Hel"] }, encodeMasked 2 (whole Ping b["?"]), encodeMasked 3 { fin = False, opcode = Continuation, payload = b["l"] }, encodeMasked 4 (whole Continuation b["o"]), encodeMasked 5 (whole Pong Bytes.empty)])
+-- | Going [PingMessage b["?"], TextMessage "Hello", PongMessage b[]] { buffer = b[], begun = Nothing, pieces = [], size = 0, closed = False }
+-- | >>> fed (feed (feedOn (feed reader (encodeMasked 1 { fin = False, opcode = Binary, payload = b[1] }))) (encodeMasked 2 (whole Continuation b[2])))
+-- | MkPair [BinaryMessage b[1, 2]] "0 left"
+-- | >>> fed (feed reader (Bytes.concat [encodeMasked 1 (frameOf (CloseMessage 1000 "bye")), encodeMasked 2 (whole Text b["after"])]))
+-- | MkPair [CloseMessage 1000 "bye"] "0 left, closed"
+-- | >>> List.map (\p -> fed (feed reader (encodeMasked 1 (whole Close p)))) [b[], b[3, 232]]
+-- | [MkPair [CloseMessage 1005 ""] "0 left, closed", MkPair [CloseMessage 1000 ""] "0 left, closed"]
+-- | >>> List.map (\p -> fed (feed reader (encodeMasked 1 (whole Close p)))) [b[3], b[3, 236], b[0, 1], b[3, 232, 0xff]]
+-- | [MkPair [] "1002: a close of one byte", MkPair [] "1002: a close of code 1004", MkPair [] "1002: a close of code 1", MkPair [] "1007: a close's reason not UTF-8"]
+-- | >>> fed (feed reader (Bytes.concat [encodeMasked 1 (whole Text b["ok"]), encodeMasked 2 (whole Text b[0xc3, 0x28])]))
+-- | MkPair [TextMessage "ok"] "1007: text not UTF-8"
+-- | >>> fed (feed reader (encodeMasked 1 (whole Binary b[0xc3, 0x28])))
+-- | MkPair [BinaryMessage b[195, "("]] "0 left"
+-- | >>> List.map (\b -> fed (feed reader b)) [encodeMasked 1 (whole Continuation b["x"]), Bytes.concat [encodeMasked 1 { fin = False, opcode = Text, payload = b["x"] }, encodeMasked 1 (whole Text b["y"])]]
+-- | [MkPair [] "1002: a continuation of no message", MkPair [] "1002: a message begun before the one before it ended"]
+-- | >>> fed (feed (most := 4) reader (Bytes.concat [encodeMasked 1 { fin = False, opcode = Text, payload = b["abc"] }, encodeMasked 2 (whole Continuation b["de"])]))
+-- | MkPair [] "1009: a message of more than 4 bytes"
+-- | >>> fed (feed reader b[0x81, 0x05, "Hello"])
+-- | MkPair [] "1002: a client's frame not masked"
+feed : {most : Int := 16777216}
+     -> {masked : Bool := True}
+     -> Reader
+     -> Bytes
+     -> Fed
+feed r bs = from Nil { r | buffer = Bytes.append r.buffer bs }
+  where
+  -- (the frames of the reader's buffer read, after the messages `got`,
+  -- the last first)
+  from : List Message -> Reader -> Fed
+  from got r = after got (step r)
+    where
+    -- (one frame, if the reader is not closed)
+    step : Reader -> Took
+    step r =
+      if r.closed then Waits r
+      else framed
+          most
+          r
+          (decodeFrame (most := most) (masked := masked) r.buffer)
+    -- (on after a frame)
+    after : List Message -> Took -> Fed
+    after got (Waits r) = Going (List.reverse got) r
+    after got (Fails code why) = Failing (List.reverse got) code why
+    after got (Taken Nothing r) = from got r
+    after got (Taken (Just m) r) = from (m :: got) r

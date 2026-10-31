@@ -1,0 +1,292 @@
+-- Public-key signatures, as JSON Web Signatures have them (RFC 7518):
+-- a message signed with a private key, which only its holder can do,
+-- and verified with the public key, which anyone can.  Keys are read
+-- from PEM -- PKCS#8 and SubjectPublicKeyInfo, and RSA's and EC's own
+-- (`BEGIN RSA PRIVATE KEY`) -- or made from a JSON Web Key's fields,
+-- each already decoded from base64url (std.base64's `decodeURL`).
+--
+-- | Algorithm | What signs | The key |
+-- |---|---|---|
+-- | `RS256` | RSASSA-PKCS1-v1_5, SHA-256 | RSA |
+-- | `PS256` | RSASSA-PSS, SHA-256, a salt of 32 bytes | RSA |
+-- | `ES256` | ECDSA, SHA-256; `r` and `s`, 32 bytes each | P-256 |
+-- | `EdDSA` | Ed25519 | Ed25519 |
+--
+-- An effect, done by the host: OpenSSL's libcrypto, 3.0 or later, in a
+-- C program alone (pkg-config's `libcrypto`, linked into every program
+-- that imports the module).  A page cannot import it.  A key is the
+-- host's, let go of when the program drops it.  A key or a signature
+-- that cannot be made is `Left` of why; a signature that is not the
+-- key's of the message, or not of the algorithm's shape, or by a key
+-- of another kind, is not verified: `False`.
+--
+-- ```haskell
+-- import bytes as Bytes
+-- import co
+-- import std.base64 as Base64
+-- import std.crypto as Crypto
+--
+-- -- | a JWS's signing input, `header.payload`, signed by RS256 with a
+-- -- | key read from PEM: the JWS, its signature after them
+-- signed : {e : HFunctor}
+--        -> {{c : Crypto.crypto <: e}}
+--        -> String
+--        -> String
+--        -> Co e (Either String String)
+-- signed pem input = do
+--   key <- Crypto.privateKeyFromPem pem
+--   case key of
+--     Left why -> pure (Left why)
+--     Right k -> do
+--       s <- Crypto.sign RS256 k (Bytes.fromString input)
+--       pure (case s of
+--         Left why -> Left why
+--         Right sig -> Right (input ^ "." ^ Base64.encodeURL sig))
+-- ```
+
+module std.crypto
+
+import co
+import ffi as FFI
+
+-- | A private key, the host's: no value of the program has it.
+data PrivateKey
+
+-- | A public key, the host's.
+data PublicKey
+
+-- | What a signature is made by, as JWS names it (its `alg`).
+data Algorithm = RS256 | PS256 | ES256 | EdDSA
+
+data CryptoF (m : Type -> Type) x
+  = PrivatePem String (Either FFI.Errno PrivateKey -> x)
+  | PublicPem String (Either FFI.Errno PublicKey -> x)
+  | RsaJwk Bytes Bytes (Either FFI.Errno PublicKey -> x)
+  | P256Jwk Bytes Bytes (Either FFI.Errno PublicKey -> x)
+  | Ed25519Jwk Bytes (Either FFI.Errno PublicKey -> x)
+  | PublicOf PrivateKey (PublicKey -> x)
+  | PublicPemOf PublicKey (String -> x)
+  | Sign Int PrivateKey Bytes (Either FFI.Errno Bytes -> x)
+  | Verify Int PublicKey Bytes Bytes (Bool -> x)
+  | Why (String -> x)
+
+-- | Signatures: keys read and made, messages signed and verified.
+crypto : HFunctor
+crypto =
+  { f = CryptoF
+  , hfmap = \m g p -> case p of
+      PrivatePem pem k -> PrivatePem pem (\r -> g (k r))
+      PublicPem pem k -> PublicPem pem (\r -> g (k r))
+      RsaJwk n e k -> RsaJwk n e (\r -> g (k r))
+      P256Jwk x y k -> P256Jwk x y (\r -> g (k r))
+      Ed25519Jwk x k -> Ed25519Jwk x (\r -> g (k r))
+      PublicOf key k -> PublicOf key (\r -> g (k r))
+      PublicPemOf key k -> PublicPemOf key (\r -> g (k r))
+      Sign a key msg k -> Sign a key msg (\r -> g (k r))
+      Verify a key msg sig k -> Verify a key msg sig (\r -> g (k r))
+      Why k -> Why (\r -> g (k r))
+  , hmap = \m n nt p -> case p of
+      PrivatePem pem k -> PrivatePem pem k
+      PublicPem pem k -> PublicPem pem k
+      RsaJwk n e k -> RsaJwk n e k
+      P256Jwk x y k -> P256Jwk x y k
+      Ed25519Jwk x k -> Ed25519Jwk x k
+      PublicOf key k -> PublicOf key k
+      PublicPemOf key k -> PublicPemOf key k
+      Sign a key msg k -> Sign a key msg k
+      Verify a key msg sig k -> Verify a key msg sig k
+      Why k -> Why k
+  }
+
+-- (a key, as C has it: an `EVP_PKEY`, `EVP_PKEY_free` letting it go)
+key : FFI.CType
+key = FFI.pointer "EVP_PKEY" "EVP_PKEY_free"
+
+-- | The operations, each a function of the module's C, on OpenSSL's.
+cryptoInC : FFI.Described
+cryptoInC =
+  FFI.describe
+    ["<openssl/evp.h>"]
+    [ FFI.operation
+      "PrivatePem"
+      (FFI.fun "cr_private_pem" [FFI.string] (FFI.givesOrErrno key))
+    , FFI.operation
+      "PublicPem"
+      (FFI.fun "cr_public_pem" [FFI.string] (FFI.givesOrErrno key))
+    , FFI.operation
+      "RsaJwk"
+      (FFI.fun "cr_rsa_jwk" [FFI.bytes, FFI.bytes] (FFI.givesOrErrno key))
+    , FFI.operation
+      "P256Jwk"
+      (FFI.fun "cr_p256_jwk" [FFI.bytes, FFI.bytes] (FFI.givesOrErrno key))
+    , FFI.operation
+      "Ed25519Jwk"
+      (FFI.fun "cr_ed25519_jwk" [FFI.bytes] (FFI.givesOrErrno key))
+    , FFI.operation "PublicOf" (FFI.fun "cr_public_of" [key] (FFI.gives key))
+    , FFI.operation
+      "PublicPemOf"
+      (FFI.fun "cr_public_pem_of" [key] (FFI.gives FFI.ownedString))
+    , FFI.operation
+      "Sign"
+      (FFI.fun
+         "cr_sign"
+         [FFI.int, key, FFI.bytes]
+         (FFI.givesOrErrno FFI.ownedBytes))
+    , FFI.operation
+      "Verify"
+      (FFI.fun
+         "cr_verify"
+         [FFI.int, key, FFI.bytes, FFI.bytes]
+         (FFI.gives FFI.bool))
+    , FFI.operation "Why" (FFI.fun "cr_why_of" [] (FFI.gives FFI.string))
+    ]
+
+-- | What the module's C is linked with: libcrypto.
+cryptoLinks : FFI.Links
+cryptoLinks = { pkgConfig = ["libcrypto"] }
+
+-- | The algorithm's name, JWS's `alg`.
+-- | >>> name ES256
+-- | "ES256"
+name : Algorithm -> String
+name RS256 = "RS256"
+name PS256 = "PS256"
+name ES256 = "ES256"
+name EdDSA = "EdDSA"
+
+-- | The algorithm JWS names so, if it is one of these.
+-- | >>> maybe "none" name (named "EdDSA")
+-- | "EdDSA"
+-- | >>> maybe "none" name (named "HS256")
+-- | "none"
+named : String -> Maybe Algorithm
+named "RS256" = Just RS256
+named "PS256" = Just PS256
+named "ES256" = Just ES256
+named "EdDSA" = Just EdDSA
+named _ = Nothing
+
+-- | As JWS names it.
+-- | >>> show (PS256 : Algorithm)
+-- | "PS256"
+instance instanceShowAlgorithm : Show Algorithm
+instanceShowAlgorithm = { show = name }
+
+-- | The same algorithm.
+-- | >>> (RS256 : Algorithm) == RS256 && (RS256 : Algorithm) /= PS256
+-- | True
+instance instanceEqualityAlgorithm : Equality Algorithm
+instanceEqualityAlgorithm = { equal = \x y -> strEq (name x) (name y) }
+
+-- (the algorithm, as the module's C numbers it)
+codeOf : Algorithm -> Int
+codeOf RS256 = 0
+codeOf PS256 = 1
+codeOf ES256 = 2
+codeOf EdDSA = 3
+
+-- (why the last operation that failed did)
+why : {e : HFunctor} -> {{ev : crypto <: e}} -> Co e String
+why = op (ev (Why (\s -> s))) val
+
+-- (what C gave, a failure said as why)
+said : {e : HFunctor}
+     -> {a : Type}
+     -> {{ev : crypto <: e}}
+     -> Either FFI.Errno a
+     -> Co e (Either String a)
+said (Right x) = pure (Right x)
+said (Left _) = do
+  w <- why
+  pure (Left w)
+
+-- | The private key a PEM holds: PKCS#8 (`BEGIN PRIVATE KEY`), or RSA's
+-- | or EC's own (`BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`); not
+-- | one encrypted.
+privateKeyFromPem : {e : HFunctor}
+                  -> {{ev : crypto <: e}}
+                  -> String
+                  -> Co e (Either String PrivateKey)
+privateKeyFromPem pem = do
+  r <- op (ev (PrivatePem pem (\r -> r))) val
+  said r
+
+-- | The public key a PEM holds: SubjectPublicKeyInfo
+-- | (`BEGIN PUBLIC KEY`), or RSA's own (`BEGIN RSA PUBLIC KEY`).
+publicKeyFromPem : {e : HFunctor}
+                 -> {{ev : crypto <: e}}
+                 -> String
+                 -> Co e (Either String PublicKey)
+publicKeyFromPem pem = do
+  r <- op (ev (PublicPem pem (\r -> r))) val
+  said r
+
+-- | An RSA public key, of a JWK's `n` and `e`: the modulus and the
+-- | exponent, big-endian.
+rsaPublicKey : {e : HFunctor}
+             -> {{ev : crypto <: e}}
+             -> Bytes
+             -> Bytes
+             -> Co e (Either String PublicKey)
+rsaPublicKey n x = do
+  r <- op (ev (RsaJwk n x (\r -> r))) val
+  said r
+
+-- | A P-256 public key, of a JWK's `x` and `y` (its `crv` `P-256`): the
+-- | point's coordinates, 32 bytes each, a point of the curve.
+p256PublicKey : {e : HFunctor}
+              -> {{ev : crypto <: e}}
+              -> Bytes
+              -> Bytes
+              -> Co e (Either String PublicKey)
+p256PublicKey x y = do
+  r <- op (ev (P256Jwk x y (\r -> r))) val
+  said r
+
+-- | An Ed25519 public key, of a JWK's `x` (its `crv` `Ed25519`): 32
+-- | bytes.
+ed25519PublicKey : {e : HFunctor}
+                 -> {{ev : crypto <: e}}
+                 -> Bytes
+                 -> Co e (Either String PublicKey)
+ed25519PublicKey x = do
+  r <- op (ev (Ed25519Jwk x (\r -> r))) val
+  said r
+
+-- | The public key of a private one, a key of its own, nothing private
+-- | in it: what verifies what it signs.
+publicOf : {e : HFunctor}
+         -> {{ev : crypto <: e}}
+         -> PrivateKey
+         -> Co e PublicKey
+publicOf k = op (ev (PublicOf k (\r -> r))) val
+
+-- | The message signed by the algorithm with the key: `Left` where the
+-- | key is not of the algorithm's kind.
+sign : {e : HFunctor}
+     -> {{ev : crypto <: e}}
+     -> Algorithm
+     -> PrivateKey
+     -> Bytes
+     -> Co e (Either String Bytes)
+sign a k msg = do
+  r <- op (ev (Sign (codeOf a) k msg (\r -> r))) val
+  said r
+
+-- | `verify a key message signature`: whether the signature is the
+-- | key's of the message, by the algorithm.
+verify : {e : HFunctor}
+       -> {{ev : crypto <: e}}
+       -> Algorithm
+       -> PublicKey
+       -> Bytes
+       -> Bytes
+       -> Co e Bool
+verify a k msg sig = op (ev (Verify (codeOf a) k msg sig (\r -> r))) val
+
+-- | The public key as PEM, SubjectPublicKeyInfo (`BEGIN PUBLIC KEY`).
+publicKeyToPem : {e : HFunctor}
+               -> {{ev : crypto <: e}}
+               -> PublicKey
+               -> Co e String
+publicKeyToPem k = op (ev (PublicPemOf k (\r -> r))) val

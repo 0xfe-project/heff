@@ -22,6 +22,9 @@ library declares them.
 - `lib/std/`'s effects are the system's, with C providers: `std.io`,
   `std.filesystem`, `std.process`, `std.progress`, `std.http`,
   `std.net`, `std.reactor`, `std.signal`, `std.terminal`.
+- `std.crypto`'s signatures are C's alone, OpenSSL's libcrypto (3.0 or
+  later) linked into the program by pkg-config's `libcrypto`: a program
+  importing it is built where libcrypto's headers and pkg-config are.
 - `std.reference` and `std.time` have both a C and a JavaScript
   provider.
 - `lib/browser/`'s are the browser's, JavaScript only: `browser.dom`,
