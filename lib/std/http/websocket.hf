@@ -1,12 +1,13 @@
--- WebSocket (RFC 6455), as a server speaks it, its pure part: a
--- handshake checked and answered, frames read and written, and the
--- frames a client sends put together into its messages.  Nothing here
--- reads or writes a socket: a server that has answered a handshake by
--- `101 Switching Protocols`, with `upgradeHeaders`, gives what it reads
--- to `feed`, which says the messages it finishes and the reader to read
--- on by, and writes `encodeFrame` of what it answers.  Import it by a
--- name, `import std.http.websocket as WebSocket`, beside `import
--- std.http.server as Server`, whose `Request` a handshake is.
+-- WebSocket (RFC 6455), as a server speaks it: a handshake checked and
+-- answered, frames read and written, and the frames a client sends put
+-- together into its messages -- its pure part -- and, over a connection
+-- std.http.server has handed over, messages received and sent.  The
+-- pure part reads and writes no socket: a server that has answered a
+-- handshake by `101 Switching Protocols`, with `upgradeHeaders`, gives
+-- what it reads to `feed`, which says the messages it finishes and the
+-- reader to read on by, and writes `encodeFrame` of what it answers.
+-- Import it by a name, `import std.http.websocket as WebSocket`, beside
+-- `import std.http.server as Server`, whose `Request` a handshake is.
 --
 -- ```haskell
 -- import bytes as Bytes
@@ -31,6 +32,55 @@
 -- refused, 1007; any other breach of the protocol, 1002.  What is
 -- refused is `Failing`, the code and why: a server sends them in a close
 -- frame, `frameOf (CloseMessage code why)`, and closes the connection.
+--
+-- Over std.http.server, which serves one connection at a time, a
+-- handler answers a request asking for WebSocket by `accept`, given the
+-- function the connection is then for: its handshake refused, a response
+-- whole; else `101 Switching Protocols`, and the function given a
+-- `Connection`, whose messages it pulls, one `receive` at a time, and
+-- answers by `send`.  A `receive` gives the next message of text or of
+-- bytes, and the connection to receive the one after by (the reader's
+-- state is in it, a value as the reader is); a ping on the way is
+-- answered by a pong, a close by a close and the end, a breach of the
+-- protocol by a close of its code and the end.  `close` ends it from the
+-- server's side.  A read or a write that fails, or waits longer than
+-- `idle` milliseconds -- 30 seconds unless another is given, by name,
+-- `WebSocket.accept (idle := 0) r echo`, 0 no limit -- throws its
+-- `NetError`, as a streamed body's `yield` does; `accept` hears it, and
+-- the server closes the connection.
+--
+-- ```haskell
+-- import co
+-- import exception
+-- import std.http.server as Server
+-- import std.http.websocket as WebSocket
+-- import std.net as Net
+--
+-- -- | each message sent back as it came, until the connection ends
+-- echo : {e : HFunctor}
+--      -> {s : Type}
+--      -> {{nt : Net.net <: e}}
+--      -> {{ex : exception Net.NetError <: e}}
+--      -> WebSocket.Connection s
+--      -> Co e Unit
+-- echo ws = bind (WebSocket.receive ws) echoed
+--   where
+--   echoed : WebSocket.Received s -> Co e Unit
+--   echoed (Arrived m next) = bind (WebSocket.send next m) (\u -> echo next)
+--   echoed (Ended code why) = pure MkUnit
+--
+-- -- | `/echo` a WebSocket's, its messages echoed; any other target, 404
+-- answer : {e : HFunctor}
+--        -> {{nt : Net.net <: e}}
+--        -> {{ex : exception Net.NetError <: e}}
+--        -> Server.Request
+--        -> Co e (Server.Reply e)
+-- answer r =
+--   if strEq r.target "/echo" then pure (WebSocket.accept r echo)
+--   else pure (Whole (Server.plain 404 "no such thing\n"))
+-- ```
+--
+-- It is served as any handler is: `Server.serve l answer`.
 
 module std.http.websocket
   ( acceptKey
@@ -49,16 +99,26 @@ module std.http.websocket
   , reader
   , Fed(..)
   , feed
+  , Connection
+  , Received(..)
+  , send
+  , receive
+  , close
+  , accept
   )
 
 import bytes as Bytes
+import co
+import exception
 import int as Int
 import rune as Rune
 import std.base64 as Base64
 import std.http as HTTP
 import std.http.server as Server
+import std.net as Net
 import std.sha1 as SHA1
 import uint8 as UInt8
+import resource
 
 -- The handshake
 --------------------------------------------------------------------------------
@@ -617,3 +677,173 @@ feed r bs = from Nil { r | buffer = Bytes.append r.buffer bs }
     after got (Fails code why) = Failing (List.reverse got) code why
     after got (Taken Nothing r) = from got r
     after got (Taken (Just m) r) = from (m :: got) r
+
+-- Over a connection taken over
+--------------------------------------------------------------------------------
+
+-- | A WebSocket connection, a server's, its handshake answered: the
+-- | request that asked for it, the connection, what was fed to its
+-- | reader and is not yet received, how long a read or a write waits
+-- | (`idle`, 0 no limit) and how long a message may be (`most`).  A
+-- | `receive` gives the connection to receive the next message by: the
+-- | one before is done with, its reader behind the connection's.
+type Connection s =
+  { request : Server.Request
+  , connection : With s Net.TcpStream
+  , fed : Fed
+  , idle : Int
+  , most : Int
+  }
+
+-- | What a `receive` comes to: a message of text or of bytes, and the
+-- | connection to receive the next by (`Arrived`); or the connection's
+-- | end (`Ended`), the code of the close that ended it and why -- the
+-- | client's, or the one sent for the client's breach of the protocol;
+-- | 1006 where it ended with no close.
+data Received s = Arrived Message (Connection s) | Ended Int String
+
+-- (how much is read at a time)
+readSize : Int
+readSize = 65536
+
+-- | A message sent, in a frame of its own, not masked, as a server's is.
+-- | Not written within `idle` -- the client gone, or not reading -- the
+-- | write's `NetError` is thrown.
+send : {e : HFunctor}
+     -> {s : Type}
+     -> {{nt : Net.net <: e}}
+     -> {{ex : exception Net.NetError <: e}}
+     -> Connection s
+     -> Message
+     -> Co e Unit
+send c m =
+  bind
+    (Net.write (timeout := c.idle) c.connection (encodeFrame (frameOf m)))
+    (either throw pure)
+
+-- | The client's next message of text or of bytes, and the connection to
+-- | receive the one after by.  A ping on the way is answered by a pong, a
+-- | pong let go of.  A close is answered by a close of its code, and is
+-- | the end: `Ended`, its code and why.  A frame breaking the protocol is
+-- | answered by a close of its code and why (`feed`'s), and is the end
+-- | too.  Where the client ends the connection with no close, the end is
+-- | 1006.  Where nothing comes within `idle`, or a read fails, its
+-- | `NetError` is thrown.
+receive : {e : HFunctor}
+        -> {s : Type}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Connection s
+        -> Co e (Received s)
+receive c = from c.fed
+  where
+  -- (the next message of what was fed, and of what is read after it)
+  from : Fed -> Co e (Received s)
+  from f = next f
+    where
+    -- (the bytes read fed to the reader: none, the connection's end)
+    more : Reader -> Either Net.NetError Bytes -> Co e (Received s)
+    more r (Left err) = throw err
+    more r (Right b) =
+      if Bytes.length b == 0 then pure (Ended 1006 "")
+      else from (feed (most := c.most) r b)
+    -- (a message, the rest of what was fed after it)
+    took : Message -> Fed -> Co e (Received s)
+    took (PingMessage p) rest = bind (send c (PongMessage p)) (\u -> from rest)
+    took (PongMessage p) rest = from rest
+    took (CloseMessage code why) rest =
+      bind (send c (CloseMessage code "")) (\u -> pure (Ended code why))
+    took m rest = pure (Arrived m { c | fed = rest })
+    -- (a message of what was fed, or its end; none left, more read)
+    next : Fed -> Co e (Received s)
+    next (Going Nil r) =
+      bind (Net.read (timeout := c.idle) c.connection readSize) (more r)
+    next (Going (m :: ms) r) = took m (Going ms r)
+    next (Failing Nil code why) =
+      bind (send c (CloseMessage code why)) (\u -> pure (Ended code why))
+    next (Failing (m :: ms) code why) = took m (Failing ms code why)
+
+-- | A close sent, its code and why, and the client's close waited for,
+-- | the messages before it let go of: the end of the connection, which
+-- | the server then closes.  Where the client's close does not come
+-- | within `idle`, or the client ends the connection, or breaks the
+-- | protocol, it is not waited for any longer.  Where the close is not
+-- | written, its `NetError` is thrown.
+close : {e : HFunctor}
+      -> {s : Type}
+      -> {{nt : Net.net <: e}}
+      -> {{ex : exception Net.NetError <: e}}
+      -> Connection s
+      -> Int
+      -> String
+      -> Co e Unit
+close c code why = bind (send c (CloseMessage code why)) (\u -> awaited c.fed)
+  where
+  -- (until the client's close: its reader closed by it)
+  awaited : Fed -> Co e Unit
+  awaited (Failing ms code why) = pure MkUnit
+  awaited (Going ms r) =
+    if r.closed then pure MkUnit
+    else bind (Net.read (timeout := c.idle) c.connection readSize) (more r)
+    where
+    -- (the bytes read fed to the reader: none, or a read failed, the end)
+    more : Reader -> Either Net.NetError Bytes -> Co e Unit
+    more r (Left err) = pure MkUnit
+    more r (Right b) =
+      if Bytes.length b == 0 then pure MkUnit
+      else awaited (feed (most := c.most) r b)
+
+-- (the connection taken over given to `f`, what was read after the
+-- request fed first: what it throws of `NetError` heard, the end of it)
+session : {e : HFunctor}
+        -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
+        -> Int
+        -> Int
+        -> ({s : Type} -> Connection s -> Co e Unit)
+        -> {s : Type}
+        -> Server.Taken s
+        -> Co e Unit
+session idle most f t = do
+  try
+    f
+        { request = t.request
+        , connection = t.connection
+        , fed = feed (most := most) reader t.rest
+        , idle = idle
+        , most = most
+        }
+  catch (err : Net.NetError) ->
+    pure MkUnit
+
+-- (the handshake answered: `101`, the connection then `f`'s; or refused)
+answered : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
+         -> Int
+         -> Int
+         -> ({s : Type} -> Connection s -> Co e Unit)
+         -> Handshake
+         -> Server.Reply e
+answered idle most f (Accept key) =
+  TakenOver 101 (upgradeHeaders key) (session idle most f)
+answered idle most f (Refuse res) = Whole res
+
+-- | A std.http.server handler's reply to a request asking for WebSocket:
+-- | its handshake checked (`handshake`), and refused, a response whole;
+-- | or answered, `101 Switching Protocols`, and the connection given to
+-- | `f`, the server done with it once `f` is.  What `f` throws of
+-- | `NetError` -- a write not done, a read failed, the client silent for
+-- | `idle` milliseconds (30 seconds unless another is given, by name; 0
+-- | for no limit) -- is heard there, and the connection closed.  A
+-- | message is at most `most` bytes (16 MiB unless another is given), or
+-- | the connection is closed, 1009.
+accept : {e : HFunctor}
+       -> {idle : Int := 30000}
+       -> {most : Int := 16777216}
+       -> {{nt : Net.net <: e}}
+       -> {{ex : exception Net.NetError <: e}}
+       -> Server.Request
+       -> ({s : Type} -> Connection s -> Co e Unit)
+       -> Server.Reply e
+accept r f = answered idle most f (handshake r)
