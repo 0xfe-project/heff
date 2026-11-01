@@ -2908,6 +2908,82 @@ worldFirst e sp since n headTy a t = do
       _ -> pure MkUnit
     Nothing -> pure MkUnit
 
+-- (whether one of the metavariables `ms` was made since `since`)
+madeSince : Int -> List Int -> Bool
+madeSince since [] = False
+madeSince since (m :: ms) = m >= since || madeSince since ms
+
+-- (how many of the problems postponed failed)
+failedCount : List Postponed -> Int
+failedCount [] = 0
+failedCount (p :: ps) = (if p.failed then 1 else 0) + failedCount ps
+
+-- (what went wrong so far: the diagnostics kept, the problems failed)
+failures : StCore -> Int
+failures c = List.length c.recovered + failedCount c.postponed
+
+-- (a try given up: the state, and the checks waiting, as they were)
+undoneTo : StCore -> Saved -> Elab (Maybe Memoed.El)
+undoneTo before waiting = do
+  modify (backTo before)
+  restoreWaiting waiting
+  pure Nothing
+
+-- (whether a try went well: nothing more went wrong, and no more
+-- problems wait than before it)
+wentWell : StCore -> StCore -> Bool
+wentWell c0 c1 =
+  failures c1 == failures c0
+  && List.length c1.postponed <= List.length c0.postponed
+
+-- (what `applied` comes to, its arguments elaborated, where nothing went
+-- wrong in them -- an instance argument whose type is known, found now
+-- or refused; else nothing of it is kept, back to `before`)
+argumentsFirst : ElabEnv -> StCore -> Saved -> Syn -> Elab (Maybe Memoed.El)
+argumentsFirst e before waiting applied = do
+  c0 <- gets (\c -> c)
+  r <-
+    tryE (do
+      pm <- runSyn applied e
+      Meta.runDelayed False
+      found <- Meta.resolveWanteds False
+      pure (fst pm))
+  c1 <- gets (\c -> c)
+  case r of
+    Right m -> if wentWell c0 c1 then pure (Just m) else undoneTo before waiting
+    Left _ -> undoneTo before waiting
+
+-- | an application checked at a value's type `a`, its type said first,
+-- | where that type, `r` (whatever its arguments are), has a
+-- | metavariable of the head's (made since `since`) that `a` would
+-- | decide: the two unified, then the arguments elaborated knowing it.
+-- | A value of another type may still be coerced to `a` (a `String`
+-- | given where a `Path` is): where the arguments do not elaborate so,
+-- | nothing of the try is kept, and `fallback` is the application, as
+-- | `apply` coerces it
+valueFirst : ElabEnv
+           -> Params.Span
+           -> Int
+           -> Value.Ty
+           -> Syn
+           -> (Unit -> Elab Memoed.El)
+           -> Maybe Value.Ty
+           -> Elab Memoed.El
+valueFirst e sp since a applied fallback Nothing = fallback MkUnit
+valueFirst e sp since a applied fallback (Just t) = do
+  mc <- gets (\c -> c.metas)
+  if not (madeSince since (metasLeft e mc t)) then fallback MkUnit
+  else do
+    before <- gets (\c -> c)
+    waiting <- saveDelayed
+    whole <- unifiedFirst e sp a t
+    if not whole then fallback MkUnit
+    else do
+      got <- argumentsFirst e before waiting applied
+      case got of
+        Just m -> pure m
+        Nothing -> fallback MkUnit
+
 -- | an application of `head` to `n` explicit arguments (`elims`, each
 -- | one's elimination), checked at a function type `a` (a
 -- | computation's, `Co e a`), its type said first: the head's
@@ -2918,7 +2994,9 @@ worldFirst e sp since n headTy a t = do
 -- | its statements, and a statement's evidence is found as it is wanted
 -- | (where the two do not unify so, as an application at a type it is
 -- | coerced to, nothing of it is kept, and they are unified after, as
--- | `apply` does).  `nominal`: in descriptive position, the application
+-- | `apply` does).  Checked at a value's type, as `valueFirst` says it,
+-- | the arguments tried so and, where they fail, the application coerced
+-- | as `apply` does.  `nominal`: in descriptive position, the application
 -- | elaborated as nominal and its result marked so; `firstSp`, where the
 -- | head's implicit arguments are said to be, as its first argument's
 -- | elimination says them
@@ -2932,11 +3010,10 @@ applyResultFirst : Params.Span
 applyResultFirst sp firstSp nominal head n elims =
   MkChk (\e a0 -> do
     a <- Meta.forceT a0
-    -- (only a computation's type, a function's, is said first: a value
-    -- of another type may be coerced to it once it is elaborated, as a
-    -- `String` given where a `Path` is, and the arguments are not to be
-    -- held to the type it is coerced to)
-    if not (explicitPi a) then runChk (apply sp (markedIf (elims head))) e a0
+    -- (an implicit function's type, or one not known yet, says nothing
+    -- first)
+    if isImplicitPi a || Unify.isFlexTy a
+    then runChk (apply sp (markedIf (elims head))) e a0
     else do
       pm <- runSyn head (headEnv e)
       t0 <- Meta.forceT (snd pm)
@@ -2948,26 +3025,38 @@ applyResultFirst sp firstSp nominal head n elims =
         since <- gets (\c -> c.nextMeta)
         pi <- insertImplicits (headEnv e) firstSp (fst pm) t0
         r <- resultAfter (snd pi) n
-        first <- case r of
-          -- (the whole type said first; where that does not hold, its
-          -- world alone, where that is the head's own)
-          Just t ->
-            bind
-              (unifiedFirst e sp a t)
-              (\(whole : Bool) ->
-                 if whole then (pure True : Elab Bool)
-                 else bind
-                     (worldFirst e sp since n (snd pi) a t)
-                     (\u -> pure False))
-          Nothing -> pure False
         let applied = markedIf (elims (MkSyn (\e2 -> pure pi)))
-        if first
-        then do
-          -- (the type said already: what the arguments come to is of it)
-          pm2 <- runSyn applied e
-          Meta.runDelayed False
-          pure (fst pm2)
-        else runChk (apply sp applied) e a0)
+        -- (a value's type: said first where the arguments elaborate so,
+        -- else not, the application coerced to it as it is)
+        if not (explicitPi a)
+        then valueFirst
+            e
+            sp
+            since
+            a
+            applied
+            (\u -> runChk (apply sp applied) e a0)
+            r
+        else do
+          first <- case r of
+            -- (the whole type said first; where that does not hold, its
+            -- world alone, where that is the head's own)
+            Just t ->
+              bind
+                (unifiedFirst e sp a t)
+                (\(whole : Bool) ->
+                   if whole then (pure True : Elab Bool)
+                   else bind
+                       (worldFirst e sp since n (snd pi) a t)
+                       (\u -> pure False))
+            Nothing -> pure False
+          if first
+          then do
+            -- (the type said already: what the arguments come to is of it)
+            pm2 <- runSyn applied e
+            Meta.runDelayed False
+            pure (fst pm2)
+          else runChk (apply sp applied) e a0)
   where
   headEnv : ElabEnv -> ElabEnv
   headEnv e = if nominal then withFor e ForNominative else e
