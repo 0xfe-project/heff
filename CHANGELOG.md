@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Backends and performance
+
+- The runtime's reactor no longer looks at every pending wait each turn: the nearest deadline is the top of a heap, the waits done are listed, and a descriptor closed finds its waits by their marks. On Linux, each thread's waits' descriptors are in an epoll of its own, as they are in a kqueue on macOS and the BSDs, so a turn asks the kernel for those ready alone, not a poll of every descriptor; 2000 server-sent event streams from one broadcast, in a container, 15% less of the server's CPU.
+
 ### Standard library
 
 - std.http.server reads a request for a handler and answers it: `segments r`, the target's path before its `?` and `#`, split at each `/` and each piece unescaped after (`%2F` a `/` in a segment), the empty piece before the first `/` and after a last one not segments (`/rooms/` is `["rooms"]`, `/` is `[]`), one between two `/`s kept, `""` -- a list to match on with the method, `("GET", ["rooms", name])`; `query key r`, `queryAll key r` and `queries r`, the query as std.url's `parseQuery` reads it (none where it does not read); `json status j`, `application/json`; `notAllowed methods`, `405` with `Allow`. examples/rooms routes by them.

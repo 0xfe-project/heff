@@ -54,6 +54,13 @@ extern char **environ;
 #define HEFF_KQUEUE 1
 #include <sys/event.h>
 #endif
+#if defined(__linux__)
+#define HEFF_EPOLL 1
+#include <sys/epoll.h>
+#endif
+#if defined(HEFF_KQUEUE) || defined(HEFF_EPOLL)
+#define HEFF_EVQ 1
+#endif
 #endif
 #include <errno.h>
 #include <limits.h>
@@ -5724,8 +5731,9 @@ struct HeffWait {
                                  //  by any thread, when it began to wait)
   int marked;                    // (the descriptor its reactor is marked
                                  //  as waiting on, for it, or -1)
-  int kfd;                       // (where there is a kqueue: the descriptor
-  short kway;                    //  it is waiting on there, and which way --
+  int kfd;                       // (where there is an event queue: the
+  short kway;                    //  descriptor it is waiting on there, and
+                                 //  which way --
                                  //  1 reading, 2 writing -- or 0, on none;
                                  //  3, polled instead)
   HeffWait *prev, *next;
@@ -5782,7 +5790,7 @@ HEFF_VAR(HEFF_TLS size_t heff_nready);
 HEFF_VAR(HEFF_TLS size_t heff_capready);
 HEFF_VAR(HEFF_TLS int64_t heff_wait_seq);
 // (how many of its pending waits the turn polls itself: where there is
-// a kqueue, those it was not given, none mostly)
+// an event queue, those it was not given, none mostly)
 HEFF_VAR(HEFF_TLS size_t heff_npolled);
 HEFF_VAR(HEFF_TLS HeffFinished *heff_finished);
 HEFF_VAR(HEFF_TLS size_t heff_nfinished);
@@ -5894,115 +5902,159 @@ HEFF_FN void heff_mark_off(int fd) {
 }
 #endif
 
-#ifdef HEFF_KQUEUE
-// (where the system has kqueue: each thread's reactor keeps its waits'
-// descriptors in a kqueue of its own, each added as its wait begins and
-// deleted as it ends, so that a turn asks the kernel for those ready
-// alone -- a poll of every pending wait's descriptor, every turn, costs
-// as many as are pending, and a server's many quiet connections made
-// each turn as dear as they are many.  A descriptor waited on one way
-// by two waits of the thread at once, or one kqueue refuses, is polled
-// as before, the later wait's.  The kqueue, made with the thread's
-// first group, as its pipe is, is polled with the others, and read, not
-// waiting, where it is ready; and each wait of it has its descriptor
-// and its way kept, by both, at `heff_kq_owner`)
-HEFF_VAR(HEFF_TLS int heff_kq);
-HEFF_VAR(HEFF_TLS int heff_kq_made);
-HEFF_VAR(HEFF_TLS HeffWait **heff_kq_owner);
-HEFF_VAR(HEFF_TLS size_t heff_capkq_owner);
+#ifdef HEFF_EVQ
+// (where the system has an event queue -- kqueue, or Linux's epoll --
+// each thread's reactor keeps its waits' descriptors in one of its own,
+// each added as its wait begins and taken out as it ends, so that a
+// turn asks the kernel for those ready alone -- a poll of every pending
+// wait's descriptor, every turn, costs as many as are pending, and a
+// server's many quiet connections made each turn as dear as they are
+// many.  A descriptor waited on one way by two waits of the thread at
+// once, or one the queue refuses, is polled as before, the later
+// wait's.  The queue, made with the thread's first group, as its pipe
+// is, is polled with the others, and read, not waiting, where it is
+// ready; and each wait in it has its descriptor and its way kept, by
+// both, at `heff_evq_owner`, which says whose an event is.  The two
+// differ in what the kernel is told alone: kqueue keeps each way of a
+// descriptor apart, epoll the two together, as one)
+HEFF_VAR(HEFF_TLS int heff_evq);
+HEFF_VAR(HEFF_TLS int heff_evq_made);
+HEFF_VAR(HEFF_TLS HeffWait **heff_evq_owner);
+HEFF_VAR(HEFF_TLS size_t heff_capevq_owner);
 
-// (the wait polled by the turn, not the kqueue: counted so)
-static inline void heff_kq_polled(HeffWait *w) {
+// (the wait waiting on `fd` the way `way` -- 1 reading, 2 writing -- in
+// the queue, or NULL)
+static inline HeffWait *heff_evq_whose(int fd, short way) {
+  size_t at = (size_t)fd * 2 + (size_t)(way - 1);
+  return at < heff_capevq_owner ? heff_evq_owner[at] : NULL;
+}
+
+#ifdef HEFF_KQUEUE
+// (the kernel told: `fd` waited on `way`, or, not `on`, no longer --
+// whether it took it)
+HEFF_FN int heff_evq_tell(int fd, short way, int on) {
+  struct kevent ch, got;
+  struct timespec zero = { 0, 0 };
+  short filter = way == 1 ? EVFILT_READ : EVFILT_WRITE;
+  if (!on) {
+    EV_SET(&ch, (uintptr_t)fd, filter, EV_DELETE, 0, 0, NULL);
+    (void)kevent(heff_evq, &ch, 1, NULL, 0, &zero);
+    return 1;
+  }
+  EV_SET(&ch, (uintptr_t)fd, filter, EV_ADD | EV_RECEIPT, 0, 0, NULL);
+  int r = kevent(heff_evq, &ch, 1, &got, 1, &zero);
+  return !(r < 0 || (r == 1 && (got.flags & EV_ERROR) && got.data != 0));
+}
+#else
+// (epoll: the descriptor's ways, both, as the waits in it say -- the
+// other way's kept as it is.  Its registration may be gone, the
+// descriptor closed meanwhile, or there, one of the same number's:
+// either told again, where a wait is to be added; one taken out of a
+// descriptor that is gone is not added back)
+HEFF_FN int heff_evq_tell(int fd, short way, int on) {
+  int other = heff_evq_whose(fd, way == 1 ? 2 : 1) != NULL;
+  uint32_t mask = 0;
+  if (on) mask |= way == 1 ? EPOLLIN : EPOLLOUT;
+  if (other) mask |= way == 1 ? EPOLLOUT : EPOLLIN;
+  struct epoll_event ev;
+  memset(&ev, 0, sizeof ev);
+  ev.events = mask;
+  ev.data.u64 = (uint64_t)fd;
+  if (!mask) {
+    (void)epoll_ctl(heff_evq, EPOLL_CTL_DEL, fd, &ev);
+    return 1;
+  }
+  int op = on && !other ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+  if (epoll_ctl(heff_evq, op, fd, &ev) == 0) return 1;
+  if (op == EPOLL_CTL_ADD && errno == EEXIST) return epoll_ctl(heff_evq, EPOLL_CTL_MOD, fd, &ev) == 0;
+  if (op == EPOLL_CTL_MOD && errno == ENOENT && on) return epoll_ctl(heff_evq, EPOLL_CTL_ADD, fd, &ev) == 0;
+  return 0;
+}
+#endif
+
+// (the wait polled by the turn, not the queue: counted so)
+static inline void heff_evq_polled(HeffWait *w) {
   w->kway = 3;
   heff_npolled++;
 }
 
-// (the wait's descriptor and way in the kqueue: where it has one, and
-// another wait of the thread has not, and kqueue takes it; else polled)
-HEFF_FN void heff_kq_add(HeffWait *w) {
+// (the wait's descriptor and way in the queue: where it has one, and
+// another wait of the thread has not, and the queue takes it; else
+// polled)
+HEFF_FN void heff_evq_add(HeffWait *w) {
   w->kway = 0;
   w->kfd = w->fd;
   if (w->fd < 0 || w->done) return;
   short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
-  if (!way) {
-    heff_kq_polled(w);
-    return;
-  }
-  if (!heff_kq_made) {
-    heff_kq_polled(w);
+  if (!way || !heff_evq_made) {
+    heff_evq_polled(w);
     return;
   }
   size_t at = (size_t)w->fd * 2 + (size_t)(way - 1);
-  if (at >= heff_capkq_owner) {
-    size_t cap = heff_capkq_owner ? heff_capkq_owner : 512;
+  if (at >= heff_capevq_owner) {
+    size_t cap = heff_capevq_owner ? heff_capevq_owner : 512;
     while (cap <= at) cap *= 2;
     HeffWait **m = heff_alloc(cap * sizeof *m);
-    if (heff_capkq_owner) memcpy(m, heff_kq_owner, heff_capkq_owner * sizeof *m);
-    memset(m + heff_capkq_owner, 0, (cap - heff_capkq_owner) * sizeof *m);
-    free(heff_kq_owner);
-    heff_kq_owner = m;
-    heff_capkq_owner = cap;
+    if (heff_capevq_owner) memcpy(m, heff_evq_owner, heff_capevq_owner * sizeof *m);
+    memset(m + heff_capevq_owner, 0, (cap - heff_capevq_owner) * sizeof *m);
+    free(heff_evq_owner);
+    heff_evq_owner = m;
+    heff_capevq_owner = cap;
   }
-  if (heff_kq_owner[at]) {
-    heff_kq_polled(w);
+  if (heff_evq_owner[at] || !heff_evq_tell(w->fd, way, 1)) {
+    heff_evq_polled(w);
     return;
   }
-  struct kevent ch, got;
-  EV_SET(&ch, (uintptr_t)w->fd, way == 1 ? EVFILT_READ : EVFILT_WRITE, EV_ADD | EV_RECEIPT, 0, 0, w);
-  struct timespec zero = { 0, 0 };
-  int r = kevent(heff_kq, &ch, 1, &got, 1, &zero);
-  if (r < 0 || (r == 1 && (got.flags & EV_ERROR) && got.data != 0)) {
-    heff_kq_polled(w);
-    return;
-  }
-  heff_kq_owner[at] = w;
+  heff_evq_owner[at] = w;
   w->kway = way;
 }
 
-// (the wait's descriptor deleted from the kqueue, where it is there --
-// closed meanwhile, the kernel deleted it then)
-HEFF_FN void heff_kq_delete(HeffWait *w) {
+// (the wait's descriptor taken out of the queue, where it is there --
+// closed meanwhile, the kernel took it out then)
+HEFF_FN void heff_evq_delete(HeffWait *w) {
   short way = w->kway;
   w->kway = 0;
   if (way == 3) heff_npolled--;
   if (way != 1 && way != 2) return;
   size_t at = (size_t)w->kfd * 2 + (size_t)(way - 1);
-  if (at < heff_capkq_owner && heff_kq_owner[at] == w) heff_kq_owner[at] = NULL;
-  struct kevent ch;
-  EV_SET(&ch, (uintptr_t)w->kfd, way == 1 ? EVFILT_READ : EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-  struct timespec zero = { 0, 0 };
-  (void)kevent(heff_kq, &ch, 1, NULL, 0, &zero);
+  if (at < heff_capevq_owner && heff_evq_owner[at] == w) heff_evq_owner[at] = NULL;
+  heff_evq_tell(w->kfd, way, 0);
 }
 
 // (the wait's way, after a step: where it waits on another descriptor,
-// or the other way, or is done, so in the kqueue)
-HEFF_FN void heff_kq_again(HeffWait *w) {
+// or the other way, or is done, so in the queue)
+HEFF_FN void heff_evq_again(HeffWait *w) {
   short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
   if (w->done || w->fd != w->kfd || (w->kway != 3 && way != w->kway)) {
-    heff_kq_delete(w);
-    heff_kq_add(w);
+    heff_evq_delete(w);
+    heff_evq_add(w);
   }
 }
 
-// (the kqueue made, with the thread's first group, as its pipe is:
-// where it cannot be, its waits polled)
-HEFF_FN void heff_kq_open(void) {
-  if (heff_kq_made) return;
-  heff_kq = kqueue();
-  if (heff_kq < 0) return;
-  fcntl(heff_kq, F_SETFD, FD_CLOEXEC);
-  heff_kq_made = 1;
+// (the queue made, with the thread's first group, as its pipe is: where
+// it cannot be, its waits polled)
+HEFF_FN void heff_evq_open(void) {
+  if (heff_evq_made) return;
+#ifdef HEFF_KQUEUE
+  heff_evq = kqueue();
+  if (heff_evq < 0) return;
+  fcntl(heff_evq, F_SETFD, FD_CLOEXEC);
+#else
+  heff_evq = epoll_create1(EPOLL_CLOEXEC);
+  if (heff_evq < 0) return;
+#endif
+  heff_evq_made = 1;
 }
 
-// (the kqueue let go of, with the thread's last group: none of its
+// (the queue let go of, with the thread's last group: none of its
 // waits pending)
-HEFF_FN void heff_kq_close(void) {
-  if (!heff_kq_made) return;
-  close(heff_kq);
-  heff_kq_made = 0;
-  free(heff_kq_owner);
-  heff_kq_owner = NULL;
-  heff_capkq_owner = 0;
+HEFF_FN void heff_evq_close(void) {
+  if (!heff_evq_made) return;
+  close(heff_evq);
+  heff_evq_made = 0;
+  free(heff_evq_owner);
+  heff_evq_owner = NULL;
+  heff_capevq_owner = 0;
 }
 #endif
 
@@ -6121,8 +6173,8 @@ HEFF_FN void heff_wait_link(HeffWait *w) {
   // sees the mark, or this the close counted)
   w->marked = heff_mark_on(w->fd) ? w->fd : -1;
 #endif
-#ifdef HEFF_KQUEUE
-  heff_kq_add(w);
+#ifdef HEFF_EVQ
+  heff_evq_add(w);
 #endif
   w->epoch = __atomic_load_n(&heff_closed_epoch, __ATOMIC_SEQ_CST);
   heff_group_pending(w->group, 1);
@@ -6140,8 +6192,8 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
 #ifndef _WIN32
   heff_mark_off(w->marked);
 #endif
-#ifdef HEFF_KQUEUE
-  heff_kq_delete(w);
+#ifdef HEFF_EVQ
+  heff_evq_delete(w);
 #endif
   heff_group_pending(w->group, -1);
 }
@@ -6151,7 +6203,7 @@ HEFF_FN void heff_wait_done(HeffWait *w) { heff_wait_finish(w); }
 
 // (this thread's waits on `fd` begun before the count `before`: done,
 // EBADF -- whether any was.  Found by its marks, where every wait on it
-// is in the kqueue, else by every pending wait looked at; none where
+// is in the event queue, else by every pending wait looked at; none where
 // none is marked)
 HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
   int some = 0;
@@ -6159,11 +6211,10 @@ HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
   if (fd >= 0 && heff_mark && (size_t)fd < (size_t)HEFF_MARK_CHUNK * HEFF_MARK_CHUNKS) {
     int32_t on = (size_t)fd < heff_capmarks_mine ? heff_marks_mine[fd] : 0;
     if (on == 0) return 0;
-#ifdef HEFF_KQUEUE
+#ifdef HEFF_EVQ
     int32_t found = 0;
     for (size_t way = 0; way < 2; way++) {
-      size_t at = (size_t)fd * 2 + way;
-      HeffWait *w = at < heff_capkq_owner ? heff_kq_owner[at] : NULL;
+      HeffWait *w = heff_evq_whose(fd, (short)(way + 1));
       if (!w || w->marked != fd) continue;
       found++;
       if (!w->done && w->epoch < before) {
@@ -6382,8 +6433,8 @@ HEFF_FN void heff_waker_add(int64_t g) {
       fcntl(heff_wake_fds[i], F_SETFD, FD_CLOEXEC);
     }
     heff_wake_made = 1;
-#ifdef HEFF_KQUEUE
-    heff_kq_open();
+#ifdef HEFF_EVQ
+    heff_evq_open();
 #endif
   }
   pthread_mutex_lock(&heff_wakers_mu);
@@ -6438,8 +6489,8 @@ HEFF_FN void heff_waker_remove(int64_t g) {
     free(heff_ready);
     heff_dues = heff_ready = NULL;
     heff_ndues = heff_capdues = heff_nready = heff_capready = 0;
-#ifdef HEFF_KQUEUE
-    heff_kq_close();
+#ifdef HEFF_EVQ
+    heff_evq_close();
 #endif
   }
   pthread_mutex_unlock(&heff_wakers_mu);
@@ -6592,9 +6643,9 @@ HEFF_FN void heff_polled_room(size_t n) {
 }
 
 // (whether the wait's descriptor is polled by the turn: where there is
-// no kqueue, every pending one's; else those kqueue was not given)
+// no event queue, every pending one's; else those it was not given)
 static inline int heff_wait_polled(HeffWait *w) {
-#ifdef HEFF_KQUEUE
+#ifdef HEFF_EVQ
   return !w->done && w->fd >= 0 && w->kway == 3;
 #else
   return !w->done && w->fd >= 0;
@@ -6610,26 +6661,40 @@ static inline void heff_wait_ready(HeffWait *w) {
     heff_mark_off(w->marked);
     w->marked = heff_mark_on(w->fd) ? w->fd : -1;
   }
-#ifdef HEFF_KQUEUE
-  heff_kq_again(w);
+#ifdef HEFF_EVQ
+  heff_evq_again(w);
 #endif
 }
 
-#ifdef HEFF_KQUEUE
-// (the kqueue's ready read, not waiting, and each ready wait stepped)
-HEFF_FN void heff_kq_ready(void) {
-  struct kevent got[256];
-  struct timespec zero = { 0, 0 };
+#ifdef HEFF_EVQ
+// (an event of the queue's, `fd` ready `way`: its wait stepped -- not
+// one whose way an earlier step of this read took out)
+static inline void heff_evq_fire(int fd, short way) {
+  HeffWait *w = heff_evq_whose(fd, way);
+  if (w && w->kway == way && w->kfd == fd) heff_wait_ready(w);
+}
+
+// (the queue's ready read, not waiting, and each ready wait stepped)
+HEFF_FN void heff_evq_ready(void) {
   for (;;) {
-    int r = kevent(heff_kq, NULL, 0, got, 256, &zero);
+#ifdef HEFF_KQUEUE
+    struct kevent got[256];
+    struct timespec zero = { 0, 0 };
+    int r = kevent(heff_evq, NULL, 0, got, 256, &zero);
+    if (r <= 0) break;
+    for (int i = 0; i < r; i++) heff_evq_fire((int)got[i].ident, got[i].filter == EVFILT_READ ? 1 : 2);
+#else
+    struct epoll_event got[256];
+    int r = epoll_wait(heff_evq, got, 256, 0);
     if (r <= 0) break;
     for (int i = 0; i < r; i++) {
-      HeffWait *w = got[i].udata;
-      // (one whose way was deleted by an earlier step of this read: not
-      // its event any more)
-      short way = got[i].filter == EVFILT_READ ? 1 : 2;
-      if (w && w->kway == way && w->kfd == (int)got[i].ident) heff_wait_ready(w);
+      int fd = (int)got[i].data.u64;
+      uint32_t e = got[i].events;
+      // (a hang-up or an error is for both ways, as poll has it)
+      if (e & (EPOLLIN | EPOLLHUP | EPOLLERR)) heff_evq_fire(fd, 1);
+      if (e & (EPOLLOUT | EPOLLHUP | EPOLLERR)) heff_evq_fire(fd, 2);
     }
+#endif
     if (r < 256) break;
   }
 }
@@ -6643,16 +6708,16 @@ HEFF_FN void heff_reactor_turn(int wait) {
   int ms = wait ? -1 : 0;
   if (heff_reactor_closed_elsewhere()) ms = 0;
   ms = heff_turn_ms(ms);
-  // (the waits polled here: where there is a kqueue, those counted
+  // (the waits polled here: where there is an event queue, those counted
   // alone, none mostly, so the pending not looked at)
-#ifdef HEFF_KQUEUE
+#ifdef HEFF_EVQ
   if (heff_npolled)
 #endif
     for (HeffWait *w = heff_waits_first; w; w = w->next)
       if (heff_wait_polled(w)) n++;
   size_t mine = n;
-#ifdef HEFF_KQUEUE
-  if (heff_kq_made) n++;
+#ifdef HEFF_EVQ
+  if (heff_evq_made) n++;
 #endif
   if (heff_wake_made) n++;
   for (HeffSource *s = heff_sources; s; s = s->next) {
@@ -6671,12 +6736,12 @@ HEFF_FN void heff_reactor_turn(int wait) {
         heff_polled_waits[n] = w;
         n++;
       }
-#ifdef HEFF_KQUEUE
-  // (the kqueue as it is now: a step below may make it)
-  size_t kq = n;
-  int kq_polled = heff_kq_made;
-  if (kq_polled) {
-    heff_polled[n].fd = heff_kq;
+#ifdef HEFF_EVQ
+  // (the event queue as it is now: a step below may make it)
+  size_t q = n;
+  int q_polled = heff_evq_made;
+  if (q_polled) {
+    heff_polled[n].fd = heff_evq;
     heff_polled[n].events = POLLIN;
     heff_polled[n].revents = 0;
     n++;
@@ -6703,8 +6768,8 @@ HEFF_FN void heff_reactor_turn(int wait) {
   if (r < 0) for (size_t i = 0; i < n; i++) heff_polled[i].revents = 0;
   for (size_t i = 0; i < mine; i++)
     if (heff_polled[i].revents) heff_wait_ready(heff_polled_waits[i]);
-#ifdef HEFF_KQUEUE
-  if (kq_polled && heff_polled[kq].revents) heff_kq_ready();
+#ifdef HEFF_EVQ
+  if (q_polled && heff_polled[q].revents) heff_evq_ready();
 #endif
   if (heff_wake_made && heff_polled[wake].revents) {
     char b[64];
