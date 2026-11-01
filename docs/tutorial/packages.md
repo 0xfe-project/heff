@@ -22,7 +22,7 @@ package a `package.hf`:
 import manifest
 
 package : Package
-package = { module = "github.com/you/zipper", heff = "0.4.0" }
+package = { module = "github.com/you/zipper", heff = "0.6.1" }
 ```
 
 `module` is where the package lives, and its last part, `zipper`, is
@@ -38,7 +38,7 @@ import manifest
 package : Package
 package =
   { module = "hello"
-  , heff = "0.4.0"
+  , heff = "0.6.1"
   , require =
       [{ name = "zipper", path = "github.com/you/zipper", version = "0.1.0" }]
   , replace = [{ name = "zipper", dir = "../zipper" }]
