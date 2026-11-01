@@ -71,7 +71,7 @@ export default defineConfig({
       // (the version picker beside the title; main's notice above each page)
       components: { SiteTitle: './src/components/SiteTitle.astro', Banner: './src/components/Banner.astro' },
       sidebar: [
-        { label: 'Tutorial', items: ['tutorial/first-program', 'tutorial/data', 'tutorial/effects', 'tutorial/own-effects', 'tutorial/terminal', 'tutorial/packages', 'tutorial/tests'] },
+        { label: 'Tutorial', items: ['tutorial/first-program', 'tutorial/data', 'tutorial/effects', 'tutorial/own-effects', 'tutorial/terminal', 'tutorial/packages', 'tutorial/tests', 'tutorial/web'] },
         {
           label: 'Reference',
           items: [
