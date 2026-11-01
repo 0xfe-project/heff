@@ -20,7 +20,6 @@
 -- import exception
 -- import std.http as HTTP
 -- import std.http.bocserver as BocServer
--- import std.http.server as Server
 -- import std.net as Net
 -- import std.signal as Signal
 -- import std.time as Time
@@ -29,10 +28,10 @@
 -- -- | each request answered at once
 -- hello : {e : HFunctor}
 --       -> {{bc : BOC.boc <: e}}
---       -> Server.Request
+--       -> HTTP.ServerRequest
 --       -> BocServer.Responder e Empty
 --       -> Co (exception Empty <+> e) Unit
--- hello r respond = respond (Whole (Server.plain 200 ("hello, " ^ r.target ^ "\n")))
+-- hello r respond = respond (Whole (HTTP.plain 200 ("hello, " ^ r.target ^ "\n")))
 --
 -- -- | the listener served until SIGTERM or Ctrl-C: then closed, the
 -- -- | requests in hand answered, and every connection closed
@@ -115,8 +114,8 @@
 -- import bytes as Bytes
 -- import co
 -- import exception
+-- import std.http as HTTP
 -- import std.http.bocserver as BocServer
--- import std.http.server as Server
 -- import std.http.sse as SSE
 -- import std.http.websocket as WebSocket
 -- import std.ordmap as OrdMap
@@ -153,7 +152,7 @@
 -- chat : {e : HFunctor}
 --      -> {{bc : BOC.boc <: e}}
 --      -> Hub
---      -> Server.Request
+--      -> HTTP.ServerRequest
 --      -> BocServer.Responder e Empty
 --      -> Co (exception Empty <+> e) Unit
 -- chat hub r respond =
@@ -166,7 +165,7 @@
 --   then do
 --     with h := hub do
 --       told (SSE.event [Data (Bytes.asString r.body)]) (OrdMap.toList h)
---     respond (Whole (Server.plain 200 "said\n"))
+--     respond (Whole (HTTP.plain 200 "said\n"))
 --   else if r.target == "/echo"
 --   then respond
 --       (Upgraded
@@ -174,7 +173,7 @@
 --          , received = \out m -> BocServer.send out m
 --          , gone = \out -> pure ()
 --          })
---   else respond (Whole (Server.plain 404 "no such page\n"))
+--   else respond (Whole (HTTP.plain 404 "no such page\n"))
 -- ```
 --
 -- Once the client is gone -- a write failed, its end read, its
@@ -216,11 +215,11 @@
 -- server's world, as the handler does: one that throws an `err`
 -- closes its connection.
 --
--- Requests are read as std.http.server reads them, by its `requestIn`,
+-- Requests are read by std.http's `requestIn`,
 -- a piece at a time, each piece an act: a body by `Content-Length`, or
 -- sent in chunks, each piece read undone as it comes, a `100 Continue`
 -- written where the client waits for one, a request refused as
--- std.http.server refuses it (`400`, `413`, `431`, `501`, `505`), what
+-- `requestIn` refuses it (`400`, `413`, `431`, `501`, `505`), what
 -- the client still sends then read, up to a mebibyte, and let go of
 -- before its connection is closed.  Requests sent one after
 -- another on a connection without waiting (pipelined) are answered in
@@ -274,34 +273,12 @@ import co
 import exception
 import std.duration as Duration
 import std.http as HTTP
-import std.http.server as Server
 import std.http.sse as SSE
 import std.http.websocket as WebSocket
 import std.net as Net
 import std.ordmap as OrdMap
 import std.time as Time
-import uint8 as UInt8
 import resource
-
--- (how much is read at a time, at least)
-readSize : Int
-readSize = 65536
-
--- (how much is read at a time of a head not read all at once: so a
--- client sending its head a little at a time is waited for with a small
--- buffer, not `readSize`)
-headPiece : Int
-headPiece = 4096
-
--- (a head's most, std.http.server's: past it, its end not read, a
--- request is refused, `431`)
-headMost : Int
-headMost = 65536
-
--- (how much of what a client still sends, after a request refused, is
--- read and let go of before its connection is closed)
-drainMost : Int
-drainMost = 1048576
 
 -- Senders
 --------------------------------------------------------------------------------
@@ -375,7 +352,7 @@ type Socket (e : HFunctor) (err : Type) =
   }
 
 -- | What a handler answers its request with: a response, whole
--- | (`Whole`); a head (std.http.server's, a status and headers), then a
+-- | (`Whole`); a head (std.http's `Head`, a status and headers), then a
 -- | body sent a piece at a time (`Streamed`); or the connection taken for WebSocket, where the
 -- | request is a handshake (`Upgraded`).  A stream's headers give no
 -- | length, `Transfer-Encoding` or `Connection` of their own -- the
@@ -383,7 +360,7 @@ type Socket (e : HFunctor) (err : Type) =
 -- | connection after the stream.
 data Answer (e : HFunctor) (err : Type)
   = Whole HTTP.Response
-  | Streamed Server.Head (Streaming e err)
+  | Streamed HTTP.Head (Streaming e err)
   | Upgraded (Socket e err)
 
 -- | How a handler answers its request: in whichever world has boc's
@@ -405,8 +382,8 @@ data Phase = Reading | Answering | Writing | InStream | InSocket | Closing
 -- starts; or its head, its body sent in chunks, read so far)
 data Part
   = InHead Bytes
-  | InBody Server.Request Int
-  | InChunks Server.Request Server.Chunks
+  | InBody HTTP.ServerRequest Int
+  | InChunks HTTP.ServerRequest HTTP.Chunks
 
 -- (when the head being read is to be read by, on the monotonic clock,
 -- in milliseconds: at no time -- a body is read, or there is no limit
@@ -489,7 +466,7 @@ type Serving (e : HFunctor) (rg : Type) (err : Type) =
   , ping : Int
   , served : BOC.Cown (Served e rg err)
   , handler :
-        Server.Request
+        HTTP.ServerRequest
         -> Responder e err
         -> Co (exception err <+> e) Unit
   }
@@ -532,7 +509,8 @@ fresh within =
 -- (how much the next read asks for: what is wanted still, a body's, or
 -- `readSize`, whichever is more)
 sizeFor : {e : HFunctor} -> {err : Type} -> Conn e err -> Int
-sizeFor st = if st.want - st.got > readSize then st.want - st.got else readSize
+sizeFor st =
+  if st.want - st.got > HTTP.readSize then st.want - st.got else HTTP.readSize
 
 -- What is queued to be written
 --------------------------------------------------------------------------------
@@ -593,7 +571,7 @@ streamStep : {e : HFunctor}
            -> Conn e err
 streamStep most g (Just b) st =
   if Bytes.length b == 0 then st
-  else queued most g (if st.chunked then Server.chunk b else b) st
+  else queued most g (if st.chunked then HTTP.chunk b else b) st
 streamStep most g Nothing st =
   if sending g st
   then let t = terminated st
@@ -718,7 +696,7 @@ beaten : {e : HFunctor}
 beaten most g st =
   if Bytes.length st.beat > 0 && st.quiet
   then let q =
-         queued most g (if st.chunked then Server.chunk st.beat else st.beat) st
+         queued most g (if st.chunked then HTTP.chunk st.beat else st.beat) st
        in { q | quiet = True }
   else { st | quiet = True }
 
@@ -726,42 +704,8 @@ beaten most g st =
 isTimeout : Net.NetError -> Bool
 isTimeout why = strEq why.name "ETIMEDOUT"
 
--- (a status whose response has no body: 1xx, 204, 304)
-bodiless : Int -> Bool
-bodiless s = s < 200 || s == 204 || s == 304
-
 -- Looking for a head's end
 --------------------------------------------------------------------------------
-
--- (the byte at `k` of `a`'s bytes, then `b`'s)
-byteOf : Bytes -> Bytes -> Int -> Int
-byteOf a b k =
-  if k < Bytes.length a then UInt8.toInt (Bytes.bytesAt a k)
-  else UInt8.toInt (Bytes.bytesAt b (k - Bytes.length a))
-
--- (where the blank line after a head starts, `\r\n\r\n`, in `a`'s bytes,
--- then `b`'s, from `k` on; -1 where it is not)
-blankIn : Bytes -> Bytes -> Int -> Int
-blankIn a b k =
-  if k + 4 > Bytes.length a + Bytes.length b then 0 - 1
-  else if byteOf a b k == 13
-          && byteOf a b (k + 1) == 10
-          && byteOf a b (k + 2) == 13
-          && byteOf a b (k + 3) == 10
-  then k
-  else blankIn a b (k + 1)
-
--- (the last three bytes of `a`'s, then `b`'s; all, where there are
--- fewer)
-lastThree : Bytes -> Bytes -> Bytes
-lastThree a b =
-  if Bytes.length b >= 3
-  then Bytes.slice b (Bytes.length b - 3) (Bytes.length b)
-  else let ab = Bytes.append a b
-       in Bytes.slice
-         ab
-         (if Bytes.length ab > 3 then Bytes.length ab - 3 else 0)
-         (Bytes.length ab)
 
 -- (what a request answered leaves to be read of the next: a piece)
 leftOf : List Bytes -> Bytes
@@ -860,9 +804,9 @@ drained : {e : HFunctor}
         -> Int
         -> Co e Unit
 drained idle c got =
-  if got >= drainMost then pure ()
+  if got >= HTTP.drainMost then pure ()
   else do
-    r <- Net.read (timeout := idle) c readSize
+    r <- Net.read (timeout := idle) c HTTP.readSize
     case r of
       Right b ->
         if Bytes.length b == 0 then pure ()
@@ -885,10 +829,10 @@ refused idle c status = do
     Net.write
       (timeout := idle)
       c
-      (Server.responseBytes
+      (HTTP.responseBytes
          "close"
          True
-         (Server.plain status (Server.reason status ^ "\n")))
+         (HTTP.plain status (HTTP.reason status ^ "\n")))
   case r of
     Right u -> do
       _ <- Net.shutdown c
@@ -898,34 +842,8 @@ refused idle c status = do
 -- Responses
 --------------------------------------------------------------------------------
 
--- (whether a `Connection` header of these has the token, its case not
--- minded)
-connectionSays : String -> List (Pair String String) -> Bool
-connectionSays token [] = False
-connectionSays token (MkPair n v :: rest) =
-  (HTTP.sameName n "Connection"
-   && List.any (\t -> HTTP.sameName (trim t) token) (split "," v))
-  || connectionSays token rest
-
--- (what a response says of its connection: closed, or kept where
--- HTTP/1.0 has to be told so)
-connectionWord : Server.Request -> Bool -> String
-connectionWord r True = "close"
-connectionWord r False = if strEq r.version "HTTP/1.0" then "keep-alive" else ""
-
--- (whether the client waits for `100 Continue` before it sends the body
--- of the request whose head is read)
-expects : Maybe Server.Request -> Bool
-expects Nothing = False
-expects (Just r) =
-  strEq r.version "HTTP/1.1"
-  && maybe
-    False
-    (\v -> HTTP.sameName v "100-continue")
-    (Server.header "expect" r)
-
 -- (the request whose head is read, where it is)
-wantedOf : Server.Wanted -> Maybe Server.Request
+wantedOf : HTTP.Wanted -> Maybe HTTP.ServerRequest
 wantedOf (MoreHead want) = Nothing
 wantedOf (MoreBody r want) = Just r
 wantedOf (MoreChunks r ch) = Just r
@@ -939,7 +857,7 @@ wanting : {e : HFunctor}
         -> Conn e err
         -> Bytes
         -> Int
-        -> Server.Wanted
+        -> HTTP.Wanted
         -> Conn e err
 wanting st buf i (MoreHead want) =
   { st
@@ -1328,7 +1246,7 @@ mutual
         Bytes.empty
         (leftOf st.parts)
     else do
-      reading sg cn readSize st.by
+      reading sg cn HTTP.readSize st.by
       pure { st | want = 1 }
 
   -- (bytes `b` read, taken as far as they go, where the request is,
@@ -1348,8 +1266,7 @@ mutual
   took sg cn st (InHead tail) b = looked sg cn st tail b
   took sg cn st (InBody r at) b =
     advanced sg cn { st | parts = b :: st.parts, got = st.got + Bytes.length b }
-  took sg cn st (InChunks r ch) b =
-    dechunked sg cn st r (Server.feedChunks ch b)
+  took sg cn st (InChunks r ch) b = dechunked sg cn st r (HTTP.feedChunks ch b)
 
   -- (what a piece of a body sent in chunks came to: the request, all
   -- read, handed to the handler; more read; or the request refused)
@@ -1362,13 +1279,13 @@ mutual
             -> Serving e rg err
             -> Connection e rg err
             -> Conn e err
-            -> Server.Request
-            -> Server.Dechunked
+            -> HTTP.ServerRequest
+            -> HTTP.Dechunked
             -> Co e (Conn e err)
   dechunked sg cn st r (BodyRead body rest) =
     answered sg cn st (Asked { r | body = body } rest)
   dechunked sg cn st r (ChunksToCome ch) = do
-    reading sg cn readSize Whenever
+    reading sg cn HTTP.readSize Whenever
     pure { st | part = InChunks r ch }
   dechunked sg cn st r (ChunksRefused status) =
     answered sg cn st (Refused status)
@@ -1389,16 +1306,16 @@ mutual
          -> Bytes
          -> Co e (Conn e err)
   looked sg cn st tail b = do
-    let at = blankIn tail b 0
+    let at = HTTP.blankIn tail b 0
     let read = { st | parts = b :: st.parts, got = st.got + Bytes.length b }
     if at >= 0 then headed sg cn read (st.got - Bytes.length tail + at)
-    else if read.got > headMost
+    else if read.got > HTTP.headMost
     then do
       refusing sg cn 431
       pure { st | phase = Closing }
     else do
-      reading sg cn headPiece st.by
-      pure { read | want = read.got + 1, part = InHead (lastThree tail b) }
+      reading sg cn HTTP.headPiece st.by
+      pure { read | want = read.got + 1, part = InHead (HTTP.lastThree tail b) }
 
   -- (the head read, its blank line at `i` of what is read: parsed, and
   -- its body read; a `100 Continue` written, where the client waits for
@@ -1416,10 +1333,10 @@ mutual
          -> Co e (Conn e err)
   headed sg cn st i = do
     let buf = leftOf st.parts
-    case Server.requestIn (from := i) cn.peer buf of
+    case HTTP.requestIn (from := i) cn.peer buf of
       Left wanted -> do
         let more = wanting st buf i wanted
-        if expects (wantedOf wanted) && not st.continued
+        if maybe False HTTP.expects (wantedOf wanted) && not st.continued
         then do
           continuing sg cn
           pure { more | continued = True }
@@ -1484,7 +1401,7 @@ mutual
            -> Serving e rg err
            -> Connection e rg err
            -> Conn e err
-           -> Server.Got
+           -> HTTP.Got
            -> Co e (Conn e err)
   answered sg cn st (Asked r rest) = do
     outcome <- attempt err (sg.handler r (\a -> responded cn a))
@@ -1525,7 +1442,7 @@ mutual
            -> {{clock : Time.time <: e}}
            -> Serving e rg err
            -> Connection e rg err
-           -> Server.Request
+           -> HTTP.ServerRequest
            -> Co e Unit
   replying sg cn r = do
     with st := cn.state once replied st do
@@ -1540,7 +1457,7 @@ mutual
         -> {{clock : Time.time <: e}}
         -> Serving e rg err
         -> Connection e rg err
-        -> Server.Request
+        -> HTTP.ServerRequest
         -> Conn e err
         -> Co e (Conn e err)
   given sg cn r st = givenAs sg cn r { st | reply = Nothing } st.reply
@@ -1553,7 +1470,7 @@ mutual
           -> {{clock : Time.time <: e}}
           -> Serving e rg err
           -> Connection e rg err
-          -> Server.Request
+          -> HTTP.ServerRequest
           -> Conn e err
           -> Maybe (Answer e err)
           -> Co e (Conn e err)
@@ -1571,7 +1488,7 @@ mutual
         -> {{clock : Time.time <: e}}
         -> Serving e rg err
         -> Connection e rg err
-        -> Server.Request
+        -> HTTP.ServerRequest
         -> Conn e err
         -> Answer e err
         -> Co e (Conn e err)
@@ -1589,21 +1506,21 @@ mutual
            -> {{clock : Time.time <: e}}
            -> Serving e rg err
            -> Connection e rg err
-           -> Server.Request
+           -> HTTP.ServerRequest
            -> Conn e err
            -> HTTP.Response
            -> Co e (Conn e err)
   wholeOut sg cn r st res = do
     let close =
       st.stopping
-      || not (Server.keptAlive r)
-      || connectionSays "close" res.headers
+      || not (HTTP.keptAlive r)
+      || HTTP.connectionSays "close" res.headers
     writing
         sg
         cn
         close
-        (Server.responseBytes
-           (connectionWord r close)
+        (HTTP.responseBytes
+           (HTTP.connectionWord r close)
            (not (strEq r.method "HEAD"))
            res)
     pure { st | phase = Writing }
@@ -1619,9 +1536,9 @@ mutual
               -> {{clock : Time.time <: e}}
               -> Serving e rg err
               -> Connection e rg err
-              -> Server.Request
+              -> HTTP.ServerRequest
               -> Conn e err
-              -> Server.Head
+              -> HTTP.Head
               -> Streaming e err
               -> Co e (Conn e err)
   streamStart sg cn r st h s = do
@@ -1629,14 +1546,14 @@ mutual
     let close =
       st.stopping
       || not chunked
-      || not (Server.keptAlive r)
-      || connectionSays "close" h.headers
+      || not (HTTP.keptAlive r)
+      || HTTP.connectionSays "close" h.headers
     let head =
-      Server.streamedHead
-        (connectionWord r close)
-        (chunked && not (bodiless h.status))
+      HTTP.streamedHead
+        (HTTP.connectionWord r close)
+        (chunked && not (HTTP.bodiless h.status))
         h
-    if bodiless h.status || strEq r.method "HEAD"
+    if HTTP.bodiless h.status || strEq r.method "HEAD"
     then do
       writing sg cn close head
       pure { st | phase = Writing }
@@ -1694,7 +1611,7 @@ mutual
               -> {{clock : Time.time <: e}}
               -> Serving e rg err
               -> Connection e rg err
-              -> Server.Request
+              -> HTTP.ServerRequest
               -> Conn e err
               -> Socket e err
               -> WebSocket.Handshake
@@ -1702,7 +1619,7 @@ mutual
   socketStart sg cn r st s (Refuse res) = wholeOut sg cn r st res
   socketStart sg cn r st s (Accept key) = do
     let head =
-      Server.takeoverHead
+      HTTP.takeoverHead
         { status = 101, headers = WebSocket.upgradeHeaders key }
     let upgraded =
       { st
@@ -1747,7 +1664,9 @@ mutual
                 -> Co e Unit
   socketReading sg cn g = do
     with st := cn.state
-         got := BOC.await (Net.read (timeout := sg.ping) cn.socket readSize) do
+         got :=
+             BOC.await
+               (Net.read (timeout := sg.ping) cn.socket HTTP.readSize) do
       st := (<- socketCame sg cn g st got)
 
   -- (what a read of socket `g` came to, where it is still the
@@ -1992,7 +1911,7 @@ mutual
             -> Co e Unit
   listening sg cn g ms = do
     with st := cn.state
-         got := BOC.await (Net.read (timeout := ms) cn.socket headPiece) do
+         got := BOC.await (Net.read (timeout := ms) cn.socket HTTP.headPiece) do
       st := (<- listened sg cn g ms st got)
 
   -- (what a read of stream `g`'s connection came to, by where the
@@ -2151,7 +2070,7 @@ accepting sg l = do
           | open = OrdMap.insert sv.open sv.next cn
           , next = sv.next + 1
           }
-        reading sg cn readSize st.by
+        reading sg cn HTTP.readSize st.by
         accepting sg l
       Right Nothing -> accepting sg l
       Left err -> do
@@ -2188,7 +2107,7 @@ serve : {e : HFunctor}
       -> {{nt : Net.net <: e}}
       -> {{clock : Time.time <: e}}
       -> With rg Net.TcpListener
-      -> (Server.Request
+      -> (HTTP.ServerRequest
           -> Responder e err
           -> Co (exception err <+> e) Unit)
       -> Co e Unit
