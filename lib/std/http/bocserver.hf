@@ -1,11 +1,9 @@
 -- For an HTTP/1.1 server on boc's behaviours: a listener's connections
--- served at once, as many as come, each a cown of its own, each step
--- of each a behaviour -- a request parsed and handed to the handler, a
--- response written, the next request read -- and every wait (an
--- accept, a read, a write) an act awaited (`BOC.await`), so no thread
--- and no cown is held while a client is slow.  Each act waits in the
--- reactor of a thread of the program's pool of boc's,
--- and the connections are served in parallel on as many threads as the
+-- served at once, as many as come, each step of each a behaviour, and
+-- every wait (an accept, a read, a write) an act awaited (`BOC.await`),
+-- so no thread and no cown is held while a client is slow.  Each act
+-- waits in the reactor of a thread of the program's pool of boc's, and
+-- the connections are served in parallel on as many threads as the
 -- machine has cores.  It is the C backend's alone, as std.net is.
 -- Import it by a name, `import std.http.bocserver as BocServer`.
 --
@@ -75,20 +73,36 @@
 -- program ends then, if nothing else is pending.  A connection is had by
 -- std.net's `accepted`, in the listener's region, and closed by the
 -- server: when its client ends it or fails, when a request asks
--- (HTTP/1.0, `Connection: close`), or when the server stops.  The
--- handler is given each request in a behaviour on its connection's
--- cown, and a responder: it may answer there and then, or later, from
--- another behaviour -- after acts of its own awaited, a request of
--- std.http, a query -- the connection meanwhile waiting, read no
--- further.  An act it awaits is of its world, its `with`'s (boc's
--- `await`), an `attempt`'s around it too.  The
--- answer is kept on the connection's cown, and written by a
--- behaviour of the server's world waiting for it there (`once`): what
--- comes after on the connection is the server's, not the handler's, so
--- that the handler's `attempt`, around its behaviours, is not around
--- the next request's.  Its first answer is taken; one after it is not.  A
--- handler that never responds leaves its connection open until the
--- program lets go of it.
+-- (HTTP/1.0, `Connection: close`), or when the server stops.
+--
+-- A connection is two cowns: its inbox, the side that reads, and its
+-- outbox, the side that writes.  Where the connection is, is which
+-- behaviour comes next on it.  A read awaited comes back as a behaviour
+-- on the inbox, which takes the bytes as far as they go and awaits the
+-- next read, until the request is all read; then it hands the request
+-- to the handler, with a responder.  The responder puts the answer in
+-- the outbox, by a behaviour there, from whichever world it is called
+-- in: there and then, or later, from another behaviour -- after acts of
+-- the handler's own awaited, a request of std.http, a query -- the
+-- connection meanwhile read no further.  An act the handler awaits is
+-- of its world, its `with`'s (boc's `await`), an `attempt`'s around it
+-- too.  Its first answer is taken; one after it is not.  A handler that
+-- never responds leaves its connection open until the program lets go of
+-- it.
+--
+-- The outbox holds what is to be written, in order, and its writer: a
+-- behaviour of the server's world waiting there, `once`, for something
+-- to write.  It writes what the socket takes at once, there; the rest
+-- by a write it awaits, its behaviour on the outbox once it is done.
+-- One write is awaited at a time -- the behaviours after writes awaited
+-- come in the order the writes are done, not the order they were begun
+-- -- and what is put in the outbox meanwhile waits for it, but for more
+-- than the most, which closes the connection at once.  An answer written, the writer awaits the
+-- next request's read: what comes after on the connection is the
+-- server's, not the handler's, so the handler's `attempt`, around its
+-- behaviours, is not around the next request's.  The two sides share
+-- no behaviour but those that close the connection or stop it, which
+-- are on both at once.
 --
 -- An answer is one of three.  A response, whole (`Whole`).  A stream
 -- (`Streamed`): a status and headers, written at once -- in chunks to
@@ -99,16 +113,14 @@
 -- as std.http.websocket's `handshake` checks it, answered by its refusal
 -- where it is refused, else by `101 Switching Protocols`, then messages
 -- both ways.  A stream's or a socket's handler is given its sender in
--- `opened`, in a behaviour of the server's on the connection's cown, the
--- head queued: a value -- no region in its type -- kept anywhere, in a
--- cown of the handler's beside others, and sent by from any behaviour
--- (`send`), each piece a behaviour on the connection's cown, queued
--- there in the order sent, and written by the server after the ones
--- before it -- what the socket takes at once, in the server's
--- behaviour, the rest by a write it awaits -- never waited for by the
--- sender.  `finish` ends a stream: its last chunk written, the
--- connection is read on for the next request.  A socket's sender sends
--- messages, each written as a frame; its `finish` closes it, `1000`.
+-- `opened`, by the writer, once the head is written: a value -- no
+-- region in its type -- kept anywhere, in a cown of the handler's beside
+-- others, and sent by from any behaviour (`send`), each piece a
+-- behaviour on the outbox, put there in the order sent and written
+-- after the ones before it, never waited for by the sender.  `finish`
+-- ends a stream: its last chunk written, the connection is read on for
+-- the next request.  A socket's sender sends messages, each written as a
+-- frame; its `finish` closes it, `1000`.
 --
 -- ```haskell
 -- import boc as BOC
@@ -179,35 +191,38 @@
 --
 -- Once the client is gone -- a write failed, its end read, its
 -- socket closed -- the connection is closed, a sender's `send` does
--- nothing, and the handler's `gone` is called, once, in a behaviour on
--- the connection's cown: so a hub of senders takes it out.  A stream's
--- `gone` is not called once it is finished; a socket's is, at its end,
--- whyever it ends.  What is sent and not yet written, on a connection,
--- is `pending` bytes at most -- a mebibyte unless another is given, by
+-- nothing, and the handler's `gone` is called, once, by the behaviour
+-- that closes it: so a hub of senders takes it out.  A stream's `gone`
+-- is not called once it is finished; a socket's is, at its end, whyever
+-- it ends.  What is sent and not yet written, on a connection, is
+-- `pending` bytes at most -- a mebibyte unless another is given, by
 -- name, `BocServer.serve (pending := 65536) err l handle`; 0 for no
 -- limit -- past which the connection is closed, its client too slow, and
 -- `gone` called: a sender is never made to wait.  A stream's connection
--- is read while it goes on, a piece at a time: where the client closes
--- it, it is gone at once, not at the next write.  What the client sends
--- then is the next request's, kept for after the stream; with it
--- kept, the connection is read no further until the stream is finished.
+-- is read while it goes on, a piece at a time, on the inbox: where the
+-- client closes it, it is gone at once, not at the next write.  What the
+-- client sends then is the next request's, kept for after the stream;
+-- with it kept, the connection is read no further until the stream is
+-- finished, and the read waiting when it is finished is the next
+-- request's.
 --
 -- A stream of server-sent events (its `Content-Type`
 -- `text/event-stream`, std.http.sse's `headers`) is sent a comment, `:`,
--- after every `heartbeat` milliseconds of the client's silence -- 15
--- seconds unless another is given, by name; 0 for none -- which
--- keeps it from being taken for a dead one by what is between, and
--- tells the server soon after the client has gone, as its write fails.
--- The wait is the connection's read: a read, its time limit `heartbeat`.
+-- after every `heartbeat` milliseconds of the client's silence where
+-- nothing else was sent since the last -- 15 seconds unless another is
+-- given, by name; 0 for none -- which keeps it from being taken for a
+-- dead one by what is between, and tells the server soon after the
+-- client has gone, as its write fails.  The wait is the stream's read: a
+-- read, its time limit `heartbeat`.
 --
--- A socket's frames are read an act at a time, each read's bytes given
--- to std.http.websocket's `feed`: each message of text or of bytes the
--- client sends is a behaviour on the connection's cown, given to the
--- handler's `received` with the sender, in the order sent.  A ping is
--- answered by a pong; a close by a close, the same code, then the
--- connection closed once it is written; a frame that breaks the
--- protocol by a close of the code `feed` says, then the same.  A socket
--- is not held to `idle`: where its client is silent for `ping`
+-- A socket's frames are read an act at a time, on the inbox, each
+-- read's bytes given to std.http.websocket's `feed`: each message of
+-- text or of bytes the client sends is given to the handler's
+-- `received` with the sender, in the order sent, by the behaviour that
+-- read it.  A ping is answered by a pong; a close by a close, the same
+-- code, then the connection closed once it is written; a frame that
+-- breaks the protocol by a close of the code `feed` says, then the same.
+-- A socket is not held to `idle`: where its client is silent for `ping`
 -- milliseconds -- 30 seconds unless another is given, by name; 0 for
 -- none -- it is sent a ping, and, silent for as long again, closed.  A
 -- close sent by the handler (`finish`, or a `CloseMessage` sent) is
@@ -219,7 +234,7 @@
 -- Requests are read as std.http.server reads them, by its `requestIn`,
 -- a piece at a time, each piece an act: a body by `Content-Length`, or
 -- sent in chunks, each piece read undone as it comes, a `100 Continue`
--- written where the client waits for one, a request refused as
+-- put in the outbox where the client waits for one, a request refused as
 -- std.http.server refuses it (`400`, `413`, `431`, `501`, `505`), what
 -- the client still sends then read, up to a mebibyte, and let go of
 -- before its connection is closed.  Requests sent one after
@@ -228,34 +243,36 @@
 -- milliseconds -- 30 seconds unless another is given, by name,
 -- `BocServer.serve (idle := 5000) l handle`; 0 for no limit -- is
 -- closed, within a request or between two; a response not taken in that
--- time too, a piece of a stream or a frame of a socket too.  A client that is not silent but sends a request's head a
--- little at a time, which `idle` alone would let hold its connection
--- for ever, is held to `headerWithin` milliseconds for the whole head --
--- 30 seconds unless another is given, by name; 0 for no limit --
--- counted from the connection's accept, or from the response before it
--- (so on a connection kept open, the wait for the next request counts
--- too): past that, the connection is closed, unanswered, as one silent
--- too long is.  The time is std.time's monotonic clock, so the server's
--- world has `time`.  A head's end is looked for in each piece only as
--- it is read, with the three bytes before it, and the head is parsed
--- once, when all of it is read.
+-- time too, a piece of a stream or a frame of a socket too.  A client
+-- that is not silent but sends a request's head a little at a time,
+-- which `idle` alone would let hold its connection for ever, is held to
+-- `headerWithin` milliseconds for the whole head -- 30 seconds unless
+-- another is given, by name; 0 for no limit -- counted from the
+-- connection's accept, or from the response before it (so on a
+-- connection kept open, the wait for the next request counts too): past
+-- that, the connection is closed, unanswered, as one silent too long
+-- is.  The time is std.time's monotonic clock, so the server's world has
+-- `time`.  A head's end is looked for in each piece only as it is read,
+-- with the three bytes before it, and the head is parsed once, when all
+-- of it is read.
 --
 -- The server stops where a connection cannot be accepted: the listener
 -- closed (`Net.closeListener`, as above on a signal), or the program
--- out of descriptors (`EMFILE`).  Then the connections waiting for a
--- request are closed at once, a stream is ended (its last chunk), a
--- socket closed (`1001`), each once what was sent on it is written,
--- `gone` called, and the others are closed once the request in hand is
--- answered: once the last is closed, nothing of the server is
--- pending, and the program ends, if nothing else is.  The
--- handler runs in a behaviour, of the server's world, and may throw
--- an `err` (`Empty` where it throws nothing): a throw no `recover` of
--- the handler's hears closes that connection at once, unanswered, what
--- was thrown let go of -- a handler that is to say why catches it
--- itself -- and the others are served on.  A handler that fails
--- otherwise (abandons) fails its behaviour, which boc's `failed` hears:
--- its request is not answered, and its connection, read no further, is
--- closed where the program lets go of it, at the run's end.
+-- out of descriptors (`EMFILE`).  Then each connection is stopped by a
+-- behaviour on both its cowns: one waiting for a request is closed at
+-- once; a stream is ended (its last chunk), a socket closed (`1001`),
+-- each once what was sent on it is written, `gone` called; the others
+-- are closed once the request in hand is answered.  Once the last is
+-- closed, nothing of the server is pending, and the program ends, if
+-- nothing else is.  The handler runs in a behaviour, of the server's
+-- world, and may throw an `err` (`Empty` where it throws nothing): a
+-- throw no `recover` of the handler's hears closes that connection at
+-- once, unanswered, what was thrown let go of -- a handler that is to
+-- say why catches it itself -- and the others are served on.  A handler
+-- that fails otherwise (abandons) fails its behaviour, which boc's
+-- `failed` hears: its request is not answered, and its connection, read
+-- no further, is closed where the program lets go of it, at the run's
+-- end.
 
 module std.http.bocserver
   ( serve
@@ -272,7 +289,6 @@ import boc as BOC
 import bytes as Bytes
 import co
 import exception
-import std.duration as Duration
 import std.http as HTTP
 import std.http.server as Server
 import std.http.sse as SSE
@@ -283,41 +299,21 @@ import std.time as Time
 import uint8 as UInt8
 import resource
 
--- (how much is read at a time, at least)
-readSize : Int
-readSize = 65536
-
--- (how much is read at a time of a head not read all at once: so a
--- client sending its head a little at a time is waited for with a small
--- buffer, not `readSize`)
-headPiece : Int
-headPiece = 4096
-
--- (a head's most, std.http.server's: past it, its end not read, a
--- request is refused, `431`)
-headMost : Int
-headMost = 65536
-
--- (how much of what a client still sends, after a request refused, is
--- read and let go of before its connection is closed)
-drainMost : Int
-drainMost = 1048576
-
 -- Senders
 --------------------------------------------------------------------------------
 
 -- | What a handler sends its client by, on an answer that goes on: a
 -- | stream's pieces (`Bytes`), or a socket's messages
--- | (`WebSocket.Message`).  A value, its connection's cown within it --
--- | no region in its type -- so kept anywhere, a cown of the handler's
--- | among others, and sent by from any behaviour.
+-- | (`WebSocket.Message`).  A value, its connection's outbox within it
+-- | -- no region in its type -- so kept anywhere, a cown of the
+-- | handler's among others, and sent by from any behaviour.
 data Sender a
   = MkSender Int ({f : HFunctor}
                   -> {{bc : BOC.boc <: f}}
                   -> Maybe a
                   -> Co f Unit)
 
--- | `x` sent: queued on its connection, by a behaviour on its cown, to
+-- | `x` sent: put in its connection's outbox, by a behaviour there, to
 -- | be written after what was sent before it, by the server; the write
 -- | not waited for.  A stream's piece is written as a chunk, a socket's
 -- | message as a frame (a `CloseMessage` closes the socket).  Once the
@@ -351,20 +347,20 @@ senderNumber (MkSender n go) = n
 --------------------------------------------------------------------------------
 
 -- | What a handler does with a stream, by its sender: `opened`, once
--- | its head is queued, before any piece; `gone`, once its connection is
--- | gone before it is finished -- its client gone, or too slow, or the
--- | server stopped.  Each is run in a behaviour on the connection's
--- | cown, of the server's world: a throw closes the connection.
+-- | its head is written, before any piece; `gone`, once its connection
+-- | is gone before it is finished -- its client gone, or too slow, or the
+-- | server stopped.  Each is run in a behaviour of the server's world: a
+-- | throw closes the connection.
 type Streaming (e : HFunctor) (err : Type) =
   { opened : Sender Bytes -> Co (exception err <+> e) Unit
   , gone : Sender Bytes -> Co (exception err <+> e) Unit
   }
 
 -- | What a handler does with a socket, by its sender: `opened`, once
--- | the `101` is queued; `received`, each message of text or of bytes
+-- | the `101` is written; `received`, each message of text or of bytes
 -- | the client sends, in order; `gone`, once its connection is closed,
--- | whyever.  Each is run in a behaviour on the connection's cown, of the
--- | server's world: a throw closes the connection.
+-- | whyever.  Each is run in a behaviour of the server's world: a throw
+-- | closes the connection.
 type Socket (e : HFunctor) (err : Type) =
   { opened : Sender WebSocket.Message -> Co (exception err <+> e) Unit
   , received :
@@ -391,82 +387,68 @@ data Answer (e : HFunctor) (err : Type)
 type Responder (e : HFunctor) (err : Type) =
   {f : HFunctor} -> {{bc : BOC.boc <: f}} -> Answer e err -> Co f Unit
 
--- The server's state
+-- The connection's cowns
 --------------------------------------------------------------------------------
 
--- (where a connection is: reading its next request; that request with
--- the handler, to be answered; its response being written; a stream
--- or a socket going on; or closed, or being closed)
-data Phase = Reading | Answering | Writing | InStream | InSocket | Closing
+-- (how a stream is written: in chunks or not, its connection closed
+-- after it or not, and its heartbeat as written, none where empty)
+type Way = { chunked : Bool, close : Bool, beat : Bytes }
 
--- (how far the next request is read: its head not yet -- the last bytes
--- looked through for its end, three at most, kept, for an end read
--- in two pieces -- or its head, its body to come, from where that
--- starts; or its head, its body sent in chunks, read so far)
-data Part
-  = InHead Bytes
-  | InBody Server.Request Int
-  | InChunks Server.Request Server.Chunks
+-- (what the outbox has to do, in order: bytes written; once what is
+-- before it is written, the next request read, from what was read after
+-- the last (`ReadOn`); the connection closed (`Shut`); a stream begun, of
+-- answer `g`, what was read after its request kept for after it
+-- (`Opens`); a socket begun, of answer `g`, what was read after its
+-- request its first frames (`Upgrades`); or a stream's end written, its
+-- connection closed after it where it says (`Finished`))
+data Out (e : HFunctor) (err : Type)
+  = Writes Bytes
+  | ReadOn Bytes
+  | Shut
+  | Opens Int Bytes Way (Streaming e err)
+  | Upgrades Int Bytes (Socket e err)
+  | Finished Bool
 
--- (when the head being read is to be read by, on the monotonic clock,
--- in milliseconds: at no time -- a body is read, or there is no limit
--- -- within so many of the next read's start, or by then)
-data HeadBy = Whenever | Within Int | By Int
-
--- (the handler's of the stream or the socket going on, if one is)
-data Live (e : HFunctor) (err : Type)
-  = Unheld
-  | Streams (Streaming e err)
-  | Sockets (Socket e err)
-
--- (a connection's cown: what it is doing; what is read of its next
--- request, the last read first, `got` bytes in all, how many in all
--- are wanted before it is read again, and how far that is; when its
--- head is to be read by; whether a `100 Continue` was written for it;
--- whether the server has stopped, for the connection to be closed once
--- the request in hand is answered; and the handler's answer to it,
--- where it has given one and it is not yet taken.  Of a stream or a
--- socket: which answer of the connection's it is, `gen`, its senders
--- sending to it alone; what is queued to be written, the last first,
--- and how many bytes are queued or being written; whether a write is
--- being waited for; whether more than the most was sent; whether it is
--- ending, its last queued; whether a stream is chunked, and its
--- connection closed after it; a stream's heartbeat, and whether nothing
--- was queued since the last; a socket's reader, whether a ping is
--- unanswered, and whether a close was sent; and the handler's)
-type Conn (e : HFunctor) (err : Type) =
-  { phase : Phase
-  , parts : List Bytes
-  , got : Int
-  , want : Int
-  , part : Part
-  , by : HeadBy
-  , continued : Bool
-  , stopping : Bool
-  , reply : Maybe (Answer e err)
-  , gen : Int
-  , out : List Bytes
+-- (a connection's outbox: what it has to do, the last first; how many
+-- bytes are put there or being written; whether a write is awaited --
+-- one at a time, for the behaviours after writes awaited come in the
+-- order the writes are done; whether more than the most was
+-- sent, for the connection to be closed at once; how many answers were
+-- given -- the next taken is to that request, by its number -- and how
+-- many are written to their end; which answer's sender may send, -1
+-- none; what is put there to end that answer where the server stops;
+-- whether nothing was sent since a stream's last heartbeat; whether the
+-- server has stopped, and whether the connection is closed; and what is
+-- done of the answer going on as it closes, its handler's `gone`)
+type Outbox (e : HFunctor) (err : Type) =
+  { queue : List (Out e err)
   , pending : Int
   , busy : Bool
   , over : Bool
-  , ending : Bool
-  , chunked : Bool
-  , closeAfter : Bool
-  , beat : Bytes
+  , given : Int
+  , answered : Int
+  , sender : Int
+  , halt : List (Out e err)
   , quiet : Bool
-  , frames : WebSocket.Reader
-  , pinged : Bool
-  , closeSent : Bool
-  , live : Live e err
+  , stopping : Bool
+  , closed : Bool
+  , leave : Co e Unit
   }
 
+-- (a connection's inbox: how many requests are begun -- some of each
+-- read -- whether the connection is closed, what a stream's read kept
+-- of the next request, and whether a stream goes on, what is read kept
+-- for after it)
+type Inbox = { asked : Int, closed : Bool, kept : Bytes, streaming : Bool }
+
 -- (a connection, as the server keeps it: its socket, its number among
--- the server's, where its other side is, and its cown)
+-- the server's, where its other side is, and its cowns)
 type Connection (e : HFunctor) (rg : Type) (err : Type) =
   { socket : With rg Net.TcpStream
   , number : Int
   , peer : Net.Address
-  , state : BOC.Cown (Conn e err)
+  , inbox : BOC.Cown Inbox
+  , outbox : BOC.Cown (Outbox e err)
   }
 
 -- (the server's cown: its connections open, by their numbers; the next
@@ -478,7 +460,7 @@ type Served (e : HFunctor) (rg : Type) (err : Type) =
   }
 
 -- (what every behaviour of the server knows: the time limits, a
--- silence's and a head's, the most bytes a connection may have queued,
+-- silence's and a head's, the most bytes a connection may have pending,
 -- a heartbeat's and a ping's time, the server's cown, and the handler,
 -- of the server's world, which may throw an `err`)
 type Serving (e : HFunctor) (rg : Type) (err : Type) =
@@ -494,92 +476,88 @@ type Serving (e : HFunctor) (rg : Type) (err : Type) =
         -> Co (exception err <+> e) Unit
   }
 
--- (when a head begun is to be read by, given `headerWithin`: 0, at no
--- time)
-headStart : Int -> HeadBy
-headStart 0 = Whenever
-headStart within = Within within
+-- (no answer's sender)
+noSender : Int
+noSender = 0 - 1
 
--- (a connection just accepted: nothing read of it, its head to be read
--- within `within` milliseconds)
-fresh : {e : HFunctor} -> {err : Type} -> Int -> Conn e err
-fresh within =
-  { phase = Reading
-  , parts = Nil
-  , got = 0
-  , want = 1
-  , part = InHead Bytes.empty
-  , by = headStart within
-  , continued = False
-  , stopping = False
-  , reply = Nothing
-  , gen = 0
-  , out = Nil
+-- (a connection's outbox, as it is accepted)
+emptyOutbox : {e : HFunctor} -> {err : Type} -> Outbox e err
+emptyOutbox =
+  { queue = Nil
   , pending = 0
   , busy = False
   , over = False
-  , ending = False
-  , chunked = False
-  , closeAfter = False
-  , beat = Bytes.empty
+  , given = 0
+  , answered = 0
+  , sender = noSender
+  , halt = Nil
   , quiet = True
-  , frames = WebSocket.reader
-  , pinged = False
-  , closeSent = False
-  , live = Unheld
+  , stopping = False
+  , closed = False
+  , leave = pure ()
   }
 
--- (how much the next read asks for: what is wanted still, a body's, or
--- `readSize`, whichever is more)
-sizeFor : {e : HFunctor} -> {err : Type} -> Conn e err -> Int
-sizeFor st = if st.want - st.got > readSize then st.want - st.got else readSize
+-- (a connection's inbox, as it is accepted)
+emptyInbox : Inbox
+emptyInbox =
+  { asked = 0, closed = False, kept = Bytes.empty, streaming = False }
 
--- What is queued to be written
+-- What the outbox is given
 --------------------------------------------------------------------------------
 
--- (whether a phase is an answer's that goes on: a stream's, a socket's)
-goesOn : Phase -> Bool
-goesOn InStream = True
-goesOn InSocket = True
-goesOn _ = False
+-- (`x` put in the outbox, after what is there, its bytes counted)
+pushed : {e : HFunctor}
+       -> {err : Type}
+       -> Out e err
+       -> Outbox e err
+       -> Outbox e err
+pushed (Writes b) o =
+  { o | queue = Writes b :: o.queue, pending = o.pending + Bytes.length b }
+pushed x o = { o | queue = x :: o.queue }
 
--- (whether the connection is on its answer `g`, a stream or a socket)
-onAnswer : {e : HFunctor} -> {err : Type} -> Int -> Conn e err -> Bool
-onAnswer g st = st.gen == g && goesOn st.phase
+-- (each of `xs` put in the outbox, in order)
+pushedAll : {e : HFunctor}
+          -> {err : Type}
+          -> List (Out e err)
+          -> Outbox e err
+          -> Outbox e err
+pushedAll [] o = o
+pushedAll (x :: xs) o = pushedAll xs (pushed x o)
 
--- (whether answer `g`'s sender may send yet: not ended, no close sent)
-sending : {e : HFunctor} -> {err : Type} -> Int -> Conn e err -> Bool
-sending g st = onAnswer g st && not st.ending && not st.closeSent
-
--- (bytes queued on answer `g`, where its sender may send: past `most`
--- in all, 0 none, the connection to be closed instead)
+-- (bytes a sender of answer `g` sent, where it may send: past `most` in
+-- all, 0 none, the connection to be closed instead)
 queued : {e : HFunctor}
        -> {err : Type}
        -> Int
        -> Int
        -> Bytes
-       -> Conn e err
-       -> Conn e err
-queued most g b st =
-  if not (sending g st) || Bytes.length b == 0 then st
-  else if most > 0 && st.pending + Bytes.length b > most
-  then { st | over = True }
-  else { st
-       | out = b :: st.out
-       , pending = st.pending + Bytes.length b
-       , quiet = False
-       }
+       -> Outbox e err
+       -> Outbox e err
+queued most g b o =
+  if o.sender /= g || Bytes.length b == 0 then o
+  else if most > 0 && o.pending + Bytes.length b > most
+  then { o | over = True }
+  else let q = pushed (Writes b) o
+       in { q | quiet = False }
 
--- (a stream's end queued: its last chunk, where it is chunked)
-terminated : {e : HFunctor} -> {err : Type} -> Conn e err -> Conn e err
-terminated st =
-  if st.chunked
-  then { st
-       | out = b["0\r\n\r\n"] :: st.out
-       , pending = st.pending + 5
-       , ending = True
-       }
-  else { st | ending = True }
+-- (the outbox changed by `f`, in a behaviour on it, of whichever world)
+outboxed : {f : HFunctor}
+         -> {e : HFunctor}
+         -> {err : Type}
+         -> {{bc : BOC.boc <: f}}
+         -> BOC.Cown (Outbox e err)
+         -> (Outbox e err -> Outbox e err)
+         -> Co f Unit
+outboxed outbox change = do
+  with o := outbox do
+    o := change o
+
+-- (what ends a stream: its last chunk, where it is chunked, then its
+-- end)
+endOf : {e : HFunctor} -> {err : Type} -> Way -> List (Out e err)
+endOf way =
+  if way.chunked then [Writes b["0\r\n\r\n"], Finished way.close]
+  else [Finished way.close]
 
 -- (what a stream's sender, of answer `g`, is given: a piece, a chunk
 -- where it is chunked -- none of no bytes, which would end the chunks --
@@ -588,17 +566,19 @@ streamStep : {e : HFunctor}
            -> {err : Type}
            -> Int
            -> Int
+           -> Way
            -> Maybe Bytes
-           -> Conn e err
-           -> Conn e err
-streamStep most g (Just b) st =
-  if Bytes.length b == 0 then st
-  else queued most g (if st.chunked then Server.chunk b else b) st
-streamStep most g Nothing st =
-  if sending g st
-  then let t = terminated st
-       in { t | live = Unheld }
-  else st
+           -> Outbox e err
+           -> Outbox e err
+streamStep most g way (Just b) o =
+  if Bytes.length b == 0 then o
+  else queued most g (if way.chunked then Server.chunk b else b) o
+streamStep most g way Nothing o =
+  if o.sender == g
+  then pushedAll
+      (endOf way)
+      { o | sender = noSender, halt = Nil, leave = pure () }
+  else o
 
 -- (a message as it is written: a frame)
 frameBytes : WebSocket.Message -> Bytes
@@ -610,67 +590,110 @@ isClose (CloseMessage code why) = True
 isClose _ = False
 
 -- (what a socket's sender, of answer `g`, is given: a message, a close
--- the last; or its end, a close, `1000`)
+-- the last, after which the connection is closed where the server
+-- stops; or its end, a close, `1000`)
 socketStep : {e : HFunctor}
            -> {err : Type}
            -> Int
            -> Int
            -> Maybe WebSocket.Message
-           -> Conn e err
-           -> Conn e err
-socketStep most g (Just m) st =
-  let q = queued most g (frameBytes m) st
-  in if isClose m && sending g st then { q | closeSent = True } else q
-socketStep most g Nothing st =
-  socketStep most g (Just (CloseMessage 1000 "")) st
+           -> Outbox e err
+           -> Outbox e err
+socketStep most g (Just m) o =
+  let q = queued most g (frameBytes m) o
+  in if isClose m && o.sender == g then { q | sender = noSender, halt = [Shut] }
+  else q
+socketStep most g Nothing o = socketStep most g (Just (CloseMessage 1000 "")) o
 
--- (a sender on the connection's cown: each thing given it, `step`, in
+-- (a sender on the connection's outbox: each thing given it, `step`, in
 -- a behaviour there, of whichever world it is sent from)
 senderOn : {e : HFunctor}
          -> {err : Type}
          -> {a : Type}
-         -> BOC.Cown (Conn e err)
+         -> BOC.Cown (Outbox e err)
          -> Int
-         -> (Maybe a -> Conn e err -> Conn e err)
+         -> (Maybe a -> Outbox e err -> Outbox e err)
          -> Sender a
-senderOn state number step =
-  MkSender number (\x -> do
-    with st := state do
-      st := step x st)
+senderOn outbox number step = MkSender number (\x -> outboxed outbox (step x))
 
--- (the sender of the connection's stream, answer `g`)
-streamSender : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Int
-             -> Sender Bytes
-streamSender sg cn g = senderOn cn.state cn.number (streamStep sg.most g)
+-- (a socket's close, its code, answered, on answer `g`: a close of the
+-- same code, unless one was sent, then the connection closed once it is
+-- written)
+closedBack : {e : HFunctor}
+           -> {err : Type}
+           -> Int
+           -> Int
+           -> Outbox e err
+           -> Outbox e err
+closedBack g code o =
+  if o.closed then o
+  else if o.sender == g
+  then pushed
+      Shut
+      (pushed
+         (Writes (frameBytes (CloseMessage code "")))
+         { o | sender = noSender, halt = Nil })
+  else pushed Shut { o | halt = Nil }
 
--- (the sender of the connection's socket, answer `g`)
-socketSender : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Int
-             -> Sender WebSocket.Message
-socketSender sg cn g = senderOn cn.state cn.number (socketStep sg.most g)
+-- (a socket whose client broke the protocol, on answer `g`: a close of
+-- the code, and why, unless one was sent, then the connection closed
+-- once it is written)
+broke : {e : HFunctor}
+      -> {err : Type}
+      -> Int
+      -> Int
+      -> String
+      -> Outbox e err
+      -> Outbox e err
+broke g code why o =
+  if o.closed then o
+  else if o.sender == g
+  then pushed
+      Shut
+      (pushed
+         (Writes (frameBytes (CloseMessage code why)))
+         { o | sender = noSender, halt = Nil })
+  else pushed Shut { o | halt = Nil }
 
--- (the connection, its stream or its socket going on, as the server
--- stops: a stream ended, its last chunk queued -- `gone` called once it
--- is written, where the handler had not finished it -- a socket closed,
--- `1001`, closed once that is written)
-halted : {e : HFunctor} -> {err : Type} -> Conn e err -> Phase -> Conn e err
-halted st InStream =
-  if st.ending then { st | stopping = True }
-  else let t = terminated st
-       in { t | stopping = True }
-halted st InSocket =
-  let q = socketStep 0 st.gen (Just (CloseMessage 1001 "")) st
-  in { q | ending = True, stopping = True }
-halted st _ = { st | stopping = True }
+-- (socket `g`'s client silent for a ping's time: a ping sent; or, a
+-- close sent already, the connection closed)
+silent : {e : HFunctor}
+       -> {err : Type}
+       -> Int
+       -> Int
+       -> Outbox e err
+       -> Outbox e err
+silent most g o =
+  if o.closed then o
+  else if o.sender == g
+  then queued most g (frameBytes (PingMessage Bytes.empty)) o
+  else pushed Shut { o | halt = Nil }
+
+-- (a heartbeat's time passed on stream `g`: its heartbeat, `beat`, put
+-- in the outbox, where nothing was since the last)
+beaten : {e : HFunctor}
+       -> {err : Type}
+       -> Int
+       -> Int
+       -> Bytes
+       -> Outbox e err
+       -> Outbox e err
+beaten most g beat o =
+  if o.quiet
+  then let q = queued most g beat o
+       in { q | quiet = True }
+  else { o | quiet = True }
+
+-- (the server stopped, for a connection with a request in hand: its
+-- answer going on ended, the connection closed after what ends it)
+halting : {e : HFunctor} -> {err : Type} -> Outbox e err -> Outbox e err
+halting o =
+  let h = pushedAll o.halt o
+  in { h
+     | stopping = True
+     , halt = Nil
+     , sender = if List.null o.halt then o.sender else noSender
+     }
 
 -- (whether a header says its body is server-sent events)
 isEventStream : Pair String String -> Bool
@@ -679,59 +702,225 @@ isEventStream (MkPair n v) =
   && HTTP.sameName (strSlice (trim v) 0 17) "text/event-stream"
 
 -- (a stream's heartbeat, of these headers: an empty comment, where they
--- are events'; none else)
-beatOf : List (Pair String String) -> Bytes
-beatOf headers =
-  if List.any isEventStream headers then SSE.event [Comment ""]
+-- are events' and there is a heartbeat's time; none else)
+beatOf : Int -> List (Pair String String) -> Bytes
+beatOf heartbeat headers =
+  if heartbeat > 0 && List.any isEventStream headers
+  then SSE.event [Comment ""]
   else Bytes.empty
 
--- (whether there is something for answer `g`'s writer to do: past the
--- most, the connection closed, a write waited for or not; what is
--- queued written, or, ending, its end, no write waited for; or the
--- answer is no longer the connection's)
-outReady : {e : HFunctor} -> {err : Type} -> Int -> Conn e err -> Bool
-outReady g st =
-  not (onAnswer g st)
-  || st.over
-  || (not st.busy && (not (List.null st.out) || st.ending))
+-- The answer
+--------------------------------------------------------------------------------
 
--- (how long a stream's connection is read for at a time: a heartbeat's
--- time, where it has one, else `idle`)
-listenFor : {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> Serving e rg err
-          -> Conn e err
-          -> Int
-listenFor sg st =
-  if Bytes.length st.beat > 0 && sg.heartbeat > 0 then sg.heartbeat
-  else sg.idle
+-- (what comes after a response written: the connection closed, or its
+-- next request read, from what was read after this one)
+afterWhole : {e : HFunctor} -> {err : Type} -> Bool -> Bytes -> Out e err
+afterWhole True rest = Shut
+afterWhole False rest = ReadOn rest
 
--- (a heartbeat's time passed on stream `g`: its heartbeat queued, where
--- it has one and nothing was queued since the last)
-beaten : {e : HFunctor}
-       -> {err : Type}
-       -> Int
-       -> Int
-       -> Conn e err
-       -> Conn e err
-beaten most g st =
-  if Bytes.length st.beat > 0 && st.quiet
-  then let q =
-         queued most g (if st.chunked then Server.chunk st.beat else st.beat) st
-       in { q | quiet = True }
-  else { st | quiet = True }
+-- (a response, whole, to `r`, put in the outbox: the connection closed
+-- after where the request or the response asks, or the server stops)
+whole : {e : HFunctor}
+      -> {err : Type}
+      -> Server.Request
+      -> Bytes
+      -> HTTP.Response
+      -> Outbox e err
+      -> Outbox e err
+whole r rest res o =
+  let close =
+    o.stopping
+    || not (Server.keptAlive r)
+    || Server.connectionSays "close" res.headers
+  in pushed
+    (afterWhole close rest)
+    (pushed
+       (Writes
+          (Server.responseBytes
+             (Server.connectionWord r close)
+             (not (strEq r.method "HEAD"))
+             res))
+       o)
+
+-- (a stream, answer `n` to `r`, put in the outbox, `chunked` whether
+-- in chunks, `close` whether its connection is closed after it: its
+-- head, then the stream begun; to a `HEAD`, or of a status with no
+-- body, its head alone, the handler not given it)
+streamedAs : {e : HFunctor}
+           -> {err : Type}
+           -> Int
+           -> Int
+           -> Server.Request
+           -> Bytes
+           -> Server.Head
+           -> Streaming e err
+           -> Bool
+           -> Bool
+           -> Outbox e err
+           -> Outbox e err
+streamedAs heartbeat n r rest h s chunked close o =
+  let wrote =
+    pushed
+      (Writes
+         (Server.streamedHead
+            (Server.connectionWord r close)
+            (chunked && not (Server.bodiless h.status))
+            h))
+      o
+  in if Server.bodiless h.status || strEq r.method "HEAD"
+  then pushed (afterWhole close rest) wrote
+  else pushed
+      (Opens
+         n
+         rest
+         { chunked = chunked
+         , close = close
+         , beat = beatOf heartbeat h.headers
+         }
+         s)
+      wrote
+
+-- (... in chunks to HTTP/1.1, the connection closed after it to
+-- HTTP/1.0, or where the request or the head asks, or the server
+-- stops)
+streamed : {e : HFunctor}
+         -> {err : Type}
+         -> Int
+         -> Int
+         -> Server.Request
+         -> Bytes
+         -> Server.Head
+         -> Streaming e err
+         -> Outbox e err
+         -> Outbox e err
+streamed heartbeat n r rest h s o =
+  let chunked = strEq r.version "HTTP/1.1"
+  in streamedAs
+    heartbeat
+    n
+    r
+    rest
+    h
+    s
+    chunked
+    (o.stopping
+     || not chunked
+     || not (Server.keptAlive r)
+     || Server.connectionSays "close" h.headers)
+    o
+
+-- (a socket's handshake checked: refused, its refusal written; else its
+-- `101` written, then the socket begun)
+upgraded : {e : HFunctor}
+         -> {err : Type}
+         -> Int
+         -> Server.Request
+         -> Bytes
+         -> Socket e err
+         -> WebSocket.Handshake
+         -> Outbox e err
+         -> Outbox e err
+upgraded n r rest s (Refuse res) o = whole r rest res o
+upgraded n r rest s (Accept key) o =
+  pushed
+    (Upgrades n rest s)
+    (pushed
+       (Writes
+          (Server.takeoverHead
+             { status = 101, headers = WebSocket.upgradeHeaders key }))
+       o)
+
+answerOf : {e : HFunctor}
+         -> {err : Type}
+         -> Int
+         -> Int
+         -> Server.Request
+         -> Bytes
+         -> Answer e err
+         -> Outbox e err
+         -> Outbox e err
+answerOf heartbeat n r rest (Whole res) o = whole r rest res o
+answerOf heartbeat n r rest (Streamed h s) o = streamed heartbeat n r rest h s o
+answerOf heartbeat n r rest (Upgraded s) o =
+  upgraded n r rest s (WebSocket.handshake r) o
+
+-- (the handler's answer to request `n`, `r`, what was read after it
+-- `rest`: taken where it is the first, and the connection open)
+respondedTo : {e : HFunctor}
+            -> {err : Type}
+            -> Int
+            -> Int
+            -> Server.Request
+            -> Bytes
+            -> Answer e err
+            -> Outbox e err
+            -> Outbox e err
+respondedTo heartbeat n r rest a o =
+  if o.closed || o.given /= n then o
+  else answerOf heartbeat n r rest a { o | given = n + 1 }
+
+-- Reading
+--------------------------------------------------------------------------------
+
+-- (how far a request is read: its head not yet -- the last bytes looked
+-- through for its end, three at most, kept, for an end read in two
+-- pieces -- or its head, its body to come, from where that starts; or
+-- its head, its body sent in chunks, read so far)
+data Part
+  = InHead Bytes
+  | InBody Server.Request Int
+  | InChunks Server.Request Server.Chunks
+
+-- (when the head being read is to be read by, on the monotonic clock,
+-- in milliseconds: at no time -- a body is read, or there is no limit
+-- -- within so many of the next read's start, or by then)
+data HeadBy = Whenever | Within Int | By Int
+
+-- (what is read of a request: the last read first, `got` bytes in all,
+-- how many in all are wanted before it is read again, how far that is,
+-- when its head is to be read by, and whether a `100 Continue` was put
+-- in the outbox for it)
+type Progress =
+  { parts : List Bytes
+  , got : Int
+  , want : Int
+  , part : Part
+  , by : HeadBy
+  , continued : Bool
+  }
+
+-- (when a head begun is to be read by, given `headerWithin`: 0, at no
+-- time)
+headStart : Int -> HeadBy
+headStart 0 = Whenever
+headStart within = Within within
+
+-- (a request of which nothing is read yet)
+begun : HeadBy -> Progress
+begun by =
+  { parts = Nil
+  , got = 0
+  , want = 1
+  , part = InHead Bytes.empty
+  , by = by
+  , continued = False
+  }
+
+-- (whether nothing of the request is read yet)
+unread : Part -> Int -> Bool
+unread (InHead tail) got = got == 0
+unread _ got = False
+
+-- (how much the next read asks for: what is wanted still, a body's, or
+-- `readSize`, whichever is more)
+sizeFor : Progress -> Int
+sizeFor pg =
+  if pg.want - pg.got > Server.readSize then pg.want - pg.got
+  else Server.readSize
 
 -- (whether a read or a write failed for its time limit)
 isTimeout : Net.NetError -> Bool
 isTimeout why = strEq why.name "ETIMEDOUT"
-
--- (a status whose response has no body: 1xx, 204, 304)
-bodiless : Int -> Bool
-bodiless s = s < 200 || s == 204 || s == 304
-
--- Looking for a head's end
---------------------------------------------------------------------------------
 
 -- (the byte at `k` of `a`'s bytes, then `b`'s)
 byteOf : Bytes -> Bytes -> Int -> Int
@@ -763,10 +952,46 @@ lastThree a b =
          (if Bytes.length ab > 3 then Bytes.length ab - 3 else 0)
          (Bytes.length ab)
 
--- (what a request answered leaves to be read of the next: a piece)
+-- (bytes kept, the last first, as one)
 leftOf : List Bytes -> Bytes
 leftOf [b] = b
 leftOf parts = Bytes.concat (List.reverse parts)
+
+-- (whether the client waits for `100 Continue` before it sends the body
+-- of the request whose head is read)
+expectsOf : Maybe Server.Request -> Bool
+expectsOf Nothing = False
+expectsOf (Just r) = Server.expects r
+
+-- (the request whose head is read, where it is)
+wantedOf : Server.Wanted -> Maybe Server.Request
+wantedOf (MoreHead want) = Nothing
+wantedOf (MoreBody r want) = Just r
+wantedOf (MoreChunks r ch) = Just r
+
+-- (what is read of a request, the head read, `buf` all that is read of
+-- it, the head's blank line at `i`, as what the request still wants
+-- says: so many bytes in all, its body from `i + 4` on; or its body's
+-- chunks, which hold what is read of them)
+wanting : Progress -> Bytes -> Int -> Server.Wanted -> Progress
+wanting pg buf i (MoreHead want) =
+  { pg
+  | parts = [buf]
+  , got = Bytes.length buf
+  , want = want
+  , part = InHead Bytes.empty
+  , by = Whenever
+  }
+wanting pg buf i (MoreBody r want) =
+  { pg
+  | parts = [buf]
+  , got = Bytes.length buf
+  , want = want
+  , part = InBody r (i + 4)
+  , by = Whenever
+  }
+wanting pg buf i (MoreChunks r ch) =
+  { pg | parts = Nil, got = 0, want = 0, part = InChunks r ch, by = Whenever }
 
 -- The acts
 --------------------------------------------------------------------------------
@@ -804,16 +1029,6 @@ came : HeadBy -> Either Net.NetError Bytes -> Arrived
 came by (Right b) = Came by b
 came by (Left err) = Failed
 
--- (the monotonic clock, in milliseconds)
-millisecondsNow : {e : HFunctor} -> {{clock : Time.time <: e}} -> Co e Int
-millisecondsNow =
-  bind Time.monotonic (\d -> pure (Duration.totalNanoseconds d / 1000000))
-
--- (the shorter of two time limits, 0 none)
-shorter : Int -> Int -> Int
-shorter 0 left = left
-shorter idle left = if idle < left then idle else left
-
 -- (a read, `now`, of `size` bytes at most, within `idle` milliseconds,
 -- and by `until`: where that has passed, none)
 readUntil : {e : HFunctor}
@@ -828,7 +1043,7 @@ readUntil : {e : HFunctor}
 readUntil idle until now c size =
   if now >= until then pure Failed
   else bind
-      (Net.read (timeout := shorter idle (until - now)) c size)
+      (Net.read (timeout := Server.shorter idle (until - now)) c size)
       (\r -> pure (came (By until) r))
 
 -- (a read of `size` bytes at most, within `idle` milliseconds, and where
@@ -846,28 +1061,9 @@ readBy : {e : HFunctor}
 readBy idle Whenever c size =
   bind (Net.read (timeout := idle) c size) (\r -> pure (came Whenever r))
 readBy idle (Within within) c size =
-  bind millisecondsNow (\now -> readUntil idle (now + within) now c size)
+  bind Server.millisecondsNow (\now -> readUntil idle (now + within) now c size)
 readBy idle (By until) c size =
-  bind millisecondsNow (\now -> readUntil idle until now c size)
-
--- (what the client still sends read and let go of, `got` bytes of it
--- already, until it ends or there has been `drainMost` of it)
-drained : {e : HFunctor}
-        -> {rg : Type}
-        -> {{nt : Net.net <: e}}
-        -> Int
-        -> With rg Net.TcpStream
-        -> Int
-        -> Co e Unit
-drained idle c got =
-  if got >= drainMost then pure ()
-  else do
-    r <- Net.read (timeout := idle) c readSize
-    case r of
-      Right b ->
-        if Bytes.length b == 0 then pure ()
-        else drained idle c (got + Bytes.length b)
-      Left err -> pure ()
+  bind Server.millisecondsNow (\now -> readUntil idle until now c size)
 
 -- (a refusal written, then this side shut down, so that the client reads
 -- it to its end, and what the client still sends drained, so that the
@@ -880,92 +1076,22 @@ refused : {e : HFunctor}
         -> With rg Net.TcpStream
         -> Int
         -> Co e Unit
-refused idle c status = do
-  r <-
-    Net.write
-      (timeout := idle)
-      c
-      (Server.responseBytes
-         "close"
-         True
-         (Server.plain status (Server.reason status ^ "\n")))
-  case r of
-    Right u -> do
-      _ <- Net.shutdown c
-      drained idle c 0
-    Left err -> pure ()
+refused idle c status =
+  bind
+    (Net.write
+       (timeout := idle)
+       c
+       (Server.responseBytes
+          "close"
+          True
+          (Server.plain status (Server.reason status ^ "\n"))))
+    (Server.lingered idle c)
 
--- Responses
+-- Closing
 --------------------------------------------------------------------------------
 
--- (whether a `Connection` header of these has the token, its case not
--- minded)
-connectionSays : String -> List (Pair String String) -> Bool
-connectionSays token [] = False
-connectionSays token (MkPair n v :: rest) =
-  (HTTP.sameName n "Connection"
-   && List.any (\t -> HTTP.sameName (trim t) token) (split "," v))
-  || connectionSays token rest
-
--- (what a response says of its connection: closed, or kept where
--- HTTP/1.0 has to be told so)
-connectionWord : Server.Request -> Bool -> String
-connectionWord r True = "close"
-connectionWord r False = if strEq r.version "HTTP/1.0" then "keep-alive" else ""
-
--- (whether the client waits for `100 Continue` before it sends the body
--- of the request whose head is read)
-expects : Maybe Server.Request -> Bool
-expects Nothing = False
-expects (Just r) =
-  strEq r.version "HTTP/1.1"
-  && maybe
-    False
-    (\v -> HTTP.sameName v "100-continue")
-    (Server.header "expect" r)
-
--- (the request whose head is read, where it is)
-wantedOf : Server.Wanted -> Maybe Server.Request
-wantedOf (MoreHead want) = Nothing
-wantedOf (MoreBody r want) = Just r
-wantedOf (MoreChunks r ch) = Just r
-
--- (the connection's state, the head of its request read, `buf` all that
--- is read of it, the head's blank line at `i`, as what the request still
--- wants says: so many bytes in all, its body from `i + 4` on; or its
--- body's chunks, which hold what is read of them)
-wanting : {e : HFunctor}
-        -> {err : Type}
-        -> Conn e err
-        -> Bytes
-        -> Int
-        -> Server.Wanted
-        -> Conn e err
-wanting st buf i (MoreHead want) =
-  { st
-  | parts = [buf]
-  , got = Bytes.length buf
-  , want = want
-  , part = InHead Bytes.empty
-  , by = Whenever
-  }
-wanting st buf i (MoreBody r want) =
-  { st
-  | parts = [buf]
-  , got = Bytes.length buf
-  , want = want
-  , part = InBody r (i + 4)
-  , by = Whenever
-  }
-wanting st buf i (MoreChunks r ch) =
-  { st | parts = Nil, got = 0, want = 0, part = InChunks r ch, by = Whenever }
-
--- The behaviours
---------------------------------------------------------------------------------
-
--- (the connection closed, and taken from the server's: its cown's
--- phase set to closing by the caller, so that what comes back to it
--- after does nothing)
+-- (the connection's socket closed, and the connection taken from the
+-- server's)
 closing : {e : HFunctor}
         -> {rg : Type}
         -> {err : Type}
@@ -979,38 +1105,48 @@ closing sg cn = do
        _ := BOC.await (Net.close cn.socket) do
     sv := { sv | open = OrdMap.delete sv.open cn.number }
 
--- (the handler's `gone` of answer `g`, where a stream or a socket goes
--- on, run: what it throws let go of, its connection closed already)
-goneFor : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Int
-        -> Live e err
-        -> Co e Unit
-goneFor sg cn g Unheld = pure ()
-goneFor sg cn g (Streams s) =
-  bind (attempt err (s.gone (streamSender sg cn g))) (\o -> pure ())
-goneFor sg cn g (Sockets s) =
-  bind (attempt err (s.gone (socketSender sg cn g))) (\o -> pure ())
-
--- (the connection closed, and the handler's `gone` called where a
--- stream or a socket goes on: its state after)
-ended : {e : HFunctor}
-      -> {rg : Type}
-      -> {err : Type}
-      -> {{bc : BOC.boc <: e}}
-      -> {{nt : Net.net <: e}}
-      -> Serving e rg err
-      -> Connection e rg err
-      -> Conn e err
-      -> Co e (Conn e err)
-ended sg cn st = do
+-- (the connection closed, from a behaviour holding its outbox: its
+-- socket closed, the handler's `gone` called where an answer goes on,
+-- and the outbox closed, nothing written after)
+shut : {e : HFunctor}
+     -> {rg : Type}
+     -> {err : Type}
+     -> {{bc : BOC.boc <: e}}
+     -> {{nt : Net.net <: e}}
+     -> Serving e rg err
+     -> Connection e rg err
+     -> Outbox e err
+     -> Co e (Outbox e err)
+shut sg cn o = do
   closing sg cn
-  goneFor sg cn st.gen st.live
-  pure { st | phase = Closing, live = Unheld, out = Nil, pending = 0 }
+  o.leave
+  pure
+      { o
+      | queue = Nil
+      , pending = 0
+      , sender = noSender
+      , halt = Nil
+      , closed = True
+      , leave = pure ()
+      }
+
+-- (the connection closed, by a behaviour on both its cowns, where it is
+-- not yet: what comes back to either after does nothing)
+closer : {e : HFunctor}
+       -> {rg : Type}
+       -> {err : Type}
+       -> {{bc : BOC.boc <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Serving e rg err
+       -> Connection e rg err
+       -> Co e Unit
+closer sg cn = do
+  with i := cn.inbox
+       o := cn.outbox do
+    if o.closed then pure ()
+    else do
+      i := { i | closed = True }
+      o := (<- shut sg cn o)
 
 -- (a refusal written, what the client still sends drained, then the
 -- connection closed)
@@ -1025,172 +1161,30 @@ refusing : {e : HFunctor}
          -> Co e Unit
 refusing sg cn status = do
   with _ := BOC.await (refused sg.idle cn.socket status) do
-    closing sg cn
+    closer sg cn
 
--- (whether the handler has given its answer)
-replied : {e : HFunctor} -> {err : Type} -> Conn e err -> Bool
-replied st = case st.reply of
-  Just res -> True
-  Nothing -> False
-
--- (the connection's state, given the handler's answer: kept where it
--- is the first to its request)
-respondedTo : {e : HFunctor}
-            -> {err : Type}
-            -> Answer e err
-            -> Conn e err
-            -> Phase
-            -> Conn e err
-respondedTo a st Answering = if replied st then st else { st | reply = Just a }
-respondedTo a st _ = st
-
--- (the connection closed: its state after)
-closed : {e : HFunctor}
-       -> {rg : Type}
-       -> {err : Type}
-       -> {{bc : BOC.boc <: e}}
-       -> {{nt : Net.net <: e}}
-       -> Serving e rg err
-       -> Connection e rg err
-       -> Conn e err
-       -> Co e (Conn e err)
-closed sg cn st = do
-  closing sg cn
-  pure { st | phase = Closing }
-
--- (the answer the handler gives, its first, kept on the connection's
--- cown for the server to take: in the handler's world, whichever)
-responded : {f : HFunctor}
-          -> {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> {{bc : BOC.boc <: f}}
-          -> Connection e rg err
-          -> Answer e err
-          -> Co f Unit
-responded cn a = do
-  with st := cn.state do
-    st := respondedTo a st st.phase
-
--- (a socket's close, its code, answered, on answer `g`: a close of the
--- same code, unless one was sent, then the connection closed once it is
--- written)
-closedBack : {e : HFunctor}
-           -> {err : Type}
-           -> Int
-           -> Int
-           -> Int
-           -> Conn e err
-           -> Conn e err
-closedBack most g code st =
-  if st.closeSent then { st | ending = True }
-  else let q = queued most g (frameBytes (CloseMessage code "")) st
-       in { q | closeSent = True, ending = True }
-
--- (a socket whose client broke the protocol, on answer `g`: a close of
--- the code, and why, then the connection closed once it is written)
-broke : {e : HFunctor}
-      -> {err : Type}
-      -> Int
-      -> Int
-      -> Int
-      -> String
-      -> Conn e err
-      -> Conn e err
-broke most g code why st =
-  let q = queued most g (frameBytes (CloseMessage code why)) st
-  in { q | closeSent = True, ending = True }
-
--- (a message of text or of bytes given to the handler's `received`)
-receivedBy : {e : HFunctor}
+-- (a `100 Continue` put in the outbox)
+continuing : {f : HFunctor}
+           -> {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> Serving e rg err
+           -> {{bc : BOC.boc <: f}}
            -> Connection e rg err
-           -> Int
-           -> Conn e err
-           -> Live e err
-           -> WebSocket.Message
-           -> Co e (Conn e err)
-receivedBy sg cn g st (Sockets s) m = do
-  outcome <- attempt err (s.received (socketSender sg cn g) m)
-  case outcome of
-    Right u -> pure st
-    Left thrown -> ended sg cn st
-receivedBy sg cn g st _ m = pure st
+           -> Co f Unit
+continuing cn =
+  outboxed
+    cn.outbox
+    (\o ->
+       if o.closed then o
+       else pushed (Writes b["HTTP/1.1 100 Continue\r\n\r\n"]) o)
 
--- (a message the client sent on socket `g`, in a behaviour of its own:
--- a ping answered, a close answered, the others the handler's)
-heardIn : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> {{nt : Net.net <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Int
-        -> Conn e err
-        -> WebSocket.Message
-        -> Co e (Conn e err)
-heardIn sg cn g st (PingMessage p) =
-  pure (queued sg.most g (frameBytes (PongMessage p)) st)
-heardIn sg cn g st (PongMessage p) = pure st
-heardIn sg cn g st (CloseMessage code why) = pure (closedBack sg.most g code st)
-heardIn sg cn g st m = receivedBy sg cn g st st.live m
-
--- (a message the client sent on socket `g`, where it is still the
--- connection's)
-heardOn : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> {{nt : Net.net <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Int
-        -> Conn e err
-        -> WebSocket.Message
-        -> Co e (Conn e err)
-heardOn sg cn g st m = if onAnswer g st then heardIn sg cn g st m else pure st
-
--- (socket `g`, where it is still the connection's, after its client
--- broke the protocol: a close of the code, and why, then the connection
--- closed once it is written)
-brokeOn : {e : HFunctor}
-        -> {err : Type}
-        -> Int
-        -> Int
-        -> Int
-        -> String
-        -> Conn e err
-        -> Conn e err
-brokeOn most g code why st =
-  if onAnswer g st then broke most g code why st else st
-
--- (the messages the client sent on socket `g`, each a behaviour on the
--- connection's cown, in order)
-heardAll : {e : HFunctor}
-         -> {rg : Type}
-         -> {err : Type}
-         -> {{bc : BOC.boc <: e}}
-         -> {{nt : Net.net <: e}}
-         -> Serving e rg err
-         -> Connection e rg err
-         -> Int
-         -> List WebSocket.Message
-         -> Co e Unit
-heardAll sg cn g [] = pure ()
-heardAll sg cn g (m :: ms) = do
-  with st := cn.state do
-    st := (<- heardOn sg cn g st m)
-  heardAll sg cn g ms
+-- The inbox's behaviours: a request read
+--------------------------------------------------------------------------------
 
 mutual
-  -- (more of the connection read, `size` bytes at most, in `idle`
-  -- milliseconds, and where its head is read, by `by`: what it comes to
-  -- taken with what was read)
+  -- (more of the request read, `size` bytes at most, in `idle`
+  -- milliseconds, and where its head is read, by `pg.by`: what it comes
+  -- to taken, in a behaviour on the inbox, with what was read)
   reading : {e : HFunctor}
           -> {rg : Type}
           -> {err : Type}
@@ -1200,16 +1194,15 @@ mutual
           -> Serving e rg err
           -> Connection e rg err
           -> Int
-          -> HeadBy
+          -> Progress
           -> Co e Unit
-  reading sg cn size by = do
-    with st := cn.state
-         got := BOC.await (readBy sg.idle by cn.socket size) do
-      st := (<- readCame sg cn st st.phase got)
+  reading sg cn size pg = do
+    with i := cn.inbox
+         got := BOC.await (readBy sg.idle pg.by cn.socket size) do
+      i := (<- readCame sg cn i pg got)
 
-  -- (what a read came to, by where the connection is: nothing, closed;
-  -- else its bytes taken, or, at its end or failed, the connection
-  -- closed)
+  -- (what a read came to, where the connection is open: the request's
+  -- first bytes counted)
   readCame : {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
@@ -1218,121 +1211,42 @@ mutual
            -> {{clock : Time.time <: e}}
            -> Serving e rg err
            -> Connection e rg err
-           -> Conn e err
-           -> Phase
+           -> Inbox
+           -> Progress
            -> Arrived
-           -> Co e (Conn e err)
-  readCame sg cn st Closing got = pure st
-  readCame sg cn st _ (Came after b) =
-    if Bytes.length b == 0 then closed sg cn st
-    else took sg cn { st | by = after } st.part b
-  readCame sg cn st _ Failed = closed sg cn st
+           -> Co e Inbox
+  readCame sg cn i pg got =
+    if i.closed then pure i
+    else if unread pg.part pg.got
+    then cameTo sg cn { i | asked = i.asked + 1 } pg got
+    else cameTo sg cn i pg got
 
-  -- (a `100 Continue` written, then the body read)
-  continuing : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> {{bc : BOC.boc <: e}}
-             -> {{nt : Net.net <: e}}
-             -> {{clock : Time.time <: e}}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Co e Unit
-  continuing sg cn = do
-    with st := cn.state
-         sent :=
-             BOC.await
-               (Net.write
-                  (timeout := sg.idle)
-                  cn.socket
-                  b["HTTP/1.1 100 Continue\r\n\r\n"]) do
-      st := (<- continued sg cn st st.phase sent)
-
-  -- (what writing `100 Continue` came to: the body read; or closed)
-  continued : {e : HFunctor}
-            -> {rg : Type}
-            -> {err : Type}
-            -> {{bc : BOC.boc <: e}}
-            -> {{nt : Net.net <: e}}
-            -> {{clock : Time.time <: e}}
-            -> Serving e rg err
-            -> Connection e rg err
-            -> Conn e err
-            -> Phase
-            -> Either Net.NetError Unit
-            -> Co e (Conn e err)
-  continued sg cn st Closing sent = pure st
-  continued sg cn st _ (Right u) = do
-    reading sg cn (sizeFor st) Whenever
-    pure st
-  continued sg cn st _ (Left why) = closed sg cn st
-
-  -- (the response written, `close` whether the connection is then
-  -- closed: else its next request read -- from what was read after the
-  -- last, where that holds one)
-  writing : {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> {{bc : BOC.boc <: e}}
-          -> {{nt : Net.net <: e}}
-          -> {{clock : Time.time <: e}}
-          -> Serving e rg err
-          -> Connection e rg err
-          -> Bool
-          -> Bytes
-          -> Co e Unit
-  writing sg cn close bytes = do
-    with st := cn.state
-         sent := BOC.await (Net.write (timeout := sg.idle) cn.socket bytes) do
-      st := (<- written sg cn close st st.phase sent)
-
-  -- (what writing a response came to: the next request read, or the
+  -- (what a read came to: its bytes taken; at its end, or failed, the
   -- connection closed)
-  written : {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> {{bc : BOC.boc <: e}}
-          -> {{nt : Net.net <: e}}
-          -> {{clock : Time.time <: e}}
-          -> Serving e rg err
-          -> Connection e rg err
-          -> Bool
-          -> Conn e err
-          -> Phase
-          -> Either Net.NetError Unit
-          -> Co e (Conn e err)
-  written sg cn close st Closing sent = pure st
-  written sg cn close st _ (Right u) =
-    if close || st.stopping then closed sg cn st
-    else nextRequest sg cn { st | phase = Reading }
-  written sg cn close st _ (Left why) = closed sg cn st
-
-  -- (the next request read, a response written: looked for first in
-  -- what was read after the last, where there is any)
-  nextRequest : {e : HFunctor}
-              -> {rg : Type}
-              -> {err : Type}
-              -> {{bc : BOC.boc <: e}}
-              -> {{nt : Net.net <: e}}
-              -> {{clock : Time.time <: e}}
-              -> Serving e rg err
-              -> Connection e rg err
-              -> Conn e err
-              -> Co e (Conn e err)
-  nextRequest sg cn st =
-    if st.got > 0
-    then looked
-        sg
-        cn
-        { st | parts = Nil, got = 0 }
-        Bytes.empty
-        (leftOf st.parts)
-    else do
-      reading sg cn readSize st.by
-      pure { st | want = 1 }
+  cameTo : {e : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{bc : BOC.boc <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{clock : Time.time <: e}}
+         -> Serving e rg err
+         -> Connection e rg err
+         -> Inbox
+         -> Progress
+         -> Arrived
+         -> Co e Inbox
+  cameTo sg cn i pg (Came after b) =
+    if Bytes.length b == 0
+    then do
+      closer sg cn
+      pure i
+    else took sg cn i { pg | by = after } pg.part b
+  cameTo sg cn i pg Failed = do
+    closer sg cn
+    pure i
 
   -- (bytes `b` read, taken as far as they go, where the request is,
-  -- `part`: the connection's state after)
+  -- `part`)
   took : {e : HFunctor}
        -> {rg : Type}
        -> {err : Type}
@@ -1341,15 +1255,20 @@ mutual
        -> {{clock : Time.time <: e}}
        -> Serving e rg err
        -> Connection e rg err
-       -> Conn e err
+       -> Inbox
+       -> Progress
        -> Part
        -> Bytes
-       -> Co e (Conn e err)
-  took sg cn st (InHead tail) b = looked sg cn st tail b
-  took sg cn st (InBody r at) b =
-    advanced sg cn { st | parts = b :: st.parts, got = st.got + Bytes.length b }
-  took sg cn st (InChunks r ch) b =
-    dechunked sg cn st r (Server.feedChunks ch b)
+       -> Co e Inbox
+  took sg cn i pg (InHead tail) b = looked sg cn i pg tail b
+  took sg cn i pg (InBody r at) b =
+    advanced
+      sg
+      cn
+      i
+      { pg | parts = b :: pg.parts, got = pg.got + Bytes.length b }
+  took sg cn i pg (InChunks r ch) b =
+    dechunked sg cn i pg r (Server.feedChunks ch b)
 
   -- (what a piece of a body sent in chunks came to: the request, all
   -- read, handed to the handler; more read; or the request refused)
@@ -1361,17 +1280,18 @@ mutual
             -> {{clock : Time.time <: e}}
             -> Serving e rg err
             -> Connection e rg err
-            -> Conn e err
+            -> Inbox
+            -> Progress
             -> Server.Request
             -> Server.Dechunked
-            -> Co e (Conn e err)
-  dechunked sg cn st r (BodyRead body rest) =
-    answered sg cn st (Asked { r | body = body } rest)
-  dechunked sg cn st r (ChunksToCome ch) = do
-    reading sg cn readSize Whenever
-    pure { st | part = InChunks r ch }
-  dechunked sg cn st r (ChunksRefused status) =
-    answered sg cn st (Refused status)
+            -> Co e Inbox
+  dechunked sg cn i pg r (BodyRead body rest) =
+    answered sg cn i (Asked { r | body = body } rest)
+  dechunked sg cn i pg r (ChunksToCome ch) = do
+    reading sg cn Server.readSize { pg | part = InChunks r ch }
+    pure i
+  dechunked sg cn i pg r (ChunksRefused status) =
+    answered sg cn i (Refused status)
 
   -- (bytes `b` read of a head, its end looked for in them alone, and in
   -- `tail`, the last bytes read before them: where it is found, the
@@ -1384,25 +1304,31 @@ mutual
          -> {{clock : Time.time <: e}}
          -> Serving e rg err
          -> Connection e rg err
-         -> Conn e err
+         -> Inbox
+         -> Progress
          -> Bytes
          -> Bytes
-         -> Co e (Conn e err)
-  looked sg cn st tail b = do
+         -> Co e Inbox
+  looked sg cn i pg tail b = do
     let at = blankIn tail b 0
-    let read = { st | parts = b :: st.parts, got = st.got + Bytes.length b }
-    if at >= 0 then headed sg cn read (st.got - Bytes.length tail + at)
-    else if read.got > headMost
+    let read = { pg | parts = b :: pg.parts, got = pg.got + Bytes.length b }
+    if at >= 0 then headed sg cn i read (pg.got - Bytes.length tail + at)
+    else if read.got > Server.headMost
     then do
       refusing sg cn 431
-      pure { st | phase = Closing }
+      pure i
     else do
-      reading sg cn headPiece st.by
-      pure { read | want = read.got + 1, part = InHead (lastThree tail b) }
+      reading
+          sg
+          cn
+          Server.headPiece
+          { read | want = read.got + 1, part = InHead (lastThree tail b) }
+      pure i
 
-  -- (the head read, its blank line at `i` of what is read: parsed, and
-  -- its body read; a `100 Continue` written, where the client waits for
-  -- one; or the request handed to the handler, or refused)
+  -- (the head read, its blank line at `at` of what is read: parsed, and
+  -- its body read, a `100 Continue` put in the outbox first where the
+  -- client waits for one; or the request handed to the handler, or
+  -- refused)
   headed : {e : HFunctor}
          -> {rg : Type}
          -> {err : Type}
@@ -1411,25 +1337,25 @@ mutual
          -> {{clock : Time.time <: e}}
          -> Serving e rg err
          -> Connection e rg err
-         -> Conn e err
+         -> Inbox
+         -> Progress
          -> Int
-         -> Co e (Conn e err)
-  headed sg cn st i = do
-    let buf = leftOf st.parts
-    case Server.requestIn (from := i) cn.peer buf of
+         -> Co e Inbox
+  headed sg cn i pg at = do
+    let buf = leftOf pg.parts
+    case Server.requestIn (from := at) cn.peer buf of
       Left wanted -> do
-        let more = wanting st buf i wanted
-        if expects (wantedOf wanted) && not st.continued
+        let more = wanting pg buf at wanted
+        if expectsOf (wantedOf wanted) && not pg.continued
         then do
-          continuing sg cn
-          pure { more | continued = True }
-        else do
-          reading sg cn (sizeFor more) Whenever
-          pure more
-      Right g -> answered sg cn st g
+          continuing cn
+          reading sg cn (sizeFor more) { more | continued = True }
+        else reading sg cn (sizeFor more) more
+        pure i
+      Right g -> answered sg cn i g
 
-  -- (what is read of a request's body, `st`: more read, where too
-  -- little is; else the request handed to the handler)
+  -- (what is read of a request's body: more read, where too little is;
+  -- else the request handed to the handler)
   advanced : {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
@@ -1438,14 +1364,15 @@ mutual
            -> {{clock : Time.time <: e}}
            -> Serving e rg err
            -> Connection e rg err
-           -> Conn e err
-           -> Co e (Conn e err)
-  advanced sg cn st =
-    if st.got < st.want
+           -> Inbox
+           -> Progress
+           -> Co e Inbox
+  advanced sg cn i pg =
+    if pg.got < pg.want
     then do
-      reading sg cn (sizeFor st) Whenever
-      pure st
-    else bodied sg cn st st.part
+      reading sg cn (sizeFor pg) pg
+      pure i
+    else bodied sg cn i pg pg.part
 
   -- (the request whose head is read, `part`, its body all read: handed
   -- to the handler, what was read after it kept)
@@ -1457,24 +1384,27 @@ mutual
          -> {{clock : Time.time <: e}}
          -> Serving e rg err
          -> Connection e rg err
-         -> Conn e err
+         -> Inbox
+         -> Progress
          -> Part
-         -> Co e (Conn e err)
-  bodied sg cn st (InBody r at) = do
-    let buf = leftOf st.parts
+         -> Co e Inbox
+  bodied sg cn i pg (InBody r at) = do
+    let buf = leftOf pg.parts
     answered
         sg
         cn
-        st
+        i
         (Asked
-           { r | body = Bytes.slice buf at st.want }
-           (Bytes.slice buf st.want (Bytes.length buf)))
-  bodied sg cn st (InHead tail) =
-    looked sg cn { st | parts = Nil, got = 0 } Bytes.empty (leftOf st.parts)
-  bodied sg cn st (InChunks r ch) = dechunked sg cn st r (ChunksToCome ch)
+           { r | body = Bytes.slice buf at pg.want }
+           (Bytes.slice buf pg.want (Bytes.length buf)))
+  bodied sg cn i pg (InHead tail) =
+    looked sg cn i { pg | parts = Nil, got = 0 } Bytes.empty (leftOf pg.parts)
+  bodied sg cn i pg (InChunks r ch) = dechunked sg cn i pg r (ChunksToCome ch)
 
-  -- (what a request read came to: handed to the handler, or refused, or
-  -- the connection's end: the connection's state after)
+  -- (what a request read came to: handed to the handler, with a
+  -- responder that puts its answer in the outbox -- what was read after
+  -- it, where there is some, the next request begun -- or refused, or
+  -- the connection's end)
   answered : {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
@@ -1483,502 +1413,64 @@ mutual
            -> {{clock : Time.time <: e}}
            -> Serving e rg err
            -> Connection e rg err
-           -> Conn e err
+           -> Inbox
            -> Server.Got
-           -> Co e (Conn e err)
-  answered sg cn st (Asked r rest) = do
-    outcome <- attempt err (sg.handler r (\a -> responded cn a))
+           -> Co e Inbox
+  answered sg cn i (Asked r rest) = do
+    let n = i.asked - 1
+    outcome <-
+      attempt
+        err
+        (sg.handler
+           r
+           (\a -> outboxed cn.outbox (respondedTo sg.heartbeat n r rest a)))
     case outcome of
-      Right u -> do
-        replying sg cn r
-        pure
-            { st
-            | phase = Answering
-            , parts = [rest]
-            , got = Bytes.length rest
-            , want = 0
-            , part = InHead Bytes.empty
-            , by = headStart sg.headerWithin
-            , continued = False
-            }
+      Right u ->
+        pure (if Bytes.length rest > 0 then { i | asked = i.asked + 1 } else i)
       Left thrown -> do
-        closing sg cn
-        pure { st | phase = Closing }
-  answered sg cn st (Refused status) = do
+        closer sg cn
+        pure i
+  answered sg cn i (Refused status) = do
     refusing sg cn status
-    pure { st | phase = Closing }
-  answered sg cn st Ended = do
-    closing sg cn
-    pure { st | phase = Closing }
+    pure i
+  answered sg cn i Ended = do
+    closer sg cn
+    pure i
 
-  -- (the answer to `r` taken, once the handler has given it, and
-  -- written.  A behaviour of the server's world, spawned outside the
-  -- handler's -- so that what comes after on the connection, the
-  -- requests after, is not of the handler's, run by its `attempt` --
-  -- waiting for the answer the handler gives, in its world, on the
-  -- connection's cown)
-  replying : {e : HFunctor}
-           -> {rg : Type}
-           -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> {{clock : Time.time <: e}}
-           -> Serving e rg err
-           -> Connection e rg err
-           -> Server.Request
-           -> Co e Unit
-  replying sg cn r = do
-    with st := cn.state once replied st do
-      st := (<- given sg cn r st)
+-- (the next request read, a response written: from what was read after
+-- the last, where there is some, else from a read)
+nextOn : {e : HFunctor}
+       -> {rg : Type}
+       -> {err : Type}
+       -> {{bc : BOC.boc <: e}}
+       -> {{nt : Net.net <: e}}
+       -> {{clock : Time.time <: e}}
+       -> Serving e rg err
+       -> Connection e rg err
+       -> Bytes
+       -> Co e Unit
+nextOn sg cn rest =
+  if Bytes.length rest == 0
+  then reading sg cn Server.readSize (begun (headStart sg.headerWithin))
+  else do
+    with i := cn.inbox do
+      if i.closed then pure ()
+      else do
+        i :=
+          (<- looked
+            sg
+            cn
+            i
+            (begun (headStart sg.headerWithin))
+            Bytes.empty
+            rest)
 
-  -- (the answer given, where it is)
-  given : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> {{nt : Net.net <: e}}
-        -> {{clock : Time.time <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Server.Request
-        -> Conn e err
-        -> Co e (Conn e err)
-  given sg cn r st = givenAs sg cn r { st | reply = Nothing } st.reply
+-- The inbox's behaviours: a stream's reads
+--------------------------------------------------------------------------------
 
-  givenAs : {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> {{bc : BOC.boc <: e}}
-          -> {{nt : Net.net <: e}}
-          -> {{clock : Time.time <: e}}
-          -> Serving e rg err
-          -> Connection e rg err
-          -> Server.Request
-          -> Conn e err
-          -> Maybe (Answer e err)
-          -> Co e (Conn e err)
-  givenAs sg cn r st (Just a) = taken sg cn r st a
-  givenAs sg cn r st Nothing = pure st
-
-  -- (the answer to `r` taken: a response written, the connection closed
-  -- after where the request or the response asks, or the server has
-  -- stopped; a stream begun; a socket's handshake answered)
-  taken : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> {{nt : Net.net <: e}}
-        -> {{clock : Time.time <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Server.Request
-        -> Conn e err
-        -> Answer e err
-        -> Co e (Conn e err)
-  taken sg cn r st (Whole res) = wholeOut sg cn r st res
-  taken sg cn r st (Streamed head s) = streamStart sg cn r st head s
-  taken sg cn r st (Upgraded s) =
-    socketStart sg cn r st s (WebSocket.handshake r)
-
-  -- (a response, whole, written)
-  wholeOut : {e : HFunctor}
-           -> {rg : Type}
-           -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> {{clock : Time.time <: e}}
-           -> Serving e rg err
-           -> Connection e rg err
-           -> Server.Request
-           -> Conn e err
-           -> HTTP.Response
-           -> Co e (Conn e err)
-  wholeOut sg cn r st res = do
-    let close =
-      st.stopping
-      || not (Server.keptAlive r)
-      || connectionSays "close" res.headers
-    writing
-        sg
-        cn
-        close
-        (Server.responseBytes
-           (connectionWord r close)
-           (not (strEq r.method "HEAD"))
-           res)
-    pure { st | phase = Writing }
-
-  -- (a stream begun: its head queued, in chunks to HTTP/1.1, the
-  -- connection closed after it to HTTP/1.0; to a `HEAD`, or of a status
-  -- with no body, its head written alone, the handler not given it)
-  streamStart : {e : HFunctor}
-              -> {rg : Type}
-              -> {err : Type}
-              -> {{bc : BOC.boc <: e}}
-              -> {{nt : Net.net <: e}}
-              -> {{clock : Time.time <: e}}
-              -> Serving e rg err
-              -> Connection e rg err
-              -> Server.Request
-              -> Conn e err
-              -> Server.Head
-              -> Streaming e err
-              -> Co e (Conn e err)
-  streamStart sg cn r st h s = do
-    let chunked = strEq r.version "HTTP/1.1"
-    let close =
-      st.stopping
-      || not chunked
-      || not (Server.keptAlive r)
-      || connectionSays "close" h.headers
-    let head =
-      Server.streamedHead
-        (connectionWord r close)
-        (chunked && not (bodiless h.status))
-        h
-    if bodiless h.status || strEq r.method "HEAD"
-    then do
-      writing sg cn close head
-      pure { st | phase = Writing }
-    else opening
-        sg
-        cn
-        { st
-        | phase = InStream
-        , gen = st.gen + 1
-        , out = [head]
-        , pending = Bytes.length head
-        , busy = False
-        , over = False
-        , ending = False
-        , chunked = chunked
-        , closeAfter = close
-        , beat = beatOf h.headers
-        , quiet = True
-        , live = Streams s
-        }
-        s
-
-  -- (a stream's head queued, `st`: the handler's `opened` run, then
-  -- what is queued written, and the connection read, where nothing of
-  -- the next request is read yet)
-  opening : {e : HFunctor}
-          -> {rg : Type}
-          -> {err : Type}
-          -> {{bc : BOC.boc <: e}}
-          -> {{nt : Net.net <: e}}
-          -> {{clock : Time.time <: e}}
-          -> Serving e rg err
-          -> Connection e rg err
-          -> Conn e err
-          -> Streaming e err
-          -> Co e (Conn e err)
-  opening sg cn st s = do
-    outcome <- attempt err (s.opened (streamSender sg cn st.gen))
-    case outcome of
-      Left thrown -> ended sg cn st
-      Right u -> do
-        awaitingOut sg cn st.gen
-        if st.got == 0 then listening sg cn st.gen (listenFor sg st)
-        else pure ()
-        pure (if st.stopping then halted st InStream else st)
-
-  -- (a socket's handshake checked: refused, its refusal written; else
-  -- its `101` queued, the handler's `opened` run, and what was read
-  -- after the request, then the connection, read as its frames)
-  socketStart : {e : HFunctor}
-              -> {rg : Type}
-              -> {err : Type}
-              -> {{bc : BOC.boc <: e}}
-              -> {{nt : Net.net <: e}}
-              -> {{clock : Time.time <: e}}
-              -> Serving e rg err
-              -> Connection e rg err
-              -> Server.Request
-              -> Conn e err
-              -> Socket e err
-              -> WebSocket.Handshake
-              -> Co e (Conn e err)
-  socketStart sg cn r st s (Refuse res) = wholeOut sg cn r st res
-  socketStart sg cn r st s (Accept key) = do
-    let head =
-      Server.takeoverHead
-        { status = 101, headers = WebSocket.upgradeHeaders key }
-    let upgraded =
-      { st
-      | phase = InSocket
-      , gen = st.gen + 1
-      , parts = Nil
-      , got = 0
-      , out = [head]
-      , pending = Bytes.length head
-      , busy = False
-      , over = False
-      , ending = False
-      , closeSent = False
-      , pinged = False
-      , frames = WebSocket.reader
-      , live = Sockets s
-      }
-    outcome <- attempt err (s.opened (socketSender sg cn upgraded.gen))
-    case outcome of
-      Left thrown -> ended sg cn upgraded
-      Right u -> do
-        awaitingOut sg cn upgraded.gen
-        let going : Conn e err =
-          if st.stopping then halted upgraded InSocket else upgraded
-        if st.got > 0
-        then socketGot sg cn going.gen going (Right (leftOf st.parts))
-        else do
-          socketReading sg cn going.gen
-          pure going
-
-  -- (socket `g` read on: what comes in `ping` milliseconds, or that
-  -- nothing did)
-  socketReading : {e : HFunctor}
-                -> {rg : Type}
-                -> {err : Type}
-                -> {{bc : BOC.boc <: e}}
-                -> {{nt : Net.net <: e}}
-                -> {{clock : Time.time <: e}}
-                -> Serving e rg err
-                -> Connection e rg err
-                -> Int
-                -> Co e Unit
-  socketReading sg cn g = do
-    with st := cn.state
-         got := BOC.await (Net.read (timeout := sg.ping) cn.socket readSize) do
-      st := (<- socketCame sg cn g st got)
-
-  -- (what a read of socket `g` came to, where it is still the
-  -- connection's)
-  socketCame : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> {{bc : BOC.boc <: e}}
-             -> {{nt : Net.net <: e}}
-             -> {{clock : Time.time <: e}}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Int
-             -> Conn e err
-             -> Either Net.NetError Bytes
-             -> Co e (Conn e err)
-  socketCame sg cn g st got =
-    if onAnswer g st then socketGot sg cn g st got else pure st
-
-  -- (what a read of socket `g` came to: its frames' messages heard,
-  -- and read on unless a close has come or the client broke the
-  -- protocol; where nothing came for `ping` milliseconds, a ping sent,
-  -- or, one sent already, or a close, the connection closed; where the
-  -- client has gone, the connection closed)
-  socketGot : {e : HFunctor}
-            -> {rg : Type}
-            -> {err : Type}
-            -> {{bc : BOC.boc <: e}}
-            -> {{nt : Net.net <: e}}
-            -> {{clock : Time.time <: e}}
-            -> Serving e rg err
-            -> Connection e rg err
-            -> Int
-            -> Conn e err
-            -> Either Net.NetError Bytes
-            -> Co e (Conn e err)
-  socketGot sg cn g st (Right b) =
-    if Bytes.length b == 0 then ended sg cn st
-    else fedTo sg cn g { st | pinged = False } (WebSocket.feed st.frames b)
-  socketGot sg cn g st (Left why) =
-    if isTimeout why && not st.pinged && not st.closeSent
-    then do
-      socketReading sg cn g
-      let q = queued sg.most g (frameBytes (PingMessage Bytes.empty)) st
-      pure { q | pinged = True }
-    else ended sg cn st
-
-  -- (what the frames read came to: their messages heard, and the
-  -- socket read on; or, after the client broke the protocol, closed)
-  fedTo : {e : HFunctor}
-        -> {rg : Type}
-        -> {err : Type}
-        -> {{bc : BOC.boc <: e}}
-        -> {{nt : Net.net <: e}}
-        -> {{clock : Time.time <: e}}
-        -> Serving e rg err
-        -> Connection e rg err
-        -> Int
-        -> Conn e err
-        -> WebSocket.Fed
-        -> Co e (Conn e err)
-  fedTo sg cn g st (Going ms r) = do
-    heardAll sg cn g ms
-    if r.closed then pure { st | frames = r }
-    else do
-      socketReading sg cn g
-      pure { st | frames = r }
-  fedTo sg cn g st (Failing ms code why) = do
-    heardAll sg cn g ms
-    with later := cn.state do
-      later := brokeOn sg.most g code why later
-    pure st
-
-  -- (what is queued on answer `g` written, once there is some, and
-  -- not while a write of it is waited for: in a behaviour waiting on
-  -- the connection's cown for it, `once`)
-  awaitingOut : {e : HFunctor}
-              -> {rg : Type}
-              -> {err : Type}
-              -> {{bc : BOC.boc <: e}}
-              -> {{nt : Net.net <: e}}
-              -> {{clock : Time.time <: e}}
-              -> Serving e rg err
-              -> Connection e rg err
-              -> Int
-              -> Co e Unit
-  awaitingOut sg cn g = do
-    with st := cn.state once outReady g st do
-      st := (<- pumpedOn sg cn g st)
-
-  -- (what answer `g` has queued, where it is still the connection's)
-  pumpedOn : {e : HFunctor}
-           -> {rg : Type}
-           -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> {{clock : Time.time <: e}}
-           -> Serving e rg err
-           -> Connection e rg err
-           -> Int
-           -> Conn e err
-           -> Co e (Conn e err)
-  pumpedOn sg cn g st = if onAnswer g st then pumped sg cn g st else pure st
-
-  -- (answer `g`'s writer, its turn come: past the most, the connection
-  -- closed; what is queued written, all at once -- as much as the
-  -- socket takes now, here, the rest by a write waited for -- and the
-  -- writer waiting again, for the most passed, too, while the write is
-  -- waited for; once it is ending, its end; else waiting again)
-  pumped : {e : HFunctor}
-         -> {rg : Type}
-         -> {err : Type}
-         -> {{bc : BOC.boc <: e}}
-         -> {{nt : Net.net <: e}}
-         -> {{clock : Time.time <: e}}
-         -> Serving e rg err
-         -> Connection e rg err
-         -> Int
-         -> Conn e err
-         -> Co e (Conn e err)
-  pumped sg cn g st =
-    if st.over then ended sg cn st
-    else if not (List.null st.out)
-    then do
-      let bytes = leftOf st.out
-      now <- Net.writeNow cn.socket bytes
-      writtenNow sg cn g { st | out = Nil } bytes now
-    else if st.ending then finishedOut sg cn st st.phase
-    else do
-      awaitingOut sg cn g
-      pure st
-
-  -- (what writing `bytes` of answer `g` at once came to: all of them
-  -- written, the writer on, its end next where it is ending; some, the
-  -- rest written by a write waited for, the writer waiting; or, not
-  -- written, the connection closed)
-  writtenNow : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> {{bc : BOC.boc <: e}}
-             -> {{nt : Net.net <: e}}
-             -> {{clock : Time.time <: e}}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Int
-             -> Conn e err
-             -> Bytes
-             -> Either Net.NetError Int
-             -> Co e (Conn e err)
-  writtenNow sg cn g st bytes (Right n) =
-    if n == Bytes.length bytes
-    then pumped sg cn g { st | pending = st.pending - n }
-    else do
-      wroteOut sg cn g (Bytes.slice bytes n (Bytes.length bytes))
-      awaitingOut sg cn g
-      pure { st | busy = True, pending = st.pending - n }
-  writtenNow sg cn g st bytes (Left why) = ended sg cn st
-
-  -- (bytes of answer `g` written, a write waited for no longer; where
-  -- they are not, the connection closed)
-  wroteOut : {e : HFunctor}
-           -> {rg : Type}
-           -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> {{clock : Time.time <: e}}
-           -> Serving e rg err
-           -> Connection e rg err
-           -> Int
-           -> Bytes
-           -> Co e Unit
-  wroteOut sg cn g bytes = do
-    with st := cn.state
-         sent := BOC.await (Net.write (timeout := sg.idle) cn.socket bytes) do
-      st := (<- afterOut sg cn g (Bytes.length bytes) st sent)
-
-  -- (what writing `n` bytes of answer `g` came to, where it is still the
-  -- connection's: no write waited for, so the writer, waiting, writes
-  -- what was queued meanwhile; or, not written, the connection closed)
-  afterOut : {e : HFunctor}
-           -> {rg : Type}
-           -> {err : Type}
-           -> {{bc : BOC.boc <: e}}
-           -> {{nt : Net.net <: e}}
-           -> {{clock : Time.time <: e}}
-           -> Serving e rg err
-           -> Connection e rg err
-           -> Int
-           -> Int
-           -> Conn e err
-           -> Either Net.NetError Unit
-           -> Co e (Conn e err)
-  afterOut sg cn g n st (Right u) =
-    if onAnswer g st
-    then pure { st | busy = False, pending = st.pending - n }
-    else pure st
-  afterOut sg cn g n st (Left why) =
-    if onAnswer g st then ended sg cn st else pure st
-
-  -- (all of an answer that goes on written, its end too: a stream's
-  -- connection read on, for the next request -- by the read it waits
-  -- on, where nothing of that is read yet -- or closed, where it is to
-  -- be; a socket's closed)
-  finishedOut : {e : HFunctor}
-              -> {rg : Type}
-              -> {err : Type}
-              -> {{bc : BOC.boc <: e}}
-              -> {{nt : Net.net <: e}}
-              -> {{clock : Time.time <: e}}
-              -> Serving e rg err
-              -> Connection e rg err
-              -> Conn e err
-              -> Phase
-              -> Co e (Conn e err)
-  finishedOut sg cn st InStream =
-    if st.closeAfter || st.stopping then ended sg cn st
-    else do
-      let after =
-        { st
-        | phase = Reading
-        , ending = False
-        , live = Unheld
-        , out = Nil
-        , pending = 0
-        }
-      if after.got == 0 then pure after else nextRequest sg cn after
-  finishedOut sg cn st _ = ended sg cn st
-
+mutual
   -- (stream `g`'s connection read, a piece at a time, within `ms`
-  -- milliseconds, while nothing of the next request is read: its end
-  -- read, the stream gone; where nothing came, a heartbeat queued)
+  -- milliseconds: what it comes to taken in a behaviour on the inbox)
   listening : {e : HFunctor}
             -> {rg : Type}
             -> {err : Type}
@@ -1989,15 +1481,16 @@ mutual
             -> Connection e rg err
             -> Int
             -> Int
+            -> Bytes
             -> Co e Unit
-  listening sg cn g ms = do
-    with st := cn.state
-         got := BOC.await (Net.read (timeout := ms) cn.socket headPiece) do
-      st := (<- listened sg cn g ms st got)
+  listening sg cn g ms beat = do
+    with i := cn.inbox
+         got :=
+             BOC.await (Net.read (timeout := ms) cn.socket Server.headPiece) do
+      i := (<- listened sg cn g ms beat i got)
 
-  -- (what a read of stream `g`'s connection came to, by where the
-  -- connection is now: the stream going on, or finished, the read its
-  -- next request's)
+  -- (what a read of stream `g`'s connection came to: while the stream
+  -- goes on, the stream's; once it is finished, the next request's)
   listened : {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
@@ -2008,35 +1501,20 @@ mutual
            -> Connection e rg err
            -> Int
            -> Int
-           -> Conn e err
+           -> Bytes
+           -> Inbox
            -> Either Net.NetError Bytes
-           -> Co e (Conn e err)
-  listened sg cn g ms st got = listenedIn sg cn g ms st st.phase got
-
-  listenedIn : {e : HFunctor}
-             -> {rg : Type}
-             -> {err : Type}
-             -> {{bc : BOC.boc <: e}}
-             -> {{nt : Net.net <: e}}
-             -> {{clock : Time.time <: e}}
-             -> Serving e rg err
-             -> Connection e rg err
-             -> Int
-             -> Int
-             -> Conn e err
-             -> Phase
-             -> Either Net.NetError Bytes
-             -> Co e (Conn e err)
-  listenedIn sg cn g ms st InStream got =
-    if st.gen == g then streamHeard sg cn g ms st got else pure st
-  listenedIn sg cn g ms st Reading got = afterStream sg cn st got
-  listenedIn sg cn g ms st _ got = pure st
+           -> Co e Inbox
+  listened sg cn g ms beat i got =
+    if i.closed then pure i
+    else if i.streaming then streamHeard sg cn g ms beat i got
+    else afterStream sg cn i got
 
   -- (what a read of stream `g`'s connection came to while it goes on:
   -- the client's end, the connection closed; bytes, the next request's,
   -- kept, the connection read no further; nothing, the time passed, a
-  -- heartbeat queued where there is one and nothing else was since the
-  -- last, and the connection read on)
+  -- heartbeat put in the outbox where there is one, and the connection
+  -- read on)
   streamHeard : {e : HFunctor}
               -> {rg : Type}
               -> {err : Type}
@@ -2047,18 +1525,26 @@ mutual
               -> Connection e rg err
               -> Int
               -> Int
-              -> Conn e err
+              -> Bytes
+              -> Inbox
               -> Either Net.NetError Bytes
-              -> Co e (Conn e err)
-  streamHeard sg cn g ms st (Right b) =
-    if Bytes.length b == 0 then ended sg cn st
-    else pure { st | parts = b :: st.parts, got = st.got + Bytes.length b }
-  streamHeard sg cn g ms st (Left why) =
+              -> Co e Inbox
+  streamHeard sg cn g ms beat i (Right b) =
+    if Bytes.length b == 0
+    then do
+      closer sg cn
+      pure i
+    else pure { i | kept = b, asked = i.asked + 1 }
+  streamHeard sg cn g ms beat i (Left why) =
     if isTimeout why
     then do
-      listening sg cn g ms
-      pure (beaten sg.most g st)
-    else ended sg cn st
+      if Bytes.length beat > 0 then outboxed cn.outbox (beaten sg.most g beat)
+      else pure ()
+      listening sg cn g ms beat
+      pure i
+    else do
+      closer sg cn
+      pure i
 
   -- (what a read a stream waited on came to, the stream finished: the
   -- next request's start, or, nothing come in its time, the next
@@ -2072,34 +1558,528 @@ mutual
               -> {{clock : Time.time <: e}}
               -> Serving e rg err
               -> Connection e rg err
-              -> Conn e err
+              -> Inbox
               -> Either Net.NetError Bytes
-              -> Co e (Conn e err)
-  afterStream sg cn st (Right b) =
-    if Bytes.length b == 0 then closed sg cn st
-    else looked sg cn { st | parts = Nil, got = 0 } Bytes.empty b
-  afterStream sg cn st (Left why) =
-    if isTimeout why then nextRequest sg cn st else closed sg cn st
+              -> Co e Inbox
+  afterStream sg cn i (Right b) =
+    readCame
+      sg
+      cn
+      i
+      (begun (headStart sg.headerWithin))
+      (Came (headStart sg.headerWithin) b)
+  afterStream sg cn i (Left why) =
+    if isTimeout why
+    then do
+      nextOn sg cn Bytes.empty
+      pure i
+    else do
+      closer sg cn
+      pure i
 
--- (the server stopped, for a connection where it is)
-stopFor : {e : HFunctor}
+-- (how long a stream's connection is read for at a time: a heartbeat's
+-- time, where it has one, else `idle`)
+listenFor : {e : HFunctor}
+          -> {rg : Type}
+          -> {err : Type}
+          -> Serving e rg err
+          -> Bytes
+          -> Int
+listenFor sg beat = if Bytes.length beat > 0 then sg.heartbeat else sg.idle
+
+-- (stream `g` begun, on the inbox: what was read after its request
+-- kept for after it, else its connection read)
+streamHeld : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
+           -> Serving e rg err
+           -> Connection e rg err
+           -> Int
+           -> Bytes
+           -> Bytes
+           -> Co e Unit
+streamHeld sg cn g beat rest = do
+  with i := cn.inbox do
+    if i.closed then pure ()
+    else if Bytes.length rest > 0
+    then do
+      i := { i | streaming = True, kept = rest }
+    else do
+      listening sg cn g (listenFor sg beat) beat
+      i := { i | streaming = True }
+
+-- (a stream finished and written, on the inbox: the next request read
+-- from what was kept, where there is some; else the read waiting is
+-- its)
+streamDone : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
+           -> Serving e rg err
+           -> Connection e rg err
+           -> Co e Unit
+streamDone sg cn = do
+  with i := cn.inbox do
+    if i.closed then pure ()
+    else if Bytes.length i.kept > 0
+    then do
+      i :=
+        (<- looked
+          sg
+          cn
+          { i | streaming = False, kept = Bytes.empty }
+          (begun (headStart sg.headerWithin))
+          Bytes.empty
+          i.kept)
+    else do
+      i := { i | streaming = False }
+
+-- The inbox's behaviours: a socket's reads
+--------------------------------------------------------------------------------
+
+-- (the sender of the connection's socket, answer `g`)
+socketSender : {e : HFunctor}
+             -> {rg : Type}
+             -> {err : Type}
+             -> Serving e rg err
+             -> Connection e rg err
+             -> Int
+             -> Sender WebSocket.Message
+socketSender sg cn g = senderOn cn.outbox cn.number (socketStep sg.most g)
+
+-- (a message the client sent on socket `g`: a ping answered, a close
+-- answered, the others the handler's; whether to go on, not where the
+-- handler threw, its connection closed)
+heardOne : {e : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{bc : BOC.boc <: e}}
+         -> {{nt : Net.net <: e}}
+         -> Serving e rg err
+         -> Connection e rg err
+         -> Int
+         -> Socket e err
+         -> WebSocket.Message
+         -> Co e Bool
+heardOne sg cn g s (PingMessage p) = do
+  outboxed cn.outbox (queued sg.most g (frameBytes (PongMessage p)))
+  pure True
+heardOne sg cn g s (PongMessage p) = pure True
+heardOne sg cn g s (CloseMessage code why) = do
+  outboxed cn.outbox (closedBack g code)
+  pure True
+heardOne sg cn g s m = do
+  outcome <- attempt err (s.received (socketSender sg cn g) m)
+  case outcome of
+    Right u -> pure True
+    Left thrown -> do
+      closer sg cn
+      pure False
+
+-- (the messages the client sent on socket `g`, in order, until the
+-- handler throws: whether it did not)
+heard : {e : HFunctor}
+      -> {rg : Type}
+      -> {err : Type}
+      -> {{bc : BOC.boc <: e}}
+      -> {{nt : Net.net <: e}}
+      -> Serving e rg err
+      -> Connection e rg err
+      -> Int
+      -> Socket e err
+      -> List WebSocket.Message
+      -> Co e Bool
+heard sg cn g s [] = pure True
+heard sg cn g s (m :: ms) = do
+  go <- heardOne sg cn g s m
+  if go then heard sg cn g s ms else pure False
+
+mutual
+  -- (socket `g` read on, `fr` its frames so far, `pinged` whether a ping
+  -- is unanswered: what comes in `ping` milliseconds, or that nothing
+  -- did, taken in a behaviour on the inbox)
+  socketReading : {e : HFunctor}
+                -> {rg : Type}
+                -> {err : Type}
+                -> {{bc : BOC.boc <: e}}
+                -> {{nt : Net.net <: e}}
+                -> Serving e rg err
+                -> Connection e rg err
+                -> Int
+                -> Socket e err
+                -> WebSocket.Reader
+                -> Bool
+                -> Co e Unit
+  socketReading sg cn g s fr pinged = do
+    with i := cn.inbox
+         got :=
+             BOC.await
+               (Net.read (timeout := sg.ping) cn.socket Server.readSize) do
+      if i.closed then pure () else socketCame sg cn g s fr pinged got
+
+  -- (what a read of socket `g` came to: its frames' messages heard,
+  -- and read on unless a close has come or the client broke the
+  -- protocol; where nothing came for `ping` milliseconds, a ping sent,
+  -- or, one sent already, the connection closed; where the client has
+  -- gone, the connection closed)
+  socketCame : {e : HFunctor}
+             -> {rg : Type}
+             -> {err : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> {{nt : Net.net <: e}}
+             -> Serving e rg err
+             -> Connection e rg err
+             -> Int
+             -> Socket e err
+             -> WebSocket.Reader
+             -> Bool
+             -> Either Net.NetError Bytes
+             -> Co e Unit
+  socketCame sg cn g s fr pinged (Right b) =
+    if Bytes.length b == 0 then closer sg cn
+    else fedTo sg cn g s (WebSocket.feed fr b)
+  socketCame sg cn g s fr pinged (Left why) =
+    if isTimeout why && not pinged
+    then do
+      outboxed cn.outbox (silent sg.most g)
+      socketReading sg cn g s fr True
+    else closer sg cn
+
+  -- (what the frames read came to: their messages heard, and the
+  -- socket read on; or, after the client broke the protocol, closed)
+  fedTo : {e : HFunctor}
         -> {rg : Type}
         -> {err : Type}
         -> {{bc : BOC.boc <: e}}
         -> {{nt : Net.net <: e}}
         -> Serving e rg err
         -> Connection e rg err
-        -> Conn e err
-        -> Phase
-        -> Co e (Conn e err)
-stopFor sg cn st Reading =
-  if st.got == 0 then closed sg cn st else pure { st | stopping = True }
-stopFor sg cn st Closing = pure st
-stopFor sg cn st p = pure (halted st p)
+        -> Int
+        -> Socket e err
+        -> WebSocket.Fed
+        -> Co e Unit
+  fedTo sg cn g s (Going ms r) = do
+    go <- heard sg cn g s ms
+    if go && not r.closed then socketReading sg cn g s r False else pure ()
+  fedTo sg cn g s (Failing ms code why) = do
+    go <- heard sg cn g s ms
+    if go then outboxed cn.outbox (broke g code why) else pure ()
 
--- (the server stopped, for a connection: closed at once where it waits
--- for a request; a stream or a socket ended; else closed once the one
--- in hand is answered)
+-- (socket `g` begun, on the inbox: what was read after its request
+-- taken as its first frames, else its connection read)
+socketHeld : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> Serving e rg err
+           -> Connection e rg err
+           -> Int
+           -> Socket e err
+           -> Bytes
+           -> Co e Unit
+socketHeld sg cn g s rest = do
+  with i := cn.inbox do
+    if i.closed then pure ()
+    else if Bytes.length rest > 0
+    then socketCame sg cn g s WebSocket.reader False (Right rest)
+    else socketReading sg cn g s WebSocket.reader False
+
+-- The outbox's writer
+--------------------------------------------------------------------------------
+
+-- (whether the writer has something to do: the connection closed, more
+-- than the most sent, or, no write awaited, something put in the
+-- outbox)
+ready : {e : HFunctor} -> {err : Type} -> Outbox e err -> Bool
+ready o = o.closed || o.over || (not o.busy && not (List.null o.queue))
+
+-- (what writing `n` bytes came to: no write awaited any more, so the
+-- writer, waiting, does what was put in the outbox meanwhile; or, not
+-- written, the connection closed)
+afterWrite : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> Serving e rg err
+           -> Connection e rg err
+           -> Int
+           -> Outbox e err
+           -> Either Net.NetError Unit
+           -> Co e (Outbox e err)
+afterWrite sg cn n o (Right u) =
+  if o.closed then pure o
+  else pure { o | busy = False, pending = o.pending - n }
+afterWrite sg cn n o (Left why) =
+  if o.closed then pure o
+  else do
+    closer sg cn
+    pure o
+
+-- (bytes written by a write awaited, in a behaviour on the outbox once
+-- it is done)
+wroteRest : {e : HFunctor}
+          -> {rg : Type}
+          -> {err : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Serving e rg err
+          -> Connection e rg err
+          -> Bytes
+          -> Co e Unit
+wroteRest sg cn bytes = do
+  with o := cn.outbox
+       sent := BOC.await (Net.write (timeout := sg.idle) cn.socket bytes) do
+    o := (<- afterWrite sg cn (Bytes.length bytes) o sent)
+
+-- (the bytes at the front of `items`, the last first, and what is
+-- after them)
+leading : {e : HFunctor}
+        -> {err : Type}
+        -> List (Out e err)
+        -> List Bytes
+        -> Pair (List Bytes) (List (Out e err))
+leading (Writes b :: rest) acc = leading rest (b :: acc)
+leading items acc = MkPair acc items
+
+-- (the sender of the connection's stream, answer `g`)
+streamSender : {e : HFunctor}
+             -> {rg : Type}
+             -> {err : Type}
+             -> Serving e rg err
+             -> Connection e rg err
+             -> Int
+             -> Way
+             -> Sender Bytes
+streamSender sg cn g way =
+  senderOn cn.outbox cn.number (streamStep sg.most g way)
+
+-- (a handler's `gone`, what it throws let go of)
+goneWith : {e : HFunctor}
+         -> {err : Type}
+         -> {a : Type}
+         -> (Sender a -> Co (exception err <+> e) Unit)
+         -> Sender a
+         -> Co e Unit
+goneWith gone out = bind (attempt err (gone out)) (\o -> pure ())
+
+mutual
+  -- (the writer, waiting on the outbox, `once`, until it has something
+  -- to do: then it does it, in a behaviour of the server's world)
+  writing : {e : HFunctor}
+          -> {rg : Type}
+          -> {err : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> {{nt : Net.net <: e}}
+          -> {{clock : Time.time <: e}}
+          -> Serving e rg err
+          -> Connection e rg err
+          -> Co e Unit
+  writing sg cn = do
+    with o := cn.outbox once ready o do
+      o := (<- wrote sg cn o)
+
+  -- (the writer's turn come: the connection closed, nothing more done;
+  -- else what is in the outbox done, in order)
+  wrote : {e : HFunctor}
+        -> {rg : Type}
+        -> {err : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{clock : Time.time <: e}}
+        -> Serving e rg err
+        -> Connection e rg err
+        -> Outbox e err
+        -> Co e (Outbox e err)
+  wrote sg cn o =
+    if o.closed then pure o
+    else pumped sg cn { o | queue = Nil } (List.reverse o.queue)
+
+  -- (`items` done, in order, taken from the outbox: past the most, the
+  -- connection closed instead)
+  pumped : {e : HFunctor}
+         -> {rg : Type}
+         -> {err : Type}
+         -> {{bc : BOC.boc <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{clock : Time.time <: e}}
+         -> Serving e rg err
+         -> Connection e rg err
+         -> Outbox e err
+         -> List (Out e err)
+         -> Co e (Outbox e err)
+  pumped sg cn o items =
+    if o.over
+    then do
+      closer sg cn
+      pure o
+    else pumpedOn sg cn o items
+
+  -- (... all done, what was put in the outbox meanwhile done, else the
+  -- writer waiting again; bytes at the front written, as one)
+  pumpedOn : {e : HFunctor}
+           -> {rg : Type}
+           -> {err : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{nt : Net.net <: e}}
+           -> {{clock : Time.time <: e}}
+           -> Serving e rg err
+           -> Connection e rg err
+           -> Outbox e err
+           -> List (Out e err)
+           -> Co e (Outbox e err)
+  pumpedOn sg cn o [] =
+    if List.null o.queue
+    then do
+      writing sg cn
+      pure o
+    else pumped sg cn { o | queue = Nil } (List.reverse o.queue)
+  pumpedOn sg cn o items = written sg cn o (leading items Nil)
+
+  -- (the bytes at the front, where there are any, written: what the
+  -- socket takes at once; else the first thing done)
+  written : {e : HFunctor}
+          -> {rg : Type}
+          -> {err : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> {{nt : Net.net <: e}}
+          -> {{clock : Time.time <: e}}
+          -> Serving e rg err
+          -> Connection e rg err
+          -> Outbox e err
+          -> Pair (List Bytes) (List (Out e err))
+          -> Co e (Outbox e err)
+  written sg cn o (MkPair [] (x :: rest)) = act sg cn o x rest
+  written sg cn o (MkPair [] []) = pumpedOn sg cn o []
+  written sg cn o (MkPair bs rest) = do
+    let bytes = leftOf bs
+    now <- Net.writeNow cn.socket bytes
+    writtenNow sg cn o rest bytes now
+
+  -- (what writing `bytes` at once came to: all of them written, the
+  -- rest of `items` done; some, the rest of them written by a write
+  -- awaited, what is still to do put back in the outbox before what was
+  -- put there since, and the writer waiting again, for the most passed
+  -- too, while the write is awaited; or, not written, the connection
+  -- closed)
+  writtenNow : {e : HFunctor}
+             -> {rg : Type}
+             -> {err : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> {{nt : Net.net <: e}}
+             -> {{clock : Time.time <: e}}
+             -> Serving e rg err
+             -> Connection e rg err
+             -> Outbox e err
+             -> List (Out e err)
+             -> Bytes
+             -> Either Net.NetError Int
+             -> Co e (Outbox e err)
+  writtenNow sg cn o items bytes (Right n) =
+    if n == Bytes.length bytes
+    then pumped sg cn { o | pending = o.pending - n } items
+    else do
+      wroteRest sg cn (Bytes.slice bytes n (Bytes.length bytes))
+      writing sg cn
+      pure
+          { o
+          | busy = True
+          , pending = o.pending - n
+          , queue = List.append o.queue (List.reverse items)
+          }
+  writtenNow sg cn o items bytes (Left why) = do
+    closer sg cn
+    pure o
+
+  -- (one thing done, what is before it written, then the rest of
+  -- `items`: a response's next request read, or, the server stopped, the
+  -- connection closed; the connection closed; a stream or a socket
+  -- begun; a stream's end, the next request read, or the connection
+  -- closed)
+  act : {e : HFunctor}
+      -> {rg : Type}
+      -> {err : Type}
+      -> {{bc : BOC.boc <: e}}
+      -> {{nt : Net.net <: e}}
+      -> {{clock : Time.time <: e}}
+      -> Serving e rg err
+      -> Connection e rg err
+      -> Outbox e err
+      -> Out e err
+      -> List (Out e err)
+      -> Co e (Outbox e err)
+  act sg cn o (Writes b) items = pumped sg cn o (Writes b :: items)
+  act sg cn o (ReadOn rest) items =
+    if o.stopping
+    then do
+      closer sg cn
+      pure { o | answered = o.answered + 1 }
+    else do
+      nextOn sg cn rest
+      pumped sg cn { o | answered = o.answered + 1 } items
+  act sg cn o Shut items = do
+    closer sg cn
+    pure o
+  act sg cn o (Opens g rest way s) items = do
+    let out = streamSender sg cn g way
+    let going =
+      { o
+      | sender = g
+      , halt = endOf way
+      , quiet = True
+      , leave = goneWith s.gone out
+      }
+    outcome <- attempt err (s.opened out)
+    case outcome of
+      Left thrown -> do
+        closer sg cn
+        pure going
+      Right u -> do
+        streamHeld
+            sg
+            cn
+            g
+            (if way.chunked then Server.chunk way.beat else way.beat)
+            rest
+        pumped sg cn (if o.stopping then halting going else going) items
+  act sg cn o (Upgrades g rest s) items = do
+    let out = socketSender sg cn g
+    let going =
+      { o
+      | sender = g
+      , halt = [Writes (frameBytes (CloseMessage 1001 "")), Shut]
+      , leave = goneWith s.gone out
+      }
+    outcome <- attempt err (s.opened out)
+    case outcome of
+      Left thrown -> do
+        closer sg cn
+        pure going
+      Right u -> do
+        socketHeld sg cn g s rest
+        pumped sg cn (if o.stopping then halting going else going) items
+  act sg cn o (Finished close) items =
+    if close || o.stopping
+    then do
+      closer sg cn
+      pure { o | answered = o.answered + 1 }
+    else do
+      streamDone sg cn
+      pumped sg cn { o | answered = o.answered + 1 } items
+
+-- Stopping
+--------------------------------------------------------------------------------
+
+-- (the server stopped, for a connection, by a behaviour on both its
+-- cowns: closed at once where every request begun is answered, the next
+-- waited for; else its answer going on ended, and closed once the
+-- request in hand is answered)
 stoppedFor : {e : HFunctor}
            -> {rg : Type}
            -> {err : Type}
@@ -2109,8 +2089,15 @@ stoppedFor : {e : HFunctor}
            -> Connection e rg err
            -> Co e Unit
 stoppedFor sg cn = do
-  with st := cn.state do
-    st := (<- stopFor sg cn st st.phase)
+  with i := cn.inbox
+       o := cn.outbox do
+    if o.closed then pure ()
+    else if i.asked == o.answered
+    then do
+      i := { i | closed = True }
+      o := (<- shut sg cn o)
+    else do
+      o := halting o
 
 stoppedAll : {e : HFunctor}
            -> {rg : Type}
@@ -2125,9 +2112,9 @@ stoppedAll sg (MkPair n cn :: rest) = do
   stoppedFor sg cn
   stoppedAll sg rest
 
--- (the listener's next connection accepted, and given a cown, its
--- requests read; then the one after it; where none is accepted, the
--- server stopped)
+-- (the listener's next connection accepted, and given its cowns, its
+-- writer waiting and its first request read; then the one after it;
+-- where none is accepted, the server stopped)
 accepting : {e : HFunctor}
           -> {rg : Type}
           -> {err : Type}
@@ -2142,16 +2129,22 @@ accepting sg l = do
        c := BOC.await (acceptedFrom l) do
     case c of
       Right (Just (sock, peer)) -> do
-        let st : Conn e err = fresh sg.headerWithin
-        state <- BOC.newCown st
+        inbox <- BOC.newCown emptyInbox
+        outbox <- BOC.newCown (emptyOutbox : Outbox e err)
         let cn : Connection e rg err =
-          { socket = sock, number = sv.next, peer = peer, state = state }
+          { socket = sock
+          , number = sv.next
+          , peer = peer
+          , inbox = inbox
+          , outbox = outbox
+          }
         sv :=
           { sv
           | open = OrdMap.insert sv.open sv.next cn
           , next = sv.next + 1
           }
-        reading sg cn readSize st.by
+        writing sg cn
+        reading sg cn Server.readSize (begun (headStart sg.headerWithin))
         accepting sg l
       Right Nothing -> accepting sg l
       Left err -> do
@@ -2161,7 +2154,7 @@ accepting sg l = do
 
 -- | The listener's connections served, each request given to `handle`
 -- | with a responder, every wait an act awaited -- so as many
--- | connections are served at once as come, none onAnswer a thread while
+-- | connections are served at once as come, none holding a thread while
 -- | it waits.  Comes back at once, the server running in behaviours of
 -- | its own, until a connection cannot be accepted (the listener closed,
 -- | `EMFILE`): then the connections waiting for a request are closed,
