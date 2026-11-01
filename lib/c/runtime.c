@@ -5729,6 +5729,11 @@ struct HeffWait {
                                  //  1 reading, 2 writing -- or 0, on none;
                                  //  3, polled instead)
   HeffWait *prev, *next;
+  int linked;                    // (whether it is among the pending)
+  int64_t seq;                   // (the order it began to wait in, among
+                                 //  this thread's)
+  size_t heapat, readyat;        // (where it is in the deadlines' heap,
+                                 //  and among the done; 1 on, 0 nowhere)
 };
 
 #ifndef _WIN32
@@ -5764,6 +5769,21 @@ HEFF_VAR(HEFF_TLS size_t heff_ngroups);
 HEFF_VAR(HEFF_TLS size_t heff_capgroups);
 HEFF_VAR(HEFF_TLS HeffWait *heff_waits_first);
 HEFF_VAR(HEFF_TLS HeffWait *heff_waits_last);
+// (this thread's pending waits with a deadline, in a heap, the nearest
+// first, and its waits done and not yet woken, in no order: so that a
+// turn asks the nearest deadline, and the waits done, of these alone,
+// and does not look at every pending wait, as many as a server has
+// quiet connections)
+HEFF_VAR(HEFF_TLS HeffWait **heff_dues);
+HEFF_VAR(HEFF_TLS size_t heff_ndues);
+HEFF_VAR(HEFF_TLS size_t heff_capdues);
+HEFF_VAR(HEFF_TLS HeffWait **heff_ready);
+HEFF_VAR(HEFF_TLS size_t heff_nready);
+HEFF_VAR(HEFF_TLS size_t heff_capready);
+HEFF_VAR(HEFF_TLS int64_t heff_wait_seq);
+// (how many of its pending waits the turn polls itself: where there is
+// a kqueue, those it was not given, none mostly)
+HEFF_VAR(HEFF_TLS size_t heff_npolled);
 HEFF_VAR(HEFF_TLS HeffFinished *heff_finished);
 HEFF_VAR(HEFF_TLS size_t heff_nfinished);
 HEFF_VAR(HEFF_TLS size_t heff_capfinished);
@@ -5891,6 +5911,12 @@ HEFF_VAR(HEFF_TLS int heff_kq_made);
 HEFF_VAR(HEFF_TLS HeffWait **heff_kq_owner);
 HEFF_VAR(HEFF_TLS size_t heff_capkq_owner);
 
+// (the wait polled by the turn, not the kqueue: counted so)
+static inline void heff_kq_polled(HeffWait *w) {
+  w->kway = 3;
+  heff_npolled++;
+}
+
 // (the wait's descriptor and way in the kqueue: where it has one, and
 // another wait of the thread has not, and kqueue takes it; else polled)
 HEFF_FN void heff_kq_add(HeffWait *w) {
@@ -5899,11 +5925,11 @@ HEFF_FN void heff_kq_add(HeffWait *w) {
   if (w->fd < 0 || w->done) return;
   short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
   if (!way) {
-    w->kway = 3;
+    heff_kq_polled(w);
     return;
   }
   if (!heff_kq_made) {
-    w->kway = 3;
+    heff_kq_polled(w);
     return;
   }
   size_t at = (size_t)w->fd * 2 + (size_t)(way - 1);
@@ -5918,7 +5944,7 @@ HEFF_FN void heff_kq_add(HeffWait *w) {
     heff_capkq_owner = cap;
   }
   if (heff_kq_owner[at]) {
-    w->kway = 3;
+    heff_kq_polled(w);
     return;
   }
   struct kevent ch, got;
@@ -5926,7 +5952,7 @@ HEFF_FN void heff_kq_add(HeffWait *w) {
   struct timespec zero = { 0, 0 };
   int r = kevent(heff_kq, &ch, 1, &got, 1, &zero);
   if (r < 0 || (r == 1 && (got.flags & EV_ERROR) && got.data != 0)) {
-    w->kway = 3;
+    heff_kq_polled(w);
     return;
   }
   heff_kq_owner[at] = w;
@@ -5938,6 +5964,7 @@ HEFF_FN void heff_kq_add(HeffWait *w) {
 HEFF_FN void heff_kq_delete(HeffWait *w) {
   short way = w->kway;
   w->kway = 0;
+  if (way == 3) heff_npolled--;
   if (way != 1 && way != 2) return;
   size_t at = (size_t)w->kfd * 2 + (size_t)(way - 1);
   if (at < heff_capkq_owner && heff_kq_owner[at] == w) heff_kq_owner[at] = NULL;
@@ -5997,12 +6024,98 @@ HEFF_FN void heff_group_pending(int64_t id, int64_t by) {
   }
 }
 
+// (whether wait `a` is due before `b`: the nearer deadline, or, of the
+// same, the one that began to wait first)
+static inline int heff_heap_before(HeffWait *a, HeffWait *b) {
+  return a->until < b->until || (a->until == b->until && a->seq < b->seq);
+}
+
+static inline void heff_heap_put(size_t i, HeffWait *w) {
+  heff_dues[i] = w;
+  w->heapat = i + 1;
+}
+
+// (the wait at `i` moved up the heap, or down, to where it is due)
+HEFF_FN void heff_heap_fix(size_t i) {
+  HeffWait *w = heff_dues[i];
+  while (i > 0 && heff_heap_before(w, heff_dues[(i - 1) / 2])) {
+    heff_heap_put(i, heff_dues[(i - 1) / 2]);
+    i = (i - 1) / 2;
+  }
+  for (;;) {
+    size_t c = 2 * i + 1;
+    if (c >= heff_ndues) break;
+    if (c + 1 < heff_ndues && heff_heap_before(heff_dues[c + 1], heff_dues[c])) c++;
+    if (!heff_heap_before(heff_dues[c], w)) break;
+    heff_heap_put(i, heff_dues[c]);
+    i = c;
+  }
+  heff_heap_put(i, w);
+}
+
+// (the wait among the deadlines)
+HEFF_FN void heff_heap_add(HeffWait *w) {
+  if (heff_ndues == heff_capdues) {
+    size_t cap = heff_capdues ? heff_capdues * 2 : 64;
+    HeffWait **m = heff_alloc(cap * sizeof *m);
+    if (heff_ndues) memcpy(m, heff_dues, heff_ndues * sizeof *m);
+    free(heff_dues);
+    heff_dues = m;
+    heff_capdues = cap;
+  }
+  heff_heap_put(heff_ndues++, w);
+  heff_heap_fix(heff_ndues - 1);
+}
+
+// (the wait no longer among the deadlines, where it is)
+HEFF_FN void heff_heap_remove(HeffWait *w) {
+  if (!w->heapat) return;
+  size_t i = w->heapat - 1;
+  w->heapat = 0;
+  HeffWait *last = heff_dues[--heff_ndues];
+  if (i == heff_ndues) return;
+  heff_heap_put(i, last);
+  heff_heap_fix(i);
+}
+
+// (the wait done: where it is pending, among those the turn wakes, once)
+HEFF_FN void heff_wait_finish(HeffWait *w) {
+  if (w->done) return;
+  w->done = 1;
+  if (!w->linked || w->readyat) return;
+  if (heff_nready == heff_capready) {
+    size_t cap = heff_capready ? heff_capready * 2 : 64;
+    HeffWait **m = heff_alloc(cap * sizeof *m);
+    if (heff_nready) memcpy(m, heff_ready, heff_nready * sizeof *m);
+    free(heff_ready);
+    heff_ready = m;
+    heff_capready = cap;
+  }
+  heff_ready[heff_nready++] = w;
+  w->readyat = heff_nready;
+}
+
+// (the wait no longer among the done, where it is)
+static inline void heff_ready_remove(HeffWait *w) {
+  if (!w->readyat) return;
+  size_t i = w->readyat - 1;
+  w->readyat = 0;
+  HeffWait *last = heff_ready[--heff_nready];
+  if (i == heff_nready) return;
+  heff_ready[i] = last;
+  last->readyat = i + 1;
+}
+
 HEFF_FN void heff_wait_link(HeffWait *w) {
   w->prev = heff_waits_last;
   w->next = NULL;
   if (heff_waits_last) heff_waits_last->next = w;
   else heff_waits_first = w;
   heff_waits_last = w;
+  w->linked = 1;
+  w->seq = ++heff_wait_seq;
+  w->heapat = w->readyat = 0;
+  if (w->until) heff_heap_add(w);
 #ifndef _WIN32
   // (marked first, then the count read: a thread closing its descriptor
   // sees the mark, or this the close counted)
@@ -6021,6 +6134,9 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
   if (w->next) w->next->prev = w->prev;
   else heff_waits_last = w->prev;
   w->prev = w->next = NULL;
+  w->linked = 0;
+  heff_heap_remove(w);
+  heff_ready_remove(w);
 #ifndef _WIN32
   heff_mark_off(w->marked);
 #endif
@@ -6031,17 +6147,49 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
 }
 
 // (a wait done, as its source says: given its answer at the next turn)
-HEFF_FN void heff_wait_done(HeffWait *w) { w->done = 1; }
+HEFF_FN void heff_wait_done(HeffWait *w) { heff_wait_finish(w); }
+
+// (this thread's waits on `fd` begun before the count `before`: done,
+// EBADF -- whether any was.  Found by its marks, where every wait on it
+// is in the kqueue, else by every pending wait looked at; none where
+// none is marked)
+HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
+  int some = 0;
+#ifndef _WIN32
+  if (fd >= 0 && heff_mark && (size_t)fd < (size_t)HEFF_MARK_CHUNK * HEFF_MARK_CHUNKS) {
+    int32_t on = (size_t)fd < heff_capmarks_mine ? heff_marks_mine[fd] : 0;
+    if (on == 0) return 0;
+#ifdef HEFF_KQUEUE
+    int32_t found = 0;
+    for (size_t way = 0; way < 2; way++) {
+      size_t at = (size_t)fd * 2 + way;
+      HeffWait *w = at < heff_capkq_owner ? heff_kq_owner[at] : NULL;
+      if (!w || w->marked != fd) continue;
+      found++;
+      if (!w->done && w->epoch < before) {
+        w->err = EBADF;
+        heff_wait_finish(w);
+        some = 1;
+      }
+    }
+    if (found == on) return some;
+#endif
+  }
+#endif
+  for (HeffWait *w = heff_waits_first; w; w = w->next)
+    if (w->fd == fd && !w->done && w->epoch < before) {
+      w->err = EBADF;
+      heff_wait_finish(w);
+      some = 1;
+    }
+  return some;
+}
 
 // (the waits on the descriptor `fd`, which is being closed: done, their
 // answers that it was -- EBADF -- not a poll of a descriptor that may be
 // another's by then)
 HEFF_FN void heff_reactor_closing(int fd) {
-  for (HeffWait *w = heff_waits_first; w; w = w->next)
-    if (w->fd == fd && !w->done) {
-      w->err = EBADF;
-      w->done = 1;
-    }
+  heff_fd_waits_closed(fd, INT64_MAX);
 #ifndef _WIN32
   // (and every other thread's that waits on it, by that thread: told so,
   // and woken -- where none is marked, none told; a wait begun after the
@@ -6091,12 +6239,7 @@ HEFF_FN int heff_reactor_closed_elsewhere(void) {
   if (e - from >= HEFF_CLOSED_KEPT) from = e - HEFF_CLOSED_KEPT + 1;
   for (int64_t k = from; k <= e; k++) {
     HeffClosed c = heff_closed[k % HEFF_CLOSED_KEPT];
-    for (HeffWait *w = heff_waits_first; w; w = w->next)
-      if (w->fd == c.fd && !w->done && w->epoch < c.epoch) {
-        w->err = EBADF;
-        w->done = 1;
-        some = 1;
-      }
+    if (heff_fd_waits_closed(c.fd, c.epoch)) some = 1;
   }
   pthread_mutex_unlock(&heff_wakers_mu);
   heff_closed_seen = e;
@@ -6290,6 +6433,11 @@ HEFF_FN void heff_waker_remove(int64_t g) {
     // (its bit given back: no wait of its is pending, none marked)
     if (heff_mark != HEFF_MARK_ANY) heff_marks_given &= ~heff_mark;
     heff_mark = 0;
+    // (and its deadlines' and its done's room: none is pending)
+    free(heff_dues);
+    free(heff_ready);
+    heff_dues = heff_ready = NULL;
+    heff_ndues = heff_capdues = heff_nready = heff_capready = 0;
 #ifdef HEFF_KQUEUE
     heff_kq_close();
 #endif
@@ -6376,34 +6524,58 @@ HEFF_FN V heff_reactor_start(int64_t g, V c) {
 // (the waits done -- stepped done, or said so -- taken out of the
 // pending, then each given its answer, the rest of what it was started
 // in run, in the order they were pending)
+static int heff_by_seq(const void *x, const void *y) {
+  int64_t a = (*(HeffWait *const *)x)->seq, b = (*(HeffWait *const *)y)->seq;
+  return a < b ? -1 : a > b;
+}
+
 HEFF_FN void heff_reactor_wake(void) {
-  HeffWait *first = NULL, *last = NULL;
-  for (HeffWait *w = heff_waits_first, *next; w; w = next) {
-    next = w->next;
-    if (!w->done) continue;
-    heff_wait_unlink(w);
-    if (last) last->next = w;
-    else first = w;
-    last = w;
+  size_t n = heff_nready;
+  if (!n) return;
+  HeffWait *few[64];
+  HeffWait **done = n <= 64 ? few : heff_alloc(n * sizeof *done);
+  memcpy(done, heff_ready, n * sizeof *done);
+  heff_nready = 0;
+  if (n > 1) qsort(done, n, sizeof *done, heff_by_seq);
+  for (size_t i = 0; i < n; i++) {
+    done[i]->readyat = 0;
+    heff_wait_unlink(done[i]);
   }
-  for (HeffWait *w = first, *next; w; w = next) {
-    next = w->next;
+  for (size_t i = 0; i < n; i++) {
+    HeffWait *w = done[i];
     V f = w->f, k = w->k;
     int64_t g = w->group;
     V x = heff_answer(f, w->answer(w));
     heff_reactor_run(g, k, x);
   }
+  if (done != few) free(done);
 }
 
 // (the waits whose deadline has passed: done, timed out -- a sleep's
 // answer minds it not)
 HEFF_FN void heff_reactor_expire(void) {
+  if (!heff_ndues) return;
   int64_t now = heff_now_ms();
-  for (HeffWait *w = heff_waits_first; w; w = w->next)
-    if (!w->done && w->until && now >= w->until) {
+  while (heff_ndues && now >= heff_dues[0]->until) {
+    HeffWait *w = heff_dues[0];
+    heff_heap_remove(w);
+    if (!w->done) {
       if (!w->err) w->err = ETIMEDOUT;
-      w->done = 1;
+      heff_wait_finish(w);
     }
+  }
+}
+
+// (how long the turn may wait, as the waits done and the nearest
+// deadline say, `ms` before: -1 for ever)
+static inline int heff_turn_ms(int ms) {
+  if (heff_nready) return 0;
+  if (heff_ndues) {
+    int64_t now = heff_now_ms(), until = heff_dues[0]->until;
+    int64_t left = until > now ? until - now : 0;
+    if (ms < 0 || left < ms) ms = left > INT_MAX ? INT_MAX : (int)left;
+  }
+  return ms;
 }
 
 #ifndef _WIN32
@@ -6432,7 +6604,7 @@ static inline int heff_wait_polled(HeffWait *w) {
 // (the wait stepped, its descriptor ready: done, or waiting again, maybe
 // on another)
 static inline void heff_wait_ready(HeffWait *w) {
-  if (!w->done && w->step(w) == HEFF_STEP_DONE) w->done = 1;
+  if (!w->done && w->step(w) == HEFF_STEP_DONE) heff_wait_finish(w);
   if (w->fd != w->marked) {
     // (a step on to another descriptor: its reactor marked so)
     heff_mark_off(w->marked);
@@ -6470,17 +6642,14 @@ HEFF_FN void heff_reactor_turn(int wait) {
   size_t n = 0;
   int ms = wait ? -1 : 0;
   if (heff_reactor_closed_elsewhere()) ms = 0;
-  int64_t now = heff_now_ms();
-  for (HeffWait *w = heff_waits_first; w; w = w->next) {
-    if (w->done) ms = 0;
-    else {
+  ms = heff_turn_ms(ms);
+  // (the waits polled here: where there is a kqueue, those counted
+  // alone, none mostly, so the pending not looked at)
+#ifdef HEFF_KQUEUE
+  if (heff_npolled)
+#endif
+    for (HeffWait *w = heff_waits_first; w; w = w->next)
       if (heff_wait_polled(w)) n++;
-      if (w->until) {
-        int64_t left = w->until > now ? w->until - now : 0;
-        if (ms < 0 || left < ms) ms = left > INT_MAX ? INT_MAX : (int)left;
-      }
-    }
-  }
   size_t mine = n;
 #ifdef HEFF_KQUEUE
   if (heff_kq_made) n++;
@@ -6493,14 +6662,15 @@ HEFF_FN void heff_reactor_turn(int wait) {
   }
   heff_polled_room(n);
   n = 0;
-  for (HeffWait *w = heff_waits_first; w; w = w->next)
-    if (heff_wait_polled(w)) {
-      heff_polled[n].fd = w->fd;
-      heff_polled[n].events = w->events;
-      heff_polled[n].revents = 0;
-      heff_polled_waits[n] = w;
-      n++;
-    }
+  if (mine)
+    for (HeffWait *w = heff_waits_first; w; w = w->next)
+      if (heff_wait_polled(w)) {
+        heff_polled[n].fd = w->fd;
+        heff_polled[n].events = w->events;
+        heff_polled[n].revents = 0;
+        heff_polled_waits[n] = w;
+        n++;
+      }
 #ifdef HEFF_KQUEUE
   // (the kqueue as it is now: a step below may make it)
   size_t kq = n;
@@ -6548,14 +6718,7 @@ HEFF_FN void heff_reactor_turn(int wait) {
 #else
 // (no descriptor is polled: the deadlines alone are waited for)
 HEFF_FN void heff_reactor_turn(int wait) {
-  int64_t now = heff_now_ms(), ms = wait ? -1 : 0;
-  for (HeffWait *w = heff_waits_first; w; w = w->next) {
-    if (w->done) ms = 0;
-    else if (w->until) {
-      int64_t left = w->until > now ? w->until - now : 0;
-      if (ms < 0 || left < ms) ms = left;
-    }
-  }
+  int ms = heff_turn_ms(wait ? -1 : 0);
   if (ms < 0) heff_fail("the reactor waits, with nothing to wait for");
   if (ms > 0) Sleep((DWORD)ms);
   heff_reactor_expire();
