@@ -249,6 +249,11 @@ Rules:
   (`MkName`, `Nil`, `Just x`), a lambda and a record take the type
   expected as their own, so `3` where a `Name` is wanted is still an
   error. Annotate to coerce one: `(3 : Int)`.
+- A call checked at a type has that type reach its arguments first:
+  `"todos" / dir / "done"` where a `Path` is expected is `Path`'s `/`,
+  each literal coerced. Where the arguments do not elaborate so, as
+  `fromMaybe "x" m` of an `m : Maybe String`, the call is elaborated
+  on its own and coerced whole.
 - `coe x` says it explicitly.
 
 The prelude has one coercion, `Coe (Lazy a) a`: a delayed value given
