@@ -29,9 +29,9 @@
 --
 -- `send` reads a response's body whole, into memory.  `stream` gives the
 -- response's head as soon as it has come, and its body as a computation
--- that yields each piece as it comes -- stream's `yield` of `Bytes`, as
--- the body of a streamed reply of std.http.server's is -- read from the
--- server only as the program asks for the next: a body of any length is
+-- that yields each piece as it comes -- stream's `yield` of `Bytes` --
+-- read from the server only as the program asks for the next: a body
+-- of any length is
 -- held a piece at a time, and a program can say how far it has come.
 -- `Stream.source` makes it pieces to pull, `Stream.fold` goes through
 -- them; what it comes to is how the body ended, whole or why not.  A
@@ -76,12 +76,114 @@
 -- piece, before it asks for the next, is not counted.  Where curl is
 -- spawned, `idle` is as its tool has it, in whole seconds: what comes
 -- slower than a byte a second for that long.
+--
+-- A server's side of a request is here too, HTTP/1.1 as RFC 9112 says
+-- it, with no socket read or written: a request read from the bytes
+-- that have come of it so far, and a response written as the bytes to
+-- send.  `requestIn` says what the bytes read come to -- the request, a
+-- `ServerRequest`; the status it is refused with; or, not all read yet,
+-- what it still wants -- and a body sent in chunks (`Transfer-Encoding:
+-- chunked`) is read a piece at a time by `feedChunks`.  `responseBytes`
+-- writes a response whole, with its length; `streamedHead` the head of
+-- one whose body comes in pieces, each a `chunk` to HTTP/1.1; and
+-- `takeoverHead` the head after which the connection is no longer
+-- HTTP's, `101 Switching Protocols`.  std.http.bocserver serves by them.
+--
+-- A handler reads a request's path as its segments, a list to match
+-- on with the method, `case (r.method, HTTP.segments r)` and a branch
+-- `("GET", ["rooms", name])`; its query by a key (`query`, `queryAll`),
+-- or whole (`queries`).  It answers with text (`plain`), with `json`,
+-- and a method a path has not with `notAllowed`, its `Allow` the
+-- methods it has.
+--
+-- ```haskell
+-- import json as JSON
+-- import std.http as HTTP
+--
+-- -- | a room, by its name: its name as JSON to a `GET`, 405 to another
+-- -- | method; any other path, 404
+-- room : HTTP.ServerRequest -> HTTP.Response
+-- room r = case (r.method, HTTP.segments r) of
+--   ("GET", ["rooms", name]) ->
+--     HTTP.json 200 (JSON.obj [JSON.kv "room" (JString name)])
+--   (_, ["rooms", name]) -> HTTP.notAllowed ["GET"]
+--   _ -> HTTP.plain 404 "no such room\n"
+-- ```
+--
+-- A request is refused, as `requestIn` reads it: in chunks and with a
+-- `Content-Length` too, or in chunks to HTTP/1.0, `400`, as either may
+-- be what another reader of the request, a proxy before the server,
+-- went by; in another coding (`gzip`), `501 Not Implemented`; a chunk
+-- not as RFC 9112 says it, or its size's line longer than 4 KiB, `400`;
+-- a head longer than 64 KiB (`headMost`), `431`; a body longer than 64
+-- MiB (`bodyMost`), `413`, its chunks' data counted; a request that is
+-- no HTTP/1.x, `400` or `505`.  A body sent in chunks is its chunks'
+-- data, each chunk's extensions and the trailer after the last let go
+-- of: a trailer's fields are not the request's headers.
 
 module std.http
+  ( Request
+  , Response
+  , HttpError
+  , Transfer
+  , Opened
+  , HttpF(..)
+  , http
+  , Streamed
+  , stream
+  , send
+  , get
+  , text
+  , getText
+  , sameName
+  , headerIn
+  , header
+  , instanceShowHttpError
+  , ServerRequest
+  , requestHeader
+  , plain
+  , json
+  , notAllowed
+  , headMost
+  , bodyMost
+  , readSize
+  , headPiece
+  , drainMost
+  , blankIn
+  , lastThree
+  , parseHead
+  , segments
+  , queries
+  , queryAll
+  , query
+  , BodyIs(..)
+  , expects
+  , Chunks
+  , chunks
+  , Dechunked(..)
+  , feedChunks
+  , Got(..)
+  , Wanted(..)
+  , requestIn
+  , reason
+  , bodiless
+  , responseBytes
+  , chunk
+  , Head
+  , streamedHead
+  , takeoverHead
+  , connectionSays
+  , keptAlive
+  , connectionWord
+  )
 
 import bytes as Bytes
 import co
+import json as JSON
+import std.net as Net
+import std.url as URL
 import stream as Stream
+import uint8 as UInt8
 
 -- | A request: where it goes, its method, its headers (a name and a
 -- | value each, sent in their order), its body, how long it may take
@@ -147,8 +249,8 @@ http =
 
 -- | A response as it comes: its status and its headers, and its body, a
 -- | computation that yields each piece of it as it comes (stream's
--- | `yield` of `Bytes`, as a streamed reply of std.http.server's body
--- | does) and comes to how the body ended: whole, or why not.
+-- | `yield` of `Bytes`) and comes to how the body ended: whole, or why
+-- | not.
 type Streamed (e : HFunctor) =
   { status : Int
   , headers : List (Pair String String)
@@ -317,3 +419,804 @@ header name r = headerIn name r.headers
 instance instanceShowHttpError : Show HttpError
 instanceShowHttpError =
   { show = \err -> err.url ^ ": curl: (" ^ show err.code ^ ") " ^ err.message }
+
+-- A server's side
+--------------------------------------------------------------------------------
+
+-- | A request, as a server is sent it: its method (`GET`), its target as
+-- | the request line says it (`/items?id=3`), its version (`HTTP/1.1`),
+-- | its headers (a name and a value each, in their order), its body,
+-- | and where it came from.  (`Request` is a client's: a URL, a time to
+-- | wait, redirects followed.)
+type ServerRequest =
+  { method : String
+  , target : String
+  , version : String
+  , headers : List (Pair String String)
+  , body : Bytes
+  , peer : Net.Address
+  }
+
+-- | The first header of that name, its case not minded (an ASCII
+-- | name's), if there is one.
+requestHeader : String -> ServerRequest -> Maybe String
+requestHeader name r = headerIn name r.headers
+
+-- | A response of text, `text/plain`, UTF-8.
+-- | >>> (plain 404 "no such item").headers
+-- | [MkPair "Content-Type" "text/plain; charset=utf-8"]
+plain : Int -> String -> Response
+plain status t =
+  { status = status
+  , headers = [MkPair "Content-Type" "text/plain; charset=utf-8"]
+  , body = Bytes.fromString t
+  }
+
+-- | A response of JSON, `application/json`: the value as `JSON.stringify`
+-- | writes it, and a line's end.
+-- | >>> Bytes.asString (json 200 (JSON.obj [JSON.kv "ok" (JBool True)])).body
+-- | "{\"ok\":true}\n"
+-- | >>> (json 201 JNull).headers
+-- | [MkPair "Content-Type" "application/json"]
+json : Int -> JSON.Json -> Response
+json status j =
+  { status = status
+  , headers = [MkPair "Content-Type" "application/json"]
+  , body = Bytes.fromString (JSON.stringify j ^ "\n")
+  }
+
+-- | `405 Method Not Allowed`, its `Allow` the methods the path has, as
+-- | they are given.
+-- | >>> (notAllowed ["GET", "HEAD"]).headers
+-- | [MkPair "Content-Type" "text/plain; charset=utf-8", MkPair "Allow" "GET, HEAD"]
+-- | >>> (notAllowed ["POST"]).status
+-- | 405
+notAllowed : List String -> Response
+notAllowed methods =
+  { status = 405
+  , headers =
+      [ MkPair "Content-Type" "text/plain; charset=utf-8"
+      , MkPair "Allow" (joinWith ", " methods)
+      ]
+  , body = Bytes.fromString "method not allowed\n"
+  }
+
+-- Limits
+--------------------------------------------------------------------------------
+
+-- | A head's most, its lines and the blank one after them: 64 KiB.
+headMost : Int
+headMost = 65536
+
+-- | A body's most, its chunks' data counted where it is sent in chunks:
+-- | 64 MiB.
+bodyMost : Int
+bodyMost = 67108864
+
+-- | How much a server reads at a time: 64 KiB.
+readSize : Int
+readSize = 65536
+
+-- | How much a server reads at a time of a head not read all at once: 4
+-- | KiB, so a client sending its head a little at a time is waited for
+-- | with a small buffer, not `readSize`.
+headPiece : Int
+headPiece = 4096
+
+-- | How much of what a client still sends, after its request is
+-- | refused, a server reads and lets go of before it closes the
+-- | connection: 1 MiB.
+drainMost : Int
+drainMost = 1048576
+
+-- Reading a request
+--------------------------------------------------------------------------------
+
+-- (whether the byte at `i` is `c`)
+byteIs : Bytes -> Int -> Int -> Bool
+byteIs b i c = UInt8.toInt (Bytes.bytesAt b i) == c
+
+-- (the byte at `k` of `a`'s bytes, then `b`'s)
+byteOf : Bytes -> Bytes -> Int -> Int
+byteOf a b k =
+  if k < Bytes.length a then UInt8.toInt (Bytes.bytesAt a k)
+  else UInt8.toInt (Bytes.bytesAt b (k - Bytes.length a))
+
+-- | Where the blank line after a head starts, `\r\n\r\n`, in `a`'s
+-- | bytes, then `b`'s, from `k` on; -1 where it is not.  A reader that
+-- | keeps the last bytes it looked through (`lastThree`) looks in them
+-- | and what came after, not in all it has read.
+-- | >>> List.map (\(p : Pair String String) -> blankIn (Bytes.fromString (fst p)) (Bytes.fromString (snd p)) 0) [MkPair "a\r\n" "\r\nb", MkPair "" "ab\r\n\r\n", MkPair "\r\n\r" "x"]
+-- | [1, 2, -1]
+blankIn : Bytes -> Bytes -> Int -> Int
+blankIn a b k =
+  if k + 4 > Bytes.length a + Bytes.length b then 0 - 1
+  else if byteOf a b k == 13
+          && byteOf a b (k + 1) == 10
+          && byteOf a b (k + 2) == 13
+          && byteOf a b (k + 3) == 10
+  then k
+  else blankIn a b (k + 1)
+
+-- | The last three bytes of `a`'s, then `b`'s; all, where there are
+-- | fewer: where a head's end begun in them would be.
+-- | >>> List.map (\(p : Pair String String) -> Bytes.asString (lastThree (Bytes.fromString (fst p)) (Bytes.fromString (snd p)))) [MkPair "ab" "cdef", MkPair "abc" "d", MkPair "" "x"]
+-- | ["def", "bcd", "x"]
+lastThree : Bytes -> Bytes -> Bytes
+lastThree a b =
+  if Bytes.length b >= 3
+  then Bytes.slice b (Bytes.length b - 3) (Bytes.length b)
+  else let ab = Bytes.append a b
+       in Bytes.slice
+         ab
+         (if Bytes.length ab > 3 then Bytes.length ab - 3 else 0)
+         (Bytes.length ab)
+
+-- (a header line, `Name: value`: its name, with no space in it, and its
+-- value, trimmed)
+headerLine : String -> Maybe (Pair String String)
+headerLine l = headerAt (indexOf ":" l 0)
+  where
+  -- (a header line's name, up to `i`, and its value after it)
+  headerAt : Maybe Int -> Maybe (Pair String String)
+  headerAt Nothing = Nothing
+  headerAt (Just i) =
+    let name = strSlice l 0 i
+    in if i == 0 || contains " " name || contains "\t" name then Nothing
+    else Just (MkPair name (trim (strSlice l (i + 1) (strLength l))))
+
+consBoth : {a : Type} -> Maybe a -> Maybe (List a) -> Maybe (List a)
+consBoth (Just x) (Just xs) = Just (x :: xs)
+consBoth _ _ = Nothing
+
+-- (each line a header's, or none)
+headerLines : List String -> Maybe (List (Pair String String))
+headerLines [] = Just Nil
+headerLines (l :: rest) = consBoth (headerLine l) (headerLines rest)
+
+-- (a request of its line's three parts and its headers, its body to come)
+requestOf : Net.Address
+          -> List String
+          -> Maybe (List (Pair String String))
+          -> Maybe ServerRequest
+requestOf peer [m, t, v] (Just hs) =
+  if strLength m == 0 || strLength t == 0 then Nothing
+  else Just
+      { method = m
+      , target = t
+      , version = v
+      , headers = hs
+      , body = Bytes.empty
+      , peer = peer
+      }
+requestOf peer _ _ = Nothing
+
+headOfLines : Net.Address -> List String -> Maybe ServerRequest
+headOfLines peer [] = Nothing
+headOfLines peer (l :: rest) = requestOf peer (split " " l) (headerLines rest)
+
+-- | A request's head, its lines without the blank one after them: its
+-- | method, target, version and headers, its body to come; none where
+-- | it is no request's.
+-- | >>> maybe "none" (\(r : ServerRequest) -> r.method ^ " " ^ r.target) (parseHead { host = "::1", port = 1 } "GET /a?b HTTP/1.1\r\nHost: x\r\nX-Y:  z ")
+-- | "GET /a?b"
+-- | >>> maybe Nil (\(r : ServerRequest) -> r.headers) (parseHead { host = "::1", port = 1 } "GET / HTTP/1.1\r\nHost: x\r\nX-Y:  z ")
+-- | [MkPair "Host" "x", MkPair "X-Y" "z"]
+-- | >>> maybe "none" (\(r : ServerRequest) -> r.method) (parseHead { host = "::1", port = 1 } "GET  HTTP/1.1")
+-- | "none"
+parseHead : Net.Address -> String -> Maybe ServerRequest
+parseHead peer text = headOfLines peer (split "\r\n" text)
+
+-- Paths and queries
+--------------------------------------------------------------------------------
+
+-- (where a string ends, at the first `stop` in it or else at its end)
+endAt : String -> String -> Int
+endAt stop s = fromMaybe (strLength s) (indexOf stop s 0)
+
+-- (what is before the first `stop`; all, where there is none)
+beforeFirst : String -> String -> String
+beforeFirst stop s = strSlice s 0 (endAt stop s)
+
+-- (what is after the first `stop`; "", where there is none)
+afterFirst : String -> String -> String
+afterFirst stop s =
+  strSlice s (min (endAt stop s + 1) (strLength s)) (strLength s)
+
+-- (a target's path: what is before its `?` and its `#`)
+pathOf : String -> String
+pathOf t = beforeFirst "?" (beforeFirst "#" t)
+
+-- (a target's query: what is after its `?`, before its `#`)
+queryOf : String -> String
+queryOf t = afterFirst "?" (beforeFirst "#" t)
+
+-- (the pieces without the first, where it is empty)
+emptyFirstDropped : List String -> List String
+emptyFirstDropped ("" :: rest) = rest
+emptyFirstDropped pieces = pieces
+
+-- (a segment unescaped; as it is written where an escape is broken)
+segmentRead : String -> String
+segmentRead s = fromMaybe s (URL.unescape s)
+
+-- | The segments of a request's path, to match on (`["rooms", name]`):
+-- | the target's path, before its `?` and its `#`, split at each `/`, each
+-- | piece unescaped after -- so `%2F` is a `/` in a segment, not between
+-- | two -- and a `+` kept.  The empty piece before the first `/` is not
+-- | a segment, nor one after a last `/`: `/rooms/` is `/rooms`'s, and `/`
+-- | has none.  An empty segment between two `/`s is kept (`""`).  A
+-- | piece whose `%` is not followed by two hex digits is as written.
+-- | >>> List.map (\t -> maybe Nil segments (parseHead { host = "::1", port = 1 } ("GET " ^ t ^ " HTTP/1.1"))) ["/rooms/lobby/events", "/rooms/", "/", "/files/a%2Fb+c%20d", "/a//b?x=1#top", "/a/%zz"]
+-- | [["rooms", "lobby", "events"], ["rooms"], [], ["files", "a/b+c d"], ["a", "", "b"], ["a", "%zz"]]
+segments : ServerRequest -> List String
+segments r =
+  List.map
+    segmentRead
+    (List.reverse
+       (emptyFirstDropped
+          (List.reverse (emptyFirstDropped (split "/" (pathOf r.target))))))
+
+-- | A request's query, its keys and values in order, as `URL.parseQuery`
+-- | reads them: `+` a space, an escape its byte, a key without `=` a
+-- | value of `""`, a key given twice twice.  A query that does not read
+-- | (a `%` not followed by two hex digits) has none; no `?`, none.
+-- | >>> List.map (\t -> maybe Nil queries (parseHead { host = "::1", port = 1 } ("GET " ^ t ^ " HTTP/1.1"))) ["/a?x=1&y=a+b%26", "/a?", "/a", "/a?a&b=1", "/a?k=1&k=2#f", "/a?x=%zz&y=1"]
+-- | [[MkPair ("x") ("1"), MkPair ("y") ("a b&")], [], [], [MkPair ("a") (""), MkPair ("b") ("1")], [MkPair ("k") ("1"), MkPair ("k") ("2")], []]
+queries : ServerRequest -> List (Pair String String)
+queries r = fromMaybe Nil (URL.parseQuery (queryOf r.target))
+
+-- | The values a key of a request's query is given, in order.
+-- | >>> List.map (\k -> maybe Nil (queryAll k) (parseHead { host = "::1", port = 1 } "GET /a?k=1&b&k=2 HTTP/1.1")) ["k", "b", "z"]
+-- | [["1", "2"], [""], []]
+queryAll : String -> ServerRequest -> List String
+queryAll key r = List.map snd (List.keepIf (\kv -> fst kv == key) (queries r))
+
+-- | The first value a key of a request's query is given, if it is given
+-- | one: a key without `=` is given `""`.
+-- | >>> List.map (\k -> maybe Nothing (query k) (parseHead { host = "::1", port = 1 } "GET /a?k=1&b&k=2 HTTP/1.1")) ["k", "b", "z"]
+-- | [Just ("1"), Just (""), Nothing]
+query : String -> ServerRequest -> Maybe String
+query key r = List.head (queryAll key r)
+
+-- (what a request's head says of its body: its length, that it is sent
+-- in chunks, or the status it is answered with, its connection then
+-- closed)
+data BodyIs = Length Int | Chunked | Refuse Int
+
+sized : Maybe Int -> BodyIs
+sized Nothing = Refuse 400
+sized (Just n) =
+  if n < 0 then Refuse 400 else if n > bodyMost then Refuse 413 else Length n
+
+lengthOf : Maybe String -> BodyIs
+lengthOf Nothing = Length 0
+lengthOf (Just s) = sized (parseInt s)
+
+isSome : {a : Type} -> Maybe a -> Bool
+isSome m = maybe False (\_ -> True) m
+
+-- (the codings a `Transfer-Encoding` header names, where it is one)
+codingsIn : Pair String String -> List String
+codingsIn (MkPair n v) =
+  if sameName n "Transfer-Encoding" then split "," v else Nil
+
+-- (the codings a request's `Transfer-Encoding` headers name, all of
+-- them, in their order, none empty)
+codings : List (Pair String String) -> List String
+codings hs =
+  List.keepIf
+    (\t -> strLength t > 0)
+    (List.map trim (List.concatMap codingsIn hs))
+
+isChunked : String -> Bool
+isChunked t = sameName t "chunked"
+
+-- (a body in the codings named: in chunks, where `chunked` is the one;
+-- `501` where another is named, which is not known; else `400`, as
+-- `chunked` twice, or none)
+codingsOf : List String -> BodyIs
+codingsOf [t] = if isChunked t then Chunked else Refuse 501
+codingsOf ts = if List.all isChunked ts then Refuse 400 else Refuse 501
+
+-- (a body in chunks, where nothing else of the request says how long it
+-- is: a `Content-Length` beside the chunks, which another reader of the
+-- request may have gone by, or HTTP/1.0, which has no chunks, is `400`)
+chunkedOnly : ServerRequest -> BodyIs -> BodyIs
+chunkedOnly r Chunked =
+  if strEq r.version "HTTP/1.0" || isSome (requestHeader "content-length" r)
+  then Refuse 400
+  else Chunked
+chunkedOnly r is = is
+
+bodyOf : ServerRequest -> BodyIs
+bodyOf r =
+  if not (strEq r.version "HTTP/1.1" || strEq r.version "HTTP/1.0")
+  then Refuse (if startsWith "HTTP/" r.version then 505 else 400)
+  else if isSome (requestHeader "transfer-encoding" r)
+  then chunkedOnly r (codingsOf (codings r.headers))
+  else lengthOf (requestHeader "content-length" r)
+
+-- | Whether the client waits for `100 Continue` before it sends its
+-- | body: an HTTP/1.1 request that says `Expect: 100-continue`.
+expects : ServerRequest -> Bool
+expects r =
+  strEq r.version "HTTP/1.1"
+  && maybe False (\v -> sameName v "100-continue") (requestHeader "expect" r)
+
+-- Reading a body sent in chunks
+--------------------------------------------------------------------------------
+
+-- (a line's most, of a chunk's size and its extensions, or of the end
+-- after a chunk's data)
+chunkLineMost : Int
+chunkLineMost = 4096
+
+-- (where a body sent in chunks is read to: a chunk's size line, its
+-- data, so many bytes of it still to come, the line's end after the
+-- data, or the trailer after the last chunk)
+data ChunkAt = SizeLine | InChunk Int | ChunkEnd | InTrailer
+
+-- | A body sent in chunks (`Transfer-Encoding: chunked`), read so far:
+-- | where it is read to; a line begun, not yet ended; the data of its
+-- | chunks, the last first; the data taken of the piece being read,
+-- | the last first; how many bytes of data in all; and how many bytes of
+-- | its trailer.
+type Chunks =
+  { at : ChunkAt
+  , line : Bytes
+  , parts : List Bytes
+  , taken : List Bytes
+  , size : Int
+  , trailer : Int
+  }
+
+-- | A body sent in chunks, nothing of it read yet.
+chunks : Chunks
+chunks =
+  { at = SizeLine
+  , line = Bytes.empty
+  , parts = Nil
+  , taken = Nil
+  , size = 0
+  , trailer = 0
+  }
+
+-- | What a body sent in chunks comes to, a piece of it read: all read,
+-- | its data, and what was read after it (`BodyRead`); more to come
+-- | (`ChunksToCome`); or the status the request is answered with, its
+-- | connection then closed (`ChunksRefused`).
+data Dechunked = BodyRead Bytes Bytes | ChunksToCome Chunks | ChunksRefused Int
+
+-- (a step of a piece's reading: on, from `k`; the trailer's end read,
+-- the piece's rest from `k` the next request's; or done)
+data ChunkStep = StepOn Chunks Int | TrailerRead Chunks Int | Stepped Dechunked
+
+-- (where the next line feed is in `b`, from `k` on; -1 where there is
+-- none)
+lineFeedIn : Bytes -> Int -> Int
+lineFeedIn b k =
+  if k >= Bytes.length b then 0 - 1
+  else if byteIs b k 10 then k
+  else lineFeedIn b (k + 1)
+
+-- (a hexadecimal digit's value, of the byte `c`; -1 where it is none)
+hexValue : Int -> Int
+hexValue c =
+  if c >= 48 && c <= 57 then c - 48
+  else if c >= 97 && c <= 102 then c - 87
+  else if c >= 65 && c <= 70 then c - 55
+  else 0 - 1
+
+-- (the byte at `k` of `l` a hexadecimal digit's value; -1 where it is
+-- none, or `l` ends before `k`)
+hexAt : Bytes -> Int -> Int
+hexAt l k =
+  if k < Bytes.length l then hexValue (UInt8.toInt (Bytes.bytesAt l k))
+  else 0 - 1
+
+-- (whether `l`, from `k` on, after spaces or tabs, is an extension: `;`)
+extensionAfter : Bytes -> Int -> Bool
+extensionAfter l k =
+  if k >= Bytes.length l then False
+  else if byteIs l k 59 then True
+  else if byteIs l k 32 || byteIs l k 9 then extensionAfter l (k + 1)
+  else False
+
+-- (whether `l`, from `k` on, after a chunk's size, is nothing, or its
+-- extensions: `;`, after spaces or tabs, if any.  What they say is not
+-- minded)
+extensions : Bytes -> Int -> Bool
+extensions l k = k >= Bytes.length l || extensionAfter l k
+
+-- (a chunk's size, its hexadecimal digits in `l` from `k` on, `digits`
+-- of them read, `n` so far: none where there is no digit, or what
+-- follows them is not its extensions.  Past `bodyMost`, `bodyMost + 1`)
+chunkSize : Bytes -> Int -> Int -> Int -> Maybe Int
+chunkSize l k digits n =
+  let d = hexAt l k
+  in if d >= 0
+  then chunkSize
+      l
+      (k + 1)
+      (digits + 1)
+      (if n * 16 + d > bodyMost then bodyMost + 1 else n * 16 + d)
+  else if digits > 0 && extensions l k then Just n
+  else Nothing
+
+-- (a chunk's size read: the chunk's data next, or, at 0, the trailer;
+-- past what a body may be in all, `413`)
+sizeRead : Chunks -> Maybe Int -> Int -> ChunkStep
+sizeRead st Nothing k = Stepped (ChunksRefused 400)
+sizeRead st (Just 0) k = StepOn { st | at = InTrailer } k
+sizeRead st (Just n) k =
+  if st.size + n > bodyMost then Stepped (ChunksRefused 413)
+  else StepOn { st | at = InChunk n, size = st.size + n } k
+
+-- (a line read, `l`, its CRLF not in it, and the piece read on from `k`:
+-- a chunk's size; the end after a chunk's data, which is empty; or a
+-- line of the trailer, let go of, or its end)
+lineRead : ChunkAt -> Chunks -> Bytes -> Int -> ChunkStep
+lineRead SizeLine st l k = sizeRead st (chunkSize l 0 0 0) k
+lineRead ChunkEnd st l k =
+  if Bytes.length l == 0 then StepOn { st | at = SizeLine } k
+  else Stepped (ChunksRefused 400)
+lineRead InTrailer st l k =
+  if Bytes.length l == 0 then TrailerRead st k
+  else if st.trailer + Bytes.length l > headMost
+  then Stepped (ChunksRefused 400)
+  else StepOn { st | trailer = st.trailer + Bytes.length l } k
+lineRead (InChunk n) st l k = Stepped (ChunksRefused 400)
+
+-- (how long a line may be where the body is read to: the trailer's, as
+-- a head may be; another, `chunkLineMost`, its CRLF too)
+lineMostAt : ChunkAt -> Int
+lineMostAt InTrailer = headMost
+lineMostAt at = chunkLineMost
+
+-- (a line read of `b` from `k` on, after what was read of it before: up
+-- to its CRLF, and the line taken; else kept, to be read on with the
+-- next piece.  Longer than it may be, or its line feed not after a
+-- carriage return, `400`)
+lineIn : Chunks -> Bytes -> Int -> ChunkStep
+lineIn st b k =
+  let j = lineFeedIn b k
+  in let l =
+    Bytes.append
+      st.line
+      (Bytes.slice b k (if j < 0 then Bytes.length b else j + 1))
+  in if Bytes.length l > lineMostAt st.at then Stepped (ChunksRefused 400)
+  else if j < 0 then StepOn { st | line = l } (Bytes.length b)
+  else if Bytes.length l < 2 || not (byteIs l (Bytes.length l - 2) 13)
+  then Stepped (ChunksRefused 400)
+  else lineRead
+      st.at
+      { st | line = Bytes.empty }
+      (Bytes.slice l 0 (Bytes.length l - 2))
+      (j + 1)
+
+-- (a chunk's data, `n` bytes of it to come, read of `b` from `k` on: as
+-- much as is there of it, taken)
+dataIn : Chunks -> Int -> Bytes -> Int -> ChunkStep
+dataIn st n b k =
+  let m : Int = if n < Bytes.length b - k then n else Bytes.length b - k
+  in StepOn
+    { st
+    | at = if m == n then ChunkEnd else InChunk (n - m)
+    , taken = Bytes.slice b k (k + m) :: st.taken
+    }
+    (k + m)
+
+stepAt : ChunkAt -> Chunks -> Bytes -> Int -> ChunkStep
+stepAt (InChunk n) st b k = dataIn st n b k
+stepAt at st b k = lineIn st b k
+
+-- (the data taken of a piece, put with the data before it: one part, so
+-- that a body of many small chunks is no list of as many)
+joined : List Bytes -> List Bytes -> List Bytes
+joined [] parts = parts
+joined [p] parts = p :: parts
+joined taken parts = Bytes.concat (List.reverse taken) :: parts
+
+flushed : Chunks -> Chunks
+flushed st = { st | parts = joined st.taken st.parts, taken = Nil }
+
+-- (a piece `b` read on, a step of it taken: from where it got to, to
+-- the piece's end; the body, all read, and the piece's rest; or done)
+fedOn : Bytes -> ChunkStep -> Dechunked
+fedOn b (StepOn st k) =
+  if k >= Bytes.length b then ChunksToCome (flushed st)
+  else fedOn b (stepAt st.at st b k)
+fedOn b (TrailerRead done at) =
+  BodyRead
+    (Bytes.concat (List.reverse (flushed done).parts))
+    (Bytes.slice b at (Bytes.length b))
+fedOn b (Stepped d) = d
+
+-- (pieces fed, one after another, while more is to come)
+fedAll : Dechunked -> List Bytes -> Dechunked
+fedAll (ChunksToCome st) (b :: bs) = fedAll (fedOn b (StepOn st 0)) bs
+fedAll d bs = d
+
+dechunkedSaid : Dechunked -> String
+dechunkedSaid (BodyRead body rest) = show body ^ ", then " ^ show rest
+dechunkedSaid (ChunksToCome st) = "to come, " ^ debug st.size ^ " bytes so far"
+dechunkedSaid (ChunksRefused status) = "refused, " ^ debug status
+
+-- (a body's pieces read, what they come to said: for the examples)
+chunksSaid : List Bytes -> String
+chunksSaid pieces = dechunkedSaid (fedAll (ChunksToCome chunks) pieces)
+
+-- | A piece more of a body sent in chunks read, `Transfer-Encoding:
+-- | chunked` as RFC 9112 says it: each chunk its size in hexadecimal,
+-- | its extensions, if any, not minded, a line's end, its data and a
+-- | line's end; the last of size 0, then the trailer, its fields let go
+-- | of, and a blank line.  Its data more than a body's most, 64 MiB,
+-- | `413`; a line not so, a chunk's size line longer than 4 KiB or a
+-- | trailer longer than a head may be, `400`.
+-- | >>> chunksSaid [b["3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n"]]
+-- | "abcdefg, then "
+-- | >>> chunksSaid [b["3\r"], b["\nab"], b["c\r\n1;name=\"v\" ; x\r\n"], b["d\r\n0\r\n\r"], b["\n"]]
+-- | "abcd, then "
+-- | >>> chunksSaid [b["3\r\nabc\r\n0\r\nExpires: never\r\nX-Sum: 1\r\n\r\nGET / HTTP/1.1\r\n"]]
+-- | "abc, then GET / HTTP/1.1\r\n"
+-- | >>> chunksSaid [b["A\r\n0123456789\r\n"], b["0\r\n"]]
+-- | "to come, 10 bytes so far"
+-- | >>> chunksSaid [b["4000000\r\n"]]
+-- | "to come, 67108864 bytes so far"
+-- | >>> chunksSaid [b["4000001\r\n"]]
+-- | "refused, 413"
+-- | >>> chunksSaid [b["fffffffffffffffffffff\r\n"]]
+-- | "refused, 413"
+-- | >>> List.map (\(t : String) -> chunksSaid [Bytes.fromString t]) ["x\r\n", "\r\n", "3 \r\n", "3\nabc", "3\r\nabcd\r\n", "-3\r\n"]
+-- | ["refused, 400", "refused, 400", "refused, 400", "refused, 400", "refused, 400", "refused, 400"]
+-- | >>> chunksSaid [Bytes.fromString ("1;" ^ joinWith "" (List.replicate 4096 "x"))]
+-- | "refused, 400"
+feedChunks : Chunks -> Bytes -> Dechunked
+feedChunks st b = fedOn b (StepOn st 0)
+
+-- (what reading a request came to: the request, and what was read after
+-- it; a status it is answered with, the connection then closed; or the
+-- connection's end)
+data Got = Asked ServerRequest Bytes | Refused Int | Ended
+
+bodied : ServerRequest -> Int -> Maybe Bytes -> Got
+bodied r n Nothing = Ended
+bodied r n (Just b) =
+  Asked { r | body = Bytes.slice b 0 n } (Bytes.slice b n (Bytes.length b))
+
+-- | What a request not all read yet wants: more of its head, so many
+-- | bytes in all at least (`MoreHead`); its head read, more of its body,
+-- | so many bytes in all, the head's too (`MoreBody`); or its head read,
+-- | more of its body sent in chunks, read so far (`MoreChunks`), each
+-- | piece read after given to `feedChunks`.
+data Wanted
+  = MoreHead Int
+  | MoreBody ServerRequest Int
+  | MoreChunks ServerRequest Chunks
+
+-- (what a request whose head is read comes to: `buf` read of it, its
+-- body from `at` on)
+bodyIn : ServerRequest -> Bytes -> Int -> BodyIs -> Either Wanted Got
+bodyIn r buf at (Refuse status) = Right (Refused status)
+bodyIn r buf at (Length n) =
+  if Bytes.length buf < at + n then Left (MoreBody r (at + n))
+  else Right (bodied r n (Just (Bytes.slice buf at (Bytes.length buf))))
+bodyIn r buf at Chunked =
+  dechunkedIn r (feedChunks chunks (Bytes.slice buf at (Bytes.length buf)))
+  where
+  dechunkedIn : ServerRequest -> Dechunked -> Either Wanted Got
+  dechunkedIn r (BodyRead body rest) = Right (Asked { r | body = body } rest)
+  dechunkedIn r (ChunksToCome st) = Left (MoreChunks r st)
+  dechunkedIn r (ChunksRefused status) = Right (Refused status)
+
+-- (what reading a request came to, said: for the examples)
+wantedSaid : Either Wanted Got -> String
+wantedSaid (Left (MoreHead n)) = "head, " ^ debug n
+wantedSaid (Left (MoreBody r n)) = "body, " ^ debug n
+wantedSaid (Left (MoreChunks r st)) = "chunks, " ^ debug st.size
+wantedSaid (Right (Asked r rest)) = show r.body ^ ", then " ^ show rest
+wantedSaid (Right (Refused status)) = "refused, " ^ debug status
+wantedSaid (Right Ended) = "ended"
+
+-- | What the bytes read so far of a connection's next request come to,
+-- | read all at once, not waiting for more (a server that reads a piece
+-- | at a time asks after each): the request, and what was read after
+-- | it (`Asked`), or the status it is answered with (`Refused`); else,
+-- | not all read yet, `Left`, what it wants (`Wanted`).  The head's end,
+-- | its blank line, is looked for from `from` on, by name (0, the start,
+-- | unless another is given): a reader that has looked through what
+-- | came before, or knows where it is, says so.
+-- | >>> wantedSaid (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nab"])
+-- | "body, 40"
+-- | >>> wantedSaid (requestIn { host = "::1", port = 1 } b["GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET"])
+-- | "abc, then GET"
+-- | >>> wantedSaid (requestIn (from := 14) { host = "::1", port = 1 } b["GET / HTTP/1.1\r\n\r\n"])
+-- | ", then "
+-- | >>> wantedSaid (requestIn { host = "::1", port = 1 } b["POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab"])
+-- | "chunks, 3"
+-- | >>> wantedSaid (requestIn { host = "::1", port = 1 } b["POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET"])
+-- | "abc, then GET"
+-- | >>> List.map (\(h : String) -> wantedSaid (requestIn { host = "::1", port = 1 } (Bytes.fromString ("POST / HTTP/1.1\r\n" ^ h ^ "\r\n\r\n")))) ["Transfer-Encoding: gzip", "Transfer-Encoding: gzip, chunked", "Transfer-Encoding: chunked\r\nContent-Length: 0", "Transfer-Encoding: chunked, chunked", "Transfer-Encoding: Chunked\r\nTransfer-Encoding: gzip"]
+-- | ["refused, 501", "refused, 501", "refused, 400", "refused, 400", "refused, 501"]
+requestIn : {from : Int := 0} -> Net.Address -> Bytes -> Either Wanted Got
+requestIn peer buf =
+  let i = blankIn buf Bytes.empty from
+  in if i < 0
+  then (if Bytes.length buf > headMost then Right (Refused 431)
+        else Left (MoreHead (Bytes.length buf + 1)))
+  else case parseHead peer (show (Bytes.slice buf 0 i)) of
+    Nothing -> Right (Refused 400)
+    Just r -> bodyIn r buf (i + 4) (bodyOf r)
+
+-- Writing a response
+--------------------------------------------------------------------------------
+
+-- | A status's reason, as a status line says it (`OK`, `Not Found`); a
+-- | status not known, none.
+reason : Int -> String
+reason 100 = "Continue"
+reason 101 = "Switching Protocols"
+reason 200 = "OK"
+reason 201 = "Created"
+reason 202 = "Accepted"
+reason 204 = "No Content"
+reason 206 = "Partial Content"
+reason 301 = "Moved Permanently"
+reason 302 = "Found"
+reason 303 = "See Other"
+reason 304 = "Not Modified"
+reason 307 = "Temporary Redirect"
+reason 308 = "Permanent Redirect"
+reason 400 = "Bad Request"
+reason 401 = "Unauthorized"
+reason 403 = "Forbidden"
+reason 404 = "Not Found"
+reason 405 = "Method Not Allowed"
+reason 408 = "Request Timeout"
+reason 409 = "Conflict"
+reason 410 = "Gone"
+reason 411 = "Length Required"
+reason 413 = "Content Too Large"
+reason 414 = "URI Too Long"
+reason 415 = "Unsupported Media Type"
+reason 422 = "Unprocessable Content"
+reason 429 = "Too Many Requests"
+reason 431 = "Request Header Fields Too Large"
+reason 500 = "Internal Server Error"
+reason 501 = "Not Implemented"
+reason 502 = "Bad Gateway"
+reason 503 = "Service Unavailable"
+reason 504 = "Gateway Timeout"
+reason 505 = "HTTP Version Not Supported"
+reason _ = ""
+
+-- | Whether a status's response has no body: 1xx, 204, 304.
+bodiless : Int -> Bool
+bodiless s = s < 200 || s == 204 || s == 304
+
+-- (a header the server writes itself: the length, and the connection)
+ownHeader : Pair String String -> Bool
+ownHeader (MkPair n v) =
+  sameName n "Content-Length"
+  || sameName n "Transfer-Encoding"
+  || sameName n "Connection"
+
+headerText : String -> Pair String String -> String
+headerText acc (MkPair n v) = acc ^ n ^ ": " ^ v ^ "\r\n"
+
+-- (a status line)
+statusLine : Int -> String
+statusLine status = "HTTP/1.1 " ^ debug status ^ " " ^ reason status ^ "\r\n"
+
+-- (a head: its status line, its headers but the server's own, the
+-- server's own lines, `own`, and the blank line after them)
+headWith : Int -> List (Pair String String) -> String -> String
+headWith status headers own =
+  statusLine status
+  ^ List.foldl headerText "" (List.keepIf (\h -> not (ownHeader h)) headers)
+  ^ own
+  ^ "\r\n"
+
+-- (`Connection: connection`, where that is not empty)
+connectionLine : String -> String
+connectionLine "" = ""
+connectionLine connection = "Connection: " ^ connection ^ "\r\n"
+
+-- | A response as it is written: its status line, its headers but its
+-- | own length and connection, its length (`Content-Length`, where its
+-- | status has a body), `Connection: connection` where that is not
+-- | empty, and its body where `withBody` (not for a `HEAD`).
+-- | >>> debug (responseBytes "close" True (plain 200 "hi"))
+-- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Content-Type: text/plain; charset=utf-8\", 13, 10, \"Content-Length: 2\", 13, 10, \"Connection: close\", 13, 10, 13, 10, \"hi\"]"
+-- | >>> debug (responseBytes "" False { status = 204, headers = [MkPair "Content-Length" "9"], body = b["x"] })
+-- | "b[\"HTTP/1.1 204 No Content\", 13, 10, 13, 10]"
+responseBytes : String -> Bool -> Response -> Bytes
+responseBytes connection withBody res =
+  let none = bodiless res.status
+  in let head =
+    headWith
+      res.status
+      res.headers
+      ((if none then ""
+        else "Content-Length: " ^ debug (Bytes.length res.body) ^ "\r\n")
+       ^ connectionLine connection)
+  in if withBody && not none then Bytes.append (Bytes.fromString head) res.body
+  else Bytes.fromString head
+
+-- (a digit of hexadecimal, 0 to 15)
+hexDigit : Int -> String
+hexDigit d = strSlice "0123456789abcdef" d (d + 1)
+
+-- (`n`, not negative, in hexadecimal)
+hexOf : Int -> String
+hexOf n = if n < 16 then hexDigit n else hexOf (n / 16) ^ hexDigit (n % 16)
+
+-- | A piece of a streamed body as it is written to an HTTP/1.1 request,
+-- | a chunk of `Transfer-Encoding: chunked`: its length in hexadecimal,
+-- | then the piece, each ended by a line's end.  (A piece of no bytes is
+-- | the last chunk, which ends the body: the server writes none of the
+-- | body's so.)
+-- | >>> debug (chunk b["hello, world, and the rest"])
+-- | "b[\"1a\", 13, 10, \"hello, world, and the rest\", 13, 10]"
+chunk : Bytes -> Bytes
+chunk b =
+  Bytes.concat
+    [Bytes.fromString (hexOf (Bytes.length b) ^ "\r\n"), b, b["\r\n"]]
+
+-- | What a reply that is not whole begins with, before its body or the
+-- | connection taken over: its status, and its headers.
+type Head = { status : Int, headers : List (Pair String String) }
+
+-- | A streamed reply's head as it is written: its status line, its
+-- | headers but its own length and connection, `Transfer-Encoding:
+-- | chunked` where `chunked`, and `Connection: connection` where that is
+-- | not empty.
+-- | >>> debug (streamedHead "" True { status = 200, headers = [MkPair "Content-Type" "text/event-stream", MkPair "Content-Length" "3"] })
+-- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Content-Type: text/event-stream\", 13, 10, \"Transfer-Encoding: chunked\", 13, 10, 13, 10]"
+-- | >>> debug (streamedHead "close" False { status = 200, headers = Nil })
+-- | "b[\"HTTP/1.1 200 OK\", 13, 10, \"Connection: close\", 13, 10, 13, 10]"
+streamedHead : String -> Bool -> Head -> Bytes
+streamedHead connection chunked head =
+  Bytes.fromString
+    (headWith
+       head.status
+       head.headers
+       ((if chunked then "Transfer-Encoding: chunked\r\n" else "")
+        ^ connectionLine connection))
+
+-- | The head written before a connection is taken over: its status line
+-- | and its headers, all as they are given, `Connection` too -- no
+-- | length, nothing of the server's.
+-- | >>> debug (takeoverHead { status = 101, headers = [MkPair "Connection" "Upgrade", MkPair "Upgrade" "websocket"] })
+-- | "b[\"HTTP/1.1 101 Switching Protocols\", 13, 10, \"Connection: Upgrade\", 13, 10, \"Upgrade: websocket\", 13, 10, 13, 10]"
+takeoverHead : Head -> Bytes
+takeoverHead head =
+  Bytes.fromString
+    (statusLine head.status ^ List.foldl headerText "" head.headers ^ "\r\n")
+
+-- | Whether a `Connection` header of these has the token, its case not
+-- | minded.
+-- | >>> List.map (\t -> connectionSays t [MkPair "connection" "keep-alive, Upgrade"]) ["upgrade", "close"]
+-- | [True, False]
+connectionSays : String -> List (Pair String String) -> Bool
+connectionSays token [] = False
+connectionSays token (MkPair n v :: rest) =
+  (sameName n "Connection"
+   && List.any (\t -> sameName (trim t) token) (split "," v))
+  || connectionSays token rest
+
+-- | Whether a request's connection is kept after its response, as the
+-- | request asks: HTTP/1.1's unless it says `Connection: close`,
+-- | HTTP/1.0's where it says `Connection: keep-alive`.
+keptAlive : ServerRequest -> Bool
+keptAlive r =
+  if strEq r.version "HTTP/1.1" then not (connectionSays "close" r.headers)
+  else connectionSays "keep-alive" r.headers
+
+-- | What a response to the request says of its connection, closed
+-- | where `close`: `close`; else kept, `keep-alive` where HTTP/1.0 has
+-- | to be told so, and nothing to HTTP/1.1.
+connectionWord : ServerRequest -> Bool -> String
+connectionWord r True = "close"
+connectionWord r False = if strEq r.version "HTTP/1.0" then "keep-alive" else ""
