@@ -185,10 +185,14 @@ struct BcPark {
   BcPark *next;
 };
 
+#define BC_LINE 128
+
 struct BcCown {
   _Atomic(BcRequest *) last;
-  V v;               // the holder's
-  BcPark *waiting;   // the holder's
+  // (what the holder reads and writes on a line apart from `last`: each
+  // spawn on the cown swaps `last`, and each body run on it writes `v`)
+  _Alignas(BC_LINE) V v;  // the holder's
+  BcPark *waiting;        // the holder's
 };
 
 struct BcBehaviour {
@@ -236,11 +240,10 @@ static void bc_wait_less(BcWait *w) {
 }
 
 // (a cown holding `v`, shared; `v` consumed)
-// (a cown on a cache line of its own: each spawn on it swaps `last`, and
+// (a cown on cache lines of its own: each spawn on it swaps `last`, and
 // a line two cowns shared would be written by the spawns on both)
-#define BC_LINE 128
 static BcCown *bc_cown(V v) {
-  BcCown *c = aligned_alloc(BC_LINE, BC_LINE);
+  BcCown *c = aligned_alloc(BC_LINE, sizeof(BcCown));
   if (!c) heff_fail("out of memory");
   atomic_init(&c->last, NULL);
   c->v = heff_share(v);
