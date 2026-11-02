@@ -4,6 +4,7 @@
 
 ### Backends and performance
 
+- boc: a behaviour one worker makes and another runs is given back to the worker that made it, a run of 32 at a time, not the system's malloc on one side and its free on the other (four thousand at most kept for a worker, the rest the system's again): producer_consumer at 10M messages, 1.07 s to 1.01 s, its CPU 8.2 s to 7.9 s, no time left in the system's allocator.
 - boc: a cown's turnstile, which each spawn on it swaps, is on a cache line apart from what the cown holds, which each body run on it reads and writes: producer_consumer at 10M messages (four producers spawning on four consumers), M4 Pro, 1.15 s to 1.08 s, its CPU 8.8 s to 8.25 s.
 - boc: a worker putting a behaviour a body readied in its own queue read the behaviour's pool after another worker may have taken it, run it and let go of it: producer_consumer at 10M messages crashed in one run of ten or so, more under load.
 - On Linux, a block of 64 KiB to 4 MiB given back -- a socket read's buffer, a file's chunk, a long string or array -- is kept by its thread for the next of its size (four of a size, 32 MiB in all), not given back to the system: a static (musl) build's malloc mapped and unmapped each one afresh, and a server's every read was a map and an unmap. Static build, in a container: `GET /` at 64 connections 126–130k requests a second to 137–139k, as glibc's; 2 GB read from the page cache in chunks, 313 ms to 24 ms. glibc builds as before.

@@ -204,6 +204,7 @@ struct BcBehaviour {
   int64_t ws, rs;
   BcBehaviour *after;
   BcAct *act;  // an act awaited outside every worker: run by one
+  BcOwn *home;  // the worker's that made it, to be given back to; or none
   int n;
   int moved;
   BcRequest *req;  // `few`, where the cowns are as few
@@ -323,7 +324,9 @@ static inline void bc_pool_more(BcPool *pl) {
 
 // (what this thread holds given back, before it waits: where nothing is
 // left then, the end told)
+static void bc_runs_back(BcPool *pl);
 static void bc_settle(BcPool *pl) {
+  bc_runs_back(pl);
   int64_t c = bc_credit;
   bc_credit = 0;
   if (c && atomic_fetch_sub_explicit(&pl->live, c, memory_order_acq_rel) == c) {
@@ -420,7 +423,13 @@ struct BcOwn {
   _Alignas(BC_LINE) atomic_uint head;  // taken from: by any
   atomic_uint tail;                    // put at: by its worker
   int64_t since;                       // its worker's: when it last held none, ms
+  BcPool *pool;                        // whose worker's it is
+  struct BcRun *runs;                  // its worker's: one for each of the pool's
   _Atomic(BcBehaviour *) at[BC_RING];
+  // (the behaviours it made let go of by others, given back to it, and
+  // about how many since it last took them)
+  _Alignas(BC_LINE) _Atomic(BcBehaviour *) back;
+  atomic_int nback;
 };
 
 // (this worker's queue, and its place among the pool's)
@@ -578,23 +587,83 @@ static void bc_through(BcBehaviour *b) {
 
 // (a behaviour's room: one this thread let go of, kept for the next, a
 // few hundred at most -- a chain of behaviours on one thread mallocs
-// none -- else the system's)
+// none -- else one a worker made given back to it, else the system's.
+// A behaviour one worker makes and another runs is given back to the
+// worker that made it, its `home`: the one letting go of it keeps a run
+// of `BC_RUN` for each worker, and puts the run on the maker's `back`
+// at once, by one compare-and-swap; the maker takes all its `back` holds
+// where it has none kept.  So a spawner and a runner apart do not each
+// go to the system's malloc and free, the one never finding one kept,
+// the other keeping too many.  Where a worker has `BC_BACK` given back
+// and not taken -- it made a burst, and makes no more -- a run is the
+// system's again)
 #define BC_KEPT 256
+#define BC_RUN 32
+#define BC_BACK 4096
 static HEFF_TLS BcBehaviour *bc_spare;
 static HEFF_TLS int bc_nspare;
+typedef struct BcRun { BcBehaviour *first, *last; int n; } BcRun;
 
-static BcBehaviour *bc_behaviour_room(void) {
+static BcBehaviour *bc_behaviour_room(BcPool *pl) {
   BcBehaviour *b = bc_spare;
+  BcOwn *home = bc_own;
+  if (home && home->pool != pl) home = NULL;
+  if (!b && home && atomic_load_explicit(&home->back, memory_order_relaxed)) {
+    b = atomic_exchange_explicit(&home->back, NULL, memory_order_acquire);
+    atomic_store_explicit(&home->nback, 0, memory_order_relaxed);
+    bc_nspare = 0;
+  }
   if (b) {
     bc_spare = b->after;
-    bc_nspare--;
-    return b;
+    if (bc_nspare > 0) bc_nspare--;
+  } else b = heff_alloc(sizeof(BcBehaviour));
+  b->home = home;
+  return b;
+}
+
+// (a run given back to its worker, `home`: or, where it has enough not
+// taken, to the system)
+static void bc_run_back(BcOwn *home, BcRun *r) {
+  if (!r->n) return;
+  if (atomic_load_explicit(&home->nback, memory_order_relaxed) >= BC_BACK) {
+    for (BcBehaviour *b = r->first, *next; r->n; b = next, r->n--) {
+      next = b->after;
+      free(b);
+    }
+    return;
   }
-  return heff_alloc(sizeof(BcBehaviour));
+  BcBehaviour *old = atomic_load_explicit(&home->back, memory_order_relaxed);
+  do r->last->after = old;
+  while (!atomic_compare_exchange_weak_explicit(&home->back, &old, r->first, memory_order_release,
+                                                memory_order_relaxed));
+  atomic_fetch_add_explicit(&home->nback, r->n, memory_order_relaxed);
+  r->n = 0;
+}
+
+// (all this worker's runs given back: before it waits, and as it ends)
+static void bc_runs_back(BcPool *pl) {
+  BcOwn *me = bc_own;
+  if (!me || me->pool != pl) return;
+  for (int k = 0; k < pl->n; k++) bc_run_back(&pl->own[k], &me->runs[k]);
 }
 
 static void bc_behaviour_free(BcBehaviour *b) {
   if (b->req != b->few) free(b->req);
+  BcOwn *home = b->home, *me = bc_own;
+  if (home && home != me) {
+    BcPool *pl = b->pool;
+    if (me && me->pool == pl) {
+      BcRun *r = &me->runs[home - pl->own];
+      b->after = r->first;
+      r->first = b;
+      if (!r->n++) r->last = b;
+      if (r->n >= BC_RUN) bc_run_back(home, r);
+    } else {
+      BcRun one = {b, b, 1};
+      bc_run_back(home, &one);
+    }
+    return;
+  }
   if (bc_nspare >= BC_KEPT) {
     free(b);
     return;
@@ -681,7 +750,7 @@ static void bc_twice(BcPool *pl, V cs, BcCown *t) {
 static void bc_behave(BcPool *pl, V cs, V body, V cond, int64_t ws, int64_t rs) {
   int n = bc_count(cs);
   if (n > 62 && (ws >= 0 || rs > 0)) heff_fail("boc: a behaviour on more than 62 cowns, some not written");
-  BcBehaviour *b = bc_behaviour_room();
+  BcBehaviour *b = bc_behaviour_room(pl);
   b->req = n <= 2 ? b->few : heff_alloc((size_t)n * sizeof(BcRequest));
   int i = 0;
   bc_each(cs, b->req, &i);
@@ -759,7 +828,7 @@ static void bc_park_on(V cs, BcWait *w, int64_t rs, int *i) {
 // the one running lets go of its cowns as it is, whenever it is queued)
 static BcBehaviour *bc_again(BcBehaviour *b) {
   bc_movable(b);
-  BcBehaviour *nb = bc_behaviour_room();
+  BcBehaviour *nb = bc_behaviour_room(b->pool);
   nb->req = b->n <= 2 ? nb->few : heff_alloc((size_t)b->n * sizeof(BcRequest));
   for (int i = 0; i < b->n; i++) nb->req[i].t = b->req[i].t;
   nb->n = b->n;
@@ -1135,7 +1204,7 @@ static void bc_act_behaviour(BcPool *pl, BcAct *a) {
   a->arm[0] = heff_move(a->arm[0]);
   if (a->race) a->arm[1] = heff_move(a->arm[1]);
   if (a->custody) a->custody = heff_move(a->custody);
-  BcBehaviour *b = bc_behaviour_room();
+  BcBehaviour *b = bc_behaviour_room(pl);
   b->req = b->few;
   b->n = 0;
   b->pool = pl;
@@ -1401,6 +1470,9 @@ static void *bc_worker(void *u) {
   bc_me = s->me;
   free(s);
   bc_own = &pl->own[bc_me];
+  bc_own->pool = pl;
+  bc_own->runs = calloc((size_t)pl->n, sizeof(BcRun));
+  if (!bc_own->runs) heff_fail("out of memory");
   bc_running = pl;
   bc_current = pl;
   atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_acq_rel);
@@ -1515,7 +1587,12 @@ static void *bc_worker(void *u) {
     heff_reactor_close(bc_group);
     bc_group = 0;
   }
-  // (the behaviours' room this thread kept given back)
+  // (the behaviours' room this thread kept given back, and those others
+  // let go of, to their makers)
+  bc_runs_back(pl);
+  free(bc_own->runs);
+  bc_own->runs = NULL;
+  bc_own->pool = NULL;
   while (bc_spare) {
     BcBehaviour *next = bc_spare->after;
     free(bc_spare);
@@ -1626,6 +1703,12 @@ static void bc_drain(BcPool *pl) {
   pthread_cond_destroy(&pl->work);
   pthread_cond_destroy(&pl->idle);
   free(pl->threads);
+  // (the behaviours given back to workers ended since)
+  for (int k = 0; k < pl->n; k++)
+    for (BcBehaviour *b = pl->own[k].back, *next; b; b = next) {
+      next = b->after;
+      free(b);
+    }
   free(pl->own);
   free(pl);
 }
