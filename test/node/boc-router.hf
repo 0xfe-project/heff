@@ -1,0 +1,201 @@
+-- std.http.router's slots, on boc's behaviours, with no server: requests
+-- dispatched as a server's connection would, each answer kept in a
+-- log, a cown, and the log said once it has every answer.  By C alone.
+--
+--   main     a request to a route of the request alone, answered there;
+--            to a route on a state that reads it; three to one that
+--            changes it, each given the state the one before it gave
+--            back; three to a waiter that waits for three, taken in one
+--            batch, none lost; two long polls, answered only once the
+--            count is past what each asks, the count's writes waking
+--            the waiter; a handler that fails, its route answering a
+--            later request still; a `405`, and a request no route takes
+
+module test.node.boc-router
+
+import array as Array
+import boc as BOC
+import bytes as Bytes
+import co
+import exception
+import std.duration as Duration
+import std.http as HTTP
+import std.http.bocserver as BocServer
+import std.http.router as Router
+import std.io
+import std.time as Time
+
+type Shop =
+  { log : BOC.Cown (List String)
+  , count : BOC.Cown Int
+  , hits : BOC.Cown Int
+  }
+
+-- (an answer kept in the log, under its name)
+kept : {e : HFunctor}
+     -> BOC.Cown (List String)
+     -> String
+     -> {f : HFunctor}
+     -> {{bc : BOC.boc <: f}}
+     -> BocServer.Answer e Empty
+     -> Co f Unit
+kept log name (Whole res) = do
+  with l := log do
+    l := l ++ [name ^ ": " ^ debug res.status ^ " " ^ Bytes.asString res.body]
+kept log name other = do
+  with l := log do
+    l := l ++ [name ^ ": not whole"]
+
+-- | `GET /hello/NAME`: of the request alone
+hello : HTTP.ServerRequest -> String -> HTTP.Response
+hello r name = HTTP.plain 200 ("hello " ^ name)
+
+-- | `GET /items/N`: its number, and the count, read
+item : Int -> HTTP.ServerRequest -> Int -> HTTP.Response
+item c r n = HTTP.plain 200 ("item " ^ debug n ^ " at " ^ debug c)
+
+-- | `POST /hits`: the hits, one more
+hit : Int -> HTTP.ServerRequest -> Pair Int HTTP.Response
+hit n r = MkPair (n + 1) (HTTP.plain 200 ("hit " ^ debug (n + 1)))
+
+-- | `GET /boom/N`: for 1, a failure
+boom : Int -> HTTP.ServerRequest -> Int -> Pair Int HTTP.Response
+boom n r k =
+  if k == 1 then panic "boom" else MkPair n (HTTP.plain 200 ("boom " ^ debug k))
+
+-- (each of a batch answered, how many it has)
+batchAnswered : {e : HFunctor}
+              -> {{bc : BOC.boc <: e}}
+              -> Array (Router.Asked e Unit)
+              -> Co e Unit
+batchAnswered q = do
+  for a in q do
+    a.respond
+        (Whole (HTTP.plain 200 ("one of a batch of " ^ debug (Array.length q))))
+
+-- | `GET /batch`: once three have come, all three
+batched : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> Router.Slot e Unit
+        -> Co e Unit
+batched slot = do
+  with q := slot once Array.length q >= 3 do
+    batched slot
+    BOC.task (batchAnswered q)
+    q := Array.empty
+
+-- (whether the count is past what a poll asks)
+past : {e : HFunctor} -> Int -> Router.Asked e Int -> Bool
+past n a = n > a.captured
+
+-- (the polls answered, at this count)
+pollsAnswered : {e : HFunctor}
+              -> {{bc : BOC.boc <: e}}
+              -> Int
+              -> Array (Router.Asked e Int)
+              -> Co e Unit
+pollsAnswered n q = do
+  for a in q do
+    a.respond
+        (Whole (HTTP.plain 200 ("past " ^ debug a.captured ^ " at " ^ debug n)))
+
+-- | `GET /poll?after=N`: answered once the count is past `N`
+polled : {e : HFunctor}
+       -> {{bc : BOC.boc <: e}}
+       -> Shop
+       -> Router.Slot e Int
+       -> Co e Unit
+polled shop slot = do
+  with q := slot
+       n := shop.count
+       once Array.any (past n) q do
+    polled shop slot
+    BOC.task (pollsAnswered n (Array.keepIf (past n) q))
+    q := Array.keepIf (\a -> not (past n a)) q
+
+instance instanceRouteRegisterShop : {e : HFunctor}
+                                   -> {{bc : BOC.boc <: e}}
+                                   -> Router.RouteRegister e Shop
+instanceRouteRegisterShop = { routes = registered }
+  where
+  registered : Shop -> Router.Routes e
+  registered shop = do
+    Router.get ("hello" / Router.string) hello
+    Router.get ("items" / Router.int) (Router.on shop.count item)
+    Router.post "hits" (Router.on shop.hits hit)
+    Router.get ("boom" / Router.int) (Router.on shop.hits boom)
+    Router.waiting "GET" "batch" batched
+    Router.waiting "GET" ("poll" + Router.query "after") (polled shop)
+
+-- (a request of this method and target)
+requested : String -> String -> HTTP.ServerRequest
+requested m target =
+  { method = m
+  , target = target
+  , version = "HTTP/1.1"
+  , headers = []
+  , body = Bytes.empty
+  , peer = { host = "::1", port = 1 }
+  }
+
+noPage : HTTP.ServerRequest -> HTTP.Response
+noPage r = HTTP.plain 404 "no such page"
+
+-- (a request dispatched, its answer kept under its target)
+asked : {e : HFunctor}
+      -> {{bc : BOC.boc <: e}}
+      -> Router.Router e
+      -> BOC.Cown (List String)
+      -> String
+      -> String
+      -> Co e Unit
+asked router log m target = do
+  r <-
+    attempt
+      Empty
+      (Router.dispatch router noPage (requested m target) (kept log target))
+  pure ()
+
+-- (the requests; a while after the failing one, the next to its route;
+-- then the count written past the first poll, then past the second)
+run : {e : HFunctor}
+    -> {{bc : BOC.boc <: e}}
+    -> {{io : stdio <: e}}
+    -> {{clock : Time.time <: e}}
+    -> Shop
+    -> Router.Router e
+    -> Co e Unit
+run shop router = do
+  asked router shop.log "GET" "/poll?after=2"
+  asked router shop.log "GET" "/poll?after=1"
+  asked router shop.log "GET" "/hello/you"
+  asked router shop.log "GET" "/items/1"
+  asked router shop.log "POST" "/hits"
+  asked router shop.log "POST" "/hits"
+  asked router shop.log "POST" "/hits"
+  asked router shop.log "GET" "/batch"
+  asked router shop.log "GET" "/batch"
+  asked router shop.log "GET" "/batch"
+  asked router shop.log "POST" "/items/3"
+  asked router shop.log "GET" "/nothing"
+  asked router shop.log "GET" "/boom/1"
+  with _ := BOC.await (Time.sleep (Duration.milliseconds 300)) do
+    asked router shop.log "GET" "/boom/2"
+  with l := shop.log once List.length l >= 11 do
+    with n := shop.count do
+      n := 2
+  with l := shop.log once List.length l >= 12 do
+    with n := shop.count do
+      n := 3
+  with l := shop.log once List.length l >= 13 do
+    print (joinWith "\n" (List.sort l))
+
+main : Co (BOC.boc <+> stdio <+> Time.time) Unit
+main = do
+  log <- BOC.newCown (Nil : List String)
+  count <- BOC.newCown 0
+  hits <- BOC.newCown 0
+  routed <- Router.serving ({ log = log, count = count, hits = hits } : Shop)
+  case routed of
+    Right router -> run { log = log, count = count, hits = hits } router
+    Left conflicts -> print (joinWith "; " (List.map show conflicts))

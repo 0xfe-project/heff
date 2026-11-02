@@ -1,0 +1,2128 @@
+-- For routing HTTP requests: each route a method, a path and a
+-- handler, registered by a service in a `do` block.  A handler is a
+-- function, of the request and what its path captures, to its answer:
+-- of them alone, answered where the request is found; or on a cown's
+-- state too, its requests put in the route's slot and taken a batch
+-- at a time.  Import it by a name, `import std.http.router as Router`.
+--
+-- ```haskell
+-- import array as Array
+-- import boc as BOC
+-- import bytes as Bytes
+-- import co
+-- import std.http as HTTP
+-- import std.http.router as Router
+--
+-- type Shelf = { books : BOC.Cown (List String) }
+--
+-- -- | `GET /hello`
+-- hello : HTTP.ServerRequest -> HTTP.Response
+-- hello r = HTTP.plain 200 "hello\n"
+--
+-- -- | `GET /books/N`: the books after the `N`th
+-- books : List String -> HTTP.ServerRequest -> Int -> HTTP.Response
+-- books bs r n = HTTP.plain 200 (joinWith "\n" (List.drop n bs))
+--
+-- -- | `POST /books`: the body a new book
+-- shelved : List String -> HTTP.ServerRequest -> Pair (List String) HTTP.Response
+-- shelved bs r = MkPair (bs ++ [Bytes.asString r.body]) (HTTP.plain 201 "shelved\n")
+--
+-- -- (whether there are more books than a request has seen)
+-- more : {e : HFunctor} -> List String -> Router.Asked e Int -> Bool
+-- more bs a = List.length bs > a.captured
+--
+-- -- (the books after what each has seen)
+-- answered : {e : HFunctor}
+--          -> {{bc : BOC.boc <: e}}
+--          -> List String
+--          -> Array (Router.Asked e Int)
+--          -> Co e Unit
+-- answered bs asks = do
+--   for a in asks do
+--     a.respond (Whole (HTTP.plain 200 (joinWith "\n" (List.drop a.captured bs))))
+--
+-- -- | `GET /books?seen=N`: the books after the `N`th, once there are some
+-- newer : {e : HFunctor}
+--       -> {{bc : BOC.boc <: e}}
+--       -> Shelf
+--       -> Router.Slot e Int
+--       -> Co e Unit
+-- newer shelf slot = do
+--   with q := slot
+--        bs := shelf.books once Array.any (more bs) q do
+--     newer shelf slot
+--     BOC.task (answered bs (Array.keepIf (more bs) q))
+--     q := Array.keepIf (\a -> not (more bs a)) q
+--
+-- instance instanceRouteRegisterShelf : {e : HFunctor}
+--                                     -> {{bc : BOC.boc <: e}}
+--                                     -> Router.RouteRegister e Shelf
+-- instanceRouteRegisterShelf = { routes = registered }
+--   where
+--   registered : Shelf -> Router.Routes e
+--   registered shelf = do
+--     Router.get "hello" hello
+--     Router.waiting "GET" ("books" + Router.query "seen") (newer shelf)
+--     Router.get ("books" / Router.int) (Router.on shelf.books books)
+--     Router.post "books" (Router.on shelf.books shelved)
+-- ```
+--
+-- `/hello` is `hello`'s, `/books/3` `books`'s, its segment read as an
+-- `Int`, the shelf's books given it first; `POST /books` `shelved`'s,
+-- which gives back the books it leaves; and `/books?seen=2` `newer`'s,
+-- answered once the shelf has a third book.
+--
+-- A route is a method (`get`, `post`, `put`, `delete`, `patch`, or any,
+-- `route "OPTIONS"`), a path, and a handler.  A path is its segments,
+-- joined by `/`: a string is a literal (`"todos"`, or `"api/todos"`,
+-- split at its `/`s; `"/"` is the root), `int` and `string` a segment
+-- read as an `Int` or as it is, `matching "[a-z]+"` a segment the whole
+-- of which a regular expression matches, and `rest` the segments left,
+-- none or more, a `List String`.  After the path, `+` adds what the
+-- request must have beyond it: a query's key given a value (`queryIs
+-- "status" "open"`), a value a pattern matches (`queryMatching`), or
+-- captured (`query "page"`); the same of headers (`headerIs`,
+-- `headerMatching`, `header`), their names' case not minded.
+--
+-- A handler is given the request, then what the path captures, each
+-- read as its type says, in order: the path's slots, then the query's
+-- and headers' captures.  `int` must be read as an `Int`, `string` and
+-- `matching` as a `String`, `rest` as a `List String`; a query's or a
+-- header's, as any type that has a `Capture` -- `Int`, `String`, or a
+-- `Maybe` of one, for a key that may be missing.  A capture that does
+-- not read so (`?page=x` read as an `Int`, a missing header read as a
+-- `String`) is a route the request does not take.  What it comes to is
+-- its answer, as its type says (`Takes`): a response, `Whole`; an
+-- answer (a stream, a socket); or a computation of the server's world
+-- that comes to an answer, run as an act awaited, outside every
+-- behaviour, so that it may wait on the world.  None throws: a handler
+-- answers what went wrong (a `400`, a `502`), and what fails in the
+-- world comes to it as a value.
+--
+-- A handler of the request alone is answered in the connection's own
+-- behaviour, where the request is found: the trie is a value walked
+-- there, no cown held.  One on a state, `on cown handler`, is given
+-- what the cown holds first, and, where its type says, gives back the
+-- state after it beside its response (a `Pair`).  Its route has a
+-- slot, a cown of the requests put in it and not yet taken (an `Array`,
+-- pushed to at its end), each put in by one behaviour on that cown
+-- alone; and a waiter on it, `with q := slot once not (Array.null q)
+-- do`, which, once the slot has requests, spawns its next wait first,
+-- hands them all to a behaviour on the state, and leaves the slot
+-- empty.  That behaviour gives the handler each request in turn, the
+-- state the one before gave back, writes the state back once, and
+-- does what the cown is `kept` with (`kept state after`: `after` given
+-- the state then, to the state written back and what to do, as news
+-- told); the answers are sent by a behaviour of their own (boc's
+-- `task`), so the state is let go of at once.  A handler that only
+-- reads the state is given what it holds by a behaviour of its own,
+-- and the state is not written.  So a batch that fails is lost alone,
+-- the state as it was, and the route waits on; a request to one route
+-- never waits for another's slot.
+--
+-- `waiting` gives a route a waiter of the author's, given its slot (a
+-- `Slot e a`, of `Asked` requests: each its request, its responder and
+-- its captures, read as an `a` -- `Unit`, one of a type that has a
+-- `Capture`, or a tuple of them): one that binds more cowns beside the
+-- slot and waits `once` what they hold and the requests are as it
+-- wants -- a long poll answered once the state has moved past what the
+-- request has seen, each write to the state waking it, with no list of
+-- who waits kept anywhere.  It too waits again first, takes what it
+-- answers out of the slot, and answers it by a behaviour of its own
+-- (boc's `task`).  `spread n` gives routes `n` slots each, a waiter on
+-- each, a request put in its connection's.
+--
+-- A service's routes are its `RouteRegister`, and two services', a
+-- `Pair`'s, one after the other.  `serving` compiles them, once, before
+-- the server starts: the trie, each literal segment found by its text
+-- (among a few one by one, among many by its hash), then each slot,
+-- `int` first, `matching`s in the order given and `string` last, then
+-- `rest`, backtracking where a branch ends nowhere.  The most specific
+-- path answers.  It has a route for each of its methods, `HEAD` the
+-- `GET`'s where it has none of its own: the first route of the
+-- request's method whose conditions hold and whose captures read takes
+-- it, and a method it has none of is answered `405`, its `Allow` the
+-- path's methods.  A request no path takes, or none of whose routes
+-- take it, is answered by `notFound`'s response.  What cannot be served
+-- is said before any slot is made, each a `Conflict`: a route no
+-- request reaches (one before it of its method and path asks nothing
+-- of the request it does not, a `Maybe String` captured asking
+-- nothing), a capture the handler does not read as its type, `rest`
+-- before the end, a pattern that does not read, a condition after `/`
+-- (`"a" / query "q"`, which is `"a" + query "q"`) or a segment after
+-- `+`.  The server's error type is `Empty`: `BocServer.serve Empty`.
+
+module std.http.router
+  ( Path
+  , instanceCoeStringPath
+  , instanceDivisionPath
+  , int
+  , string
+  , matching
+  , rest
+  , instanceAdditionPath
+  , query
+  , queryIs
+  , queryMatching
+  , header
+  , headerIs
+  , headerMatching
+  , Captured(..)
+  , Capture
+  , instanceCaptureInt
+  , instanceCaptureString
+  , instanceCaptureListString
+  , instanceCaptureMaybe
+  , Run
+  , Captures
+  , instanceCapturesUnit
+  , instanceCapturesInt
+  , instanceCapturesString
+  , instanceCapturesListString
+  , instanceCapturesMaybe
+  , instanceCapturesPair
+  , Reply(..)
+  , Takes
+  , instanceTakesResponse
+  , instanceTakesAnswer
+  , instanceTakesStated
+  , instanceTakesLater
+  , instanceTakesArrow
+  , Kept
+  , kept
+  , Keeping
+  , instanceKeepingCown
+  , instanceKeepingKept
+  , On
+  , on
+  , Handles
+  , instanceHandlesRequest
+  , instanceHandlesOn
+  , Asked
+  , Slot
+  , Route
+  , waiting
+  , route
+  , get
+  , post
+  , put
+  , delete
+  , patch
+  , Routes
+  , spread
+  , RouteRegister
+  , instanceRouteRegisterPair
+  , Conflict(..)
+  , instanceShowConflict
+  , Router
+  , compiled
+  , serving
+  , dispatch
+  )
+
+import array as Array
+import bytes as Bytes
+import boc as BOC
+import co
+import exception
+import int as Int
+import regex as Regex
+import std.hashmap as HashMap
+import std.http as HTTP
+import std.http.bocserver as BocServer
+import stream as Stream
+
+-- Paths
+--------------------------------------------------------------------------------
+
+-- | A hole of a path, a segment captured: an integer (`-` and digits),
+-- | any segment, or one
+-- | a pattern matches whole (as it is written, and as it was read).
+data Hole = IntHole | StringHole | RegexHole String (Either String Regex.Regex)
+
+-- | A path's segment: one of this text, a slot, or the rest.
+data Piece = Literal String | Typed Hole | Rest
+
+-- | What a request must have beyond its path: a query's or a header's
+-- | value of this text, matched by this pattern, or captured.
+data Cond
+  = QueryIs String String
+  | QueryMatching String String (Either String Regex.Regex)
+  | QueryCapture String
+  | HeaderIs String String
+  | HeaderMatching String String (Either String Regex.Regex)
+  | HeaderCapture String
+
+-- | A route's path: its segments, its conditions, and how it was
+-- | joined amiss, where it was (a condition after `/`, a segment after
+-- | `+`), each said.
+data Path = MkPath (List Piece) (List Cond) (List String)
+
+holeKey : Hole -> String
+holeKey IntHole = "{int}"
+holeKey StringHole = "{string}"
+holeKey (RegexHole src re) = "{" ^ src ^ "}"
+
+pieceKey : Piece -> String
+pieceKey (Literal s) = s
+pieceKey (Typed slot) = holeKey slot
+pieceKey Rest = "{rest}"
+
+condKey : Cond -> String
+condKey (QueryIs k v) = "?" ^ k ^ "=" ^ v
+condKey (QueryMatching k src re) = "?" ^ k ^ "~" ^ src
+condKey (QueryCapture k) = "?" ^ k
+condKey (HeaderIs n v) = n ^ ": " ^ v
+condKey (HeaderMatching n src re) = n ^ " ~ " ^ src
+condKey (HeaderCapture n) = n ^ ":"
+
+-- (a path as a conflict says it)
+shownPath : Path -> String
+shownPath (MkPath [] [] amiss) = "/"
+shownPath (MkPath pieces [] amiss) =
+  joinWith "" (List.map (\p -> "/" ^ pieceKey p) pieces)
+shownPath (MkPath pieces conds amiss) =
+  shownPath (MkPath pieces [] amiss)
+  ^ " "
+  ^ joinWith " " (List.map condKey conds)
+
+-- (a segment of text, not empty)
+literals : List String -> List Piece
+literals [] = []
+literals ("" :: more) = literals more
+literals (s :: more) = Literal s :: literals more
+
+-- | A string is the literal segments between its `/`s.
+-- | >>> shownPath ("api/todos" : Path)
+-- | "/api/todos"
+-- | >>> shownPath ("/" : Path)
+-- | "/"
+instance instanceCoeStringPath : Coe String Path
+instanceCoeStringPath = { coe = \s -> MkPath (literals (split "/" s)) [] [] }
+
+-- (two paths, one after the other, how each was joined amiss and how
+-- they are)
+joinedPath : List String -> Path -> Path -> Path
+joinedPath amiss (MkPath a c x) (MkPath b d y) =
+  MkPath (a ++ b) (c ++ d) (x ++ y ++ amiss)
+
+-- (how `/` joins amiss: a condition after it, or a segment after a
+-- condition)
+slashAmiss : Path -> Path -> List String
+slashAmiss (MkPath a c x) (MkPath [] (d :: ds) y) =
+  ["a condition after `/`, which `+` adds"]
+slashAmiss (MkPath a (c :: cs) x) (MkPath (b :: bs) d y) =
+  ["a segment after a condition"]
+slashAmiss p q = []
+
+-- (how `+` joins amiss: a segment after it)
+plusAmiss : Path -> List String
+plusAmiss (MkPath (b :: bs) d y) = ["a segment after `+`, which `/` joins"]
+plusAmiss q = []
+
+-- | `a / b`: `a`'s segments, then `b`'s.  (A condition after `/`, as
+-- | `"a" / query "q"`, is a `Conflict` once the routes are compiled.)
+instance instanceDivisionPath : Division Path
+instanceDivisionPath = { div = \p q -> joinedPath (slashAmiss p q) p q }
+
+-- | `p + c`: the path `p`, and what the request must have beyond it,
+-- | `c`: a query's or a header's.  (A segment after `+` is a
+-- | `Conflict`.)
+instance instanceAdditionPath : Addition Path
+instanceAdditionPath = { add = \p q -> joinedPath (plusAmiss q) p q }
+
+-- (a condition, as a path of no segment)
+beyond : Cond -> Path
+beyond c = MkPath [] [c] []
+
+-- | A segment read as an `Int`: `-` or not, then digits.
+int : Path
+int = MkPath [Typed IntHole] [] []
+
+-- | Any segment, read as it is.
+string : Path
+string = MkPath [Typed StringHole] [] []
+
+-- (a pattern of RE2's syntax, to match a value whole)
+wholly : String -> Either String Regex.Regex
+wholly src = Regex.compile ("^(?:" ^ src ^ ")$")
+
+-- | A segment the whole of which the pattern matches (regex's syntax),
+-- | read as a `String`.
+matching : String -> Path
+matching src = MkPath [Typed (RegexHole src (wholly src))] [] []
+
+-- | The segments left, none or more, read as a `List String`: last.
+rest : Path
+rest = MkPath [Rest] [] []
+
+-- | The query's key, captured: its first value.
+query : String -> Path
+query key = beyond (QueryCapture key)
+
+-- | The query's key given this value.
+queryIs : String -> String -> Path
+queryIs key value = beyond (QueryIs key value)
+
+-- | The query's key given a value the pattern matches whole.
+queryMatching : String -> String -> Path
+queryMatching key src = beyond (QueryMatching key src (wholly src))
+
+-- | The header, captured: its first value.
+header : String -> Path
+header name = beyond (HeaderCapture name)
+
+-- | The header given this value.
+headerIs : String -> String -> Path
+headerIs name value = beyond (HeaderIs name value)
+
+-- | The header given a value the pattern matches whole.
+headerMatching : String -> String -> Path
+headerMatching name src = beyond (HeaderMatching name src (wholly src))
+
+-- Captures, read as the handler's type says
+--------------------------------------------------------------------------------
+
+-- | What a slot or a condition captured: a value, values (`rest`'s), or
+-- | none (a query's key or a header not given).
+data Captured = One String | Many (List String) | Missing
+
+-- | How a capture is read as an `a`: its `kind`, what a path's slot must
+-- | give to be read so, and whether `every` value given reads so (a
+-- | `String`'s does, an `Int`'s not).
+theory Capture (a : Type) where
+  kind : String
+  every : Bool
+  read : Captured -> Maybe a
+
+readInt : Captured -> Maybe Int
+readInt (One s) = parseInt s
+readInt c = Nothing
+
+instance instanceCaptureInt : Capture Int
+instanceCaptureInt = { kind = "Int", every = False, read = readInt }
+
+readString : Captured -> Maybe String
+readString (One s) = Just s
+readString c = Nothing
+
+instance instanceCaptureString : Capture String
+instanceCaptureString = { kind = "String", every = True, read = readString }
+
+readMany : Captured -> Maybe (List String)
+readMany (Many xs) = Just xs
+readMany c = Nothing
+
+instance instanceCaptureListString : Capture (List String)
+instanceCaptureListString =
+  { kind = "List String", every = False, read = readMany }
+
+-- | A key or header that may be missing: `Nothing` where it is.
+instance instanceCaptureMaybe : {a : Type}
+                              -> {{cp : Capture a}}
+                              -> Capture (Maybe a)
+instanceCaptureMaybe =
+  { kind = "Maybe " ^ cp.kind, every = cp.every, read = maybeRead }
+  where
+  maybeRead : Captured -> Maybe (Maybe a)
+  maybeRead Missing = Just Nothing
+  maybeRead c = maybe Nothing (\x -> Just (Just x)) (cp.read c)
+
+-- | What the server's handler comes to: the router's, which throws
+-- | nothing.
+type Run (e : HFunctor) = Co (exception Empty <+> e) Unit
+
+isSome : {a : Type} -> Maybe a -> Bool
+isSome (Just x) = True
+isSome Nothing = False
+
+-- (whether a capture reads whatever a query or a header gives, a value
+-- or none)
+alwaysReads : {a : Type} -> {{cp : Capture a}} -> Bool
+alwaysReads = cp.every && isSome (cp.read Missing)
+
+-- | What a route's requests capture, read as a type, for a waiter of
+-- | the author's: none, `Unit`; one, of a type that has a `Capture`; or
+-- | a tuple of them, in order, `(String, Maybe Int)` -- the kinds they
+-- | are read as, whether each reads whatever a query or a header gives,
+-- | and them read so, where they do.
+theory Captures (a : Type) where
+  kinds : List String
+  always : List Bool
+  decoded : List Captured -> Maybe a
+
+-- (one capture, of a type that has a `Capture`)
+capturesOne : {a : Type} -> {{cp : Capture a}} -> Captures a
+capturesOne =
+  { kinds = [cp.kind], always = [alwaysReads (cp := cp)], decoded = one }
+  where
+  one : List Captured -> Maybe a
+  one [c] = cp.read c
+  one cs = Nothing
+
+noneDecoded : List Captured -> Maybe Unit
+noneDecoded [] = Just MkUnit
+noneDecoded cs = Nothing
+
+instance instanceCapturesUnit : Captures Unit
+instanceCapturesUnit = { kinds = [], always = [], decoded = noneDecoded }
+
+instance instanceCapturesInt : Captures Int
+instanceCapturesInt = capturesOne
+
+instance instanceCapturesString : Captures String
+instanceCapturesString = capturesOne
+
+instance instanceCapturesListString : Captures (List String)
+instanceCapturesListString = capturesOne
+
+instance instanceCapturesMaybe : {a : Type}
+                               -> {{cp : Capture a}}
+                               -> Captures (Maybe a)
+instanceCapturesMaybe = capturesOne
+
+paired : {a b : Type} -> Maybe a -> Maybe b -> Maybe (a, b)
+paired (Just x) (Just y) = Just (x, y)
+paired x y = Nothing
+
+-- | Captures, then one more: `(a, b, c)` is `((a, b), c)`.
+instance instanceCapturesPair : {a b : Type}
+                              -> {{l : Captures a}}
+                              -> {{r : Capture b}}
+                              -> Captures (a, b)
+instanceCapturesPair =
+  { kinds = l.kinds ++ [r.kind]
+  , always = l.always ++ [alwaysReads (cp := r)]
+  , decoded = \cs -> lastOf (List.reverse cs)
+  }
+  where
+  lastOf : List Captured -> Maybe (a, b)
+  lastOf (c :: before) = paired (l.decoded (List.reverse before)) (r.read c)
+  lastOf [] = Nothing
+
+-- Handlers
+--------------------------------------------------------------------------------
+
+-- | How a handler answers: at once (`Now`), or once a computation of
+-- | the server's world, run as an act awaited, outside every behaviour,
+-- | has come to the answer (`Later`).
+data Reply (e : HFunctor)
+  = Now (BocServer.Answer e Empty)
+  | Later (Co e (BocServer.Answer e Empty))
+
+-- | A handler, after its request (and, on a state, what the state
+-- | holds before it), as it takes its captures, and what it comes to
+-- | once given them, its result: a response; an answer (a stream, a
+-- | socket); the state after it and a response; or a computation of the
+-- | server's world that comes to an answer.  Its `kinds` are what it
+-- | reads the captures as, `always` which read whatever a query or a
+-- | header gives, `writes` whether it gives the state back changed, and
+-- | `taken` the captures read, where they read so: how the handler,
+-- | given the state, is given them -- read once, where the request is
+-- | found, so that what runs on the state is the handler alone.
+theory Takes (e : HFunctor) (s : Type) (k : Type) where
+  kinds : List String
+  always : List Bool
+  writes : Bool
+  taken : List Captured -> Maybe (s -> k -> Pair s (Reply e))
+
+-- (where there are no captures left, `f`)
+noneLeft : {a : Type} -> a -> List Captured -> Maybe a
+noneLeft f [] = Just f
+noneLeft f caps = Nothing
+
+-- | A response, whole.
+instance instanceTakesResponse : {e : HFunctor}
+                               -> {s : Type}
+                               -> Takes e s HTTP.Response
+instanceTakesResponse =
+  { kinds = []
+  , always = []
+  , writes = False
+  , taken = noneLeft (\st res -> MkPair st (Now (Whole res)))
+  }
+
+-- | An answer: a stream, a socket, or a response.
+instance instanceTakesAnswer : {e : HFunctor}
+                             -> {s : Type}
+                             -> Takes e s (BocServer.Answer e Empty)
+instanceTakesAnswer =
+  { kinds = []
+  , always = []
+  , writes = False
+  , taken = noneLeft (\st a -> MkPair st (Now a))
+  }
+
+-- | The state after it, and a response.
+instance instanceTakesStated : {e : HFunctor}
+                             -> {s : Type}
+                             -> Takes e s (Pair s HTTP.Response)
+instanceTakesStated =
+  { kinds = []
+  , always = []
+  , writes = True
+  , taken = noneLeft (\st p -> MkPair (fst p) (Now (Whole (snd p))))
+  }
+
+-- | A computation of the server's world, which comes to the answer: run
+-- | as an act awaited, so that it may wait on the world (a request of
+-- | std.http's), and what it fails at a value of it, an answer too.
+instance instanceTakesLater : {e : HFunctor}
+                            -> {s : Type}
+                            -> Takes e s (Co e (BocServer.Answer e Empty))
+instanceTakesLater =
+  { kinds = []
+  , always = []
+  , writes = False
+  , taken = noneLeft (\st c -> MkPair st (Later c))
+  }
+
+-- | A capture, then what the handler takes after it.
+instance instanceTakesArrow : {e : HFunctor}
+                            -> {s a k : Type}
+                            -> {{cp : Capture a}}
+                            -> {{tk : Takes e s k}}
+                            -> Takes e s (a -> k)
+instanceTakesArrow =
+  { kinds = cp.kind :: tk.kinds
+  , always = alwaysReads (cp := cp) :: tk.always
+  , writes = tk.writes
+  , taken = one
+  }
+  where
+  fedWith : a
+          -> Maybe (s -> k -> Pair s (Reply e))
+          -> Maybe (s -> (a -> k) -> Pair s (Reply e))
+  fedWith x (Just g) = Just (\st f -> g st (f x))
+  fedWith x Nothing = Nothing
+
+  fed : List Captured
+      -> Maybe a
+      -> Maybe (s -> (a -> k) -> Pair s (Reply e))
+  fed more (Just x) = fedWith x (tk.taken more)
+  fed more Nothing = Nothing
+
+  one : List Captured -> Maybe (s -> (a -> k) -> Pair s (Reply e))
+  one (c :: more) = fed more (cp.read c)
+  one [] = Nothing
+
+-- (a reply sent by the responder: at once; or once its act, awaited,
+-- has come to the answer, by the behaviour after it)
+replied : {e f : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> {{bf : BOC.boc <: f}}
+        -> {{ef : e <: f}}
+        -> BocServer.Responder e Empty
+        -> Reply e
+        -> Co f Unit
+replied respond (Now a) = respond a
+replied respond (Later c) = do
+  with a := BOC.await (lift c) do
+    respond a
+
+-- | A cown's state as the routes on it keep it: the cown, and what is
+-- | done once a batch of theirs has changed it -- given the state then,
+-- | the state to write back and what to do, in the batch's behaviour (a
+-- | behaviour spawned, a message sent).
+data Kept (e : HFunctor) (s : Type)
+  = MkKept (BOC.Cown s) (s -> Pair s (Co e Unit))
+
+-- | `state`, `after` done once each batch that changes it has: `after`
+-- | given what it holds then, to what it is to hold and what to do.
+kept : {e : HFunctor}
+     -> {s : Type}
+     -> BOC.Cown s
+     -> (s -> Pair s (Co e Unit))
+     -> Kept e s
+kept state after = MkKept state after
+
+-- | What a handler can be on: a cown, nothing done after a batch; or a
+-- | cown `kept`.
+theory Keeping (e : HFunctor) (c : Type) (s : Type) where
+  keptOf : c -> Kept e s
+
+instance instanceKeepingCown : {e : HFunctor}
+                             -> {s : Type}
+                             -> Keeping e (BOC.Cown s) s
+instanceKeepingCown =
+  { keptOf = \state -> MkKept state (\st -> MkPair st (pure MkUnit)) }
+
+instance instanceKeepingKept : {e : HFunctor}
+                             -> {s : Type}
+                             -> Keeping e (Kept e s) s
+instanceKeepingKept = { keptOf = \k -> k }
+
+-- | A handler on a cown's state: the cown, as it is kept, and the
+-- | handler, given what the cown holds before the request, then the
+-- | request.
+data On (e : HFunctor) (s : Type) (k : Type)
+  = MkOn (Kept e s) (s -> HTTP.ServerRequest -> k)
+
+-- | A handler on what `state` holds: `Router.on board.todos done`.  Its
+-- | requests are taken a batch at a time, the handler given each in
+-- | turn, what the one before it gave back the state for the next, and
+-- | the state written back once -- `kept`'s `after` done then, once.
+on : {e : HFunctor}
+   -> {c s k : Type}
+   -> {{kp : Keeping e c s}}
+   -> c
+   -> (s -> HTTP.ServerRequest -> k)
+   -> On e s k
+on state h = MkOn (kp.keptOf state) h
+
+-- Slots, and their waiters
+--------------------------------------------------------------------------------
+
+-- | A request a route was asked, as a waiter of the author's takes it:
+-- | the request, its responder, and what its path captured, read as an
+-- | `a`.
+type Asked (e : HFunctor) (a : Type) =
+  { request : HTTP.ServerRequest
+  , respond : BocServer.Responder e Empty
+  , captured : a
+  }
+
+-- | A route's slot, for a waiter of the author's: a cown of the requests
+-- | put in it and not yet taken, in the order they came.  Each is put
+-- | in by a behaviour on that cown alone; the waiter takes them, `with q
+-- | := slot once not (Array.null q) do`.
+type Slot (e : HFunctor) (a : Type) = BOC.Cown (Array (Asked e a))
+
+-- (how a request that found its route is taken, in the connection's
+-- behaviour, given what the path captured: where the captures do not
+-- read as the handler's, nothing)
+type Deliver (e : HFunctor) =
+  HTTP.ServerRequest
+  -> BocServer.Responder e Empty
+  -> List Captured
+  -> Maybe (Run e)
+
+-- (a value put in a slot: a behaviour on that cown alone)
+putIn : {f : HFunctor}
+      -> {a : Type}
+      -> {{bc : BOC.boc <: f}}
+      -> BOC.Cown (Array a)
+      -> a
+      -> Co f Unit
+putIn slot x = do
+  with q := slot do
+    q := Array.push q x
+
+-- (the slot of a request's connection, by its peer's port)
+slotOf : {a : Type} -> Array a -> HTTP.ServerRequest -> a
+slotOf slots r =
+  if Array.length slots == 1 then Array.arrayIndex slots 0
+  else Array.arrayIndex slots (r.peer.port % Array.length slots)
+
+-- (`n` slots made, the waiter spawned on each)
+slotsMade : {e : HFunctor}
+          -> {a : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> (BOC.Cown (Array a) -> Co e Unit)
+          -> Int
+          -> List (BOC.Cown (Array a))
+          -> Co e (Array (BOC.Cown (Array a)))
+slotsMade waiter n made =
+  if n <= 0 then pure (Array.fromList made)
+  else do
+    slot <- BOC.newCown (Array.empty : Array a)
+    waiter slot
+    slotsMade waiter (n - 1) (slot :: made)
+
+deliveredAs : {e : HFunctor}
+            -> {a : Type}
+            -> {{bc : BOC.boc <: e}}
+            -> Array (Slot e a)
+            -> HTTP.ServerRequest
+            -> BocServer.Responder e Empty
+            -> Maybe a
+            -> Maybe (Run e)
+deliveredAs slots r respond (Just x) =
+  Just (putIn (slotOf slots r) { request = r, respond = respond, captured = x })
+deliveredAs slots r respond Nothing = Nothing
+
+-- (a waiter of the author's route: its slots made, the waiter spawned
+-- on each)
+waiterOpened : {e : HFunctor}
+             -> {a : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> {{cs : Captures a}}
+             -> (Slot e a -> Co e Unit)
+             -> Int
+             -> Co e (Deliver e)
+waiterOpened waiter n = do
+  slots <- slotsMade waiter n []
+  pure (\r respond caps -> deliveredAs slots r respond (cs.decoded caps))
+
+-- (a request on a state, its handler given it and its captures: what
+-- it gives back the state as, and its reply, once given the state)
+type Pending (e : HFunctor) (s : Type) =
+  { respond : BocServer.Responder e Empty, step : s -> Pair s (Reply e) }
+
+-- (a batch through its handlers, in order: the state after the last,
+-- and each reply sent)
+mutual
+  steppedAll : {e : HFunctor}
+             -> {s : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> s
+             -> List (Pending e s)
+             -> List (Co e Unit)
+             -> Pair s (List (Co e Unit))
+  steppedAll st [] sent = MkPair st (List.reverse sent)
+  steppedAll st (p :: more) sent = steppedNext p.respond (p.step st) more sent
+
+  steppedNext : {e : HFunctor}
+              -> {s : Type}
+              -> {{bc : BOC.boc <: e}}
+              -> BocServer.Responder e Empty
+              -> Pair s (Reply e)
+              -> List (Pending e s)
+              -> List (Co e Unit)
+              -> Pair s (List (Co e Unit))
+  steppedNext respond (MkPair st reply) more sent =
+    steppedAll st more (replied respond reply :: sent)
+
+-- (each of these, in order)
+ranAll : {e : HFunctor} -> List (Co e Unit) -> Co e Unit
+ranAll [] = pure MkUnit
+ranAll (c :: more) = do
+  c
+  ranAll more
+
+-- (a batch on the state: the handlers given each in turn, what is done
+-- after it done, the state written back once; the replies sent by a
+-- behaviour of their own, so that the state is let go of at once)
+batchWritten : {e : HFunctor}
+             -> {s : Type}
+             -> {{bc : BOC.boc <: e}}
+             -> Kept e s
+             -> Array (Pending e s)
+             -> Co e Unit
+batchWritten (MkKept state after) q = do
+  with st := state do
+    let done = steppedAll st (Array.toList q) []
+    let settled = after (fst done)
+    st := fst settled
+    snd settled
+    BOC.task (ranAll (snd done))
+
+-- (a batch on the state, which its handlers read and do not change:
+-- what it holds taken, and the handlers given it by a behaviour of
+-- their own, so that the state is let go of at once)
+batchRead : {e : HFunctor}
+          -> {s : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> Kept e s
+          -> Array (Pending e s)
+          -> Co e Unit
+batchRead (MkKept state after) q = do
+  with st := state do
+    BOC.task (ranAll (snd (steppedAll st (Array.toList q) [])))
+
+-- (a state's route's waiter: once its slot has requests, it waits again
+-- first, hands them to a behaviour on the state, and leaves the slot
+-- empty -- so a batch that fails is lost alone, the state as it was,
+-- never the route)
+onState : {e : HFunctor}
+        -> {s : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> Bool
+        -> Kept e s
+        -> BOC.Cown (Array (Pending e s))
+        -> Co e Unit
+onState writes state slot = do
+  with q := slot once not (Array.null q) do
+    onState writes state slot
+    if writes then batchWritten state q else batchRead state q
+    q := Array.empty
+
+-- (a request on a state, its captures read, put in its connection's
+-- slot)
+pendingAs : {e : HFunctor}
+          -> {s k : Type}
+          -> {{bc : BOC.boc <: e}}
+          -> Array (BOC.Cown (Array (Pending e s)))
+          -> HTTP.ServerRequest
+          -> BocServer.Responder e Empty
+          -> (s -> k)
+          -> Maybe (s -> k -> Pair s (Reply e))
+          -> Maybe (Run e)
+pendingAs slots r respond h (Just g) =
+  Just
+    (putIn
+       (slotOf slots r)
+       { respond = respond, step = \st -> g st (h st) })
+pendingAs slots r respond h Nothing = Nothing
+
+-- (a request on a state, its captures read as the handler takes them,
+-- put in its connection's slot)
+pendingPut : {e : HFunctor}
+           -> {s k : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> {{tk : Takes e s k}}
+           -> (s -> HTTP.ServerRequest -> k)
+           -> Array (BOC.Cown (Array (Pending e s)))
+           -> Deliver e
+pendingPut h slots r respond caps =
+  pendingAs slots r respond (\st -> h st r) (tk.taken caps)
+
+answeredAs : {e : HFunctor}
+           -> {k : Type}
+           -> {{bc : BOC.boc <: e}}
+           -> BocServer.Responder e Empty
+           -> k
+           -> Maybe (Unit -> k -> Pair Unit (Reply e))
+           -> Maybe (Run e)
+answeredAs respond k (Just g) = Just (replied respond (snd (g MkUnit k)))
+answeredAs respond k Nothing = Nothing
+
+-- (a request answered by a handler on no state, there, in the
+-- connection's behaviour)
+answeredThere : {e : HFunctor}
+              -> {k : Type}
+              -> {{bc : BOC.boc <: e}}
+              -> {{tk : Takes e Unit k}}
+              -> (HTTP.ServerRequest -> k)
+              -> Deliver e
+answeredThere h r respond caps = answeredAs respond (h r) (tk.taken caps)
+
+-- | What a route's handler is, as the router opens it: a handler of the
+-- | request alone (`HTTP.ServerRequest -> ...`), answered in the
+-- | connection's behaviour, where it is found; or one on a state (`on`),
+-- | its requests put in its slot and taken a batch at a time.
+theory Handles (e : HFunctor) (h : Type) where
+  kinds : List String
+  always : List Bool
+  reads : List Captured -> Bool
+  opened : h -> Int -> Co e (Deliver e)
+
+instance instanceHandlesRequest : {e : HFunctor}
+                                -> {k : Type}
+                                -> {{bc : BOC.boc <: e}}
+                                -> {{tk : Takes e Unit k}}
+                                -> Handles e (HTTP.ServerRequest -> k)
+instanceHandlesRequest =
+  { kinds = tk.kinds
+  , always = tk.always
+  , reads = \caps -> isSome (tk.taken caps)
+  , opened = \h n -> pure (answeredThere h)
+  }
+
+instance instanceHandlesOn : {e : HFunctor}
+                           -> {s k : Type}
+                           -> {{bc : BOC.boc <: e}}
+                           -> {{tk : Takes e s k}}
+                           -> Handles e (On e s k)
+instanceHandlesOn =
+  { kinds = tk.kinds
+  , always = tk.always
+  , reads = \caps -> isSome (tk.taken caps)
+  , opened = openedOn
+  }
+  where
+  openedOn : On e s k -> Int -> Co e (Deliver e)
+  openedOn (MkOn state h) n = do
+    slots <- slotsMade (onState tk.writes state) n []
+    pure (pendingPut h slots)
+
+-- Routes, yielded
+--------------------------------------------------------------------------------
+
+-- | A route: its method, its path, the kinds its handler reads its
+-- | captures as, which of them read whatever they are given, whether
+-- | they read so, how many slots it has, its number among the routes,
+-- | and how it is opened, its slots made and their waiters spawned.
+type Route (e : HFunctor) =
+  { method : String
+  , path : Path
+  , kinds : List String
+  , always : List Bool
+  , reads : List Captured -> Bool
+  , slots : Int
+  , number : Int
+  , open : Int -> Co e (Deliver e)
+  }
+
+-- | A route of this method yielded, its waiter the author's: given its
+-- | slot once the routes are compiled, it takes the requests put in it
+-- | as it will -- by a `with` of the slot and of the cowns its condition
+-- | reads too, `once` the requests and those cowns are as it waits for.
+-- | It waits again first, then moves the requests it takes out of the
+-- | slot and answers them by a behaviour of their own (boc's `task`):
+-- | so a failure answering them loses those alone, never the route.
+waiting : {e f : HFunctor}
+        -> {a : Type}
+        -> {{bc : BOC.boc <: e}}
+        -> {{cs : Captures a}}
+        -> {{ys : Stream.yielding (Route e) <: f}}
+        -> String
+        -> Path
+        -> (Slot e a -> Co e Unit)
+        -> Co f Unit
+waiting m p waiter =
+  Stream.yield
+    { method = m
+    , path = p
+    , kinds = cs.kinds
+    , always = cs.always
+    , reads = \caps -> isSome (cs.decoded caps)
+    , slots = 1
+    , number = -1
+    , open = waiterOpened waiter
+    }
+
+-- | A route of this method yielded: its path, and its handler.
+route : {e f : HFunctor}
+      -> {h : Type}
+      -> {{hs : Handles e h}}
+      -> {{ys : Stream.yielding (Route e) <: f}}
+      -> String
+      -> Path
+      -> h
+      -> Co f Unit
+route m p h =
+  Stream.yield
+    { method = m
+    , path = p
+    , kinds = hs.kinds
+    , always = hs.always
+    , reads = hs.reads
+    , slots = 1
+    , number = -1
+    , open = hs.opened h
+    }
+
+-- | A `GET` route, which answers `HEAD` too.
+get : {e f : HFunctor}
+    -> {h : Type}
+    -> {{hs : Handles e h}}
+    -> {{ys : Stream.yielding (Route e) <: f}}
+    -> Path
+    -> h
+    -> Co f Unit
+get = route "GET"
+
+-- | A `POST` route.
+post : {e f : HFunctor}
+     -> {h : Type}
+     -> {{hs : Handles e h}}
+     -> {{ys : Stream.yielding (Route e) <: f}}
+     -> Path
+     -> h
+     -> Co f Unit
+post = route "POST"
+
+-- | A `PUT` route.
+put : {e f : HFunctor}
+    -> {h : Type}
+    -> {{hs : Handles e h}}
+    -> {{ys : Stream.yielding (Route e) <: f}}
+    -> Path
+    -> h
+    -> Co f Unit
+put = route "PUT"
+
+-- | A `DELETE` route.
+delete : {e f : HFunctor}
+       -> {h : Type}
+       -> {{hs : Handles e h}}
+       -> {{ys : Stream.yielding (Route e) <: f}}
+       -> Path
+       -> h
+       -> Co f Unit
+delete = route "DELETE"
+
+-- | A `PATCH` route.
+patch : {e f : HFunctor}
+      -> {h : Type}
+      -> {{hs : Handles e h}}
+      -> {{ys : Stream.yielding (Route e) <: f}}
+      -> Path
+      -> h
+      -> Co f Unit
+patch = route "PATCH"
+
+-- | Routes, yielded one at a time, in a `do` block.
+type Routes (e : HFunctor) = Co (Stream.yielding (Route e)) Unit
+
+-- | A service's routes, yielded: what registers a type of service.
+theory RouteRegister (e : HFunctor) (s : Type) where
+  routes : s -> Routes e
+
+-- | Two services' routes, the first's, then the second's.
+instance instanceRouteRegisterPair : {e : HFunctor}
+                                   -> {s t : Type}
+                                   -> {{rs : RouteRegister e s}}
+                                   -> {{rt : RouteRegister e t}}
+                                   -> RouteRegister e (Pair s t)
+instanceRouteRegisterPair = { routes = both }
+  where
+  both : Pair s t -> Routes e
+  both (MkPair a b) = do
+    rs.routes a
+    rt.routes b
+
+-- (what is yielded, kept, the last first)
+afterGathering : {o a b : Type}
+               -> Pair (List o) a
+               -> (a -> List o -> Pair (List o) b)
+               -> Pair (List o) b
+afterGathering (MkPair acc x) k = k x acc
+
+gathering : (o : Type) -> Handler (Stream.yielding o)
+gathering o =
+  { M = \x -> List o -> Pair (List o) x
+  , ret = \x acc -> MkPair acc x
+  , bind = \m k acc -> afterGathering (m acc) k
+  , malg = \p acc -> case p of
+      Yield v x -> MkPair (v :: acc) x
+  }
+
+-- (what a computation yields, in order)
+gathered : {o : Type} -> Co (Stream.yielding o) Unit -> List o
+gathered c = List.reverse (fst (handle (gathering o) c Nil))
+
+-- (each of these yielded, in order)
+yieldedAll : {o : Type} -> List o -> Co (Stream.yielding o) Unit
+yieldedAll [] = pure MkUnit
+yieldedAll (x :: more) = do
+  Stream.yield x
+  yieldedAll more
+
+-- | These routes, each with `n` slots, its waiter spawned on each, and a
+-- | request put in its connection's (by its peer's port): `n` waiters
+-- | take a route's requests at once, a connection's always the same.
+spread : {e : HFunctor} -> Int -> Routes e -> Routes e
+spread n rs =
+  yieldedAll
+    (List.map (\(rt : Route e) -> { rt | slots = n }) (gathered rs))
+
+-- Conflicts
+--------------------------------------------------------------------------------
+
+-- | Why routes cannot be served: a route no request reaches, as one
+-- | before it, of its method and path, takes every request it would
+-- | (its method, its path); a path's captures that its handler does not
+-- | read as their types (the method, the path, what the path gives,
+-- | what the handler reads); `rest` before the path's end; a pattern
+-- | that does not read (the method, the path, why); a path joined amiss,
+-- | a condition after `/` or a segment after `+` (the method, the path,
+-- | how).
+data Conflict
+  = Twice String String
+  | Mismatch String String (List String) (List String)
+  | RestNotLast String String
+  | BadPattern String String String
+  | Misjoined String String String
+
+-- | >>> show (Mismatch "GET" "/a/{int}" ["Int"] ["String"] : Conflict)
+-- | "GET /a/{int}: its path gives [Int], its handler reads [String]"
+instance instanceShowConflict : Show Conflict
+instanceShowConflict = { show = said }
+  where
+  kindsSaid : List String -> String
+  kindsSaid ks = "[" ^ joinWith ", " ks ^ "]"
+
+  said : Conflict -> String
+  said (Twice m p) =
+    m ^ " " ^ p ^ ": reached by no request, a route before it takes them"
+  said (Mismatch m p gives reads) =
+    m
+    ^ " "
+    ^ p
+    ^ ": its path gives "
+    ^ kindsSaid gives
+    ^ ", its handler reads "
+    ^ kindsSaid reads
+  said (RestNotLast m p) = m ^ " " ^ p ^ ": rest before the end"
+  said (Misjoined m p how) = m ^ " " ^ p ^ ": " ^ how
+  said (BadPattern m p why) = m ^ " " ^ p ^ ": " ^ why
+
+-- (the kind each slot of a path gives)
+slotKinds : List Piece -> List String
+slotKinds [] = []
+slotKinds (Literal s :: more) = slotKinds more
+slotKinds (Typed (RegexHole src re) :: more) = "String" :: slotKinds more
+slotKinds (Typed IntHole :: more) = "Int" :: slotKinds more
+slotKinds (Typed StringHole :: more) = "String" :: slotKinds more
+slotKinds (Rest :: more) = "List String" :: slotKinds more
+
+isCapture : Cond -> Bool
+isCapture (QueryCapture k) = True
+isCapture (HeaderCapture n) = True
+isCapture c = False
+
+-- (the slots' kinds agree with what the handler reads them as first,
+-- and the handler reads as many captures as there are)
+agrees : List String -> Int -> List String -> Bool
+agrees gives captures reads =
+  List.length reads == List.length gives + captures
+  && List.take (List.length gives) reads == gives
+
+restLast : List Piece -> Bool
+restLast [] = True
+restLast (Rest :: []) = True
+restLast (Rest :: more) = False
+restLast (p :: more) = restLast more
+
+slotWhy : Piece -> List String
+slotWhy (Typed (RegexHole src (Left why))) = [src ^ ": " ^ why]
+slotWhy p = []
+
+condWhy : Cond -> List String
+condWhy (QueryMatching k src (Left why)) = [src ^ ": " ^ why]
+condWhy (HeaderMatching n src (Left why)) = [src ^ ": " ^ why]
+condWhy c = []
+
+-- (what is wrong with a route of this method, path shown and handler's
+-- kinds, by itself)
+conflictsOf : String -> String -> List String -> Path -> List Conflict
+conflictsOf m shown reads (MkPath pieces conds amiss) =
+  (if restLast pieces then [] else [RestNotLast m shown])
+  ++ List.map (\how -> Misjoined m shown how) amiss
+  ++ List.map
+    (\why -> BadPattern m shown why)
+    (List.concatMap slotWhy pieces ++ List.concatMap condWhy conds)
+  ++ (if agrees
+           (slotKinds pieces)
+           (List.length (List.keepIf isCapture conds))
+           reads
+      then []
+      else [Mismatch m shown (slotKinds pieces) reads])
+
+-- (what is wrong with a route, by itself)
+ownConflicts : {e : HFunctor} -> Route e -> List Conflict
+ownConflicts rt = conflictsOf rt.method (shownPath rt.path) rt.kinds rt.path
+
+-- The trie
+--------------------------------------------------------------------------------
+
+-- (a path's end: the routes of each method, by their numbers, `HEAD`
+-- the `GET`'s where it has none of its own, and the `405` of the others,
+-- its `Allow` the methods there are)
+type Leaf =
+  { methods : List (Pair String (List Int))
+  , allowed : List String
+  , refused : HTTP.Response
+  }
+
+-- (a node of the trie: its literal children, a few, tried in order, or
+-- many, by their texts' hashes, in buckets, the mask the hash is taken
+-- by (-1 where they are a few), then its slots, a chain, and the leaf
+-- of the paths ending here (its number, -1 where none); a slot of the
+-- chain, its child, and the slot tried after it; the chain's end, the
+-- rest's leaf (-1 where none); or no node, where a literal is not found)
+data Node
+  = MkNode (List (Pair String Node)) Int (Array
+                                            (List (Pair String Node))) Node Int
+  | HoleNode Hole Node Node
+  | RestNode Int
+  | NoNode
+
+-- (a node as it is built: its literal children, its slots', the rest's
+-- routes and its own, each in the order given)
+data Draft (e : HFunctor)
+  = MkDraft (List (Pair String (Draft e))) (List
+                                              (Pair
+                                                 String
+                                                 (Pair Hole (Draft e)))) (List
+                                                                            (Route
+                                                                               e)) (List
+                                                                                      (Route
+                                                                                         e))
+
+emptyDraft : {e : HFunctor} -> Draft e
+emptyDraft = MkDraft [] [] [] []
+
+-- (a draft, the route put in it at the end of its pieces)
+mutual
+  inserted : {e : HFunctor}
+           -> List Piece
+           -> Route e
+           -> Draft e
+           -> Draft e
+  inserted [] rt (MkDraft lits slots rests here) =
+    MkDraft lits slots rests (here ++ [rt])
+  inserted (Rest :: more) rt (MkDraft lits slots rests here) =
+    MkDraft lits slots (rests ++ [rt]) here
+  inserted (Literal s :: more) rt (MkDraft lits slots rests here) =
+    MkDraft (literalPut s more rt lits) slots rests here
+  inserted (Typed slot :: more) rt (MkDraft lits slots rests here) =
+    MkDraft lits (slotPut (holeKey slot) slot more rt slots) rests here
+
+  literalPut : {e : HFunctor}
+             -> String
+             -> List Piece
+             -> Route e
+             -> List (Pair String (Draft e))
+             -> List (Pair String (Draft e))
+  literalPut s more rt [] = [MkPair s (inserted more rt emptyDraft)]
+  literalPut s more rt (MkPair k d :: kids) =
+    if k == s then MkPair k (inserted more rt d) :: kids
+    else MkPair k d :: literalPut s more rt kids
+
+  slotPut : {e : HFunctor}
+          -> String
+          -> Hole
+          -> List Piece
+          -> Route e
+          -> List (Pair String (Pair Hole (Draft e)))
+          -> List (Pair String (Pair Hole (Draft e)))
+  slotPut key slot more rt [] =
+    [MkPair key (MkPair slot (inserted more rt emptyDraft))]
+  slotPut key slot more rt (MkPair k (MkPair sl d) :: kids) =
+    if k == key then MkPair k (MkPair sl (inserted more rt d)) :: kids
+    else MkPair k (MkPair sl d) :: slotPut key slot more rt kids
+
+-- (the keys of a route's conditions)
+-- (what conditions ask of a request, each a key: a capture's, its
+-- kind's too, and none where it reads whatever it is given, unless
+-- `each` says to keep those)
+asking : Bool -> List Cond -> List String -> List Bool -> List String
+asking each [] kinds always = []
+asking each (QueryCapture k :: more) (kind :: kinds) (a :: always) =
+  (if a && not each then [] else ["?" ^ k ^ ":" ^ kind])
+  ++ asking each more kinds always
+asking each (HeaderCapture n :: more) (kind :: kinds) (a :: always) =
+  (if a && not each then [] else [n ^ ":" ^ kind])
+  ++ asking each more kinds always
+asking each (c :: more) kinds always =
+  condKey c :: asking each more kinds always
+
+-- (the keys of what a route's conditions ask, `each` as `asking`'s)
+condKeys : {e : HFunctor} -> Bool -> Route e -> List String
+condKeys each rt = case rt.path of
+  MkPath pieces conds amiss ->
+    asking
+      each
+      conds
+      (List.drop (List.length (slotKinds pieces)) rt.kinds)
+      (List.drop (List.length (slotKinds pieces)) rt.always)
+
+-- (whether a route takes every request `later` would: what its
+-- conditions ask, `later`'s ask too; a capture that reads whatever it is
+-- given asks nothing)
+covers : {e : HFunctor} -> Route e -> Route e -> Bool
+covers earlier later =
+  List.all
+    (\k -> List.any (\l -> l == k) (condKeys True later))
+    (condKeys False earlier)
+
+-- (the routes of a method no request reaches)
+unreached : {e : HFunctor}
+          -> List (Route e)
+          -> List (Route e)
+          -> List Conflict
+unreached before [] = []
+unreached before (rt :: more) =
+  (if List.any (\b -> covers b rt) before
+   then [Twice rt.method (shownPath rt.path)]
+   else [])
+  ++ unreached (before ++ [rt]) more
+
+-- (the methods of these routes, each once, in the order first given)
+methodsOf : {e : HFunctor}
+          -> List String
+          -> List (Route e)
+          -> List String
+methodsOf seen [] = List.reverse seen
+methodsOf seen (rt :: more) =
+  if List.any (\m -> m == rt.method) seen then methodsOf seen more
+  else methodsOf (rt.method :: seen) more
+
+ofMethod : {e : HFunctor}
+         -> List (Route e)
+         -> String
+         -> List (Route e)
+ofMethod rts m = List.keepIf (\(rt : Route e) -> rt.method == m) rts
+
+-- (the methods, `HEAD` after `GET` where there is no `HEAD`)
+withHead : List String -> List String
+withHead ms =
+  if List.any (\m -> m == "HEAD") ms then ms
+  else List.concatMap (\m -> if m == "GET" then ["GET", "HEAD"] else [m]) ms
+
+-- (the routes of a method; `HEAD`'s, the `GET`'s where there are none)
+routesOf : {e : HFunctor}
+         -> List (Route e)
+         -> String
+         -> List (Route e)
+routesOf rts "HEAD" =
+  if List.any (\(rt : Route e) -> rt.method == "HEAD") rts
+  then ofMethod rts "HEAD"
+  else ofMethod rts "GET"
+routesOf rts m = ofMethod rts m
+
+leafBy : {e : HFunctor}
+       -> List (Route e)
+       -> List String
+       -> Leaf
+leafBy rts ms =
+  { methods =
+      List.map
+        (\m ->
+           MkPair
+             m
+             (List.map (\(rt : Route e) -> rt.number) (routesOf rts m)))
+        ms
+  , allowed = ms
+  , refused = HTTP.notAllowed ms
+  }
+
+leafOf : {e : HFunctor} -> List (Route e) -> Leaf
+leafOf rts = leafBy rts (withHead (methodsOf [] rts))
+
+-- (where literal children are found by hash, not one by one)
+wideFrom : Int
+wideFrom = 8
+
+-- (the size of a table for `n` keys: a power of two, at least twice `n`)
+tableSize : Int -> Int -> Int
+tableSize n size = if size >= 2 * n then size else tableSize n (2 * size)
+
+bucketOf : Int -> List (Pair String Node) -> Int -> List (Pair String Node)
+bucketOf mask kids i =
+  List.keepIf
+    (\(kv : Pair String Node) -> and (HashMap.strHash (fst kv)) mask == i)
+    kids
+
+-- (the mask of a node's literal children: -1 where they are a few)
+maskFor : {a : Type} -> List a -> Int
+maskFor kids =
+  if List.length kids < wideFrom then -1
+  else tableSize (List.length kids) 16 - 1
+
+nodeOf : List (Pair String Node) -> Node -> Int -> Node
+nodeOf kids chain here =
+  MkNode
+    kids
+    (maskFor kids)
+    (Array.generate (maskFor kids + 1) (bucketOf (maskFor kids) kids))
+    chain
+    here
+
+-- (the order slots are tried in: `int`, the patterns, `string`)
+holeRank : Hole -> Int
+holeRank IntHole = 0
+holeRank (RegexHole src re) = 1
+holeRank StringHole = 2
+
+ranked : {a : Type} -> List (Pair String (Pair Hole a)) -> List (Pair Hole a)
+ranked kids =
+  List.concatMap
+    (\(r : Int) ->
+       List.map
+         snd
+         (List.keepIf
+            (\(kv : Pair String (Pair Hole a)) -> holeRank (fst (snd kv)) == r)
+            kids))
+    [0, 1, 2]
+
+-- (the routes of each method no request reaches)
+unreachedIn : {e : HFunctor}
+            -> List (Route e)
+            -> List Conflict
+unreachedIn rts =
+  List.concatMap (\m -> unreached [] (ofMethod rts m)) (methodsOf [] rts)
+
+-- (what the trie's building has made so far: its leaves, the last first,
+-- how many, and the routes no request reaches)
+type Building (e : HFunctor) =
+  { leaves : List Leaf, count : Int, unreachable : List Conflict }
+
+-- (a leaf of these routes added: its number, -1 where there are none)
+leafAdded : {e : HFunctor}
+          -> List (Route e)
+          -> Building e
+          -> Pair Int (Building e)
+leafAdded [] b = MkPair (-1) b
+leafAdded rts b =
+  MkPair
+    b.count
+    { leaves = leafOf rts :: b.leaves
+    , count = b.count + 1
+    , unreachable = b.unreachable ++ unreachedIn rts
+    }
+
+-- (a node, then the building on)
+afterNode : {e : HFunctor}
+          -> {a : Type}
+          -> Pair Node (Building e)
+          -> (Node -> Building e -> Pair a (Building e))
+          -> Pair a (Building e)
+afterNode (MkPair n b) k = k n b
+
+mutual
+  -- (a draft built: its node, its leaves added)
+  builtNode : {e : HFunctor}
+            -> Draft e
+            -> Building e
+            -> Pair Node (Building e)
+  builtNode (MkDraft lits slots rests here) b =
+    hereBuilt lits (ranked slots) rests (leafAdded here b)
+
+  hereBuilt : {e : HFunctor}
+            -> List (Pair String (Draft e))
+            -> List (Pair Hole (Draft e))
+            -> List (Route e)
+            -> Pair Int (Building e)
+            -> Pair Node (Building e)
+  hereBuilt lits slots rests (MkPair here b) =
+    afterNode
+      (chainBuilt slots (leafAdded rests b))
+      (\chain b2 -> literalsBuilt lits [] chain here b2)
+
+  chainBuilt : {e : HFunctor}
+             -> List (Pair Hole (Draft e))
+             -> Pair Int (Building e)
+             -> Pair Node (Building e)
+  chainBuilt [] (MkPair rest b) = MkPair (RestNode rest) b
+  chainBuilt (MkPair slot d :: more) rested =
+    afterNode
+      (chainBuilt more rested)
+      (\next b ->
+         afterNode
+           (builtNode d b)
+           (\child b2 -> MkPair (HoleNode slot child next) b2))
+
+  literalsBuilt : {e : HFunctor}
+                -> List (Pair String (Draft e))
+                -> List (Pair String Node)
+                -> Node
+                -> Int
+                -> Building e
+                -> Pair Node (Building e)
+  literalsBuilt [] kids chain here b =
+    MkPair (nodeOf (List.reverse kids) chain here) b
+  literalsBuilt (MkPair k d :: more) kids chain here b =
+    afterNode
+      (builtNode d b)
+      (\child b2 -> literalsBuilt more (MkPair k child :: kids) chain here b2)
+
+-- (routes compiled: the trie, its leaves, and the routes, by number)
+data Trie (e : HFunctor)
+  = MkTrie Node (Array Leaf) (Array (Route e))
+
+-- | Routes compiled, their slots made and their waiters spawned: the
+-- | trie, its leaves, the routes, and how a request is put in each's
+-- | slot, by number.  A value: the cowns in it are referred to, not held.
+data Router (e : HFunctor)
+  = MkRouter Node (Array Leaf) (Array (Route e)) (Array (Deliver e))
+
+pathPieces : {e : HFunctor} -> Route e -> List Piece
+pathPieces rt = case rt.path of
+  MkPath pieces conds amiss -> pieces
+
+compiledFrom : {e : HFunctor}
+             -> List (Route e)
+             -> List Conflict
+             -> Pair Node (Building e)
+             -> Either (List Conflict) (Trie e)
+compiledFrom rts own (MkPair root b) =
+  if List.null own && List.null b.unreachable
+  then Right
+      (MkTrie
+         root
+         (Array.fromList (List.reverse b.leaves))
+         (Array.fromList rts))
+  else Left (own ++ b.unreachable)
+
+-- (routes numbered, from `n`)
+numbered : {e : HFunctor}
+         -> Int
+         -> List (Route e)
+         -> List (Route e)
+numbered n [] = []
+numbered n (rt :: more) = { rt | number = n } :: numbered (n + 1) more
+
+-- (routes compiled, numbered in the order given)
+compiledAll : {e : HFunctor}
+            -> List (Route e)
+            -> Either (List Conflict) (Trie e)
+compiledAll rts =
+  compiledFrom
+    rts
+    (List.concatMap ownConflicts rts)
+    (builtNode
+       (List.foldl
+          (\d (rt : Route e) -> inserted (pathPieces rt) rt d)
+          emptyDraft
+          (List.keepIf
+             (\(rt : Route e) -> List.null (ownConflicts rt))
+             rts))
+       { leaves = [], count = 0, unreachable = [] })
+
+-- (the trie of routes, or why there is none)
+trieOf : {e : HFunctor}
+       -> Routes e
+       -> Either (List Conflict) (Trie e)
+trieOf rs = compiledAll (numbered 0 (gathered rs))
+
+-- (each route's slots made, its waiters spawned, in order)
+openedAll : {e : HFunctor}
+          -> List (Route e)
+          -> List (Deliver e)
+          -> Co e (Array (Deliver e))
+openedAll [] made = pure (Array.fromList (List.reverse made))
+openedAll (rt :: more) made = do
+  deliver <- rt.open rt.slots
+  openedAll more (deliver :: made)
+
+-- (a trie's routes opened, or the conflicts)
+openedFrom : {e : HFunctor}
+           -> Either (List Conflict) (Trie e)
+           -> Co e (Either (List Conflict) (Router e))
+openedFrom (Left cs) = pure (Left cs)
+openedFrom (Right (MkTrie root leaves routes)) = do
+  delivers <- openedAll (Array.toList routes) []
+  pure (Right (MkRouter root leaves routes delivers))
+
+-- | Routes compiled into a router, once, their slots made and their
+-- | waiters spawned; or why they cannot be, before any slot is made.
+compiled : {e : HFunctor}
+         -> Routes e
+         -> Co e (Either (List Conflict) (Router e))
+compiled rs = openedFrom (trieOf rs)
+
+-- | The routes a service registers, compiled.
+serving : {e : HFunctor}
+        -> {s : Type}
+        -> {{rr : RouteRegister e s}}
+        -> s
+        -> Co e (Either (List Conflict) (Router e))
+serving x = compiled (rr.routes x)
+
+-- Dispatch
+--------------------------------------------------------------------------------
+
+isDigit : Int -> Bool
+isDigit b = b >= 48 && b <= 57
+
+digitsFrom : String -> Int -> Int -> Bool
+digitsFrom s i n =
+  if i >= n then True else isDigit (strByteAt s i) && digitsFrom s (i + 1) n
+
+intFrom : String -> Int -> Int -> Bool
+intFrom s n from = n > from && digitsFrom s from n
+
+-- (`-` or not, then digits)
+intLike : String -> Bool
+intLike s =
+  intFrom
+    s
+    (strLength s)
+    (if strLength s > 0 && strByteAt s 0 == 45 then 1 else 0)
+
+matchedBy : Either String Regex.Regex -> String -> Bool
+matchedBy (Right re) s = Regex.matches re s
+matchedBy (Left why) s = False
+
+takes : Hole -> String -> Bool
+takes IntHole s = intLike s
+takes StringHole s = True
+takes (RegexHole src re) s = matchedBy re s
+
+-- (the child of this text among a node's literal children, or none)
+among : List (Pair String Node) -> String -> Node
+among [] s = NoNode
+among (MkPair k child :: kids) s = if strEq k s then child else among kids s
+
+-- (the literal child of the first segment, or none)
+literalOf : List (Pair String Node)
+          -> Int
+          -> Array (List (Pair String Node))
+          -> List String
+          -> Node
+literalOf kids mask buckets (s :: more) =
+  if mask < 0 then among kids s
+  else among (Array.arrayIndex buckets (and (HashMap.strHash s) mask)) s
+literalOf kids mask buckets [] = NoNode
+
+-- (the segments after the first)
+after : List String -> List String
+after (s :: more) = more
+after [] = []
+
+-- (whether the slot takes the first segment)
+takesFirst : Hole -> List String -> Bool
+takesFirst slot (s :: more) = takes slot s
+takesFirst slot [] = False
+
+-- (the leaf a request's segments end at, the most specific first: a
+-- literal, then each slot, then the rest; -1 where none)
+walk : Node -> List String -> Int
+walk (MkNode kids mask buckets chain here) [] =
+  if here >= 0 then here else walk chain []
+walk (MkNode kids mask buckets chain here) segs =
+  let found : Int = walk (literalOf kids mask buckets segs) (after segs)
+  in if found >= 0 then found else walk chain segs
+walk (HoleNode slot child next) segs =
+  let found : Int = if takesFirst slot segs then walk child (after segs) else -1
+  in if found >= 0 then found else walk next segs
+walk (RestNode rest) segs = rest
+walk NoNode segs = -1
+
+-- (what a path's slots capture of the segments)
+pathCaptures : List Piece -> List String -> List Captured
+pathCaptures (Literal t :: more) (s :: segs) = pathCaptures more segs
+pathCaptures (Typed slot :: more) (s :: segs) = One s :: pathCaptures more segs
+pathCaptures (Rest :: more) segs = [Many segs]
+pathCaptures pieces segs = []
+
+valueOf : Maybe String -> Captured
+valueOf (Just v) = One v
+valueOf Nothing = Missing
+
+isValue : String -> Maybe String -> Bool
+isValue v (Just w) = strEq v w
+isValue v Nothing = False
+
+matchedValue : Either String Regex.Regex -> Maybe String -> Bool
+matchedValue re (Just w) = matchedBy re w
+matchedValue re Nothing = False
+
+holds : HTTP.ServerRequest -> Cond -> Bool
+holds r (QueryIs k v) = isValue v (HTTP.query k r)
+holds r (QueryMatching k src re) = matchedValue re (HTTP.query k r)
+holds r (HeaderIs n v) = isValue v (HTTP.requestHeader n r)
+holds r (HeaderMatching n src re) = matchedValue re (HTTP.requestHeader n r)
+holds r c = True
+
+condCaptures : HTTP.ServerRequest -> List Cond -> List Captured
+condCaptures r [] = []
+condCaptures r (QueryCapture k :: more) =
+  valueOf (HTTP.query k r) :: condCaptures r more
+condCaptures r (HeaderCapture n :: more) =
+  valueOf (HTTP.requestHeader n r) :: condCaptures r more
+condCaptures r (c :: more) = condCaptures r more
+
+allHold : HTTP.ServerRequest -> List Cond -> Bool
+allHold r [] = True
+allHold r (c :: more) = holds r c && allHold r more
+
+-- (whether a path's conditions hold of a request)
+holdsFor : HTTP.ServerRequest -> Path -> Bool
+holdsFor r (MkPath pieces conds amiss) = allHold r conds
+
+-- (what a path captures of a request)
+capturesIn : HTTP.ServerRequest -> List String -> Path -> List Captured
+capturesIn r segs (MkPath pieces [] amiss) = pathCaptures pieces segs
+capturesIn r segs (MkPath pieces conds amiss) =
+  pathCaptures pieces segs ++ condCaptures r conds
+
+-- (the request put in the route's slot, where its conditions hold and
+-- its captures read)
+deliveredBy : {e : HFunctor}
+            -> Route e
+            -> Deliver e
+            -> HTTP.ServerRequest
+            -> BocServer.Responder e Empty
+            -> List String
+            -> Maybe (Run e)
+deliveredBy rt deliver r respond segs =
+  if holdsFor r rt.path then deliver r respond (capturesIn r segs rt.path)
+  else Nothing
+
+mutual
+  -- (the first route of these numbers that takes the request, the
+  -- request put in its slot; else `notFound`'s)
+  tried : {e : HFunctor}
+        -> {{bc : BOC.boc <: e}}
+        -> Array (Route e)
+        -> Array (Deliver e)
+        -> (HTTP.ServerRequest -> HTTP.Response)
+        -> HTTP.ServerRequest
+        -> BocServer.Responder e Empty
+        -> List String
+        -> List Int
+        -> Run e
+  tried routes delivers notFound r respond segs [] =
+    respond (Whole (notFound r))
+  tried routes delivers notFound r respond segs (i :: more) =
+    triedAt
+      routes
+      delivers
+      notFound
+      r
+      respond
+      segs
+      more
+      (deliveredBy
+         (Array.arrayIndex routes i)
+         (Array.arrayIndex delivers i)
+         r
+         respond
+         segs)
+
+  -- (a route's, where it takes the request; else the next's)
+  triedAt : {e : HFunctor}
+          -> {{bc : BOC.boc <: e}}
+          -> Array (Route e)
+          -> Array (Deliver e)
+          -> (HTTP.ServerRequest -> HTTP.Response)
+          -> HTTP.ServerRequest
+          -> BocServer.Responder e Empty
+          -> List String
+          -> List Int
+          -> Maybe (Run e)
+          -> Run e
+  triedAt routes delivers notFound r respond segs more (Just put) = put
+  triedAt routes delivers notFound r respond segs more Nothing =
+    tried routes delivers notFound r respond segs more
+
+-- (the request's method's routes; else the `405`)
+byMethod : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> Array (Route e)
+         -> Array (Deliver e)
+         -> (HTTP.ServerRequest -> HTTP.Response)
+         -> HTTP.ServerRequest
+         -> BocServer.Responder e Empty
+         -> List String
+         -> HTTP.Response
+         -> List (Pair String (List Int))
+         -> Run e
+byMethod routes delivers notFound r respond segs refused [] =
+  respond (Whole refused)
+byMethod routes delivers notFound r respond segs refused (MkPair m ns :: more) =
+  if strEq m r.method then tried routes delivers notFound r respond segs ns
+  else byMethod routes delivers notFound r respond segs refused more
+
+-- | A request found its route by the trie, walked in the connection's
+-- | behaviour: answered there by a handler of the request alone, or put
+-- | in its route's slot, by a behaviour on that cown alone; else
+-- | answered `405`, or by `notFound`'s response: the server's handler.
+dispatch : {e : HFunctor}
+         -> {{bc : BOC.boc <: e}}
+         -> Router e
+         -> (HTTP.ServerRequest -> HTTP.Response)
+         -> HTTP.ServerRequest
+         -> BocServer.Responder e Empty
+         -> Run e
+dispatch (MkRouter root leaves routes delivers) notFound r respond =
+  let segs = HTTP.segments r
+  in let i : Int = walk root segs
+  in if i < 0 then respond (Whole (notFound r))
+  else let leaf = Array.arrayIndex leaves i
+       in byMethod
+         routes
+         delivers
+         notFound
+         r
+         respond
+         segs
+         leaf.refused
+         leaf.methods
+
+-- The tests'
+--------------------------------------------------------------------------------
+
+-- (a capture as the request gave it)
+capturedText : Captured -> String
+capturedText (One s) = s
+capturedText (Many xs) = joinWith "/" xs
+capturedText Missing = "-"
+
+-- (where a request goes: the route that takes it, its method, its path,
+-- and what it captured; a method the path has none of, and the path's;
+-- or nowhere)
+data Reached
+  = Took String String (List String)
+  | Refused (List String)
+  | Nowhere
+
+-- (the first route of these numbers that takes the request)
+firstTaking : {e : HFunctor}
+            -> Array (Route e)
+            -> HTTP.ServerRequest
+            -> List String
+            -> List Int
+            -> Reached
+firstTaking routes r segs [] = Nowhere
+firstTaking routes r segs (i :: more) =
+  let rt = Array.arrayIndex routes i
+  in if holdsFor r rt.path && rt.reads (capturesIn r segs rt.path)
+  then Took
+      rt.method
+      (shownPath rt.path)
+      (List.map capturedText (capturesIn r segs rt.path))
+  else firstTaking routes r segs more
+
+reachedBy : {e : HFunctor}
+          -> Array (Route e)
+          -> HTTP.ServerRequest
+          -> List String
+          -> List String
+          -> List (Pair String (List Int))
+          -> Reached
+reachedBy routes r segs allowed [] = Refused allowed
+reachedBy routes r segs allowed (MkPair m ns :: more) =
+  if strEq m r.method then firstTaking routes r segs ns
+  else reachedBy routes r segs allowed more
+
+-- (where a request goes)
+reachedOf : {e : HFunctor}
+          -> Trie e
+          -> HTTP.ServerRequest
+          -> Reached
+reachedOf (MkTrie root leaves routes) r =
+  let i : Int = walk root (HTTP.segments r)
+  in if i < 0 then Nowhere
+  else let leaf = Array.arrayIndex leaves i
+       in reachedBy routes r (HTTP.segments r) leaf.allowed leaf.methods
+
+-- (a test's world: boc's, which its waiters, never spawned, would use)
+shopWorld : HFunctor
+shopWorld = BOC.boc
+
+-- (a request of this method, target and headers)
+requested : String -> String -> List (Pair String String) -> HTTP.ServerRequest
+requested m target hs =
+  { method = m
+  , target = target
+  , version = "HTTP/1.1"
+  , headers = hs
+  , body = Bytes.empty
+  , peer = { host = "::1", port = 1 }
+  }
+
+type Shop = { name : String }
+
+-- (a handler of the tests: what it is asked says what its route captures)
+-- (handlers of the tests: their types say what their routes capture)
+items : Shop -> HTTP.ServerRequest -> HTTP.Response
+items shop r = HTTP.plain 200 shop.name
+
+item : Shop -> HTTP.ServerRequest -> Int -> HTTP.Response
+item shop r x0 = HTTP.plain 200 shop.name
+
+named : Shop -> HTTP.ServerRequest -> String -> HTTP.Response
+named shop r x0 = HTTP.plain 200 shop.name
+
+files : Shop -> HTTP.ServerRequest -> List String -> HTTP.Response
+files shop r x0 = HTTP.plain 200 shop.name
+
+found : Shop -> HTTP.ServerRequest -> String -> Maybe Int -> HTTP.Response
+found shop r x0 x1 = HTTP.plain 200 shop.name
+
+looked : Shop -> HTTP.ServerRequest -> Maybe String -> HTTP.Response
+looked shop r x0 = HTTP.plain 200 shop.name
+
+paged : Shop -> HTTP.ServerRequest -> Maybe Int -> HTTP.Response
+paged shop r x0 = HTTP.plain 200 shop.name
+
+-- (an answer, not only a response: a stream's, a socket's)
+answering : Shop
+          -> HTTP.ServerRequest
+          -> Int
+          -> BocServer.Answer shopWorld Empty
+answering shop r n = Whole (HTTP.plain 200 (debug n))
+
+-- (an answer once a computation of the world has come to it)
+answeredLater : Shop
+              -> HTTP.ServerRequest
+              -> Maybe String
+              -> Co shopWorld (BocServer.Answer shopWorld Empty)
+answeredLater shop r q = pure (Whole (HTTP.plain 200 "later"))
+
+instance instanceRouteRegisterShop : RouteRegister shopWorld Shop
+instanceRouteRegisterShop = { routes = registered }
+  where
+  registered : Shop -> Routes shopWorld
+  registered shop = do
+    get ("items" + queryIs "status" "open") (items shop)
+    get ("items" + queryMatching "since" "[0-9]{4}-[0-9]{2}") (items shop)
+    get ("items" + headerIs "Accept" "text/plain") (items shop)
+    get ("items" + headerMatching "Accept" "application/.*json") (items shop)
+    get "items" (items shop)
+    post "items" (items shop)
+    get ("items" / "new") (items shop)
+    get ("items" / int) (item shop)
+    get ("items" / matching "[a-z]+") (named shop)
+    get ("items" / string) (named shop)
+    get ("items" / string / "reviews") (named shop)
+    get ("files" / rest) (files shop)
+    get ("search" + query "q" + query "page") (found shop)
+    post ("hooks" + header "X-Signature") (named shop)
+    get ("answers" / int) (answering shop)
+    get ("later" + query "q") (answeredLater shop)
+
+type Admin = { users : Int }
+
+stats : Admin -> HTTP.ServerRequest -> HTTP.Response
+stats admin r = HTTP.plain 200 "stats"
+
+instance instanceRouteRegisterAdmin : RouteRegister shopWorld Admin
+instanceRouteRegisterAdmin = { routes = \a -> get "admin/stats" (stats a) }
+
+-- (ten literal segments, and the root)
+wideRoutes : Shop -> Routes shopWorld
+wideRoutes shop = do
+  get "/" (items shop)
+  get "r0" (items shop)
+  get "r1" (items shop)
+  get "r2" (items shop)
+  get "r3" (items shop)
+  get "r4" (items shop)
+  get "r5" (items shop)
+  get "r6" (items shop)
+  get "r7" (items shop)
+  get "r8" (items shop)
+  get "r9" (items shop)
+
+-- (the routes a service registers)
+routesFor : {s : Type}
+          -> {{rr : RouteRegister shopWorld s}}
+          -> s
+          -> Routes shopWorld
+routesFor x = rr.routes x
+
+routesIn : Trie shopWorld -> Array (Route shopWorld)
+routesIn (MkTrie root leaves routes) = routes
+
+trieOrPanic : Either (List Conflict) (Trie shopWorld)
+            -> Trie shopWorld
+trieOrPanic (Right t) = t
+trieOrPanic (Left cs) = panic (joinWith "; " (List.map show cs))
+
+-- (the shop's and the admin's routes, compiled)
+shopTrie : Trie shopWorld
+shopTrie =
+  trieOrPanic
+    (trieOf
+       (routesFor
+          (MkPair { name = "the shop's" } { users = 3 } : Pair Shop Admin)))
+
+-- (where a request goes, the route that takes it found by the trie, and
+-- what it captured, as the request gave it)
+-- | >>> reachedIn "GET" "/items" []
+-- | Took "GET" "/items" []
+-- | >>> reachedIn "GET" "/items/12" []
+-- | Took "GET" "/items/{int}" ["12"]
+-- | >>> reachedIn "GET" "/items/-3" []
+-- | Took "GET" "/items/{int}" ["-3"]
+-- | >>> reachedIn "GET" "/items/new" []
+-- | Took "GET" "/items/new" []
+-- | >>> reachedIn "GET" "/items/pen" []
+-- | Took "GET" "/items/{[a-z]+}" ["pen"]
+-- | >>> reachedIn "GET" "/items/Pen2" []
+-- | Took "GET" "/items/{string}" ["Pen2"]
+-- | >>> reachedIn "GET" "/items/new/reviews" []
+-- | Took "GET" "/items/{string}/reviews" ["new"]
+-- | >>> reachedIn "GET" "/items/new/more" []
+-- | Nowhere
+-- | >>> reachedIn "HEAD" "/items/3" []
+-- | Took "GET" "/items/{int}" ["3"]
+-- | >>> reachedIn "GET" "/files/a/b%2Fc/d" []
+-- | Took "GET" "/files/{rest}" ["a/b/c/d"]
+-- | >>> reachedIn "GET" "/files" []
+-- | Took "GET" "/files/{rest}" [""]
+-- | >>> reachedIn "GET" "/search?q=pens&page=2" []
+-- | Took "GET" "/search ?q ?page" ["pens", "2"]
+-- | >>> reachedIn "GET" "/search?q=pens" []
+-- | Took "GET" "/search ?q ?page" ["pens", "-"]
+-- | >>> reachedIn "GET" "/search?page=2" []
+-- | Nowhere
+-- | >>> reachedIn "GET" "/search?q=pens&page=two" []
+-- | Nowhere
+-- | >>> reachedIn "GET" "/items?status=open" []
+-- | Took "GET" "/items ?status=open" []
+-- | >>> reachedIn "GET" "/items?status=done" []
+-- | Took "GET" "/items" []
+-- | >>> reachedIn "GET" "/items?since=2026-11" []
+-- | Took "GET" "/items ?since~[0-9]{4}-[0-9]{2}" []
+-- | >>> reachedIn "GET" "/items" [MkPair "accept" "text/plain"]
+-- | Took "GET" "/items Accept: text/plain" []
+-- | >>> reachedIn "GET" "/items" [MkPair "Accept" "application/vnd.api+json"]
+-- | Took "GET" "/items Accept ~ application/.*json" []
+-- | >>> reachedIn "POST" "/hooks" [MkPair "X-Signature" "abc"]
+-- | Took "POST" "/hooks X-Signature:" ["abc"]
+-- | >>> reachedIn "POST" "/hooks" []
+-- | Nowhere
+-- | >>> reachedIn "GET" "/admin/stats" []
+-- | Took "GET" "/admin/stats" []
+-- | >>> reachedIn "GET" "/answers/7" []
+-- | Took "GET" "/answers/{int}" ["7"]
+-- | >>> reachedIn "GET" "/later" []
+-- | Took "GET" "/later ?q" ["-"]
+-- | >>> reachedIn "GET" "/nothing" []
+-- | Nowhere
+-- | >>> reachedIn "DELETE" "/items" []
+-- | Refused ["GET", "HEAD", "POST"]
+-- | >>> reachedIn "POST" "/items/3" []
+-- | Refused ["GET", "HEAD"]
+reachedIn : String -> String -> List (Pair String String) -> Reached
+reachedIn m target hs = reachedOf shopTrie (requested m target hs)
+
+-- (ten literal segments at one node, found by their hashes)
+-- | >>> List.map (\t -> reachedOf wideTrie (requested "GET" t [])) ["/r0", "/r7", "/r9", "/r10", "/"]
+-- | [Took "GET" "/r0" [], Took "GET" "/r7" [], Took "GET" "/r9" [], Nowhere, Took "GET" "/" []]
+wideTrie : Trie shopWorld
+wideTrie = trieOrPanic (trieOf (wideRoutes { name = "wide" }))
+
+-- (a route spread over slots keeps its path, its captures and its number)
+-- | >>> List.map (\(rt : Route shopWorld) -> (rt.slots, rt.number)) (Array.toList (routesIn spreadTrie))
+-- | [(1, 0), (4, 1), (4, 2)]
+spreadTrie : Trie shopWorld
+spreadTrie =
+  trieOrPanic
+    (trieOf (do
+     get "a" (items { name = "a" })
+     spread 4 (do
+       get "b" (items { name = "b" })
+       get ("b" / int) (item { name = "b" }))))
+
+twice : Routes shopWorld
+twice = do
+  get "items" (items { name = "a" })
+  get "items" (items { name = "b" })
+  get ("items" + queryIs "status" "open") (items { name = "c" })
+
+mismatched : Routes shopWorld
+mismatched = do
+  get ("items" / string) (item { name = "a" })
+  get ("items" / int) (items { name = "a" })
+
+restFirst : Routes shopWorld
+restFirst = get ("files" / rest / "x") (files { name = "a" })
+
+badPattern : Routes shopWorld
+badPattern = get ("items" / matching "a{3,1}") (named { name = "a" })
+
+misjoined : Routes shopWorld
+misjoined = do
+  get ("items" / query "q") (named { name = "a" })
+  get ("items" + "new") (items { name = "a" })
+  get (("files" + header "X-Key") / string) (found { name = "a" })
+
+-- (a `Maybe String` captured reads whatever the query gives: the routes
+-- after it of its path are reached by none; a `Maybe Int`'s, or the
+-- same key read as another kind, may be)
+alwaysTaken : Routes shopWorld
+alwaysTaken = do
+  get ("look" + query "q") (looked { name = "a" })
+  get "look" (items { name = "a" })
+  get ("page" + query "n") (paged { name = "a" })
+  get ("page" + query "n") (named { name = "a" })
+  get "page" (items { name = "a" })
+
+-- (the conflicts of these routes, each said)
+-- | >>> conflictsIn twice
+-- | ["GET /items: reached by no request, a route before it takes them", "GET /items ?status=open: reached by no request, a route before it takes them"]
+-- | >>> conflictsIn mismatched
+-- | ["GET /items/{string}: its path gives [String], its handler reads [Int]", "GET /items/{int}: its path gives [Int], its handler reads []"]
+-- | >>> conflictsIn restFirst
+-- | ["GET /files/{rest}/x: rest before the end"]
+-- | >>> conflictsIn badPattern
+-- | ["GET /items/{a{3,1}}: a{3,1}: a count backwards, `{n,m}` with m below n"]
+-- | >>> conflictsIn misjoined
+-- | ["GET /items ?q: a condition after `/`, which `+` adds", "GET /items/new: a segment after `+`, which `/` joins", "GET /files/{string} X-Key:: a segment after a condition"]
+-- | >>> conflictsIn alwaysTaken
+-- | ["GET /look: reached by no request, a route before it takes them"]
+conflictsIn : Routes shopWorld -> List String
+conflictsIn c =
+  either
+    (\cs -> List.map show cs)
+    (\(t : Trie shopWorld) -> [])
+    (trieOf c)
