@@ -30,8 +30,8 @@
 // cache has it all, as the file's pages there say (`mincore`, of a
 // mapping of the file), else the ring's or a thread's.  Asking costs as
 // much as a small read that it has: after eight reads in a row it had,
-// the file's next are done unasked, timed, until one takes longer than
-// the page cache would.  A thread's round trip is several small reads'
+// the file's next are done unasked, timed, until one waits off the CPU
+// longer than the page cache would.  A thread's round trip is several small reads'
 // time, so what the page cache has is never handed to one.
 
 #include <dirent.h>
@@ -53,6 +53,10 @@
 #else
 #include <limits.h>
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/resource.h>
+#endif
 #define heff_mkdir(p) mkdir(p, 0777)
 #define heff_is_sep(c) ((c) == '/')
 #endif
@@ -526,6 +530,8 @@ static int fs_int(V v, int64_t *n) {
 #define FS_BUF ((size_t)65536)
 #define FS_READ_MAX ((int64_t)16 << 20)
 #define FS_SURE 8
+#define FS_RUN_MOST 64
+#define FS_CPU_TIMED ((size_t)256 << 10)
 
 typedef struct {
   uint32_t magic;
@@ -550,7 +556,11 @@ typedef struct {
   int unmappable;    //  or it cannot be; how many reads in a row it had
   int sure;          //  all of -- from `FS_SURE` on, the next done unasked
   int slow;          //  -- and, after one done here waited for the disk,
-                     //  how many more are a thread's, unasked)
+  int run, after;    //  how many more are a thread's, unasked: one, or,
+                     //  where the first after them waited too, twice as
+                     //  many as before, `FS_RUN_MOST` at most; and the
+  uint64_t disk;     //  process's bytes read from the disk, 1 more, when
+                     //  it last asked, where the system says, or 0)
   int sought;        // (sought in, nothing read since: the next chunk
                      //  read as asked, not ahead -- a read here and there
                      //  of a large file, each a buffer's otherwise)
@@ -827,16 +837,20 @@ static int fs_took(FsOp *o, int32_t *res) {
 }
 
 #ifndef _WIN32
-// (now, in nanoseconds of a clock that only goes forward)
-static int64_t fs_now_ns(void) {
+// (now, in nanoseconds of the clock `c`)
+static int64_t fs_now_ns(clockid_t c) {
   struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
+  clock_gettime(c, &t);
   return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
-// (whether a read of `n` bytes that took `ns` waited for the disk, as its
-// time says: longer than the page cache gives them, 50 us and 8 GB a
-// second)
+// (whether a read of `n` bytes waited for the disk, `ns` of its time --
+// of a large one's, the time not the thread's CPU's: `FS_CPU_TIMED` on --
+// longer than the page cache gives them, 50 us and 8 GB a second.  A
+// large read many threads make of the page cache at once is long by the
+// CPU's time -- one of a MiB, by 16 threads on 14 cores, 8% of them
+// over, 0.7% by the rest -- and the disk's wait is all the rest; a small
+// one's is not, and asking the CPU's time costs a tenth of it)
 static int fs_waited(size_t n, int64_t ns) { return ns > 50000 + (int64_t)(n / 8); }
 #endif
 
@@ -882,17 +896,40 @@ static int fs_cached(FsFile *h, size_t n) {
 #endif
 }
 
+// (whether the process has read from the disk since the file last asked,
+// where the system says: a read long off the CPU with none was a thread
+// put off its core, more of them running than there are cores -- 0.4% of
+// the reads of a MiB from the page cache by 16 threads on 14 cores,
+// each such read's act handed to a thread then waiting behind the
+// others in place on its worker, 15% longer for all of them)
+static int fs_disk_read(FsFile *h) {
+#ifdef __APPLE__
+  struct rusage_info_v4 u;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&u) != 0) return 1;
+  uint64_t was = h->disk;
+  h->disk = u.ri_diskio_bytesread + 1;
+  return h->disk > was;
+#else
+  (void)h;
+  return 1;
+#endif
+}
+
 // (of a file whose system cannot try a read not waiting, where the op's
 // may be a thread's: whether the read of `n` bytes into `dst` is done
 // here, what it read at `*r` -- the page cache has it all, or asking is
 // put off, or cannot be done -- or a thread's.  One done here is timed,
 // and, having waited for the disk, has the file's next a thread's,
-// unasked: pages the system is reading ahead are had, as it says, and
-// waited for)
+// unasked, a run of them, longer as they wait again: pages the system is
+// reading ahead are had, as it says, and waited for; and a thread put off
+// its core waits as long, now and then, where more run than there are
+// cores)
 static int fs_here(FsFile *h, uint8_t *dst, size_t n, ssize_t *r) {
 #ifndef _WIN32
+  if (!h->disk) fs_disk_read(h);
   if (h->slow) {
     h->slow--;
+    h->after = 1;
     return 0;
   }
   int cached = h->sure >= FS_SURE ? 1 : fs_cached(h, n);
@@ -900,12 +937,16 @@ static int fs_here(FsFile *h, uint8_t *dst, size_t n, ssize_t *r) {
     h->sure = 0;
     return 0;
   }
-  int64_t t = fs_now_ns();
+  int timed = n >= FS_CPU_TIMED;
+  int64_t t = fs_now_ns(CLOCK_MONOTONIC), cpu = timed ? fs_now_ns(CLOCK_THREAD_CPUTIME_ID) : 0;
   do *r = read(h->fd, dst, n); while (*r < 0 && errno == EINTR);
-  if (*r > 0 && fs_waited((size_t)*r, fs_now_ns() - t)) {
-    h->slow = FS_SURE;
+  int64_t off = fs_now_ns(CLOCK_MONOTONIC) - t - (timed ? fs_now_ns(CLOCK_THREAD_CPUTIME_ID) - cpu : 0);
+  if (*r > 0 && fs_waited((size_t)*r, off) && fs_disk_read(h)) {
+    h->run = h->after && h->run < FS_RUN_MOST ? h->run * 2 : 1;
+    h->slow = h->run;
     h->sure = 0;
   } else if (cached > 0 && h->sure < FS_SURE) h->sure++;
+  h->after = 0;
   return 1;
 #else
   (void)h; (void)dst; (void)n; (void)r;
