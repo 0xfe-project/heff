@@ -5205,11 +5205,26 @@ HEFF_FN pid_t heff_exec_in_dir(char **as, char **env, int in, int out, int err, 
 // `Bytes` cross by these alone, as they are: in, `n` bytes copied, by
 // `heff_bytes_in`; out, read where they are kept, `*n` of them, by
 // `heff_bytes_data` (the value not consumed, its bytes there as long as
-// it is held, and never written to).
+// it is held, and never written to).  Or made where they are to be,
+// not copied: `heff_bytes_room` makes `n` of them, `*at` where they go,
+// written there -- by a read, the kernel's -- before the value is given
+// on, and `heff_bytes_cut` keeps the first `m` alone, `m` at most `n`,
+// while the value is still the maker's alone.
 HEFF_FN V heff_bytes_in(const void *c, int64_t n) {
   Str *s = heff_bytes_new(n);
   if (n) memcpy(s->s, c, (size_t)n);
   return (V)s;
+}
+
+HEFF_FN V heff_bytes_room(int64_t n, uint8_t **at) {
+  Str *s = heff_bytes_new(n);
+  *at = s->s;
+  return (V)s;
+}
+
+HEFF_FN V heff_bytes_cut(V v, int64_t m) {
+  ((Str *)v)->len = m;
+  return v;
 }
 
 HEFF_FN const uint8_t *heff_bytes_data(V v, int64_t *n) {
