@@ -57,6 +57,16 @@ extern char **environ;
 #if defined(__linux__)
 #define HEFF_EPOLL 1
 #include <sys/epoll.h>
+#if defined(__has_include)
+#if __has_include(<linux/io_uring.h>)
+#include <linux/io_uring.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#if defined(IORING_FEAT_EXT_ARG) && defined(__NR_io_uring_setup)
+#define HEFF_URING 1
+#endif
+#endif
+#endif
 #endif
 #if defined(HEFF_KQUEUE) || defined(HEFF_EPOLL)
 #define HEFF_EVQ 1
@@ -5764,6 +5774,12 @@ struct HeffWait {
                                  //  its `fd` and `events` again)
   V (*answer)(HeffWait *);       // (its answer, made, the wait let go of)
   void (*cancel)(HeffWait *);    // (the wait let go of, undone)
+  int loose;                     // (whether its descriptor is to be the
+                                 //  kernel's only while a turn waits:
+                                 //  polled by the turn, where the reactor
+                                 //  has a ring -- a listener, which a poll
+                                 //  of the ring's would keep listening
+                                 //  once the process is gone)
   // (the reactor's)
   V f, k;
   int64_t group;
@@ -5776,7 +5792,13 @@ struct HeffWait {
   short kway;                    //  descriptor it is waiting on there, and
                                  //  which way --
                                  //  1 reading, 2 writing -- or 0, on none;
-                                 //  3, polled instead)
+                                 //  3, polled instead; 4 and 5, an
+                                 //  operation of the ring's that way, 6
+                                 //  and 7, one being taken back, the
+                                 //  wait done meanwhile, 8, one whose wait
+                                 //  is let go of)
+  int32_t ring_res;              // (that operation's result, where it has
+  int ring_got;                  //  come and is not yet looked at)
   HeffWait *prev, *next;
   int linked;                    // (whether it is among the pending)
   int64_t seq;                   // (the order it began to wait in, among
@@ -5987,12 +6009,349 @@ HEFF_FN int heff_evq_tell(int fd, short way, int on) {
   return !(r < 0 || (r == 1 && (got.flags & EV_ERROR) && got.data != 0));
 }
 #else
+#ifdef HEFF_URING
+// (Linux's io_uring, where the kernel and what the program runs in let
+// one be made, in the epoll's stead: a ring of each thread's reactor's
+// own, the queue's descriptor its.  A wait in it is a poll of its
+// descriptor one way, its token -- its slot at `heff_evq_owner` and a
+// count, so that a poll taken out, or spent, is not taken for the next
+// of that slot's -- kept at `heff_ring_armed` while the kernel has it.
+// A poll is spent as it fires, and told again where the wait, stepped,
+// waits on as it was: a step may wait again without having read all
+// there was, as poll and epoll let it, and most waits fire once and
+// end, where a poll that stayed would have to be taken out after.  What
+// the ring is told -- a poll, one taken out -- is written to its
+// submission queue alone and given to the kernel with the turn's wait,
+// in one call, and what fired comes back in its completion queue, read
+// with no call.  The ring is polled with the pipe that wakes the thread,
+// what it was told given to the kernel first: the pipe polled by the
+// ring instead, each wake a request of the ring's, cost a tenth more of
+// the CPU of 1000 streams of events at once, measured beside epoll.  A
+// poll holds its descriptor's file, a socket closed not let go of by
+// the kernel until its poll is taken out: a wait on one closed has its
+// poll taken out at once.
+//
+// A wait may instead be an operation the ring does (`heff_ring_op`): a
+// read or a write, an accept, a file opened or looked at -- its
+// provider's step taken again with its result once the kernel has done
+// it (`heff_ring_took`), into and out of memory the provider keeps until
+// then.  So the kernel has that memory until its completion comes back,
+// and a wait that ends before -- its deadline passed, its descriptor
+// closed, its group closed -- has its operation taken back (an
+// IORING_OP_ASYNC_CANCEL) and is ended, or let go of (its `cancel`),
+// only as the completion comes; the ring is let go of only once every
+// one has.  Such an operation has its descriptor's slot at
+// `heff_evq_owner`, its way's, as a poll would, so that a descriptor
+// closed finds it there.
+//
+// Where no ring is made -- no io_uring, one a sandbox refuses, one
+// before Linux 5.11 -- or `HEFF_REACTOR` is `epoll`, the epoll is; and,
+// one refused, every thread's is)
+typedef struct { uint64_t ud; int32_t res; } HeffRingGot;
+typedef struct {
+  unsigned *sq_head, *sq_tail, *sq_flags, *cq_head, *cq_tail;
+  unsigned sq_mask, cq_mask, sq_entries, tail, features;
+  uint64_t ops[4];               // (which operations the kernel has, a bit
+                                 //  each, as its probe says)
+  struct io_uring_sqe *sqes;
+  struct io_uring_cqe *cqes;
+  void *rings;
+  size_t rings_len, sqes_len;
+} HeffRing;
+// (a completion's user data: a poll's token, the count below the top
+// bit; an operation's, its wait, the top bit set; or none to look at)
+#define HEFF_RING_OP ((uint64_t)1 << 63)
+#define HEFF_RING_NONE UINT64_MAX
+HEFF_VAR(int heff_ring_refused);
+HEFF_VAR(HEFF_TLS int heff_ring_on);
+HEFF_VAR(HEFF_TLS HeffRing heff_ring);
+HEFF_VAR(HEFF_TLS uint64_t *heff_ring_armed);
+HEFF_VAR(HEFF_TLS uint32_t heff_ring_count);
+// (the completions read, not yet looked at; whether the pipe's poll is
+// the kernel's)
+HEFF_VAR(HEFF_TLS HeffRingGot *heff_ring_got);
+HEFF_VAR(HEFF_TLS size_t heff_ring_ngot);
+HEFF_VAR(HEFF_TLS size_t heff_capring_got);
+// (how many of the ring's operations the kernel has)
+HEFF_VAR(HEFF_TLS size_t heff_ring_inflight);
+
+// (the ring made, its descriptor; or -1, and no ring made again)
+HEFF_FN int heff_ring_open(void) {
+  if (__atomic_load_n(&heff_ring_refused, __ATOMIC_RELAXED)) return -1;
+  const char *how = getenv("HEFF_REACTOR");
+  struct io_uring_params p;
+  memset(&p, 0, sizeof p);
+  p.flags = IORING_SETUP_CQSIZE;
+  p.cq_entries = 4096;
+  int fd = how && strcmp(how, "epoll") == 0 ? -1 : (int)syscall(__NR_io_uring_setup, 512, &p);
+  unsigned need = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP | IORING_FEAT_EXT_ARG;
+  HeffRing *g = &heff_ring;
+  if (fd >= 0 && (p.features & need) == need) {
+    size_t sq = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    size_t cq = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+    g->rings_len = sq > cq ? sq : cq;
+    g->sqes_len = p.sq_entries * sizeof(struct io_uring_sqe);
+    g->rings = mmap(NULL, g->rings_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    void *e = g->rings == MAP_FAILED ? MAP_FAILED : mmap(NULL, g->sqes_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+    if (e != MAP_FAILED) {
+      char *r = g->rings;
+      g->sq_head = (unsigned *)(r + p.sq_off.head);
+      g->sq_tail = (unsigned *)(r + p.sq_off.tail);
+      g->sq_flags = (unsigned *)(r + p.sq_off.flags);
+      g->sq_mask = *(unsigned *)(r + p.sq_off.ring_mask);
+      g->sq_entries = p.sq_entries;
+      g->cq_head = (unsigned *)(r + p.cq_off.head);
+      g->cq_tail = (unsigned *)(r + p.cq_off.tail);
+      g->cq_mask = *(unsigned *)(r + p.cq_off.ring_mask);
+      g->cqes = (struct io_uring_cqe *)(r + p.cq_off.cqes);
+      g->sqes = e;
+      g->tail = *g->sq_tail;
+      g->features = p.features;
+      // (each entry of the queue at its own place: written there alone)
+      unsigned *at = (unsigned *)(r + p.sq_off.array);
+      for (unsigned i = 0; i < p.sq_entries; i++) at[i] = i;
+      // (the operations it has, where it says)
+      memset(g->ops, 0, sizeof g->ops);
+      size_t plen = sizeof(struct io_uring_probe) + 256 * sizeof(struct io_uring_probe_op);
+      struct io_uring_probe *pr = calloc(1, plen);
+      if (pr && syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, pr, 256) == 0)
+        for (unsigned i = 0; i < pr->ops_len && i < 256; i++)
+          if (pr->ops[i].flags & IO_URING_OP_SUPPORTED) g->ops[pr->ops[i].op / 64] |= (uint64_t)1 << (pr->ops[i].op % 64);
+      free(pr);
+      return fd;
+    }
+    if (g->rings != MAP_FAILED) munmap(g->rings, g->rings_len);
+  }
+  if (fd >= 0) close(fd);
+  __atomic_store_n(&heff_ring_refused, 1, __ATOMIC_RELAXED);
+  return -1;
+}
+
+// The program's end and the rings.  What the kernel holds of a ring at
+// the end -- a poll, a read -- holds its descriptor's file: a connection
+// stays open until the kernel tears the ring down, after the process is
+// gone, which Linux 6.12 takes a tenth of a second for.  A listener so
+// held would stay listening, and a server started again on its port
+// meanwhile -- restarted, killed -- find it taken: so a listener is
+// never the ring's (`loose`), but polled by the turn, held by the kernel
+// only while the turn waits.  At the end (`exit`, a failure's
+// `quick_exit`) what each thread's ring has with the kernel is taken
+// back first, at once (IORING_REGISTER_SYNC_CANCEL, Linux 6.0 on;
+// before, nothing is), and what it held let go of with the process; one
+// killed -- SIGKILL, a signal not handled -- runs nothing, its
+// connections closed as the kernel tears its rings down.  The rings are
+// kept by their descriptors, plus one (0, none), so many at most; one
+// let go of is taken out first, under the same lock, so that its number
+// is never another's by then.
+#define HEFF_RINGS 1024
+HEFF_VAR(int heff_rings[HEFF_RINGS]);
+HEFF_VAR(int heff_rings_lock);
+HEFF_VAR(int heff_rings_ending);
+
+HEFF_FN void heff_rings_take(void) {
+  while (__atomic_exchange_n(&heff_rings_lock, 1, __ATOMIC_ACQUIRE))
+    ;
+}
+
+HEFF_FN void heff_rings_give(void) { __atomic_store_n(&heff_rings_lock, 0, __ATOMIC_RELEASE); }
+
+// (every ring's operations taken back, at the end)
+HEFF_FN void heff_rings_end(void) {
+#ifdef IORING_ASYNC_CANCEL_ANY
+  heff_rings_take();
+  for (int i = 0; i < HEFF_RINGS; i++) {
+    if (!heff_rings[i]) continue;
+    struct io_uring_sync_cancel_reg r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.flags = IORING_ASYNC_CANCEL_ANY;
+    r.timeout.tv_nsec = 100000000;
+    (void)syscall(__NR_io_uring_register, heff_rings[i] - 1, IORING_REGISTER_SYNC_CANCEL, &r, 1);
+  }
+  heff_rings_give();
+#endif
+}
+
+// (the ring `fd` kept, or, `on` 0, taken out; the end's taking back
+// asked for, the first time)
+HEFF_FN void heff_rings_keep(int fd, int on) {
+  heff_rings_take();
+  for (int i = 0; i < HEFF_RINGS; i++)
+    if (on ? !heff_rings[i] : heff_rings[i] == fd + 1) {
+      heff_rings[i] = on ? fd + 1 : 0;
+      break;
+    }
+  int first = on && !heff_rings_ending;
+  if (first) heff_rings_ending = 1;
+  heff_rings_give();
+  if (first) {
+    atexit(heff_rings_end);
+    at_quick_exit(heff_rings_end);
+  }
+}
+
+// (the ring let go of: its descriptor closed after, by the queue's)
+HEFF_FN void heff_ring_close(void) {
+  munmap(heff_ring.sqes, heff_ring.sqes_len);
+  munmap(heff_ring.rings, heff_ring.rings_len);
+  free(heff_ring_armed);
+  free(heff_ring_got);
+  heff_ring_armed = NULL;
+  heff_ring_got = NULL;
+  heff_ring_ngot = heff_capring_got = 0;
+  heff_ring_on = 0;
+  heff_ring_inflight = 0;
+}
+
+// (the ring's completions moved to `heff_ring_got`, to be looked at
+// after; and those the kernel held, the ring full, after them)
+HEFF_FN void heff_ring_collect(void) {
+  for (;;) {
+    unsigned head = *heff_ring.cq_head;
+    unsigned tail = __atomic_load_n(heff_ring.cq_tail, __ATOMIC_ACQUIRE);
+    size_t n = (size_t)(tail - head);
+    if (heff_ring_ngot + n > heff_capring_got) {
+      size_t cap = heff_capring_got ? heff_capring_got : 256;
+      while (cap < heff_ring_ngot + n) cap *= 2;
+      HeffRingGot *m = heff_alloc(cap * sizeof *m);
+      if (heff_ring_ngot) memcpy(m, heff_ring_got, heff_ring_ngot * sizeof *m);
+      free(heff_ring_got);
+      heff_ring_got = m;
+      heff_capring_got = cap;
+    }
+    for (; head != tail; head++) {
+      struct io_uring_cqe *c = &heff_ring.cqes[head & heff_ring.cq_mask];
+      heff_ring_got[heff_ring_ngot].ud = c->user_data;
+      heff_ring_got[heff_ring_ngot].res = c->res;
+      heff_ring_ngot++;
+    }
+    __atomic_store_n(heff_ring.cq_head, head, __ATOMIC_RELEASE);
+    if (!(__atomic_load_n(heff_ring.sq_flags, __ATOMIC_ACQUIRE) & IORING_SQ_CQ_OVERFLOW)) return;
+    if (syscall(__NR_io_uring_enter, heff_evq, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0) < 0) return;
+    if (__atomic_load_n(heff_ring.cq_tail, __ATOMIC_ACQUIRE) == head) return;
+  }
+}
+
+// (what the ring was told given to the kernel, and, `ms` not 0, an event
+// waited for, `ms` milliseconds at most, -1 for ever -- not where one
+// is in already)
+HEFF_FN void heff_ring_enter(int ms) {
+  for (int tries = 0;; tries++) {
+    unsigned n = heff_ring.tail - __atomic_load_n(heff_ring.sq_head, __ATOMIC_ACQUIRE);
+    unsigned flags = 0, min = 0;
+    struct io_uring_getevents_arg a;
+    struct __kernel_timespec ts;
+    void *arg = NULL;
+    size_t argsz = 0;
+    if (ms != 0 && !heff_ring_ngot && *heff_ring.cq_head == __atomic_load_n(heff_ring.cq_tail, __ATOMIC_ACQUIRE)) {
+      flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
+      min = 1;
+      memset(&a, 0, sizeof a);
+      if (ms > 0) {
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (long long)(ms % 1000) * 1000000;
+        a.ts = (uint64_t)(uintptr_t)&ts;
+      }
+      arg = &a;
+      argsz = sizeof a;
+    }
+    if (!n && !flags) return;
+    if (syscall(__NR_io_uring_enter, heff_evq, n, min, flags, arg, argsz) >= 0) return;
+    if (errno == ETIME || errno == EINTR) return;
+    // (the kernel holding completions it has no room for: those read,
+    // and given again, not waiting)
+    if ((errno == EBUSY || errno == EAGAIN) && tries < 8) {
+      heff_ring_collect();
+      ms = 0;
+      continue;
+    }
+    heff_fail("the reactor's ring failed");
+  }
+}
+
+// (the next entry of the submission queue, cleared -- given to the
+// kernel by `heff_ring_push` -- what is in it submitted first where it is
+// full)
+HEFF_FN struct io_uring_sqe *heff_ring_sqe(void) {
+  for (int tries = 0;; tries++) {
+    if (heff_ring.tail - __atomic_load_n(heff_ring.sq_head, __ATOMIC_ACQUIRE) < heff_ring.sq_entries) {
+      struct io_uring_sqe *e = &heff_ring.sqes[heff_ring.tail & heff_ring.sq_mask];
+      memset(e, 0, sizeof *e);
+      return e;
+    }
+    if (tries == 8) heff_fail("the reactor's ring is full");
+    heff_ring_enter(0);
+  }
+}
+
+static inline void heff_ring_push(void) {
+  __atomic_store_n(heff_ring.sq_tail, ++heff_ring.tail, __ATOMIC_RELEASE);
+}
+
+// (the ring told: `fd` polled `way`, or, not `on`, its poll taken out,
+// where it has one -- taken, always: a poll the kernel refuses, the
+// descriptor closed meanwhile, fires, as poll has it)
+HEFF_FN int heff_ring_tell(int fd, short way, int on) {
+  size_t at = (size_t)fd * 2 + (size_t)(way - 1);
+  if (!on) {
+    if (at >= heff_capevq_owner || !heff_ring_armed[at]) return 1;
+    struct io_uring_sqe *e = heff_ring_sqe();
+    e->opcode = IORING_OP_POLL_REMOVE;
+    e->fd = -1;
+    e->addr = heff_ring_armed[at];
+    e->user_data = HEFF_RING_NONE;
+    if (heff_ring.features & IORING_FEAT_CQE_SKIP) e->flags = IOSQE_CQE_SKIP_SUCCESS;
+    heff_ring_push();
+    heff_ring_armed[at] = 0;
+    return 1;
+  }
+  heff_ring_count = (heff_ring_count + 1) & 0x7fffffffu;
+  if (heff_ring_count == 0) heff_ring_count = 1;
+  uint64_t token = (uint64_t)heff_ring_count << 32 | (uint32_t)at;
+  uint32_t mask = way == 1 ? POLLIN : POLLOUT;
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  mask = mask << 16 | mask >> 16;
+#endif
+  struct io_uring_sqe *e = heff_ring_sqe();
+  e->opcode = IORING_OP_POLL_ADD;
+  e->fd = fd;
+  e->poll32_events = mask;
+  e->user_data = token;
+  heff_ring_push();
+  heff_ring_armed[at] = token;
+  return 1;
+}
+
+// (the wait's operation taken back: its completion comes all the same)
+HEFF_FN void heff_ring_op_cancel(HeffWait *w) {
+  struct io_uring_sqe *e = heff_ring_sqe();
+  e->opcode = IORING_OP_ASYNC_CANCEL;
+  e->fd = -1;
+  e->addr = HEFF_RING_OP | (uint64_t)(uintptr_t)w;
+  e->user_data = HEFF_RING_NONE;
+  if (heff_ring.features & IORING_FEAT_CQE_SKIP) e->flags = IOSQE_CQE_SKIP_SUCCESS;
+  heff_ring_push();
+}
+
+// (the slot of the wait's operation free again, where it is the wait's)
+HEFF_FN void heff_ring_op_slot_free(HeffWait *w, short way) {
+  size_t at = (size_t)w->kfd * 2 + (size_t)(way - 1);
+  if (at < heff_capevq_owner && heff_evq_owner[at] == w) {
+    heff_evq_owner[at] = NULL;
+    heff_ring_armed[at] = 0;
+  }
+}
+#endif
+
 // (epoll: the descriptor's ways, both, as the waits in it say -- the
 // other way's kept as it is.  Its registration may be gone, the
 // descriptor closed meanwhile, or there, one of the same number's:
 // either told again, where a wait is to be added; one taken out of a
 // descriptor that is gone is not added back)
 HEFF_FN int heff_evq_tell(int fd, short way, int on) {
+#ifdef HEFF_URING
+  if (heff_ring_on) return heff_ring_tell(fd, way, on);
+#endif
   int other = heff_evq_whose(fd, way == 1 ? 2 : 1) != NULL;
   uint32_t mask = 0;
   if (on) mask |= way == 1 ? EPOLLIN : EPOLLOUT;
@@ -6022,16 +6381,8 @@ static inline void heff_evq_polled(HeffWait *w) {
 // (the wait's descriptor and way in the queue: where it has one, and
 // another wait of the thread has not, and the queue takes it; else
 // polled)
-HEFF_FN void heff_evq_add(HeffWait *w) {
-  w->kway = 0;
-  w->kfd = w->fd;
-  if (w->fd < 0 || w->done) return;
-  short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
-  if (!way || !heff_evq_made) {
-    heff_evq_polled(w);
-    return;
-  }
-  size_t at = (size_t)w->fd * 2 + (size_t)(way - 1);
+// (room at `heff_evq_owner` for the slot `at`)
+HEFF_FN void heff_evq_room(size_t at) {
   if (at >= heff_capevq_owner) {
     size_t cap = heff_capevq_owner ? heff_capevq_owner : 512;
     while (cap <= at) cap *= 2;
@@ -6040,8 +6391,53 @@ HEFF_FN void heff_evq_add(HeffWait *w) {
     memset(m + heff_capevq_owner, 0, (cap - heff_capevq_owner) * sizeof *m);
     free(heff_evq_owner);
     heff_evq_owner = m;
+#ifdef HEFF_URING
+    if (heff_ring_on) {
+      uint64_t *a = heff_alloc(cap * sizeof *a);
+      if (heff_capevq_owner) memcpy(a, heff_ring_armed, heff_capevq_owner * sizeof *a);
+      memset(a + heff_capevq_owner, 0, (cap - heff_capevq_owner) * sizeof *a);
+      free(heff_ring_armed);
+      heff_ring_armed = a;
+    }
+#endif
     heff_capevq_owner = cap;
   }
+}
+
+// (whether the wait has an operation of the ring's that is the kernel's:
+// one its step began, as it waits on its slot)
+static inline int heff_evq_op(HeffWait *w) {
+#ifdef HEFF_URING
+  if (heff_ring_on && w->kway >= 4 && w->kway <= 5) {
+    // (one of a path's, in no slot: -2)
+    if (w->kfd == -2) return heff_ring_inflight > 0;
+    size_t at = (size_t)w->kfd * 2 + (size_t)(w->kway - 4);
+    return at < heff_capevq_owner && heff_evq_owner[at] == w && heff_ring_armed[at] == HEFF_RING_OP;
+  }
+#else
+  (void)w;
+#endif
+  return 0;
+}
+
+HEFF_FN void heff_evq_add(HeffWait *w) {
+  if (heff_evq_op(w)) return;
+  w->kway = 0;
+  w->kfd = w->fd;
+  if (w->fd < 0 || w->done) return;
+  short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
+  if (!way || !heff_evq_made) {
+    heff_evq_polled(w);
+    return;
+  }
+#ifdef HEFF_URING
+  if (heff_ring_on && w->loose) {
+    heff_evq_polled(w);
+    return;
+  }
+#endif
+  size_t at = (size_t)w->fd * 2 + (size_t)(way - 1);
+  heff_evq_room(at);
   if (heff_evq_owner[at] || !heff_evq_tell(w->fd, way, 1)) {
     heff_evq_polled(w);
     return;
@@ -6053,6 +6449,16 @@ HEFF_FN void heff_evq_add(HeffWait *w) {
 // (the wait's descriptor taken out of the queue, where it is there --
 // closed meanwhile, the kernel took it out then)
 HEFF_FN void heff_evq_delete(HeffWait *w) {
+#ifdef HEFF_URING
+  // (an operation of the ring's: taken back, where it is not being, and
+  // its wait let go of only as it comes back)
+  if (heff_ring_on && w->kway >= 4 && w->kway <= 7) {
+    if (w->kway <= 5) heff_ring_op_cancel(w);
+    heff_ring_op_slot_free(w, (short)((w->kway - 4) % 2 + 1));
+    w->kway = 8;
+    return;
+  }
+#endif
   short way = w->kway;
   w->kway = 0;
   if (way == 3) heff_npolled--;
@@ -6065,11 +6471,19 @@ HEFF_FN void heff_evq_delete(HeffWait *w) {
 // (the wait's way, after a step: where it waits on another descriptor,
 // or the other way, or is done, so in the queue)
 HEFF_FN void heff_evq_again(HeffWait *w) {
+  if (heff_evq_op(w)) return;
   short way = w->events == POLLIN ? 1 : w->events == POLLOUT ? 2 : 0;
   if (w->done || w->fd != w->kfd || (w->kway != 3 && way != w->kway)) {
     heff_evq_delete(w);
     heff_evq_add(w);
   }
+#ifdef HEFF_URING
+  // (a ring's poll, spent as it fired: told again)
+  else if (heff_ring_on && (w->kway == 1 || w->kway == 2)) {
+    size_t at = (size_t)w->kfd * 2 + (size_t)(w->kway - 1);
+    if (!heff_ring_armed[at]) heff_ring_tell(w->kfd, w->kway, 1);
+  }
+#endif
 }
 
 // (the queue made, with the thread's first group, as its pipe is: where
@@ -6081,6 +6495,14 @@ HEFF_FN void heff_evq_open(void) {
   if (heff_evq < 0) return;
   fcntl(heff_evq, F_SETFD, FD_CLOEXEC);
 #else
+#ifdef HEFF_URING
+  heff_evq = heff_ring_open();
+  if (heff_evq >= 0) {
+    heff_ring_on = heff_evq_made = 1;
+    heff_rings_keep(heff_evq, 1);
+    return;
+  }
+#endif
   heff_evq = epoll_create1(EPOLL_CLOEXEC);
   if (heff_evq < 0) return;
 #endif
@@ -6091,6 +6513,12 @@ HEFF_FN void heff_evq_open(void) {
 // waits pending)
 HEFF_FN void heff_evq_close(void) {
   if (!heff_evq_made) return;
+#ifdef HEFF_URING
+  if (heff_ring_on) {
+    heff_rings_keep(heff_evq, 0);
+    heff_ring_close();
+  }
+#endif
   close(heff_evq);
   heff_evq_made = 0;
   free(heff_evq_owner);
@@ -6098,6 +6526,98 @@ HEFF_FN void heff_evq_close(void) {
   heff_capevq_owner = 0;
 }
 #endif
+
+// | Operations a provider's wait may have the reactor's ring do, where
+// | it has one (Linux's io_uring): a socket's `recv`, `send` and
+// | `accept`, a file's `read` and `write` at its position, and a path
+// | opened, looked at, renamed, a file closed.
+enum { HEFF_OP_RECV, HEFF_OP_SEND, HEFF_OP_ACCEPT, HEFF_OP_READ, HEFF_OP_WRITE,
+       HEFF_OP_OPEN, HEFF_OP_CLOSE, HEFF_OP_STATX, HEFF_OP_RENAME };
+
+#ifdef HEFF_URING
+static const uint8_t heff_ops_ring[] = { IORING_OP_RECV, IORING_OP_SEND, IORING_OP_ACCEPT, IORING_OP_READ,
+                                         IORING_OP_WRITE, IORING_OP_OPENAT, IORING_OP_CLOSE, IORING_OP_STATX,
+                                         IORING_OP_RENAMEAT };
+#endif
+
+// | Whether the operation `op` is the ring's to do here: in a group, the
+// | thread's reactor a ring that has it.
+HEFF_FN int heff_ring_can(int op) {
+#ifdef HEFF_URING
+  if (!heff_group || !heff_ring_on || op < 0 || op > HEFF_OP_RENAME) return 0;
+  int o = heff_ops_ring[op];
+  return (heff_ring.ops[o / 64] >> (o % 64)) & 1;
+#else
+  (void)op;
+  return 0;
+#endif
+}
+
+// | The wait `w`'s operation `op` begun by the ring, on its `fd` -- of a
+// | descriptor its way's slot, reading or writing, a path's the second
+// | of a rename's -- with `addr` and `len` as the operation has them
+// | (`recv`'s and `read`'s memory, `send`'s and `write`'s bytes, a path
+// | and its flags and mode, statx's path, flags, mask and room), all of
+// | it the kernel's until its completion comes back: whether it was
+// | begun -- not where the ring cannot (`heff_ring_can`, or a wait pending
+// | stepped by the reactor), or the slot is
+// | another wait's, which the provider then waits for as before.  The
+// | step that began it says HEFF_STEP_WAIT, and is taken again once it is
+// | done, its result there (`heff_ring_took`); a wait ended before then
+// | -- its deadline, its descriptor closed -- is answered, and one let go
+// | of let go of, only after it.
+HEFF_FN int heff_ring_op(HeffWait *w, int op, int fd, const void *addr, uint64_t len, uint64_t off, uint32_t flags,
+                         const void *addr2) {
+#ifdef HEFF_URING
+  // (in a group, or a wait pending in one, stepped by the reactor)
+  if (!heff_ring_on || op < 0 || op > HEFF_OP_RENAME || !(heff_group || w->linked)) return 0;
+  if (!((heff_ring.ops[heff_ops_ring[op] / 64] >> (heff_ops_ring[op] % 64)) & 1)) return 0;
+  short way = op == HEFF_OP_SEND || op == HEFF_OP_WRITE ? 2 : 1;
+  // (a path's operation: no descriptor's slot, the wait's own)
+  int slot = fd >= 0 && op != HEFF_OP_OPEN && op != HEFF_OP_STATX && op != HEFF_OP_RENAME && op != HEFF_OP_CLOSE;
+  if (slot) {
+    size_t at = (size_t)fd * 2 + (size_t)(way - 1);
+    heff_evq_room(at);
+    if (heff_evq_owner[at] && heff_evq_owner[at] != w) return 0;
+    if (heff_evq_owner[at] == w && heff_ring_armed[at]) heff_evq_tell(fd, way, 0);
+    heff_evq_owner[at] = w;
+    heff_ring_armed[at] = HEFF_RING_OP;
+  }
+  if (w->linked && w->kway == 3) heff_npolled--;
+  struct io_uring_sqe *e = heff_ring_sqe();
+  e->opcode = heff_ops_ring[op];
+  e->fd = op == HEFF_OP_OPEN || op == HEFF_OP_STATX || op == HEFF_OP_RENAME ? AT_FDCWD : fd;
+  e->addr = (uint64_t)(uintptr_t)addr;
+  e->len = (uint32_t)len;
+  e->off = off;
+  e->rw_flags = (int)flags;
+  if (op == HEFF_OP_STATX) e->off = (uint64_t)(uintptr_t)addr2;
+  if (op == HEFF_OP_RENAME) {
+    e->len = (uint32_t)AT_FDCWD;
+    e->addr2 = (uint64_t)(uintptr_t)addr2;
+  }
+  e->user_data = HEFF_RING_OP | (uint64_t)(uintptr_t)w;
+  heff_ring_push();
+  heff_ring_inflight++;
+  w->kfd = slot ? fd : -2;
+  w->kway = slot ? (short)(3 + way) : 4;
+  w->ring_got = 0;
+  return 1;
+#else
+  (void)w; (void)op; (void)fd; (void)addr; (void)len; (void)off; (void)flags; (void)addr2;
+  return 0;
+#endif
+}
+
+// | Whether the wait's operation of the ring's has come back, not yet
+// | looked at: its result at `*res` (as the system call's, or -errno),
+// | once.
+HEFF_FN int heff_ring_took(HeffWait *w, int32_t *res) {
+  if (!w->ring_got) return 0;
+  w->ring_got = 0;
+  *res = w->ring_res;
+  return 1;
+}
 
 // (the group open of that number, or NULL)
 HEFF_FN HeffGroup *heff_group_of(int64_t g) {
@@ -6172,9 +6692,8 @@ HEFF_FN void heff_heap_remove(HeffWait *w) {
 }
 
 // (the wait done: where it is pending, among those the turn wakes, once)
-HEFF_FN void heff_wait_finish(HeffWait *w) {
-  if (w->done) return;
-  w->done = 1;
+// (the wait, done, among those the turn wakes, where it is pending)
+HEFF_FN void heff_wait_ready_put(HeffWait *w) {
   if (!w->linked || w->readyat) return;
   if (heff_nready == heff_capready) {
     size_t cap = heff_capready ? heff_capready * 2 : 64;
@@ -6186,6 +6705,23 @@ HEFF_FN void heff_wait_finish(HeffWait *w) {
   }
   heff_ready[heff_nready++] = w;
   w->readyat = heff_nready;
+}
+
+// (the wait done: where it is pending, among those the turn wakes, once
+// -- where an operation of the ring's is its, once that has come back,
+// taken back first)
+HEFF_FN void heff_wait_finish(HeffWait *w) {
+  if (w->done) return;
+  w->done = 1;
+#ifdef HEFF_URING
+  if (w->linked && (w->kway == 4 || w->kway == 5)) {
+    heff_ring_op_cancel(w);
+    w->kway += 2;
+    return;
+  }
+  if (w->linked && w->kway >= 6 && w->kway <= 8) return;
+#endif
+  heff_wait_ready_put(w);
 }
 
 // (the wait no longer among the done, where it is)
@@ -6242,11 +6778,22 @@ HEFF_FN void heff_wait_unlink(HeffWait *w) {
 // (a wait done, as its source says: given its answer at the next turn)
 HEFF_FN void heff_wait_done(HeffWait *w) { heff_wait_finish(w); }
 
+// (a wait on a descriptor closed: done, EBADF; and, in a ring, its poll
+// taken out now, so that the kernel lets go of the descriptor as it is
+// closed, not at the next turn's call)
+static inline void heff_wait_closed(HeffWait *w) {
+  w->err = EBADF;
+  heff_wait_finish(w);
+#ifdef HEFF_URING
+  if (heff_ring_on && (w->kway == 1 || w->kway == 2)) heff_evq_delete(w);
+#endif
+}
+
 // (this thread's waits on `fd` begun before the count `before`: done,
 // EBADF -- whether any was.  Found by its marks, where every wait on it
 // is in the event queue, else by every pending wait looked at; none where
 // none is marked)
-HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
+HEFF_FN int heff_fd_waits_found_closed(int fd, int64_t before) {
   int some = 0;
 #ifndef _WIN32
   if (fd >= 0 && heff_mark && (size_t)fd < (size_t)HEFF_MARK_CHUNK * HEFF_MARK_CHUNKS) {
@@ -6259,8 +6806,7 @@ HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
       if (!w || w->marked != fd) continue;
       found++;
       if (!w->done && w->epoch < before) {
-        w->err = EBADF;
-        heff_wait_finish(w);
+        heff_wait_closed(w);
         some = 1;
       }
     }
@@ -6270,10 +6816,18 @@ HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
 #endif
   for (HeffWait *w = heff_waits_first; w; w = w->next)
     if (w->fd == fd && !w->done && w->epoch < before) {
-      w->err = EBADF;
-      heff_wait_finish(w);
+      heff_wait_closed(w);
       some = 1;
     }
+  return some;
+}
+
+// (and, in a ring, the polls taken out given to the kernel at once)
+HEFF_FN int heff_fd_waits_closed(int fd, int64_t before) {
+  int some = heff_fd_waits_found_closed(fd, before);
+#ifdef HEFF_URING
+  if (some && heff_ring_on) heff_ring_enter(0);
+#endif
   return some;
 }
 
@@ -6726,6 +7280,39 @@ HEFF_FN void heff_evq_ready(void) {
     if (r <= 0) break;
     for (int i = 0; i < r; i++) heff_evq_fire((int)got[i].ident, got[i].filter == EVFILT_READ ? 1 : 2);
 #else
+#ifdef HEFF_URING
+    if (heff_ring_on) {
+      // (each poll that fired, not one taken out or told again since;
+      // and each operation done: its wait stepped with its result, or,
+      // done meanwhile, ended, or, let go of, let go of now)
+      heff_ring_collect();
+      for (size_t i = 0; i < heff_ring_ngot; i++) {
+        uint64_t ud = heff_ring_got[i].ud;
+        if (ud == HEFF_RING_NONE) continue;
+        if (ud & HEFF_RING_OP) {
+          HeffWait *w = (HeffWait *)(uintptr_t)(ud & ~HEFF_RING_OP);
+          short was = w->kway;
+          heff_ring_inflight--;
+          w->kway = 0;
+          w->ring_res = heff_ring_got[i].res;
+          w->ring_got = 1;
+          if (was == 8) w->cancel(w);
+          else {
+            heff_ring_op_slot_free(w, (short)((was - 4) % 2 + 1));
+            if (was >= 6) heff_wait_ready_put(w);
+            else heff_wait_ready(w);
+          }
+          continue;
+        }
+        size_t at = (uint32_t)ud;
+        if (at >= heff_capevq_owner || heff_ring_armed[at] != ud) continue;
+        heff_ring_armed[at] = 0;
+        heff_evq_fire((int)(at / 2), (short)(at % 2 + 1));
+      }
+      heff_ring_ngot = 0;
+      break;
+    }
+#endif
     struct epoll_event got[256];
     int r = epoll_wait(heff_evq, got, 256, 0);
     if (r <= 0) break;
@@ -6758,10 +7345,15 @@ HEFF_FN void heff_reactor_turn(int wait) {
     for (HeffWait *w = heff_waits_first; w; w = w->next)
       if (heff_wait_polled(w)) n++;
   size_t mine = n;
+  int ring = 0;
+#ifdef HEFF_URING
+  ring = heff_ring_on;
+#endif
+  int piped = heff_wake_made;
 #ifdef HEFF_EVQ
   if (heff_evq_made) n++;
 #endif
-  if (heff_wake_made) n++;
+  if (piped) n++;
   for (HeffSource *s = heff_sources; s; s = s->next) {
     int t = -1;
     s->n = s->fds(NULL, 0, &t);
@@ -6790,7 +7382,7 @@ HEFF_FN void heff_reactor_turn(int wait) {
   }
 #endif
   size_t wake = n;
-  if (heff_wake_made) {
+  if (piped) {
     heff_polled[n].fd = heff_wake_fds[0];
     heff_polled[n].events = POLLIN;
     heff_polled[n].revents = 0;
@@ -6805,15 +7397,20 @@ HEFF_FN void heff_reactor_turn(int wait) {
     if (t >= 0 && (ms < 0 || t < ms)) ms = t;
   }
   if (n == 0 && ms < 0) heff_fail("the reactor waits, with nothing to wait for");
+#ifdef HEFF_URING
+  // (what the ring was told given to the kernel, then the ring polled
+  // with the others, its completions there where it is ready)
+  if (ring) heff_ring_enter(0);
+#endif
   int r = poll(heff_polled, (nfds_t)n, ms);
   if (r < 0 && errno != EINTR) heff_fail("the reactor's poll failed");
   if (r < 0) for (size_t i = 0; i < n; i++) heff_polled[i].revents = 0;
   for (size_t i = 0; i < mine; i++)
     if (heff_polled[i].revents) heff_wait_ready(heff_polled_waits[i]);
 #ifdef HEFF_EVQ
-  if (q_polled && heff_polled[q].revents) heff_evq_ready();
+  if (q_polled && (ring || heff_polled[q].revents)) heff_evq_ready();
 #endif
-  if (heff_wake_made && heff_polled[wake].revents) {
+  if (piped && heff_polled[wake].revents) {
     char b[64];
     while (read(heff_wake_fds[0], b, sizeof b) > 0) {}
     heff_woken = 1;
@@ -6882,6 +7479,19 @@ HEFF_FN int heff_group_in(int64_t id, int64_t g) {
 
 HEFF_FN void heff_giving_closed(int64_t g);
 
+#ifdef HEFF_URING
+// (every operation of the ring's come back -- each wait's let go of, as
+// none is pending -- so that the ring is let go of with nothing of the
+// program's the kernel's)
+HEFF_FN void heff_ring_drain(void) {
+  heff_ring_enter(0);
+  while (heff_ring_inflight) {
+    heff_ring_enter(-1);
+    heff_evq_ready();
+  }
+}
+#endif
+
 HEFF_FN void heff_reactor_close(int64_t g) {
   heff_giving_closed(g);
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
@@ -6889,10 +7499,23 @@ HEFF_FN void heff_reactor_close(int64_t g) {
     if (!heff_group_in(w->group, g)) continue;
     heff_wait_unlink(w);
     V f = w->f, k = w->k;
-    w->cancel(w);
+    // (one whose operation the ring has, let go of as it comes back)
+    if (w->kway != 8) w->cancel(w);
     heff_drop(f);
     heff_drop(k);
   }
+#ifdef HEFF_URING
+  // (the polls and operations taken out given to the kernel now: it
+  // lets go of the descriptors closed as they are; with the thread's
+  // last group, every operation come back first)
+  if (heff_ring_on) {
+    int rest = 0;
+    for (size_t i = 0; i < heff_ngroups; i++)
+      if (heff_groups_open[i].id != g && heff_groups_open[i].root != g) rest = 1;
+    if (rest) heff_ring_enter(0);
+    else heff_ring_drain();
+  }
+#endif
   size_t kept = 0;
   for (size_t i = 0; i < heff_nfinished; i++) {
     if (heff_finished[i].group == g) heff_drop(heff_finished[i].v);

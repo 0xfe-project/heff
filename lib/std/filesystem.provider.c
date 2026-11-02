@@ -18,7 +18,12 @@
 // parent's too): a read is done once poll says there is something to
 // read, and a write of no more than PIPE_BUF bytes once it says there
 // is room.  A regular file is always ready, as poll sees it, and is read
-// and written there and then, the whole program waiting for the disk.
+// and written there and then, the whole program waiting for the disk --
+// but where the reactor has a ring that does it (`heff_ring_can`): there
+// a read or a write is tried first not waiting (RWF_NOWAIT: what the
+// page cache has, at once), and what would wait for the disk is the
+// ring's, the op pending meanwhile, into memory of the op's own; one of
+// a file whose system cannot try it so is done there and then.
 
 #include <dirent.h>
 #include <errno.h>
@@ -26,6 +31,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef HEFF_URING
+#include <sys/uio.h>
+#endif
 #ifdef _WIN32
 // (no links on Windows as stat sees them, and mkdir takes no mode)
 #define lstat stat
@@ -518,6 +526,12 @@ typedef struct {
                      //  scheduler runs)
   int seekable;      // (a regular file: what was read ahead is given back
                      //  before a write)
+  int blocking;      // (a regular file whose system cannot try its reads
+                     //  and writes not waiting: read and written there
+                     //  and then, as before -- the ring would give each
+                     //  to a thread of the kernel's, several times the
+                     //  CPU of the read itself where the page cache has
+                     //  it)
   uint8_t *buf;      // (read ahead: what is not yet taken, from `at` to
   size_t cap, at, end;  //  `end`)
   uint64_t taken;    // (how many times something was taken from it)
@@ -665,6 +679,9 @@ typedef struct {
                      //  reactor until it is ready: a scheduler runs, and
                      //  the file is pollable)
   int eof;           // (a read came to the end)
+  int ringed;        // (a regular file's, where the ring reads and writes:
+  uint8_t *rbuf;     //  what it reads into, `rlen` bytes, the op's own)
+  size_t rlen;
   int64_t n;         // (a chunk's most)
   size_t scanned;    // (a line's: how far after `h->at` no newline is,
   uint64_t taken;    //  while `h->taken` is this)
@@ -686,6 +703,7 @@ static FsOp *fs_op(int what, FsFile *h) {
   o->w.events = POLLIN;
 #ifndef _WIN32
   o->async = heff_group != 0 && h->pollable;
+  o->ringed = h->seekable && heff_ring_can(what == FS_WRITE ? HEFF_OP_WRITE : HEFF_OP_READ);
 #endif
   o->taken = h->taken;
   return o;
@@ -695,14 +713,76 @@ static void fs_op_free(FsOp *o) {
   if (o->result) heff_drop(o->result);
   if (o->held) heff_drop(o->held);
   free(o->owned);
+  free(o->rbuf);
   fs_unref(o->h);
   free(o);
+}
+
+#ifdef HEFF_URING
+// (a regular file's read or write at its position, not waiting for the
+// disk: as preadv2's and pwritev2's, EAGAIN where it would)
+static ssize_t fs_nowait(int fd, const uint8_t *data, size_t n, int writing) {
+  struct iovec v = { (void *)data, n };
+  return syscall(writing ? SYS_pwritev2 : SYS_preadv2, fd, &v, 1, -1L, 0L, RWF_NOWAIT);
+}
+#endif
+
+// (a ring's read of a regular file, where the op is one: what it read,
+// into `dst`, `n` bytes at most; or, the page cache not having it, the
+// ring's read begun, -1 with EINPROGRESS; or -1 with errno.  The ring's
+// read come back is put after what the file read ahead, -3, the step
+// taking from there: it was begun for a step that may be another by
+// then.  -2 where the op is not one, read as before)
+static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n) {
+#ifdef HEFF_URING
+  if (!o->ringed) return -2;
+  int fd = o->h->fd;
+  int32_t res;
+  if (heff_ring_took(&o->w, &res)) {
+    if (res == 0) return 0;
+    if (res > 0) {
+      FsFile *h = o->h;
+      fs_room(h, (size_t)res);
+      memcpy(h->buf + h->end, o->rbuf, (size_t)res);
+      h->end += (size_t)res;
+      return -3;
+    }
+    if (res != -EAGAIN && res != -EINTR) {
+      errno = -res;
+      return -1;
+    }
+  }
+  ssize_t r = -1;
+  errno = EOPNOTSUPP;
+  if (!o->h->blocking) do r = fs_nowait(fd, dst, n, 0); while (r < 0 && errno == EINTR);
+  if (r >= 0 || (errno != EAGAIN && errno != EOPNOTSUPP && errno != EINVAL)) return r;
+  if (errno != EAGAIN) {
+    o->h->blocking = 1;
+    o->ringed = 0;
+    return -2;
+  }
+  if (o->rlen < n) {
+    free(o->rbuf);
+    o->rbuf = heff_alloc(n);
+    o->rlen = n;
+  }
+  if (heff_ring_op(&o->w, HEFF_OP_READ, fd, o->rbuf, n, (uint64_t)-1, 0, NULL)) {
+    errno = EINPROGRESS;
+    return -1;
+  }
+  o->ringed = 0;
+#else
+  (void)o; (void)dst; (void)n;
+#endif
+  return -2;
 }
 
 // (up to `n` bytes read into `dst`: how many, 0 at the end, or -1 with
 // errno -- EAGAIN, for an async op, where it is not ready)
 static ssize_t fs_read_into(FsOp *o, uint8_t *dst, size_t n) {
   int fd = o->h->fd;
+  ssize_t ringed = fs_ring_read(o, dst, n);
+  if (ringed != -2) return ringed;
   for (;;) {
     if (o->async) {
       int r = fs_ready(fd, POLLIN);
@@ -733,7 +813,9 @@ static ssize_t fs_read_into(FsOp *o, uint8_t *dst, size_t n) {
 static ssize_t fs_fill(FsOp *o) {
   FsFile *h = o->h;
   fs_room(h, FS_BUF);
+  size_t had = h->end;
   ssize_t r = fs_read_into(o, h->buf + h->end, h->cap - h->end);
+  if (r == -3) return (ssize_t)(h->end - had);
   if (r > 0) h->end += (size_t)r;
   return r;
 }
@@ -748,6 +830,7 @@ static V fs_take(FsFile *h, size_t n) {
 
 // (a step's end where a read failed: waiting, where it is not ready)
 static int fs_failed_step(FsOp *o) {
+  if (errno == EINPROGRESS) return HEFF_STEP_WAIT;
   if (o->async && errno == EAGAIN) {
     o->w.events = POLLIN;
     return HEFF_STEP_WAIT;
@@ -764,15 +847,17 @@ static int fs_chunk_step(HeffWait *w) {
   if (fs_buffered(h) == 0 && (size_t)o->n >= FS_BUF) {
     uint8_t *mine = heff_alloc((size_t)o->n);
     ssize_t r = fs_read_into(o, mine, (size_t)o->n);
-    if (r < 0) {
+    if (r == -3) free(mine);
+    else if (r < 0) {
       int e = errno;
       free(mine);
       errno = e;
       return fs_failed_step(o);
+    } else {
+      o->result = fs_right(heff_bytes_in(mine, (int64_t)r));
+      free(mine);
+      return HEFF_STEP_DONE;
     }
-    o->result = fs_right(heff_bytes_in(mine, (int64_t)r));
-    free(mine);
-    return HEFF_STEP_DONE;
   }
   if (fs_buffered(h) == 0 && fs_fill(o) < 0) return fs_failed_step(o);
   size_t n = fs_buffered(h);
@@ -829,6 +914,39 @@ static int fs_line_step(HeffWait *w) {
 static int fs_write_step(HeffWait *w) {
   FsOp *o = (FsOp *)w;
   int fd = o->h->fd;
+#ifdef HEFF_URING
+  // (a regular file's, where the ring writes: what the page cache takes
+  // at once, the rest the ring's, the op's bytes held meanwhile)
+  int32_t res;
+  if (heff_ring_took(w, &res)) {
+    if (res < 0 && res != -EAGAIN && res != -EINTR) {
+      o->err = -res;
+      return HEFF_STEP_DONE;
+    }
+    if (res > 0) o->done += res;
+  }
+  while (o->ringed && o->done < o->len) {
+    ssize_t r = -1;
+    errno = EOPNOTSUPP;
+    if (!o->h->blocking) r = fs_nowait(fd, o->data + o->done, (size_t)(o->len - o->done), 1);
+    if (r >= 0) {
+      o->done += r;
+      continue;
+    }
+    if (errno == EINTR) continue;
+    if (errno != EAGAIN && errno != EOPNOTSUPP && errno != EINVAL) {
+      o->err = errno;
+      return HEFF_STEP_DONE;
+    }
+    if (errno != EAGAIN) {
+      o->h->blocking = 1;
+      break;
+    }
+    if (heff_ring_op(w, HEFF_OP_WRITE, fd, o->data + o->done, (uint64_t)(o->len - o->done), (uint64_t)-1, 0, NULL))
+      return HEFF_STEP_WAIT;
+    o->ringed = 0;
+  }
+#endif
   while (o->done < o->len) {
     size_t n = (size_t)(o->len - o->done);
 #ifndef _WIN32
