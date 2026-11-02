@@ -14,7 +14,8 @@
 // run of a `Begin`'s, gives back the value alone, one of the group's
 // finished.  Where the group was opened with what a failure is
 // finished as, each of these runs is under `heff_try`, and one that
-// fails is finished so, its start told it waits.
+// abandons is finished so, its start told it waits; one that fails
+// otherwise -- panics, or fails in the runtime -- ends the program.
 //
 // An `End` and a `Finished` are each a function given what to do with
 // what they hold, their types erased: `rx_open` takes it -- an end's
@@ -47,7 +48,7 @@ static void rx_open(V b, int n) {
 
 static V heff_provider_reactor(V p, V k) {
   switch (heff_tag_of(p)) {
-  // (a group opened, with what a failure of a step in it is finished
+  // (a group opened, with what an abandon of a step in it is finished
   // as, where `Just` that is given)
   case TAG_Open: {
     V failing = heff_field(p, 0);
@@ -73,8 +74,8 @@ static V heff_provider_reactor(V p, V k) {
     int failed = heff_group_step(g, heff_dup(k), x, &r);
     heff_group = up;
     rx_trying = upTrying;
-    // (failed, where the group says what that is: finished so, and the
-    // start told it waits)
+    // (abandoned, where the group says what that is: finished so, and
+    // the start told it waits)
     if (failed) {
       V y = heff_answer(f, NTAG(TAG_False));
       return heff_tail(k, 1, &y);

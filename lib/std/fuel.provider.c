@@ -3,8 +3,9 @@
 #define HEFF_FUEL 1
 // `limited n c`: `c` run here under `heff_try`, a limit of `n` set on
 // this thread's count (`heff_fuel_limit`); `Just` its answer, or
-// `Nothing` where it ran out of the limit's own; a failure, or running
-// out of the limit around it, handed on as it came.  Its computation is
+// `Nothing` where it ran out of the limit's own; an abandon, or running
+// out of the limit around it, handed on as it came.  A failure is not
+// caught: it ends the program.  Its computation is
 // a function of `Unit`, computed only here.
 
 // (what an operation's `Some` holds, where `fl_open` puts it)

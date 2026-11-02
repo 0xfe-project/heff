@@ -6,11 +6,12 @@
 // limits are set on this thread: each thread's own, a thread started with
 // none, nothing here knowing what a limit is for.  With none, a tick that
 // finds the fuel out (as a thread's first does, its count 0) fills it
-// again, all but endless; under one, it stops the computation -- fails as
-// `heff_fail` does, `HEFF_FUEL`, caught by the innermost `heff_try`, the
-// limit's, which says how much is left of it then.  It does not resume:
-// what the frames jumped over were doing is left undone, what they made
-// leaked, as a failure leaves it.
+// again, all but endless; under one, it stops the computation -- jumps,
+// as an abandon does, `HEFF_FUEL`, to the innermost `heff_try`, the
+// limit's, which says how much is left of it then (`heff_stopped`): not a
+// failure, which would end the program.  It does not resume: what the
+// frames jumped over were doing is left undone, what they made leaked,
+// as an abandon leaves it.
 
 #define HEFF_FUEL "heff:fuel"
 // (as good as endless, and a word)
@@ -24,7 +25,7 @@ HEFF_VAR(HEFF_TLS long heff_fuel_on);
 HEFF_SLOW void heff_fuel_out(void) {
   if (heff_fuel_on == 0) { heff_fuel = HEFF_FUEL_ENDLESS; return; }
   heff_fuel = 0;
-  heff_fail(HEFF_FUEL);
+  heff_stopped(HEFF_FUEL);
 }
 
 // (a tick: a decrement and a branch, the branch seldom taken)
