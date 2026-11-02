@@ -532,6 +532,9 @@ typedef struct {
                      //  to a thread of the kernel's, several times the
                      //  CPU of the read itself where the page cache has
                      //  it)
+  int sought;        // (sought in, nothing read since: the next chunk
+                     //  read as asked, not ahead -- a read here and there
+                     //  of a large file, each a buffer's otherwise)
   uint8_t *buf;      // (read ahead: what is not yet taken, from `at` to
   size_t cap, at, end;  //  `end`)
   uint64_t taken;    // (how many times something was taken from it)
@@ -683,6 +686,8 @@ typedef struct {
   uint8_t *rbuf;     //  what it reads into, `rlen` bytes, the op's own;
   size_t rlen;       //  or, a chunk's, the bytes it is to be, `rbytes`,
   V rbytes;          //  the op's until the read comes back)
+  size_t pre;        // (a chunk's: what the page cache had of it at once,
+                     //  before the ring's read of the rest)
   int64_t n;         // (a chunk's most)
   size_t scanned;    // (a line's: how far after `h->at` no newline is,
   uint64_t taken;    //  while `h->taken` is this)
@@ -746,6 +751,11 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
   if (heff_ring_took(&o->w, &res)) {
     V got = o->rbytes;
     o->rbytes = 0;
+    if (o->pre) {
+      // (what the page cache had, first: given, whatever came after)
+      res = (int32_t)o->pre + (res > 0 ? res : 0);
+      o->pre = 0;
+    }
     if (res > 0 && got && fs_buffered(o->h) == 0) {
       o->result = fs_right(heff_bytes_cut(got, res));
       return -4;
@@ -774,6 +784,18 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
   ssize_t r = -1;
   errno = EOPNOTSUPP;
   if (!o->h->blocking) do r = fs_nowait(fd, dst, n, 0); while (r < 0 && errno == EINTR);
+  // (a chunk's that the page cache had the start of: the rest the
+  // ring's, so that it is all there is, as a read waiting would give)
+  if (into && r > 0 && (size_t)r < n) {
+    o->pre = (size_t)r;
+    if (heff_ring_op(&o->w, HEFF_OP_READ, fd, dst + r, n - (size_t)r, (uint64_t)-1, 0, NULL)) {
+      o->rbytes = into;
+      errno = EINPROGRESS;
+      return -1;
+    }
+    o->pre = 0;
+    return r;
+  }
   if (r >= 0 || (errno != EAGAIN && errno != EOPNOTSUPP && errno != EINVAL)) return r;
   if (errno != EAGAIN) {
     o->h->blocking = 1;
@@ -864,17 +886,19 @@ static int fs_failed_step(FsOp *o) {
 }
 
 // A chunk: what was read ahead, or read now -- straight into bytes of
-// its own where as many as a buffer's are asked for, the kernel's read
-// into them, the ring's too, and they the chunk, not copied.
+// its own where as many as a buffer's are asked for, or it is the first
+// since a seek, the kernel's read into them, the ring's too, and they
+// the chunk, not copied.
 static int fs_chunk_step(HeffWait *w) {
   FsOp *o = (FsOp *)w;
   FsFile *h = o->h;
-  if (fs_buffered(h) == 0 && (size_t)o->n >= FS_BUF) {
+  if (fs_buffered(h) == 0 && ((size_t)o->n >= FS_BUF || h->sought)) {
     uint8_t *at;
     V mine = heff_bytes_room(o->n, &at);
     ssize_t r = fs_read_into(o, at, (size_t)o->n, mine);
     if (r == -4) {
       heff_drop(mine);
+      h->sought = 0;
       return HEFF_STEP_DONE;
     }
     if (r == -3) heff_drop(mine);
@@ -885,10 +909,21 @@ static int fs_chunk_step(HeffWait *w) {
       return fs_failed_step(o);
     } else {
       o->result = fs_right(heff_bytes_cut(mine, r));
+      h->sought = 0;
       return HEFF_STEP_DONE;
     }
   }
-  if (fs_buffered(h) == 0 && fs_fill(o) < 0) return fs_failed_step(o);
+  h->sought = 0;
+  // (a regular file's read on until there is all of it, or the end: a
+  // read not waiting gives what the page cache has, which may be less)
+  while ((fs_buffered(h) == 0 || (h->seekable && !o->eof && fs_buffered(h) < (size_t)o->n))) {
+    ssize_t r = fs_fill(o);
+    if (r < 0) return fs_failed_step(o);
+    if (r == 0) {
+      o->eof = 1;
+      break;
+    }
+  }
   size_t n = fs_buffered(h);
   if (n > (size_t)o->n) n = (size_t)o->n;
   o->result = fs_right(n ? fs_take(h, n) : heff_bytes_in("", 0));
@@ -1407,6 +1442,7 @@ static V heff_provider_filesystem(V p, V k) {
       else {
         h->at = h->end = 0;
         h->taken++;
+        h->sought = 1;
         r = fs_right(heff_int(at));
       }
     }
