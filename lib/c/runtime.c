@@ -676,17 +676,11 @@ HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
 // compile` without `--name`, each definition printed -- the abandon is
 // caught there, and said.
 //
-// The one exception is the language server's (`heff_lsp_try`): what it
-// runs a failure of is caught too, said, and the server goes on, so that
-// a fault of the compiler's ends one request, not the editor's server.
-// It is the language server's alone: no library's catch may use it.
-//
 // Jumped to by `_longjmp`, which neither saves nor restores the signal
 // mask: macOS's `setjmp` does, a call of the system each time, a third
 // of a fork's cost.  A stack that overflowed comes back by a way of its
 // own, which restores the mask.
 HEFF_VAR(HEFF_TLS jmp_buf *heff_catch);
-HEFF_VAR(HEFF_TLS jmp_buf *heff_lsp_catch);
 HEFF_VAR(HEFF_TLS const char *heff_caught);
 #ifdef _WIN32
 #define HEFF_SETJMP(b) setjmp(b)
@@ -697,7 +691,6 @@ HEFF_VAR(HEFF_TLS const char *heff_caught);
 #endif
 
 HEFF_FN void heff_fail(const char *why) {
-  if (heff_lsp_catch) { heff_caught = why; HEFF_LONGJMP(*heff_lsp_catch); }
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
   heff_exit(1);
@@ -719,9 +712,7 @@ HEFF_FN void heff_stopped(const char *why) {
 
 HEFF_FN V heff_nomatch(V s);
 
-// (`panic why`: a failure, `why` its words -- the program ended, said.
-// The words are copied, and kept: the language server's catch-all may
-// take them)
+// (`panic why`: a failure, `why` its words -- the program ended, said)
 HEFF_FN char *heff_cstr_text(V v);
 HEFF_FN V heff_panic(V s) {
   char *why = heff_cstr_text(s);
@@ -2239,8 +2230,7 @@ static inline int heff_exact(V f, int n, V *a) {
 // wait.  (Definitions are in order, none using one after it: a thread
 // computing one waits only for one before it, never for one waiting for
 // it.)  An abandon caught (`heff_try`) where values were being computed
-// -- or a failure, by the language server's catch-all -- leaves them to
-// be computed again.
+// leaves them to be computed again.
 #ifdef HEFF_THREADS
 #define HEFF_ONCE uintptr_t
 #define HEFF_DONE(st) HEFF_LIKELY(__atomic_load_n(&(st), __ATOMIC_ACQUIRE) == 2)
@@ -5378,12 +5368,9 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
 // handler's stack (macOS's `_longjmp` out of a handler would leave the
 // system thinking it still on it, and the next fault unhandled).  There
 // it fails as `heff_fail` does: the program says `heff: stack overflow`
-// and exits with 2.  Only the language server's catch-all takes it,
-// why "stack overflow", what the frames jumped over were doing left
-// undone: what they made leaked, a definition they were computing
-// computed again.  But a fault in code not the program's -- the
-// system's `malloc`, a lock's -- may leave what that code holds held
-// for good: the program ends there, caught or not.
+// and exits with 2.  Where the fault was in code not the program's --
+// the system's `malloc`, a lock's -- what that code holds may be held
+// for good, so stdout is not flushed first.
 //
 // Not on Windows, nor where a sanitizer handles faults itself; and said,
 // never caught, but on x86-64 and arm64.
@@ -5460,10 +5447,6 @@ HEFF_VAR(HEFF_TLS int heff_overflow_lost);
 // (where the thread goes on after its stack overflowed: failed, as
 // `heff_fail` fails, or the program ended)
 HEFF_FN __attribute__((noreturn)) void heff_overflowed(void) {
-  if (heff_lsp_catch && !heff_overflow_lost) {
-    heff_caught = HEFF_OVERFLOW;
-    HEFF_LONGJMP(*heff_lsp_catch);
-  }
   static const char said[] = "heff: " HEFF_OVERFLOW "\n";
   if (!heff_overflow_lost) fflush(stdout);
   if (write(2, said, sizeof said - 1) < 0) _exit(HEFF_OVERFLOW_STATUS);
@@ -5576,31 +5559,6 @@ HEFF_FN const char *heff_try(V f, V x, V *out) {
     return NULL;
   }
   heff_catch = up;
-  heff_dep = dep;
-  heff_reopen(open);
-  return heff_caught;
-}
-
-// (the language server's catch-all: `f x`, as `heff_try`, every failure
-// caught besides -- a panic, the runtime's, a stack that overflowed --
-// why it failed handed back.  The language server's alone, so that a
-// fault of the compiler's ends a request, not the server: no library's
-// catch may use it, a failure anywhere else ending the program)
-HEFF_FN const char *heff_lsp_try(V f, V x, V *out) {
-  jmp_buf here;
-  jmp_buf *volatile up = heff_catch;
-  jmp_buf *volatile lsp_up = heff_lsp_catch;
-  volatile long dep = heff_dep;
-  volatile size_t open = heff_nopen;
-  heff_catch = heff_lsp_catch = &here;
-  if (HEFF_SETJMP(here) == 0) {
-    *out = heff_tr(heff_app1(f, x));
-    heff_catch = up;
-    heff_lsp_catch = lsp_up;
-    return NULL;
-  }
-  heff_catch = up;
-  heff_lsp_catch = lsp_up;
   heff_dep = dep;
   heff_reopen(open);
   return heff_caught;
