@@ -17,17 +17,27 @@
 // is, never made non-blocking (a standard stream's flags are its
 // parent's too): a read is done once poll says there is something to
 // read, and a write of no more than PIPE_BUF bytes once it says there
-// is room.  A regular file is always ready, as poll sees it, and is read
-// and written there and then, the whole program waiting for the disk --
-// but where the reactor has a ring that does it (`heff_ring_can`): there
-// a read or a write is tried first not waiting (RWF_NOWAIT: what the
-// page cache has, at once), and what would wait for the disk is the
-// ring's, the op pending meanwhile, into memory of the op's own; one of
-// a file whose system cannot try it so is done there and then.
+// is room.  A regular file is always ready, as poll sees it: outside a
+// scheduler it is read and written there and then, the whole program
+// waiting for the disk.  Where one runs, a read or a write is tried first
+// not waiting (RWF_NOWAIT: what the page cache has, at once), and what
+// would wait for the disk is done later, the op pending meanwhile, into
+// memory of the op's own: by the ring, where the reactor has one that
+// does it (`heff_ring_can`), else by a thread of the runtime's (a job,
+// `heff_job`), on a descriptor of its own.  Of a file whose system cannot
+// try it so -- macOS's every file -- a write is done there and then, the
+// page cache taking it; a read is done there and then where the page
+// cache has it all, as the file's pages there say (`mincore`, of a
+// mapping of the file), else the ring's or a thread's.  Asking costs as
+// much as a small read that it has: after eight reads in a row it had,
+// the file's next are done unasked, timed, until one waits off the CPU
+// longer than the page cache would.  A thread's round trip is several small reads'
+// time, so what the page cache has is never handed to one.
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +52,11 @@
 #define heff_is_sep(c) ((c) == '/' || (c) == '\\')
 #else
 #include <limits.h>
+#include <sys/mman.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/resource.h>
+#endif
 #define heff_mkdir(p) mkdir(p, 0777)
 #define heff_is_sep(c) ((c) == '/')
 #endif
@@ -514,6 +529,9 @@ static int fs_int(V v, int64_t *n) {
 // (how much is read ahead at a time; a chunk's most)
 #define FS_BUF ((size_t)65536)
 #define FS_READ_MAX ((int64_t)16 << 20)
+#define FS_SURE 8
+#define FS_RUN_MOST 64
+#define FS_CPU_TIMED ((size_t)256 << 10)
 
 typedef struct {
   uint32_t magic;
@@ -527,11 +545,22 @@ typedef struct {
   int seekable;      // (a regular file: what was read ahead is given back
                      //  before a write)
   int blocking;      // (a regular file whose system cannot try its reads
-                     //  and writes not waiting: read and written there
-                     //  and then, as before -- the ring would give each
-                     //  to a thread of the kernel's, several times the
-                     //  CPU of the read itself where the page cache has
-                     //  it)
+                     //  and writes not waiting: written there and then,
+                     //  and read so but by a thread's where a scheduler
+                     //  runs and the page cache has not all of a read,
+                     //  as it is asked -- the ring would give each to a
+                     //  thread of the kernel's, several times the CPU of
+                     //  the read itself where the page cache has it)
+  uint8_t *map;      // (such a file mapped, `mapped` bytes, where the
+  size_t mapped;     //  page cache is asked what it has of it, or none;
+  int unmappable;    //  or it cannot be; how many reads in a row it had
+  int sure;          //  all of -- from `FS_SURE` on, the next done unasked
+  int slow;          //  -- and, after one done here waited for the disk,
+  int run, after;    //  how many more are a thread's, unasked: one, or,
+                     //  where the first after them waited too, twice as
+                     //  many as before, `FS_RUN_MOST` at most; and the
+  uint64_t disk;     //  process's bytes read from the disk, 1 more, when
+                     //  it last asked, where the system says, or 0)
   int sought;        // (sought in, nothing read since: the next chunk
                      //  read as asked, not ahead -- a read here and there
                      //  of a large file, each a buffer's otherwise)
@@ -549,8 +578,18 @@ typedef struct {
 // that what one `with` read ahead is the next one's too)
 static FsFile *fs_standard[3];
 
+// (the file's mapping, where it has one, let go of)
+static void fs_unmap(FsFile *h) {
+#ifndef _WIN32
+  if (h->map) munmap(h->map, h->mapped);
+#endif
+  h->map = NULL;
+  h->mapped = 0;
+}
+
 static void fs_unref(FsFile *h) {
   if (--h->refs > 0) return;
+  fs_unmap(h);
   free(h->buf);
   free(h->path);
   h->magic = 0;
@@ -565,6 +604,7 @@ static void fs_let_go(void *x) {
     close(h->fd);
     h->fd = -1;
   }
+  fs_unmap(h);
   fs_unref(h);
 }
 
@@ -682,7 +722,9 @@ typedef struct {
                      //  reactor until it is ready: a scheduler runs, and
                      //  the file is pollable)
   int eof;           // (a read came to the end)
-  int ringed;        // (a regular file's, where the ring reads and writes:
+  int later;         // (a regular file's, where what would wait for the
+  int pooled;        //  disk is done later -- by the ring, or, `pooled`,
+                     //  a thread's job (`job`) -- the op pending meanwhile:
   uint8_t *rbuf;     //  what it reads into, `rlen` bytes, the op's own;
   size_t rlen;       //  or, a chunk's, the bytes it is to be, `rbytes`,
   V rbytes;          //  the op's until the read comes back)
@@ -697,6 +739,12 @@ typedef struct {
                      //  write's bytes)
   char *owned;       // (or a copy of them, a string's)
   V result;          // (its answer, once it is done and did not fail)
+  HeffJob job;       // (a thread's read or write, `jn` bytes at `jat`,
+  int jfd, jwrite;   //  of a descriptor of its own, the file's again, so
+  void *jat;         //  that the file closed meanwhile is as the ring
+  size_t jn;         //  has it; its result, as the ring's, once come back,
+  int32_t jres;      //  `jgot`)
+  int jgot;
 } FsOp;
 
 static FsOp *fs_op(int what, FsFile *h) {
@@ -709,7 +757,9 @@ static FsOp *fs_op(int what, FsFile *h) {
   o->w.events = POLLIN;
 #ifndef _WIN32
   o->async = heff_group != 0 && h->pollable;
-  o->ringed = h->seekable && heff_ring_can(what == FS_WRITE ? HEFF_OP_WRITE : HEFF_OP_READ);
+  o->later = h->seekable && heff_ring_can(what == FS_WRITE ? HEFF_OP_WRITE : HEFF_OP_READ);
+  o->pooled = !o->later && h->seekable && heff_group != 0;
+  o->later |= o->pooled;
 #endif
   o->taken = h->taken;
   return o;
@@ -725,30 +775,200 @@ static void fs_op_free(FsOp *o) {
   free(o);
 }
 
-#ifdef HEFF_URING
 // (a regular file's read or write at its position, not waiting for the
-// disk: as preadv2's and pwritev2's, EAGAIN where it would)
+// disk: as preadv2's and pwritev2's, EAGAIN where it would; EOPNOTSUPP
+// where the system has no such call)
 static ssize_t fs_nowait(int fd, const uint8_t *data, size_t n, int writing) {
+#if defined(HEFF_URING) && defined(RWF_NOWAIT)
   struct iovec v = { (void *)data, n };
   return syscall(writing ? SYS_pwritev2 : SYS_preadv2, fd, &v, 1, -1L, 0L, RWF_NOWAIT);
+#else
+  (void)fd; (void)data; (void)n; (void)writing;
+  errno = EOPNOTSUPP;
+  return -1;
+#endif
 }
+
+#ifndef _WIN32
+static FsOp *fs_job_op(HeffJob *j) { return (FsOp *)((char *)j - offsetof(FsOp, job)); }
+
+// (the op's read or write, on a thread of the runtime's, of its own
+// descriptor, closed after)
+static void fs_job_run(HeffJob *j) {
+  FsOp *o = fs_job_op(j);
+  ssize_t r;
+  do r = o->jwrite ? write(o->jfd, o->jat, o->jn) : read(o->jfd, o->jat, o->jn); while (r < 0 && errno == EINTR);
+  o->jres = r < 0 ? -errno : (int32_t)r;
+  o->jgot = 1;
+  close(o->jfd);
+}
+
+static void fs_job_let_go(HeffJob *j) { fs_op_free(fs_job_op(j)); }
 #endif
 
-// (a ring's read of a regular file, where the op is one: what it read,
-// into `dst`, `n` bytes at most; or, the page cache not having it, the
-// ring's read begun, -1 with EINPROGRESS; or -1 with errno.  The ring's
-// read come back is put after what the file read ahead, -3, the step
-// taking from there: it was begun for a step that may be another by
-// then.  -2 where the op is not one, read as before.  `into`, where it
-// is not 0, is the bytes `dst` is in, a chunk's own: the ring reads into
-// them, the op's then, and, come back with nothing read ahead
-// meanwhile, they are the chunk -- the op's answer, -4 -- not copied)
-static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
-#ifdef HEFF_URING
-  if (!o->ringed) return -2;
+// (the op's read or write of `n` bytes at `at`, of `fd` at its position,
+// begun later -- the ring's, or a thread's -- the op waiting for it:
+// whether it was)
+static int fs_later(FsOp *o, int writing, int fd, void *at, size_t n) {
+  if (!o->pooled)
+    return heff_ring_op(&o->w, writing ? HEFF_OP_WRITE : HEFF_OP_READ, fd, at, n, (uint64_t)-1, 0, NULL);
+#ifndef _WIN32
+  int d = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+  if (d < 0) return 0;
+  o->jfd = d;
+  o->jwrite = writing;
+  o->jat = at;
+  o->jn = n < ((size_t)1 << 30) ? n : (size_t)1 << 30;
+  o->job.run = fs_job_run;
+  o->job.let_go = fs_job_let_go;
+  if (heff_job(&o->w, &o->job)) return 1;
+  close(d);
+#endif
+  return 0;
+}
+
+// (whether the op's read or write begun later has come back, not yet
+// looked at: its result at `*res`, as the system call's, or -errno, once)
+static int fs_took(FsOp *o, int32_t *res) {
+  if (!o->jgot) return heff_ring_took(&o->w, res);
+  o->jgot = 0;
+  *res = o->jres;
+  return 1;
+}
+
+#ifndef _WIN32
+// (now, in nanoseconds of the clock `c`)
+static int64_t fs_now_ns(clockid_t c) {
+  struct timespec t;
+  clock_gettime(c, &t);
+  return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+// (whether a read of `n` bytes waited for the disk, `ns` of its time --
+// of a large one's, the time not the thread's CPU's: `FS_CPU_TIMED` on --
+// longer than the page cache gives them, 50 us and 8 GB a second.  A
+// large read many threads make of the page cache at once is long by the
+// CPU's time -- one of a MiB, by 16 threads on 14 cores, 8% of them
+// over, 0.7% by the rest -- and the disk's wait is all the rest; a small
+// one's is not, and asking the CPU's time costs a tenth of it)
+static int fs_waited(size_t n, int64_t ns) { return ns > 50000 + (int64_t)(n / 8); }
+#endif
+
+// (whether the `n` bytes at the file's position are in the page cache,
+// as its pages there, the first and the last, say -- seen through a
+// mapping of the file of its own, made as first asked, and again as the
+// file grows: 1, 0, or -1 where it cannot be said)
+static int fs_cached(FsFile *h, size_t n) {
+#ifndef _WIN32
+  static size_t page;
+  if (!page) page = (size_t)sysconf(_SC_PAGESIZE);
+  if (h->unmappable || !n) return -1;
+  off_t at = lseek(h->fd, 0, SEEK_CUR);
+  if (at < 0) return -1;
+  uint64_t end = (uint64_t)at + n;
+  if (end > h->mapped) {
+    struct stat st;
+    if (fstat(h->fd, &st) != 0) return -1;
+    if ((uint64_t)st.st_size <= (uint64_t)at) return 1;
+    if (h->map) munmap(h->map, h->mapped);
+    h->map = NULL;
+    h->mapped = 0;
+    void *m = (uint64_t)st.st_size > SIZE_MAX / 2 ? MAP_FAILED
+                                                   : mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, h->fd, 0);
+    if (m == MAP_FAILED) {
+      h->unmappable = 1;
+      return -1;
+    }
+    h->map = m;
+    h->mapped = (size_t)st.st_size;
+    if (end > h->mapped) end = h->mapped;
+  }
+  size_t first = (size_t)at / page * page, last = (size_t)(end - 1) / page * page;
+  unsigned char v = 0;
+  if (mincore(h->map + first, 1, (void *)&v) != 0) return -1;
+  if (!(v & 1)) return 0;
+  if (last != first && (mincore(h->map + last, 1, (void *)&v) != 0 || !(v & 1))) return 0;
+  return 1;
+#else
+  (void)h;
+  (void)n;
+  return -1;
+#endif
+}
+
+// (whether the process has read from the disk since the file last asked,
+// where the system says: a read long off the CPU with none was a thread
+// put off its core, more of them running than there are cores -- 0.4% of
+// the reads of a MiB from the page cache by 16 threads on 14 cores,
+// each such read's act handed to a thread then waiting behind the
+// others in place on its worker, 15% longer for all of them)
+static int fs_disk_read(FsFile *h) {
+#ifdef __APPLE__
+  struct rusage_info_v4 u;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&u) != 0) return 1;
+  uint64_t was = h->disk;
+  h->disk = u.ri_diskio_bytesread + 1;
+  return h->disk > was;
+#else
+  (void)h;
+  return 1;
+#endif
+}
+
+// (of a file whose system cannot try a read not waiting, where the op's
+// may be a thread's: whether the read of `n` bytes into `dst` is done
+// here, what it read at `*r` -- the page cache has it all, or asking is
+// put off, or cannot be done -- or a thread's.  One done here is timed,
+// and, having waited for the disk, has the file's next a thread's,
+// unasked, a run of them, longer as they wait again: pages the system is
+// reading ahead are had, as it says, and waited for; and a thread put off
+// its core waits as long, now and then, where more run than there are
+// cores)
+static int fs_here(FsFile *h, uint8_t *dst, size_t n, ssize_t *r) {
+#ifndef _WIN32
+  if (!h->disk) fs_disk_read(h);
+  if (h->slow) {
+    h->slow--;
+    h->after = 1;
+    return 0;
+  }
+  int cached = h->sure >= FS_SURE ? 1 : fs_cached(h, n);
+  if (!cached) {
+    h->sure = 0;
+    return 0;
+  }
+  int timed = n >= FS_CPU_TIMED;
+  int64_t t = fs_now_ns(CLOCK_MONOTONIC), cpu = timed ? fs_now_ns(CLOCK_THREAD_CPUTIME_ID) : 0;
+  do *r = read(h->fd, dst, n); while (*r < 0 && errno == EINTR);
+  int64_t off = fs_now_ns(CLOCK_MONOTONIC) - t - (timed ? fs_now_ns(CLOCK_THREAD_CPUTIME_ID) - cpu : 0);
+  if (*r > 0 && fs_waited((size_t)*r, off) && fs_disk_read(h)) {
+    h->run = h->after && h->run < FS_RUN_MOST ? h->run * 2 : 1;
+    h->slow = h->run;
+    h->sure = 0;
+  } else if (cached > 0 && h->sure < FS_SURE) h->sure++;
+  h->after = 0;
+  return 1;
+#else
+  (void)h; (void)dst; (void)n; (void)r;
+  return 0;
+#endif
+}
+
+// (a read of a regular file begun later where it would wait, where the
+// op is one: what it read, into `dst`, `n` bytes at most; or, the page
+// cache not having it, the read begun, the ring's or a thread's, -1 with
+// EINPROGRESS; or -1 with errno.  The read come back is put after what
+// the file read ahead, -3, the step taking from there: it was begun for
+// a step that may be another by then.  -2 where the op is not one, read
+// as before.  `into`, where it is not 0, is the bytes `dst` is in, a
+// chunk's own: the read is into them, the op's then, and, come back with
+// nothing read ahead meanwhile, they are the chunk -- the op's answer,
+// -4 -- not copied)
+static ssize_t fs_later_read(FsOp *o, uint8_t *dst, size_t n, V into) {
+  if (!o->later) return -2;
   int fd = o->h->fd;
   int32_t res;
-  if (heff_ring_took(&o->w, &res)) {
+  if (fs_took(o, &res)) {
     V got = o->rbytes;
     o->rbytes = 0;
     if (o->pre) {
@@ -784,11 +1004,11 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
   ssize_t r = -1;
   errno = EOPNOTSUPP;
   if (!o->h->blocking) do r = fs_nowait(fd, dst, n, 0); while (r < 0 && errno == EINTR);
-  // (a chunk's that the page cache had the start of: the rest the
-  // ring's, so that it is all there is, as a read waiting would give)
+  // (a chunk's that the page cache had the start of: the rest read
+  // later, so that it is all there is, as a read waiting would give)
   if (into && r > 0 && (size_t)r < n) {
     o->pre = (size_t)r;
-    if (heff_ring_op(&o->w, HEFF_OP_READ, fd, dst + r, n - (size_t)r, (uint64_t)-1, 0, NULL)) {
+    if (fs_later(o, 0, fd, dst + r, n - (size_t)r)) {
       o->rbytes = into;
       errno = EINPROGRESS;
       return -1;
@@ -798,9 +1018,14 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
   }
   if (r >= 0 || (errno != EAGAIN && errno != EOPNOTSUPP && errno != EINVAL)) return r;
   if (errno != EAGAIN) {
+    // (a file whose system cannot try it so: read here, unless the op's
+    // is a thread's and the page cache has not all of it)
     o->h->blocking = 1;
-    o->ringed = 0;
-    return -2;
+    if (!o->pooled) {
+      o->later = 0;
+      return -2;
+    }
+    if (fs_here(o->h, dst, n, &r)) return r;
   }
   uint8_t *to = dst;
   if (!into) {
@@ -811,15 +1036,12 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
     }
     to = o->rbuf;
   }
-  if (heff_ring_op(&o->w, HEFF_OP_READ, fd, to, n, (uint64_t)-1, 0, NULL)) {
+  if (fs_later(o, 0, fd, to, n)) {
     o->rbytes = into;
     errno = EINPROGRESS;
     return -1;
   }
-  o->ringed = 0;
-#else
-  (void)o; (void)dst; (void)n; (void)into;
-#endif
+  o->later = 0;
   return -2;
 }
 
@@ -827,8 +1049,8 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
 // errno -- EAGAIN, for an async op, where it is not ready)
 static ssize_t fs_read_into(FsOp *o, uint8_t *dst, size_t n, V into) {
   int fd = o->h->fd;
-  ssize_t ringed = fs_ring_read(o, dst, n, into);
-  if (ringed != -2) return ringed;
+  ssize_t later = fs_later_read(o, dst, n, into);
+  if (later != -2) return later;
   for (;;) {
     if (o->async) {
       int r = fs_ready(fd, POLLIN);
@@ -978,21 +1200,23 @@ static int fs_line_step(HeffWait *w) {
 static int fs_write_step(HeffWait *w) {
   FsOp *o = (FsOp *)w;
   int fd = o->h->fd;
-#ifdef HEFF_URING
-  // (a regular file's, where the ring writes: what the page cache takes
-  // at once, the rest the ring's, the op's bytes held meanwhile)
+  // (a regular file's, where what would wait is written later: what the
+  // page cache takes at once, the rest the ring's or a thread's, the op's
+  // bytes held meanwhile)
   int32_t res;
-  if (heff_ring_took(w, &res)) {
+  if (fs_took(o, &res)) {
     if (res < 0 && res != -EAGAIN && res != -EINTR) {
       o->err = -res;
       return HEFF_STEP_DONE;
     }
     if (res > 0) o->done += res;
   }
-  while (o->ringed && o->done < o->len) {
+  while (o->later && o->done < o->len) {
     ssize_t r = -1;
+    size_t n = (size_t)(o->len - o->done);
+    uint8_t *at = (uint8_t *)o->data + o->done;
     errno = EOPNOTSUPP;
-    if (!o->h->blocking) r = fs_nowait(fd, o->data + o->done, (size_t)(o->len - o->done), 1);
+    if (!o->h->blocking) r = fs_nowait(fd, at, n, 1);
     if (r >= 0) {
       o->done += r;
       continue;
@@ -1003,14 +1227,14 @@ static int fs_write_step(HeffWait *w) {
       return HEFF_STEP_DONE;
     }
     if (errno != EAGAIN) {
+      // (a file whose system cannot try it so: written here, the page
+      // cache taking it)
       o->h->blocking = 1;
       break;
     }
-    if (heff_ring_op(w, HEFF_OP_WRITE, fd, o->data + o->done, (uint64_t)(o->len - o->done), (uint64_t)-1, 0, NULL))
-      return HEFF_STEP_WAIT;
-    o->ringed = 0;
+    if (fs_later(o, 1, fd, at, n)) return HEFF_STEP_WAIT;
+    o->later = 0;
   }
-#endif
   while (o->done < o->len) {
     size_t n = (size_t)(o->len - o->done);
 #ifndef _WIN32
@@ -1061,11 +1285,16 @@ static V fs_answer(HeffWait *w) {
     r = o->result;
     o->result = 0;
   }
-  fs_op_free(o);
+  if (heff_job_give_up(&o->job)) fs_op_free(o);
   return r;
 }
 
-static void fs_cancel(HeffWait *w) { fs_op_free((FsOp *)w); }
+// (an op let go of undone: once a thread's read or write of it has come
+// back, where one is running)
+static void fs_cancel(HeffWait *w) {
+  FsOp *o = (FsOp *)w;
+  if (heff_job_give_up(&o->job)) fs_op_free(o);
+}
 
 // (the op, its first step taken: done, its answer given to `k`; or
 // waited for by the reactor -- `heff_outside`)
@@ -1276,6 +1505,7 @@ static int fs_close(FsFile *h) {
     if (close(h->fd) != 0 && errno != EINTR) err = errno;
     h->fd = -1;
   }
+  fs_unmap(h);
   return err;
 }
 

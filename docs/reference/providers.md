@@ -335,11 +335,39 @@ goes to `k` when it is done.
   a child process, is a `HeffSource` (`heff_reactor_source`).
 - A provider that closes a descriptor others may wait on calls
   `heff_reactor_closing(fd)` first.
-- What has no descriptor, such as a name lookup, runs in a system thread
-  that writes to a socket pair when done.
+- A call that blocks with no descriptor to poll, such as a regular
+  file's read where no ring does it, or a client library with no
+  non-blocking call, is a job (`HeffJob`), run on a thread of the
+  runtime's while the worker goes on. Set its `run` (the call) and
+  `let_go`, keep it in the provider's struct, and from a step call
+  `heff_job(w, &job)` and return `HEFF_STEP_WAIT`, in place of a
+  descriptor to wait for. The wait is stepped again once `run` has
+  returned. `heff_job` returns 0 outside a group, or where no thread
+  can be made: then make the call there and then.
+  - `run` touches nothing of heff's: no value of the program's, no
+    reactor, nothing of the worker's thread. It reads and writes only
+    memory the wait holds for it, and leaves its result there for the
+    next step.
+  - In `cancel`, and in `answer` where the wait can end another way (a
+    deadline), call `heff_job_give_up(&job)`. It returns 1 where the job
+    is not running (not begun, or come back): free the operation then.
+    It returns 0 where the job still runs: the runtime calls `let_go`
+    on the worker's own thread once it returns, so `let_go` frees the
+    operation, values and all.
+  - There are at most 64 such threads, made as jobs come and kept after;
+    jobs beyond them wait in a queue, the first come the first begun. A
+    worker's last group closed waits for its jobs given up to come back,
+    as it waits for the ring's operations.
+  - A job costs a thread's round trip, about 9 µs on macOS, against
+    1 µs for a small read from the page cache. Hand off what would wait,
+    not what would not: std.filesystem asks first whether the page cache
+    has what it reads.
+- A name lookup runs in a system thread of its own that writes to a
+  socket pair when done.
 
-See `lib/c/runtime.c`, "Outside operations done later", and
-`lib/std/net.provider.c` for an example.
+See the runtime's reactor ("Outside operations done later", "Calls that
+block, on threads of the runtime's") and std.net's provider for an
+example.
 
 ## The program's end
 
