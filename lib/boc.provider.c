@@ -10,7 +10,9 @@
 // it): a request at each of its cowns, in the order of their addresses,
 // queued by swapping each in as the last, the one before it -- once
 // that one's behaviour is done queueing at all of its own -- told it is
-// next.  It runs once it is first at every one: a count of the cowns it
+// next.  A behaviour on one cown is done queueing as it is swapped in,
+// so its request says so from the start, and the one behind it never
+// waits.  It runs once it is first at every one: a count of the cowns it
 // still waits at, and one more until its queueing is done.  Done, it
 // lets the next through at each, or, where none is behind it, takes its
 // request out as the last by a compare-and-swap -- or, one coming
@@ -439,7 +441,7 @@ static void bc_enqueue(BcBehaviour *b) {
   int n = b->n;
   for (int i = 0; i < n; i++) {
     atomic_init(&b->req[i].next, NULL);
-    atomic_init(&b->req[i].queued, 0);
+    atomic_init(&b->req[i].queued, n == 1);
   }
   atomic_init(&b->waits, n + 1);
   for (int i = 0; i < n; i++) {
