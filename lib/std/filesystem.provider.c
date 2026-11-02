@@ -680,8 +680,9 @@ typedef struct {
                      //  the file is pollable)
   int eof;           // (a read came to the end)
   int ringed;        // (a regular file's, where the ring reads and writes:
-  uint8_t *rbuf;     //  what it reads into, `rlen` bytes, the op's own)
-  size_t rlen;
+  uint8_t *rbuf;     //  what it reads into, `rlen` bytes, the op's own;
+  size_t rlen;       //  or, a chunk's, the bytes it is to be, `rbytes`,
+  V rbytes;          //  the op's until the read comes back)
   int64_t n;         // (a chunk's most)
   size_t scanned;    // (a line's: how far after `h->at` no newline is,
   uint64_t taken;    //  while `h->taken` is this)
@@ -714,6 +715,7 @@ static void fs_op_free(FsOp *o) {
   if (o->held) heff_drop(o->held);
   free(o->owned);
   free(o->rbuf);
+  if (o->rbytes) heff_drop(o->rbytes);
   fs_unref(o->h);
   free(o);
 }
@@ -732,25 +734,42 @@ static ssize_t fs_nowait(int fd, const uint8_t *data, size_t n, int writing) {
 // ring's read begun, -1 with EINPROGRESS; or -1 with errno.  The ring's
 // read come back is put after what the file read ahead, -3, the step
 // taking from there: it was begun for a step that may be another by
-// then.  -2 where the op is not one, read as before)
-static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n) {
+// then.  -2 where the op is not one, read as before.  `into`, where it
+// is not 0, is the bytes `dst` is in, a chunk's own: the ring reads into
+// them, the op's then, and, come back with nothing read ahead
+// meanwhile, they are the chunk -- the op's answer, -4 -- not copied)
+static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
 #ifdef HEFF_URING
   if (!o->ringed) return -2;
   int fd = o->h->fd;
   int32_t res;
   if (heff_ring_took(&o->w, &res)) {
-    if (res == 0) return 0;
+    V got = o->rbytes;
+    o->rbytes = 0;
+    if (res > 0 && got && fs_buffered(o->h) == 0) {
+      o->result = fs_right(heff_bytes_cut(got, res));
+      return -4;
+    }
     if (res > 0) {
       FsFile *h = o->h;
+      int64_t len;
+      const uint8_t *from = got ? heff_bytes_data(got, &len) : o->rbuf;
       fs_room(h, (size_t)res);
-      memcpy(h->buf + h->end, o->rbuf, (size_t)res);
+      memcpy(h->buf + h->end, from, (size_t)res);
       h->end += (size_t)res;
+      if (got) heff_drop(got);
       return -3;
     }
+    if (got) heff_drop(got);
+    if (res == 0) return 0;
     if (res != -EAGAIN && res != -EINTR) {
       errno = -res;
       return -1;
     }
+  } else if (o->rbytes) {
+    // (stepped as its read is the kernel's still)
+    errno = EINPROGRESS;
+    return -1;
   }
   ssize_t r = -1;
   errno = EOPNOTSUPP;
@@ -761,27 +780,32 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n) {
     o->ringed = 0;
     return -2;
   }
-  if (o->rlen < n) {
-    free(o->rbuf);
-    o->rbuf = heff_alloc(n);
-    o->rlen = n;
+  uint8_t *to = dst;
+  if (!into) {
+    if (o->rlen < n) {
+      free(o->rbuf);
+      o->rbuf = heff_alloc(n);
+      o->rlen = n;
+    }
+    to = o->rbuf;
   }
-  if (heff_ring_op(&o->w, HEFF_OP_READ, fd, o->rbuf, n, (uint64_t)-1, 0, NULL)) {
+  if (heff_ring_op(&o->w, HEFF_OP_READ, fd, to, n, (uint64_t)-1, 0, NULL)) {
+    o->rbytes = into;
     errno = EINPROGRESS;
     return -1;
   }
   o->ringed = 0;
 #else
-  (void)o; (void)dst; (void)n;
+  (void)o; (void)dst; (void)n; (void)into;
 #endif
   return -2;
 }
 
 // (up to `n` bytes read into `dst`: how many, 0 at the end, or -1 with
 // errno -- EAGAIN, for an async op, where it is not ready)
-static ssize_t fs_read_into(FsOp *o, uint8_t *dst, size_t n) {
+static ssize_t fs_read_into(FsOp *o, uint8_t *dst, size_t n, V into) {
   int fd = o->h->fd;
-  ssize_t ringed = fs_ring_read(o, dst, n);
+  ssize_t ringed = fs_ring_read(o, dst, n, into);
   if (ringed != -2) return ringed;
   for (;;) {
     if (o->async) {
@@ -814,7 +838,7 @@ static ssize_t fs_fill(FsOp *o) {
   FsFile *h = o->h;
   fs_room(h, FS_BUF);
   size_t had = h->end;
-  ssize_t r = fs_read_into(o, h->buf + h->end, h->cap - h->end);
+  ssize_t r = fs_read_into(o, h->buf + h->end, h->cap - h->end, 0);
   if (r == -3) return (ssize_t)(h->end - had);
   if (r > 0) h->end += (size_t)r;
   return r;
@@ -840,22 +864,27 @@ static int fs_failed_step(FsOp *o) {
 }
 
 // A chunk: what was read ahead, or read now -- straight into bytes of
-// its own where as many as a buffer's are asked for.
+// its own where as many as a buffer's are asked for, the kernel's read
+// into them, the ring's too, and they the chunk, not copied.
 static int fs_chunk_step(HeffWait *w) {
   FsOp *o = (FsOp *)w;
   FsFile *h = o->h;
   if (fs_buffered(h) == 0 && (size_t)o->n >= FS_BUF) {
-    uint8_t *mine = heff_alloc((size_t)o->n);
-    ssize_t r = fs_read_into(o, mine, (size_t)o->n);
-    if (r == -3) free(mine);
+    uint8_t *at;
+    V mine = heff_bytes_room(o->n, &at);
+    ssize_t r = fs_read_into(o, at, (size_t)o->n, mine);
+    if (r == -4) {
+      heff_drop(mine);
+      return HEFF_STEP_DONE;
+    }
+    if (r == -3) heff_drop(mine);
     else if (r < 0) {
       int e = errno;
-      free(mine);
+      if (o->rbytes != mine) heff_drop(mine);
       errno = e;
       return fs_failed_step(o);
     } else {
-      o->result = fs_right(heff_bytes_in(mine, (int64_t)r));
-      free(mine);
+      o->result = fs_right(heff_bytes_cut(mine, r));
       return HEFF_STEP_DONE;
     }
   }
