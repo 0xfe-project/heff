@@ -4,7 +4,8 @@
 // A command `Start`ed runs beside it, the host's own thing -- a foreign
 // value, a `Started`, held by a `with` -- until it is waited for or
 // its `with` ends (`Release`: ended, if it has not, and waited for);
-// those not ended at the program's end are terminated then (atexit),
+// those not ended at the program's end are terminated then (`atexit`,
+// `at_quick_exit` at a failure),
 // and asked to end where a signal ends it.  A wait on one started in a
 // group of std.reactor's is pending while the other threads go on: this
 // provider is a source of the reactor's.
@@ -1140,6 +1141,7 @@ static V heff_start(V inv) {
   if (!registered) {
     registered = 1;
     atexit(heff_subs_atexit);
+    at_quick_exit(heff_subs_atexit);
 #ifndef _WIN32
     heff_subs_watch();
 #endif

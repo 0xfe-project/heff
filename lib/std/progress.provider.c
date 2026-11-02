@@ -267,7 +267,11 @@ static void heff_st_show(V l) {
   if (n == 0) heff_st_clear();
   else if (!heff_st_going) {
     static int registered = 0;
-    if (!registered) { registered = 1; atexit(heff_st_atexit); }
+    if (!registered) {
+      registered = 1;
+      atexit(heff_st_atexit);
+      at_quick_exit(heff_st_atexit);
+    }
     heff_lines = heff_st_hold;
     heff_st_going = 1;
     heff_st_since = heff_st_now();

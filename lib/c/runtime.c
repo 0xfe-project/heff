@@ -557,8 +557,8 @@ static inline int heff_unique(V v) { return heff_alone(OBJ(v)); }
 // whether the caller is on it.
 //
 // The program's end while a job runs there (`heff_end`: its thread
-// returning, or a failure or `exit n` on any thread -- not a stack's
-// overflow, which ends it at once): with no `stop`, the ending thread
+// returning, or `exit n` on any thread -- not a failure, which ends it
+// at once): with no `stop`, the ending thread
 // ends the process itself, its output flushed -- the first thread need
 // not come back; with `stop`, it calls `stop(u)`, which is to make
 // `run` return, and waits, and the first thread, `run` returned, ends
@@ -569,8 +569,15 @@ static inline int heff_unique(V v) { return heff_alone(OBJ(v)); }
 // only asks, never waits.)  A job queued, not begun, when the program
 // ends is not run.
 // The program ends once: a thread ending it after another waits, and
-// the thread ending it, ending it again (an `atexit` handler's
-// failure), ends it at once, as `exit` does.
+// the thread ending it, ending it again (an `atexit` handler's `exit`),
+// ends it at once, as `exit` does.
+//
+// Its end runs the C libraries' own cleanup (`exit`: their `atexit`
+// handlers, their destructors).  So a provider whose threads of its own
+// call into a library has them done with it by then: its release waits
+// for its thread to be through, as the library's own close would.  A
+// thread still in the library as it is torn down may crash the program
+// at its very end.
 typedef struct {
   void (*run)(void *);
   void (*stop)(void *);
@@ -660,6 +667,13 @@ HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
   exit(status);
 }
 
+// (the program ended by a failure, by `status`, from any thread of it,
+// at once: its output flushed, what was put by `at_quick_exit` run)
+HEFF_FN __attribute__((noreturn)) void heff_fail_exit(int status) {
+  fflush(stdout);
+  quick_exit(status);
+}
+
 // Failures.  A failure -- a panic, or the runtime's own (out of memory,
 // applying what is not a function, a definition defined by itself, a
 // stack that overflowed) -- ends the program at once, from whichever
@@ -668,6 +682,10 @@ HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
 // what the program held -- a connection, a transaction, a file -- the
 // system closes, and whoever was at its other end sees it closed, as
 // it would not if the program went on without the part that failed.
+// It is ended by `quick_exit` (`heff_fail_exit`): what a provider must
+// put back even then -- the terminal's mode, the commands it started --
+// it puts back by `at_quick_exit`; the C libraries' own cleanup is not
+// run, since other threads may be in them still.
 //
 // What may be caught is an abandon (`heff_abandon`) and fuel run out
 // (std.fuel's limit): each jumps to the innermost catch (`heff_catch`,
@@ -693,14 +711,14 @@ HEFF_VAR(HEFF_TLS const char *heff_caught);
 HEFF_FN void heff_fail(const char *why) {
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
-  heff_exit(1);
+  heff_fail_exit(1);
 }
 
 HEFF_FN V heff_abandon(void) {
   if (heff_catch) { heff_caught = "heff:abandon"; HEFF_LONGJMP(*heff_catch); }
   fflush(stdout);
   fprintf(stderr, "heff:abandon\n");
-  heff_exit(1);
+  heff_fail_exit(1);
 }
 
 // (a computation stopped, `why` saying so -- fuel run out: caught as an
@@ -5244,7 +5262,7 @@ HEFF_VAR(void (*heff_foreign_failed)(V owner, const char *why));
 HEFF_FN void heff_root_failed(const char *why) {
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
-  heff_exit(1);
+  heff_fail_exit(1);
 }
 
 // (a foreign value let go of: taken out of its custodian's custody,
@@ -5370,7 +5388,7 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
 // it fails as `heff_fail` does: the program says `heff: stack overflow`
 // and exits with 2.  Where the fault was in code not the program's --
 // the system's `malloc`, a lock's -- what that code holds may be held
-// for good, so stdout is not flushed first.
+// for good, so it ends by `_exit`: nothing flushed, nothing put back.
 //
 // Not on Windows, nor where a sanitizer handles faults itself; and said,
 // never caught, but on x86-64 and arm64.
@@ -5449,8 +5467,8 @@ HEFF_VAR(HEFF_TLS int heff_overflow_lost);
 HEFF_FN __attribute__((noreturn)) void heff_overflowed(void) {
   static const char said[] = "heff: " HEFF_OVERFLOW "\n";
   if (!heff_overflow_lost) fflush(stdout);
-  if (write(2, said, sizeof said - 1) < 0) _exit(HEFF_OVERFLOW_STATUS);
-  _exit(HEFF_OVERFLOW_STATUS);
+  if (write(2, said, sizeof said - 1) < 0 || heff_overflow_lost) _exit(HEFF_OVERFLOW_STATUS);
+  quick_exit(HEFF_OVERFLOW_STATUS);
 }
 
 HEFF_FN void heff_on_fault(int sig, siginfo_t *si, void *ctx) {
