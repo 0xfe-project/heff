@@ -98,11 +98,14 @@ static int net_ready_fd(int fd) {
   if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
   int fd_fl = fcntl(fd, F_GETFD);
   if (fd_fl < 0 || fcntl(fd, F_SETFD, fd_fl | FD_CLOEXEC) < 0) return -1;
+  int one = 1;
 #ifdef SO_NOSIGPIPE
   // (a write to a connection closed an error, EPIPE, not a signal)
-  int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
+  // (each write sent as it is written, not held back for the peer's
+  // acknowledgement; a socket not TCP's refuses it, and is left so)
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
   return 0;
 }
 
