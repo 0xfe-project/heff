@@ -990,7 +990,9 @@ static V bc_contents(HeffOwnLog *g, V cs) {
 }
 
 // (what the body came to, `v`, taken apart as the cowns are, the `i`th
-// written back where its bit of `ws` says, from `*i`; `v` consumed)
+// written back where its bit of `ws` says, from `*i`; `v` consumed.  A
+// tuple's field may be flat -- an `Int64`'s bits, where the body built
+// it knowing the type -- so it is read boxed, `heff_tget_v`)
 static void bc_written(HeffOwnLog *g, V cs, V v, int64_t ws, int *i) {
   if (bc_is_cown(cs)) {
     if (bc_bit(ws, (*i)++)) bc_set_owned(g, BC_COWN(cs), v);
@@ -1001,7 +1003,7 @@ static void bc_written(HeffOwnLog *g, V cs, V v, int64_t ws, int *i) {
     heff_drop(v);
     return;
   }
-  V l = heff_dup(heff_field(v, 0)), r = heff_dup(heff_field(v, 1));
+  V l = heff_tget_v(v, 0), r = heff_tget_v(v, 1);
   heff_drop(v);
   bc_written(g, heff_field(cs, 0), l, ws, i);
   bc_written(g, heff_field(cs, 1), r, ws, i);
@@ -1728,7 +1730,7 @@ static V heff_provider_boc(V p, V k) {
   case TAG_Given: {
     V gv = bc_open(heff_dup(heff_field(p, 0)));
     heff_drop(p);
-    V v = heff_dup(heff_field(gv, 1));
+    V v = heff_tget_v(gv, 1);
     x = heff_dup(heff_field(gv, 2));
     heff_drop(gv);
     heff_bocGiven(NTAG(TAG_MkUnit), v);
@@ -1737,7 +1739,7 @@ static V heff_provider_boc(V p, V k) {
   case TAG_NewCown: {
     V mk = bc_open(heff_dup(heff_field(p, 0)));
     heff_drop(p);
-    V v = heff_dup(heff_field(mk, 0)), g = heff_dup(heff_field(mk, 1));
+    V v = heff_tget_v(mk, 0), g = heff_dup(heff_field(mk, 1));
     heff_drop(mk);
     x = heff_answer(g, heff_bocNew(v));
     break;
