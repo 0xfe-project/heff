@@ -7436,9 +7436,12 @@ HEFF_FN void heff_evq_ready(void) {
 }
 #endif
 
+HEFF_FN void heff_jobs_collect(void);
+HEFF_FN void heff_jobs_end(void);
+
 // (one turn: every pending wait's descriptor and every source's polled
 // -- for as long as they say, where `wait`, else not waiting -- each
-// ready stepped, and those done woken)
+// ready stepped, each whose job has come back too, and those done woken)
 HEFF_FN void heff_reactor_turn(int wait) {
   size_t n = 0;
   int ms = wait ? -1 : 0;
@@ -7518,10 +7521,13 @@ HEFF_FN void heff_reactor_turn(int wait) {
   if (q_polled && (ring || heff_polled[q].revents)) heff_evq_ready();
 #endif
   if (piped && heff_polled[wake].revents) {
+    // (a group woken, by a 0; a job come back, by a 1, which wakes none)
     char b[64];
-    while (read(heff_wake_fds[0], b, sizeof b) > 0) {}
-    heff_woken = 1;
+    ssize_t got;
+    while ((got = read(heff_wake_fds[0], b, sizeof b)) > 0)
+      if (memchr(b, 0, (size_t)got)) heff_woken = 1;
   }
+  heff_jobs_collect();
   for (HeffSource *s = heff_sources; s; s = s->next) s->ready(heff_polled + s->at, s->n);
   heff_reactor_expire();
   heff_reactor_wake();
@@ -7619,6 +7625,13 @@ HEFF_FN void heff_reactor_close(int64_t g) {
     else heff_ring_drain();
   }
 #endif
+#ifndef _WIN32
+  // (with the thread's last group, every job given up come back first)
+  int others = 0;
+  for (size_t i = 0; i < heff_ngroups; i++)
+    if (heff_groups_open[i].id != g && heff_groups_open[i].root != g) others = 1;
+  if (!others) heff_jobs_end();
+#endif
   size_t kept = 0;
   for (size_t i = 0; i < heff_nfinished; i++) {
     if (heff_finished[i].group == g) heff_drop(heff_finished[i].v);
@@ -7636,6 +7649,301 @@ HEFF_FN void heff_reactor_close(int64_t g) {
     } else i++;
   }
 }
+
+// Calls that block, on threads of the runtime's
+// ---------------------------------------------------------------------
+//
+// A call that waits with no descriptor to poll -- a read of a regular
+// file the disk has not yet given, where no ring does it; a call of a
+// library that has no other way, a database client's -- is a job
+// (`HeffJob`), done by a thread of the runtime's while the reactor's
+// thread goes on.  Where a group is being started in, a wait's step
+// hands its job to `heff_job` in place of a descriptor to wait for: the
+// job is called (`run`) on a thread of the runtime's, and once it has
+// returned, the wait is stepped again by its own reactor at its next
+// turn, as one whose descriptor is ready is -- done, or waiting again,
+// on another job maybe.  A job touches nothing of heff's -- no value of
+// the program's, no reactor, nothing of a thread's own: it reads and
+// writes what its wait holds for it, a buffer and the result it leaves
+// there.  Where no group is being started in, or no thread can be made
+// for it, `heff_job` says no, and the call is made there and then.
+//
+// The threads are `HEFF_JOB_THREADS` at most, each made as a job comes
+// and none is idle, kept after, waiting for the next, signals not
+// theirs; jobs beyond them wait their turn in the queue, the first come
+// the first begun.  A job done is put among its reactor's come back,
+// under the reactor's lock of jobs -- not the queue's, so that the
+// threads of the jobs of several reactors' wait little for each other --
+// and the reactor is woken by a byte written to its pipe as the first of
+// them comes: a 1, where a group is woken by a 0; the turn takes them
+// all.  A wait let go of undone -- its group closed, or it done
+// otherwise, its deadline passed -- gives up its job
+// (`heff_job_give_up`): one not yet begun is taken out of the queue, and
+// one come back out of its reactor's, the provider's to let go of then;
+// one running runs to its end, and is let go of (`let_go`) once it has
+// come back, by the thread that began it -- so that what it holds of
+// that thread's is let go of there.  A thread's last group closed waits
+// for those to come back first, as it waits for the ring's operations.
+// Nothing of this is made where no job is: no thread, no lock taken.
+
+#ifndef _WIN32
+#ifndef HEFF_JOB_THREADS
+#define HEFF_JOB_THREADS 64
+#endif
+#define HEFF_JOB_STACK ((size_t)1 << 20)
+
+typedef struct HeffJob HeffJob;
+typedef struct HeffJobs HeffJobs;
+struct HeffJob {
+  void (*run)(HeffJob *);        // (the call, on a thread of the runtime's)
+  void (*let_go)(HeffJob *);     // (it let go of, given up as it ran: by
+                                 //  the thread that began it, once it has
+                                 //  come back)
+  // (the runtime's)
+  HeffWait *w;
+  HeffJobs *of;                  // (its reactor's)
+  int state;                     // (0 none, 1 queued, 2 running, 3 come
+                                 //  back, 4 running given up, 5 come back
+                                 //  given up: from 1, under the queue's
+                                 //  lock, after, under its reactor's)
+  HeffJob *prev, *next;          // (in the queue, or among its reactor's)
+};
+
+// (a reactor's jobs, under its lock: those come back, not yet taken; its
+// pipe's end written to; how many given up are still running; and, read
+// without the lock, whether any has come back)
+struct HeffJobs {
+  pthread_mutex_t mu;
+  int made;
+  HeffJob *first, *last;
+  int fd;
+  int64_t gone;
+  int some;
+};
+
+#ifdef HEFF_PART
+extern pthread_once_t heff_jobs_once;
+extern pthread_mutex_t heff_jobs_mu;
+extern pthread_cond_t heff_jobs_cv;
+extern HeffJob *heff_jobs_first, *heff_jobs_last;
+extern int64_t heff_jobs_queued;
+extern int heff_jobs_threads, heff_jobs_idle;
+#else
+pthread_once_t heff_jobs_once = PTHREAD_ONCE_INIT;
+pthread_mutex_t heff_jobs_mu;
+pthread_cond_t heff_jobs_cv = PTHREAD_COND_INITIALIZER;
+HeffJob *heff_jobs_first, *heff_jobs_last;
+int64_t heff_jobs_queued;
+int heff_jobs_threads, heff_jobs_idle;
+#endif
+HEFF_VAR(HEFF_TLS HeffJobs heff_jobs_mine);
+
+// (a lock of the jobs', made: one taken by whichever comes first, not in
+// turn, where the system has such -- several times quicker, as many
+// threads take it, than one handed on in turn)
+static void heff_jobs_lock_made(pthread_mutex_t *m) {
+  pthread_mutexattr_t a;
+  pthread_mutexattr_init(&a);
+#ifdef PTHREAD_MUTEX_POLICY_FIRSTFIT_NP
+  pthread_mutexattr_setpolicy_np(&a, PTHREAD_MUTEX_POLICY_FIRSTFIT_NP);
+#endif
+  pthread_mutex_init(m, &a);
+  pthread_mutexattr_destroy(&a);
+}
+
+static void heff_jobs_made(void) { heff_jobs_lock_made(&heff_jobs_mu); }
+
+static inline void heff_job_put(HeffJob **first, HeffJob **last, HeffJob *j) {
+  j->prev = *last;
+  j->next = NULL;
+  if (*last) (*last)->next = j;
+  else *first = j;
+  *last = j;
+}
+
+static inline void heff_job_out(HeffJob **first, HeffJob **last, HeffJob *j) {
+  if (j->prev) j->prev->next = j->next;
+  else *first = j->next;
+  if (j->next) j->next->prev = j->prev;
+  else *last = j->prev;
+  j->prev = j->next = NULL;
+}
+
+// (a thread of the jobs': each queued taken and run, come back to its
+// reactor, which is woken where it had none come back)
+static void *heff_job_thread(void *u) {
+  (void)u;
+  pthread_mutex_lock(&heff_jobs_mu);
+  for (;;) {
+    while (!heff_jobs_first) {
+      heff_jobs_idle++;
+      pthread_cond_wait(&heff_jobs_cv, &heff_jobs_mu);
+      heff_jobs_idle--;
+    }
+    HeffJob *j = heff_jobs_first;
+    heff_job_out(&heff_jobs_first, &heff_jobs_last, j);
+    heff_jobs_queued--;
+    __atomic_store_n(&j->state, 2, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&heff_jobs_mu);
+    j->run(j);
+    HeffJobs *of = j->of;
+    pthread_mutex_lock(&of->mu);
+    int none = !of->first;
+    __atomic_store_n(&j->state, j->state == 4 ? 5 : 3, __ATOMIC_RELAXED);
+    heff_job_put(&of->first, &of->last, j);
+    __atomic_store_n(&of->some, 1, __ATOMIC_RELEASE);
+    if (none) {
+      char b = 1;
+      ssize_t r = write(of->fd, &b, 1);
+      (void)r;
+    }
+    pthread_mutex_unlock(&of->mu);
+    pthread_mutex_lock(&heff_jobs_mu);
+  }
+  return NULL;
+}
+
+// (another thread of the jobs' made, under the queue's lock: whether it
+// was)
+static int heff_job_thread_made(void) {
+  pthread_attr_t attr;
+  pthread_t t;
+  sigset_t all, was;
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, &was);
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, HEFF_JOB_STACK);
+  int r = pthread_create(&t, &attr, heff_job_thread, NULL);
+  pthread_attr_destroy(&attr);
+  pthread_sigmask(SIG_SETMASK, &was, NULL);
+  if (r != 0) return 0;
+  heff_jobs_threads++;
+  return 1;
+}
+
+// | The job `j` of the wait `w` -- `run` and `let_go` set -- begun on a
+// | thread of the runtime's, the wait waiting for it (its `fd` -1), to
+// | be stepped once it has come back: whether it was, in a group alone
+// | (its first step's), or by a step of one pending.
+HEFF_FN int heff_job(HeffWait *w, HeffJob *j) {
+  if ((!heff_group && !w->linked) || !heff_wake_made) return 0;
+  HeffJobs *of = &heff_jobs_mine;
+  if (!of->made) {
+    pthread_once(&heff_jobs_once, heff_jobs_made);
+    heff_jobs_lock_made(&of->mu);
+    of->made = 1;
+  }
+  // (the pipe is the thread's while it has a group: its jobs' threads
+  // read its end under its lock)
+  if (of->fd != heff_wake_fds[1]) {
+    pthread_mutex_lock(&of->mu);
+    of->fd = heff_wake_fds[1];
+    pthread_mutex_unlock(&of->mu);
+  }
+  pthread_mutex_lock(&heff_jobs_mu);
+  if (heff_jobs_queued >= heff_jobs_idle && heff_jobs_threads < HEFF_JOB_THREADS && !heff_job_thread_made() &&
+      !heff_jobs_threads) {
+    pthread_mutex_unlock(&heff_jobs_mu);
+    return 0;
+  }
+  j->w = w;
+  j->of = of;
+  __atomic_store_n(&j->state, 1, __ATOMIC_RELAXED);
+  heff_job_put(&heff_jobs_first, &heff_jobs_last, j);
+  heff_jobs_queued++;
+  pthread_cond_signal(&heff_jobs_cv);
+  pthread_mutex_unlock(&heff_jobs_mu);
+  w->fd = -1;
+  return 1;
+}
+
+// | The job `j` given up, its wait let go of: whether it is the
+// | provider's to let go of now -- none begun, one not yet begun, one
+// | come back -- or, running, its own `let_go`'s once it has come back.
+HEFF_FN int heff_job_give_up(HeffJob *j) {
+  if (!__atomic_load_n(&j->state, __ATOMIC_RELAXED)) return 1;
+  pthread_mutex_lock(&heff_jobs_mu);
+  if (j->state == 1) {
+    heff_job_out(&heff_jobs_first, &heff_jobs_last, j);
+    heff_jobs_queued--;
+    j->state = 0;
+    pthread_mutex_unlock(&heff_jobs_mu);
+    return 1;
+  }
+  pthread_mutex_unlock(&heff_jobs_mu);
+  HeffJobs *of = j->of;
+  pthread_mutex_lock(&of->mu);
+  int mine = j->state == 3;
+  if (j->state == 2) {
+    j->state = 4;
+    of->gone++;
+  } else if (mine) {
+    heff_job_out(&of->first, &of->last, j);
+    j->state = 0;
+  }
+  pthread_mutex_unlock(&of->mu);
+  return mine;
+}
+
+// (this thread's jobs come back: each's wait stepped, or, given up, it
+// let go of)
+HEFF_FN void heff_jobs_collect(void) {
+  HeffJobs *of = &heff_jobs_mine;
+  if (!__atomic_load_n(&of->some, __ATOMIC_ACQUIRE)) return;
+  pthread_mutex_lock(&of->mu);
+  HeffJob *j = of->first;
+  of->first = of->last = NULL;
+  of->some = 0;
+  for (HeffJob *i = j; i; i = i->next)
+    if (i->state == 5) of->gone--;
+    else i->state = 0;
+  pthread_mutex_unlock(&of->mu);
+  while (j) {
+    HeffJob *next = j->next;
+    j->prev = j->next = NULL;
+    if (j->state == 5) {
+      j->state = 0;
+      j->let_go(j);
+    } else heff_wait_ready(j->w);
+    j = next;
+  }
+}
+
+// (this thread's jobs given up, every one come back and let go of: as
+// its last group is closed, its pipe open still)
+HEFF_FN void heff_jobs_end(void) {
+  HeffJobs *of = &heff_jobs_mine;
+  if (!of->made) return;
+  for (;;) {
+    heff_jobs_collect();
+    pthread_mutex_lock(&of->mu);
+    int64_t gone = of->gone;
+    pthread_mutex_unlock(&of->mu);
+    if (!gone || !heff_wake_made) return;
+    struct pollfd p = { heff_wake_fds[0], POLLIN, 0 };
+    if (poll(&p, 1, -1) > 0) {
+      char b[64];
+      while (read(heff_wake_fds[0], b, sizeof b) > 0) {}
+    }
+  }
+}
+#else
+typedef struct HeffJob HeffJob;
+struct HeffJob {
+  void (*run)(HeffJob *);
+  void (*let_go)(HeffJob *);
+};
+HEFF_FN int heff_job(HeffWait *w, HeffJob *j) {
+  (void)w;
+  (void)j;
+  return 0;
+}
+HEFF_FN int heff_job_give_up(HeffJob *j) {
+  (void)j;
+  return 1;
+}
+#endif
 
 // Giving a group up from any thread
 // ---------------------------------------------------------------------
