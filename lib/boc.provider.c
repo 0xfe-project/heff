@@ -17,17 +17,20 @@
 // lets the next through at each, or, where none is behind it, takes its
 // request out as the last by a compare-and-swap -- or, one coming
 // meanwhile, waits for it to say so.  No mutex but the pool's, around
-// the behaviours ready to run, which its threads take in turn, sleeping
-// on its condition while there are none.  A behaviour readied by one a
-// thread of the pool runs is kept in that thread's slot, the next it
-// runs, where the slot is empty: none woken, the mutex not taken -- a
-// chain of behaviours each readying the next runs on one thread.  One
-// that has run 64 (`BC_BATCH`) from its slot in a row puts the next
-// behind the others ready, where any are.  A body is never stopped
-// partway, so the one kept would wait for the end of the body running:
-// the thread counts the body's operations of this effect, and at the
-// 256th (`BC_FUEL`) puts the one kept with the others ready, waking a
-// thread to take it.
+// the behaviours ready to run that no thread of the pool readied --
+// main's -- and around sleeping on its condition.  A behaviour readied
+// by one a thread of the pool runs is kept in that thread's slot, the
+// next it runs, where the slot is empty: none woken, the mutex not
+// taken -- a chain of behaviours each readying the next runs on one
+// thread -- and beyond the slot, in a queue of the thread's own, which
+// the others take from (see "A worker's own queue").  One that has run
+// 64 (`BC_BATCH`) from its slot in a row puts the next behind the others
+// ready, where any are.  A body is never stopped partway, so the one
+// kept would wait for the end of the body running: the thread counts the
+// body's operations of this effect, and at the 256th (`BC_FUEL`) puts
+// the one kept with the others ready, waking a thread to take it: not in
+// its own queue, which the thread, held by the body, would not run, and
+// a wake asked for it might be one already on its way to another.
 //
 // The body is a computation of the program's, `Turn -> m Unit`, `m` the
 // monad of the handler in force at the `when`, which wrapped it there
@@ -157,6 +160,7 @@ typedef struct BcPool BcPool;
 typedef struct BcWait BcWait;
 typedef struct BcPark BcPark;
 typedef struct BcAct BcAct;
+typedef struct BcOwn BcOwn;
 
 typedef struct {
   _Atomic(BcBehaviour *) next;
@@ -219,6 +223,12 @@ struct BcPool {
   // pending there, to be woken there where a behaviour is ready)
   int npolling;
   int64_t polling[BC_POLLERS];
+  // (each worker's own queue, by its place among those started; a wake
+  // asked of one sleeping, to take from them, not yet taken, under `mu`;
+  // and whether one is being woken to, which keeps another from being)
+  BcOwn *own;
+  int wanted;
+  atomic_int waking;
 };
 
 static void bc_wait_less(BcWait *w) {
@@ -374,20 +384,187 @@ static void bc_queued(BcBehaviour *b) {
   if (wake) heff_reactor_wake_group(wake);
 }
 
+// A worker's own queue.  A behaviour a worker readies beyond its slot
+// is put at the back of a queue of the worker's own, not with those
+// ready: a ring of `BC_RING`, the worker alone putting at its back, the
+// worker and the others taking from its front by a compare-and-swap, no
+// lock.  The worker runs them after its slot, in their order; one with
+// nothing to run takes half of another's into its own, and runs them.
+// The order behaviours run in is the cowns' queues' still: one comes to
+// a queue only once its turn has come.  A ring full, the behaviour goes
+// with those ready.
+//
+// What is in a worker's queue its worker is there to run -- it waits,
+// to sleep or in its reactor, only once its queue is empty -- so none is
+// lost for want of a wake: a wake is for running them at once, not for
+// running them at all.  A burst of small behaviours run where they were
+// readied is run on one core, what they share in its cache; spread over
+// every core, each of them is slower than the burst is long: 2000
+// streams sent an event at once take a third of the time on one core
+// that they take spread over fourteen.  So another worker is woken to
+// take from a queue only where its front has waited `BC_AGE` ms
+// (`bc_aged`) -- a thief's queue ages as any does, so that a long burst
+// is spread a worker at a time -- or where a body readies the first of
+// it, the body perhaps running on for long, the queue behind it; and
+// only one at a time: none where a worker looks for one already, or is
+// being woken.  (Waking at a millisecond spreads a burst of 15 ms over
+// every core again.)  The ring is as large as a burst of a few thousand,
+// so that one does not spill to those ready, which any thread takes.
+#define BC_RING 4096
+#define BC_AGE 5
+
+struct BcOwn {
+  _Alignas(BC_LINE) atomic_uint head;  // taken from: by any
+  atomic_uint tail;                    // put at: by its worker
+  int64_t since;                       // its worker's: when it last held none, ms
+  _Atomic(BcBehaviour *) at[BC_RING];
+};
+
+// (this worker's queue, and its place among the pool's)
+static HEFF_TLS BcOwn *bc_own;
+static HEFF_TLS int bc_me;
+
+static inline int bc_own_empty(BcOwn *q) {
+  return atomic_load_explicit(&q->head, memory_order_acquire) == atomic_load_explicit(&q->tail, memory_order_acquire);
+}
+
+// (`b` at the back of this worker's queue: 0 where it is full)
+static int bc_own_put(BcBehaviour *b) {
+  BcOwn *q = bc_own;
+  unsigned h = atomic_load_explicit(&q->head, memory_order_acquire);
+  unsigned t = atomic_load_explicit(&q->tail, memory_order_relaxed);
+  if (t - h >= BC_RING) return 0;
+  if (t == h) q->since = heff_now_ms();
+  atomic_store_explicit(&q->at[t % BC_RING], b, memory_order_relaxed);
+  atomic_store_explicit(&q->tail, t + 1, memory_order_release);
+  return 1;
+}
+
+// (the front of this worker's queue taken, where it holds one)
+static BcBehaviour *bc_own_take(void) {
+  BcOwn *q = bc_own;
+  for (;;) {
+    unsigned h = atomic_load_explicit(&q->head, memory_order_acquire);
+    unsigned t = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    if (t == h) return NULL;
+    BcBehaviour *b = atomic_load_explicit(&q->at[h % BC_RING], memory_order_relaxed);
+    if (atomic_compare_exchange_weak_explicit(&q->head, &h, h + 1, memory_order_release, memory_order_relaxed))
+      return b;
+  }
+}
+
+// (half of what `v` holds, the greater half, taken into this worker's
+// queue, empty: the last of them handed back to run, or none.  A head
+// and a tail read between another's take and put may say more than the
+// ring holds: read again)
+static BcBehaviour *bc_steal_from(BcOwn *v) {
+  BcOwn *q = bc_own;
+  unsigned t = atomic_load_explicit(&q->tail, memory_order_relaxed);
+  for (;;) {
+    unsigned h = atomic_load_explicit(&v->head, memory_order_acquire);
+    unsigned vt = atomic_load_explicit(&v->tail, memory_order_acquire);
+    unsigned n = vt - h;
+    n -= n / 2;
+    if (n == 0) return NULL;
+    if (n > BC_RING / 2) continue;
+    for (unsigned i = 0; i < n; i++)
+      atomic_store_explicit(&q->at[(t + i) % BC_RING],
+                            atomic_load_explicit(&v->at[(h + i) % BC_RING], memory_order_relaxed),
+                            memory_order_relaxed);
+    if (atomic_compare_exchange_weak_explicit(&v->head, &h, h + n, memory_order_acq_rel, memory_order_relaxed)) {
+      BcBehaviour *b = atomic_load_explicit(&q->at[(t + n - 1) % BC_RING], memory_order_relaxed);
+      if (n > 1) {
+        q->since = heff_now_ms();
+        atomic_store_explicit(&q->tail, t + n - 1, memory_order_release);
+      }
+      return b;
+    }
+  }
+}
+
+// (one taken from the first of the others' queues that holds one, from
+// the one after this worker's on)
+static BcBehaviour *bc_steal(BcPool *pl) {
+  for (int k = 1; k < pl->n; k++) {
+    BcOwn *v = &pl->own[(bc_me + k) % pl->n];
+    if (bc_own_empty(v)) continue;
+    BcBehaviour *b = bc_steal_from(v);
+    if (b) return b;
+  }
+  return NULL;
+}
+
+// (whether any is ready: with those ready, or in a worker's queue)
+static int bc_any_ready(BcPool *pl) {
+  if (__atomic_load_n(&pl->front, __ATOMIC_RELAXED)) return 1;
+  for (int k = 0; k < pl->n; k++)
+    if (!bc_own_empty(&pl->own[k])) return 1;
+  return 0;
+}
+
+// (one more worker to take from the queues: where none looks for one
+// already, nor is being woken -- one sleeping woken, else one waiting
+// in its reactor, else one more started.  What was put is put before
+// either is read, and one that stops looking, or is woken, looks at the
+// queues after it says so: so the one looking, or woken, sees what it
+// was not woken for)
+static void bc_wake_one(BcPool *pl) {
+  atomic_thread_fence(memory_order_seq_cst);
+  if (atomic_load_explicit(&pl->looking, memory_order_acquire) > 0) return;
+  int no = 0;
+  if (!atomic_compare_exchange_strong_explicit(&pl->waking, &no, 1, memory_order_acq_rel, memory_order_relaxed))
+    return;
+  int64_t wake = 0;
+  int one = 1;
+  pthread_mutex_lock(&pl->mu);
+  if (pl->sleeping > pl->wanted) {
+    pl->wanted++;
+    pthread_cond_signal(&pl->work);
+  } else if (pl->npolling > 0) wake = pl->polling[--pl->npolling];
+  else if (pl->started < pl->n) bc_thread_more(pl);
+  else one = 0;
+  pthread_mutex_unlock(&pl->mu);
+  if (wake) heff_reactor_wake_group(wake);
+  if (!one) atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
+}
+
+// (this worker's queue's front waited `BC_AGE`: one more woken to take
+// from it, and the wait counted from now)
+static void bc_aged(BcPool *pl) {
+  BcOwn *q = bc_own;
+  if (bc_own_empty(q)) return;
+  int64_t now = heff_now_ms();
+  if (now - q->since < BC_AGE) return;
+  q->since = now;
+  bc_wake_one(pl);
+}
+
+// (the behaviour made another's to take, at the back of this worker's
+// queue: where it is full, with those ready.  Readied by a body, the
+// queue's first, one more woken)
+static void bc_spill(BcBehaviour *b) {
+  bc_movable(b);
+  int first = bc_own_empty(bc_own);
+  if (!bc_own_put(b)) bc_queued(b);
+  else if (first && bc_in_body) bc_wake_one(b->pool);
+}
+
 // (whether this worker is looking at its reactor: where an act's rest
 // readies a behaviour into its slot, the look comes back, not waiting
 // on, so that the behaviour runs now)
 static HEFF_TLS int bc_polling;
 
 // (the behaviour ready: in this thread's slot, where it runs the pool's
-// behaviours and the slot is empty, else queued)
+// behaviours and the slot is empty, else in its queue; one readied by
+// any other thread queued with those ready)
 static void bc_ready(BcBehaviour *b) {
-  if (bc_running == b->pool && !bc_slot) {
+  if (bc_running != b->pool) bc_queued(b);
+  else if (!bc_slot) {
     bc_slot = b;
 #ifndef _WIN32
     if (bc_polling) heff_woken = 1;
 #endif
-  } else bc_queued(b);
+  } else bc_spill(b);
 }
 
 static void bc_through(BcBehaviour *b) {
@@ -1189,27 +1366,51 @@ static void bc_run_behaviour(BcBehaviour *b) {
   bc_pool_less(pl);
 }
 
-typedef struct { BcPool *pl; char *dir; } BcWorkerStart;
+typedef struct { BcPool *pl; char *dir; int me; } BcWorkerStart;
 
+// (the first of those ready, the mutex taken only where one may be)
+static BcBehaviour *bc_shared_take(BcPool *pl) {
+  if (!__atomic_load_n(&pl->front, __ATOMIC_RELAXED)) return NULL;
+  pthread_mutex_lock(&pl->mu);
+  BcBehaviour *b = pl->front;
+  if (b) {
+    __atomic_store_n(&pl->front, b->after, __ATOMIC_RELAXED);
+    if (!pl->front) pl->back = NULL;
+    pl->ready--;
+  }
+  pthread_mutex_unlock(&pl->mu);
+  return b;
+}
+
+// (a worker: its slot run, then its own queue -- those ready first
+// every `BC_BATCH`, so that main's are not passed over -- then those
+// ready, then another's queue; with none, a while looking before it
+// waits.  A wake asked of it, or that it was started for, is answered
+// once it looks)
 static void *bc_worker(void *u) {
   BcWorkerStart *s = u;
   BcPool *pl = s->pl;
   heff_dir_take(s->dir);
+  bc_me = s->me;
   free(s);
+  bc_own = &pl->own[bc_me];
   bc_running = pl;
   bc_current = pl;
   atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_acq_rel);
+  atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
   int row = 0, since = 0;
+  unsigned picks = 0;
   for (;;) {
     BcBehaviour *kept = bc_slot;
     if (kept) {
       bc_slot = NULL;
-      if (row >= BC_BATCH && __atomic_load_n(&pl->front, __ATOMIC_RELAXED))
-        bc_queued(kept);
-      else {
+      if (row >= BC_BATCH && (__atomic_load_n(&pl->front, __ATOMIC_RELAXED) || !bc_own_empty(bc_own))) {
+        if (!bc_own_put(kept)) bc_queued(kept);
+      } else {
         row = row >= BC_BATCH ? 1 : row + 1;
         bc_run_behaviour(kept);
         since++;
+        bc_aged(pl);
         continue;
       }
     }
@@ -1225,15 +1426,34 @@ static void *bc_worker(void *u) {
       bc_poll(pl, 0);
       continue;
     }
+    BcBehaviour *b = NULL;
+    int first = (++picks % BC_BATCH) == 0;
+    if (first) b = bc_shared_take(pl);
+    if (!b) b = bc_own_take();
+    if (!b && !first) b = bc_shared_take(pl);
+    if (!b) b = bc_steal(pl);
+    if (b) {
+      bc_run_behaviour(b);
+      since++;
+      bc_aged(pl);
+      continue;
+    }
     // (a while looked at before sleeping: a behaviour readied soon after
     // by another thread taken without a wake; not where acts are pending,
     // which are waited for in the reactor instead)
     if (!bc_holding) {
       atomic_fetch_add_explicit(&pl->looking, 1, memory_order_acq_rel);
-      for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->front, __ATOMIC_RELAXED)
-                      && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++)
+      atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
+      int found = 0;
+      for (int i = 0; i < BC_SPINS && !__atomic_load_n(&pl->stopping, __ATOMIC_RELAXED); i++) {
+        if ((i & 63) == 0 && bc_any_ready(pl)) {
+          found = 1;
+          break;
+        }
         bc_relax();
-      atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_acq_rel);
+      }
+      atomic_fetch_sub_explicit(&pl->looking, 1, memory_order_seq_cst);
+      if (found || bc_any_ready(pl)) continue;
     }
     bc_settle(pl);
     pthread_mutex_lock(&pl->mu);
@@ -1254,14 +1474,22 @@ static void *bc_worker(void *u) {
           }
         pthread_mutex_unlock(&pl->mu);
       } else sched_yield();
+      atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
       continue;
     }
-    while (!pl->front && !pl->stopping) {
+    while (!pl->front && !pl->stopping && !pl->wanted) {
       pl->sleeping++;
       pthread_cond_wait(&pl->work, &pl->mu);
       pl->sleeping--;
     }
-    BcBehaviour *b = pl->front;
+    if (pl->wanted) {
+      // (woken to take from the others' queues: looked at again)
+      pl->wanted--;
+      pthread_mutex_unlock(&pl->mu);
+      atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
+      continue;
+    }
+    b = pl->front;
     if (!b) {
       pthread_mutex_unlock(&pl->mu);
       break;
@@ -1272,6 +1500,7 @@ static void *bc_worker(void *u) {
     pthread_mutex_unlock(&pl->mu);
     bc_run_behaviour(b);
     since++;
+    bc_aged(pl);
   }
   // (its group closed: nothing of it is pending, or the pool would not
   // have stopped)
@@ -1299,6 +1528,7 @@ static void bc_thread_more(BcPool *pl) {
   BcWorkerStart *s = heff_alloc(sizeof(BcWorkerStart));
   s->pl = pl;
   s->dir = heff_dir_copy();
+  s->me = pl->started;
   atomic_fetch_add_explicit(&pl->looking, 1, memory_order_acq_rel);
   if (heff_thread_start(&pl->threads[pl->started], bc_worker, s) != 0) heff_fail("boc: cannot start a thread");
   pl->started++;
@@ -1323,6 +1553,11 @@ static BcPool *bc_pool(void) {
   pl->started = 0;
   pl->ready = 0;
   atomic_init(&pl->looking, 0);
+  pl->own = aligned_alloc(BC_LINE, (size_t)n * sizeof(BcOwn));
+  if (!pl->own) heff_fail("out of memory");
+  memset(pl->own, 0, (size_t)n * sizeof(BcOwn));
+  pl->wanted = 0;
+  atomic_init(&pl->waking, 0);
   pthread_mutex_lock(&pl->mu);
   bc_thread_more(pl);
   pthread_mutex_unlock(&pl->mu);
@@ -1384,6 +1619,7 @@ static void bc_drain(BcPool *pl) {
   pthread_cond_destroy(&pl->work);
   pthread_cond_destroy(&pl->idle);
   free(pl->threads);
+  free(pl->own);
   free(pl);
 }
 
