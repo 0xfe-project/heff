@@ -7291,6 +7291,15 @@ HEFF_FN void heff_reactor_wake(void) {
     V f = w->f, k = w->k;
     int64_t g = w->group;
     V x = heff_answer(f, w->answer(w));
+    // (its group closed meanwhile, by what one woken before it ran: let
+    // go of, as one pending there was, not run on in a group no one
+    // closes again -- its waits would be pending in none, a job's or a
+    // ring's operation of theirs outliving the thread)
+    if (!heff_group_of(g)) {
+      heff_drop(x);
+      heff_drop(k);
+      continue;
+    }
     heff_reactor_run(g, k, x);
   }
   if (done != few) free(done);
@@ -7567,14 +7576,6 @@ HEFF_FN int64_t heff_reactor_pending(int64_t g) {
   return gr ? gr->pending : 0;
 }
 
-// | Group `g` closed: what is pending in it let go of, undone, and what
-// | of it is finished and not asked for.
-HEFF_FN int heff_group_in(int64_t id, int64_t g) {
-  if (id == g) return 1;
-  HeffGroup *gr = heff_group_of(id);
-  return gr && gr->root == g;
-}
-
 HEFF_FN void heff_giving_closed(int64_t g);
 
 #ifdef HEFF_URING
@@ -7590,11 +7591,15 @@ HEFF_FN void heff_ring_drain(void) {
 }
 #endif
 
+// | Group `g` closed: what is pending in it let go of, undone, and what
+// | of it is finished and not asked for.
 HEFF_FN void heff_reactor_close(int64_t g) {
   heff_giving_closed(g);
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
     next = w->next;
-    if (!heff_group_in(w->group, g)) continue;
+    // (and one of a group closed before, where any is: pending in none)
+    HeffGroup *in = w->group == g ? NULL : heff_group_of(w->group);
+    if (in && in->root != g) continue;
     heff_wait_unlink(w);
     V f = w->f, k = w->k;
     // (one whose operation the ring has, let go of as it comes back)
