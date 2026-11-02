@@ -5,7 +5,7 @@
 // time as it is typed, not echoed, not a line at a time; its signals
 // kept, so that Ctrl-C is SIGINT still -- and shows the alternate
 // screen.  What was is kept, and put back by `Finish`, at the program's
-// end (atexit: `exit`, a failure), and by a handler of the signals that
+// end (`atexit` at `exit`, `at_quick_exit` at a failure), and by a handler of the signals that
 // end a program (SIGINT, SIGTERM, SIGHUP, SIGQUIT), which puts it back
 // and raises the signal again, as it was, so that the program ends as it
 // would have.  Ctrl-Z (SIGTSTP) puts it back while the program is
@@ -125,7 +125,11 @@ static int heff_cn_begin(void) {
   if (heff_cn_raw) return 1;
   if (!heff_cn_terminal() || tcgetattr(0, &heff_cn_saved) != 0) return 0;
   static int registered = 0;
-  if (!registered) { registered = 1; atexit(heff_cn_atexit); }
+  if (!registered) {
+    registered = 1;
+    atexit(heff_cn_atexit);
+    at_quick_exit(heff_cn_atexit);
+  }
   fflush(stdout);
   fflush(stderr);
   heff_cn_raw = 1;

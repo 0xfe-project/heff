@@ -247,8 +247,8 @@ caller is on the first thread.
   toolkit tells the program something through the provider, such as a
   queue and a condition variable, or a byte on a pipe the reactor waits
   on.
-- When the program ends while a job runs there, however it ends (its
-  `main` returning, `exit n`, a failure no one caught):
+- When the program ends while a job runs there, by its `main` returning
+  or by `exit n`:
   - with `stop`, the ending thread calls `stop(u)`, which must make
     `run` return, and waits; the first thread then ends the process
     with the program's status, its output flushed and its `atexit`
@@ -263,7 +263,8 @@ caller is on the first thread.
     thread: the ending thread flushes the output and exits with the
     program's status.
 - A job queued but not begun when the program ends is not run.
-- A stack overflow ends the program at once, without `stop`.
+- A failure, a stack overflow among them, ends the program at once,
+  without `stop`.
 - A program that lends nothing ends exactly as before.
 - Linux toolkits (GTK) and Win32's message loop do not need the first
   thread; their providers do not lend it.
@@ -339,3 +340,19 @@ goes to `k` when it is done.
 
 See `lib/c/runtime.c`, "Outside operations done later", and
 `lib/std/net.provider.c` for an example.
+
+## The program's end
+
+- When `main` returns or the program calls `exit n`, the process ends
+  by C's `exit`, which runs the C libraries' own cleanup: their
+  `atexit` handlers and destructors. A provider whose own threads call
+  into a library must have them done with it by then, so its release
+  waits for its thread, as the library's own close would. A thread
+  still inside a library while it is torn down can crash the program
+  at its very end.
+- A failure (a panic, the runtime's own, an `abandon` no one caught, a
+  stack overflow) ends the process at once by `quick_exit`. The
+  libraries' cleanup does not run, since other threads may still be
+  inside them. What a provider must put back even then, such as the
+  terminal's mode or the commands it started, it registers with
+  `at_quick_exit` as well as `atexit`.
