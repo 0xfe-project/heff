@@ -52,16 +52,19 @@
 // a thread's own, not shared, marked `OWNED` (`heff_own_at`) once a body
 // has written it, where the body's log (`HeffOwnLog`, the behaviour's
 // while it runs) keeps what the body counted up of it.  The write back
-// is kept by the log too, and done once the body is: a body that fails,
-// or does not write a cown, leaves it as it was.  An array a cown holds,
+// is kept by the log too, and done once the body is: a body that
+// abandons, or does not write a cown, leaves it as it was.  An array a cown holds,
 // held by the log and by the body alone, the body writes in place
 // (`heff_own_set`), the log keeping what was there, put back where the
 // cown is to hold what it held.  A value of a word read and written
 // keeps nothing in the log.
 //
-// A body that fails leaves its cowns as they were, and why is said on
-// stderr, on the thread, before the cowns are let go; the program ends
-// by 1 (`bc_failures`).
+// A body that abandons leaves its cowns as they were, and that is said
+// on stderr, on the thread, before the cowns are let go; the program
+// ends by 1 (`bc_failures`).  A body that fails -- panics, or fails in
+// the runtime -- ends the program there and then, from its thread, as a
+// failure anywhere does: nothing it held is let go of but by the system,
+// and no other behaviour runs on.
 //
 // The program has one pool (`bc_program`), opened by its first operation
 // of boc's outside every worker, and drained once the program's
@@ -104,7 +107,7 @@ static void bc_relax(void) {
 #endif
 }
 
-// (`f a0 a1`, asked for here, a failure caught: as `heff_try`, two
+// (`f a0 a1`, asked for here, an abandon caught: as `heff_try`, two
 // arguments given at once, so a body of two parameters -- its turn and
 // what comes after it -- is called, not made a partial application)
 static const char *bc_try2(V f, V a0, V a1, V *out) {
@@ -840,12 +843,12 @@ static V bc_dropped(V self, V *a) {
 
 static Clo bc_dropped_clo = {{0x80000000u, K_CLO, 0}, bc_dropped, 1, 0};
 
-// (how many behaviours and acts failed: the program ends by 1 where any
-// did)
+// (how many behaviours and acts abandoned, or were not spawned: the
+// program ends by 1 where any did)
 static atomic_int bc_failures;
 
-// (a behaviour or an act failed, why: said on stderr, as a failure of
-// the program's is, the others going on)
+// (a behaviour or an act abandoned, or a behaviour not spawned, why:
+// said on stderr, as the program's own would be, the others going on)
 static void bc_failed(BcPool *pl, const char *why) {
   (void)pl;
   atomic_fetch_add_explicit(&bc_failures, 1, memory_order_relaxed);
@@ -880,9 +883,10 @@ static void bc_failed(BcPool *pl, const char *why) {
 // are not passed over.  The pool counts an act given a worker and not
 // yet started, and a worker with acts pending (`bc_holding`): the
 // program ends once no behaviour is queued or runs and no act is
-// pending.  An act that fails -- abandons, or fails in the runtime --
-// fails as a body does: why is said (the group's function for
-// failures), and what was to come after it does not.
+// pending.  An act that abandons is as a body that does: that is said
+// (the group's function for failures), and what was to come after it
+// does not.  An act that fails -- panics, or fails in the runtime --
+// ends the program, as a body that fails does.
 //
 // An act awaited with a custodian current is in that custodian's
 // custody, as std.reactor's `giving` has it: started in a group of its
@@ -973,7 +977,7 @@ static void bc_await(BcPool *pl, V arm0, V arm1) {
   else bc_act_behaviour(pl, a);
 }
 
-// (an act that failed: `failed` given why; what the group finishes
+// (an act that abandoned: `failed` given why; what the group finishes
 // with, nothing)
 static V bc_act_failed(V self, V *a) {
   size_t len;

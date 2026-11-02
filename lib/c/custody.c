@@ -208,7 +208,8 @@ static V heff_due_finished(V self, V *a) {
 }
 
 // (what is on this thread's queue run, each once, in the order kept; one
-// that fails, its custodian's failure)
+// that abandons, its custodian's failure; one that fails, the program's
+// end there)
 HEFF_SLOW void heff_due_run(void) {
   HeffDueQ *q = heff_due_here;
 #ifdef HEFF_THREADS

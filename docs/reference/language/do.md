@@ -273,7 +273,9 @@ it is under. A custodian made by `contained` stops it there: the
 failure is printed, and the program goes on. At the root, the failure
 is the program's: it is printed and the program ends. So a server that
 serves each connection in a `contained` custodian loses only that
-connection when its close fails. What the custodians were given runs
+connection when its close fails. A panic is no failure of a
+custodian's: wherever it is, in a `stop` too, it ends the program at
+once, nothing shut down first. What the custodians were given runs
 on the thread that made them, at its next operation.
 
 What starts to run later keeps the custodian current where it was
@@ -383,8 +385,11 @@ behaviour, and the body a behaviour once it has come to `r`.
   give, it is given as a value.
 - Its value is what the handler says: a file's `with` comes to what its
   body came to, a cown's to `()` (the behaviour runs later). `x <- with
-  ... do` binds it. A behaviour that failed does not stop the others:
-  why is said on stderr, and the program exits with 1 at its end.
+  ... do` binds it. A behaviour that panics, or fails in the runtime,
+  ends the program at once: why is said on stderr, and the process
+  exits with 1, the other behaviours stopped where they are. One that
+  abandons does not stop the others: that is said on stderr, and the
+  program exits with 1 at its end.
 - A handler is a pair of instances, co's `Binder` (of what the names are
   bound to: what they are in the body, the world it runs in, and what
   the `with` comes to) and `Holder` (how it runs in the world), and the

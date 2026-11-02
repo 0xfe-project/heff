@@ -51,7 +51,7 @@ static V heff_custody_finished(V self, V *a) {
 }
 
 // (what was given run here, a computation of the program's: why it
-// failed, or 0)
+// abandoned, or 0.  One that fails ends the program there)
 static const char *heff_custody_run(V stop) {
   V out;
   const char *why = heff_try(stop, NTAG(TAG_MkUnit), &out);

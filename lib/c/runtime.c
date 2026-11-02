@@ -110,12 +110,12 @@ extern char **environ;
 // before the runtime too (`-DHEFF_THREADS` does the same).  Then each
 // thread has the runtime's per-run state for itself (`HEFF_TLS`: its
 // pages, its stack of what is given back, its count of calls and
-// its room, where a failure of it is caught).  An object is one thread's,
+// its room, where an abandon of it is caught).  An object is one thread's,
 // counted by it alone, not atomically; or shared (`SHARED`, #66),
 // counted atomically by every thread that holds it; or immortal,
 // counted by none.  What a provider gives another thread it shares
 // (`heff_share`), and runs there under `heff_try`, ending the thread by
-// `heff_thread_end`.  A definition's value is computed once, under a
+// `heff_thread_end`; a failure there ends the program, as on its own.  A definition's value is computed once, under a
 // lock, and made immortal (`heff_global`, `heff_freeze`), as is a static
 // thunk's (`heff_force_shared`).  Without `HEFF_THREADS`, all of this is
 // as one thread has it: `HEFF_TLS` is nothing, no object is shared
@@ -660,13 +660,33 @@ HEFF_FN __attribute__((noreturn)) void heff_exit(int status) {
   exit(status);
 }
 
-// (where a value is asked for that may fail -- `heff compile` without
-// `--name`, each definition printed -- a failure is caught there, and
-// said; otherwise it ends the program.  Jumped to by `_longjmp`, which
-// neither saves nor restores the signal mask: macOS's `setjmp` does, a
-// call of the system each time, a third of a fork's cost.  A stack that
-// overflowed comes back by a way of its own, which restores the mask)
+// Failures.  A failure -- a panic, or the runtime's own (out of memory,
+// applying what is not a function, a definition defined by itself, a
+// stack that overflowed) -- ends the program at once, from whichever
+// thread it is on: said on stderr (`heff: why`), and the process exited
+// by 1 (an overflow, 2), nothing unwound, nothing shut down first.  So
+// what the program held -- a connection, a transaction, a file -- the
+// system closes, and whoever was at its other end sees it closed, as
+// it would not if the program went on without the part that failed.
+//
+// What may be caught is an abandon (`heff_abandon`) and fuel run out
+// (std.fuel's limit): each jumps to the innermost catch (`heff_catch`,
+// set by `heff_try`), where there is one, else is said and the program
+// ended by 1.  Where a value is asked for that may abandon -- `heff
+// compile` without `--name`, each definition printed -- the abandon is
+// caught there, and said.
+//
+// The one exception is the language server's (`heff_lsp_try`): what it
+// runs a failure of is caught too, said, and the server goes on, so that
+// a fault of the compiler's ends one request, not the editor's server.
+// It is the language server's alone: no library's catch may use it.
+//
+// Jumped to by `_longjmp`, which neither saves nor restores the signal
+// mask: macOS's `setjmp` does, a call of the system each time, a third
+// of a fork's cost.  A stack that overflowed comes back by a way of its
+// own, which restores the mask.
 HEFF_VAR(HEFF_TLS jmp_buf *heff_catch);
+HEFF_VAR(HEFF_TLS jmp_buf *heff_lsp_catch);
 HEFF_VAR(HEFF_TLS const char *heff_caught);
 #ifdef _WIN32
 #define HEFF_SETJMP(b) setjmp(b)
@@ -677,7 +697,7 @@ HEFF_VAR(HEFF_TLS const char *heff_caught);
 #endif
 
 HEFF_FN void heff_fail(const char *why) {
-  if (heff_catch) { heff_caught = why; HEFF_LONGJMP(*heff_catch); }
+  if (heff_lsp_catch) { heff_caught = why; HEFF_LONGJMP(*heff_lsp_catch); }
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
   heff_exit(1);
@@ -690,12 +710,18 @@ HEFF_FN V heff_abandon(void) {
   heff_exit(1);
 }
 
+// (a computation stopped, `why` saying so -- fuel run out: caught as an
+// abandon is, else a failure)
+HEFF_FN void heff_stopped(const char *why) {
+  if (heff_catch) { heff_caught = why; HEFF_LONGJMP(*heff_catch); }
+  heff_fail(why);
+}
+
 HEFF_FN V heff_nomatch(V s);
 
-// (`panic why`: a failure, `why` its words -- caught as `heff_fail`'s
-// is, by the innermost `heff_try`, else said and the program ended.
-// The words are copied, and kept: the failure ends what would give
-// them back)
+// (`panic why`: a failure, `why` its words -- the program ended, said.
+// The words are copied, and kept: the language server's catch-all may
+// take them)
 HEFF_FN char *heff_cstr_text(V v);
 HEFF_FN V heff_panic(V s) {
   char *why = heff_cstr_text(s);
@@ -2212,8 +2238,9 @@ static inline int heff_exact(V f, int n, V *a) {
 // it is computing itself is told it is defined by itself, not left to
 // wait.  (Definitions are in order, none using one after it: a thread
 // computing one waits only for one before it, never for one waiting for
-// it.)  A failure caught (`heff_try`) where values were being computed
-// leaves them to be computed again.
+// it.)  An abandon caught (`heff_try`) where values were being computed
+// -- or a failure, by the language server's catch-all -- leaves them to
+// be computed again.
 #ifdef HEFF_THREADS
 #define HEFF_ONCE uintptr_t
 #define HEFF_DONE(st) HEFF_LIKELY(__atomic_load_n(&(st), __ATOMIC_ACQUIRE) == 2)
@@ -5350,13 +5377,13 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
 // system has put back the signal's mask and taken the thread off the
 // handler's stack (macOS's `_longjmp` out of a handler would leave the
 // system thinking it still on it, and the next fault unhandled).  There
-// it fails as `heff_fail` does: caught by the innermost `heff_try`, why
-// "stack overflow"; else the program says `heff: stack overflow` and
-// exits with 2.  What the frames jumped over were doing is left undone,
-// as a failure leaves it: what they made leaked, a definition they were
-// computing computed again.  But a fault in code not the program's --
-// the system's `malloc`, a lock's -- may leave what that code holds
-// held for good: the program ends there, caught or not.
+// it fails as `heff_fail` does: the program says `heff: stack overflow`
+// and exits with 2.  Only the language server's catch-all takes it,
+// why "stack overflow", what the frames jumped over were doing left
+// undone: what they made leaked, a definition they were computing
+// computed again.  But a fault in code not the program's -- the
+// system's `malloc`, a lock's -- may leave what that code holds held
+// for good: the program ends there, caught or not.
 //
 // Not on Windows, nor where a sanitizer handles faults itself; and said,
 // never caught, but on x86-64 and arm64.
@@ -5433,9 +5460,9 @@ HEFF_VAR(HEFF_TLS int heff_overflow_lost);
 // (where the thread goes on after its stack overflowed: failed, as
 // `heff_fail` fails, or the program ended)
 HEFF_FN __attribute__((noreturn)) void heff_overflowed(void) {
-  if (heff_catch && !heff_overflow_lost) {
+  if (heff_lsp_catch && !heff_overflow_lost) {
     heff_caught = HEFF_OVERFLOW;
-    HEFF_LONGJMP(*heff_catch);
+    HEFF_LONGJMP(*heff_lsp_catch);
   }
   static const char said[] = "heff: " HEFF_OVERFLOW "\n";
   if (!heff_overflow_lost) fflush(stdout);
@@ -5527,14 +5554,16 @@ HEFF_FN void heff_unwatch_stack(void) {}
 
 // Threads a provider starts (#36): each runs what it
 // is given -- shared, `heff_share` -- by `heff_try`, so
-// that a failure there is the thread's to hand back, not the end of the
-// process; and ends by `heff_thread_end`.
+// that an abandon there is the thread's to hand back, not the end of the
+// process; and ends by `heff_thread_end`.  A failure there ends the
+// process, as it would on the program's thread.
 // ---------------------------------------------------------------------
 
-// (`f x`, asked for here, a failure caught: 0, its value at `*out`; or
-// why it failed -- "heff:abandon" where it abandoned (`heff_abandon`),
-// the thread's own string otherwise, to be copied before the thread
-// ends.  What was made before the failure is leaked, not given back)
+// (`f x`, asked for here, an abandon or fuel run out caught: 0, its
+// value at `*out`; or why it stopped -- "heff:abandon" where it
+// abandoned (`heff_abandon`), "heff:fuel" where it ran out of fuel, to
+// be copied before the thread ends.  What was made before is leaked,
+// not given back.  A failure is not caught: the program ends there)
 HEFF_FN const char *heff_try(V f, V x, V *out) {
   jmp_buf here;
   jmp_buf *volatile up = heff_catch;
@@ -5552,16 +5581,36 @@ HEFF_FN const char *heff_try(V f, V x, V *out) {
   return heff_caught;
 }
 
-// (a failure handed back, as the thread it was caught in would have
-// failed: `why` from `heff_try`, copied)
+// (the language server's catch-all: `f x`, as `heff_try`, every failure
+// caught besides -- a panic, the runtime's, a stack that overflowed --
+// why it failed handed back.  The language server's alone, so that a
+// fault of the compiler's ends a request, not the server: no library's
+// catch may use it, a failure anywhere else ending the program)
+HEFF_FN const char *heff_lsp_try(V f, V x, V *out) {
+  jmp_buf here;
+  jmp_buf *volatile up = heff_catch;
+  jmp_buf *volatile lsp_up = heff_lsp_catch;
+  volatile long dep = heff_dep;
+  volatile size_t open = heff_nopen;
+  heff_catch = heff_lsp_catch = &here;
+  if (HEFF_SETJMP(here) == 0) {
+    *out = heff_tr(heff_app1(f, x));
+    heff_catch = up;
+    heff_lsp_catch = lsp_up;
+    return NULL;
+  }
+  heff_catch = up;
+  heff_lsp_catch = lsp_up;
+  heff_dep = dep;
+  heff_reopen(open);
+  return heff_caught;
+}
+
+// (an abandon, or fuel run out, handed back, as the thread it was caught
+// in would have stopped: `why` from `heff_try`, copied)
 HEFF_FN void heff_fail_again(const char *why) {
   if (strcmp(why, "heff:abandon") == 0) heff_abandon();
-  if (!heff_catch && strcmp(why, HEFF_OVERFLOW) == 0) {
-    fflush(stdout);
-    fputs("heff: " HEFF_OVERFLOW "\n", stderr);
-    heff_exit(HEFF_OVERFLOW_STATUS);
-  }
-  heff_fail(why);
+  heff_stopped(why);
 }
 
 // (this thread's pages and what else the runtime keeps for it given
@@ -6395,8 +6444,9 @@ HEFF_FN V heff_group_failed(int64_t g) {
 
 // (`k` given `x`, a step of what group `g` started, run with the group
 // as `heff_group`: what it comes to, at `*r`.  Where the group has a
-// function for failures, under `heff_try`: one that fails is finished
-// as that function's value, given why, and 1 is the answer; else 0.
+// function for failures, under `heff_try`: one that abandons is
+// finished as that function's value, given why, and 1 is the answer;
+// else 0.  A failure ends the program, whatever the group says
 // `k` and `x` consumed)
 HEFF_FN int heff_group_step(int64_t g, V k, V x, V *r) {
   int64_t up = heff_group;
@@ -6542,10 +6592,10 @@ HEFF_FN int64_t heff_group_made(int64_t root) {
 }
 
 // | A group of its own, for a scheduler: its number.  `failed`, where it
-// | is not 0, is what a step of a computation started in it that fails
-// | is finished as, given why, the others going on (kept by the group,
-// | and let go of when it is closed); where it is 0, the failure is the
-// | program's.
+// | is not 0, is what a step of a computation started in it that
+// | abandons is finished as, given why, the others going on (kept by the
+// | group, and let go of when it is closed); where it is 0, the abandon
+// | is the program's.  A failure is the program's end either way.
 HEFF_FN int64_t heff_reactor_open(V failed) {
   int64_t g = heff_group_made(0);
   heff_group_of(g)->failed = failed;
@@ -7399,7 +7449,8 @@ HEFF_FN void heff_show(Buf *b, V v, int arg) {
 }
 
 // (a definition by its name, the file's own, `heff_globals`; its value
-// asked for, the thing it is shown, or why it failed)
+// asked for, the thing it is shown, or why it stopped -- an abandon, or
+// fuel run out; a failure ends the program there)
 typedef struct { const char *name; V (*get)(void); } Global;
 
 HEFF_FN void heff_check_one(Buf *out, const Global *g) {
