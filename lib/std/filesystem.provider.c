@@ -532,6 +532,9 @@ typedef struct {
                      //  to a thread of the kernel's, several times the
                      //  CPU of the read itself where the page cache has
                      //  it)
+  int sought;        // (sought in, nothing read since: the next chunk
+                     //  read as asked, not ahead -- a read here and there
+                     //  of a large file, each a buffer's otherwise)
   uint8_t *buf;      // (read ahead: what is not yet taken, from `at` to
   size_t cap, at, end;  //  `end`)
   uint64_t taken;    // (how many times something was taken from it)
@@ -864,17 +867,19 @@ static int fs_failed_step(FsOp *o) {
 }
 
 // A chunk: what was read ahead, or read now -- straight into bytes of
-// its own where as many as a buffer's are asked for, the kernel's read
-// into them, the ring's too, and they the chunk, not copied.
+// its own where as many as a buffer's are asked for, or it is the first
+// since a seek, the kernel's read into them, the ring's too, and they
+// the chunk, not copied.
 static int fs_chunk_step(HeffWait *w) {
   FsOp *o = (FsOp *)w;
   FsFile *h = o->h;
-  if (fs_buffered(h) == 0 && (size_t)o->n >= FS_BUF) {
+  if (fs_buffered(h) == 0 && ((size_t)o->n >= FS_BUF || h->sought)) {
     uint8_t *at;
     V mine = heff_bytes_room(o->n, &at);
     ssize_t r = fs_read_into(o, at, (size_t)o->n, mine);
     if (r == -4) {
       heff_drop(mine);
+      h->sought = 0;
       return HEFF_STEP_DONE;
     }
     if (r == -3) heff_drop(mine);
@@ -885,9 +890,11 @@ static int fs_chunk_step(HeffWait *w) {
       return fs_failed_step(o);
     } else {
       o->result = fs_right(heff_bytes_cut(mine, r));
+      h->sought = 0;
       return HEFF_STEP_DONE;
     }
   }
+  h->sought = 0;
   if (fs_buffered(h) == 0 && fs_fill(o) < 0) return fs_failed_step(o);
   size_t n = fs_buffered(h);
   if (n > (size_t)o->n) n = (size_t)o->n;
@@ -1407,6 +1414,7 @@ static V heff_provider_filesystem(V p, V k) {
       else {
         h->at = h->end = 0;
         h->taken++;
+        h->sought = 1;
         r = fs_right(heff_int(at));
       }
     }
