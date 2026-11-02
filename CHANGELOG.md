@@ -4,6 +4,7 @@
 
 ### Backends and performance
 
+- boc: a worker putting a behaviour a body readied in its own queue read the behaviour's pool after another worker may have taken it, run it and let go of it: producer_consumer at 10M messages crashed in one run of ten or so, more under load.
 - On Linux, a block of 64 KiB to 4 MiB given back -- a socket read's buffer, a file's chunk, a long string or array -- is kept by its thread for the next of its size (four of a size, 32 MiB in all), not given back to the system: a static (musl) build's malloc mapped and unmapped each one afresh, and a server's every read was a map and an unmap. Static build, in a container: `GET /` at 64 connections 126–130k requests a second to 137–139k, as glibc's; 2 GB read from the page cache in chunks, 313 ms to 24 ms. glibc builds as before.
 - A file's chunk read right after a seek is read as asked, straight into its bytes, not 64 KiB ahead: 4 KiB read here and there in a 16 GB file, cold, on Linux 6.12, by the ring, 23k reads a second to 63k (the disk's most) and a sixth of the CPU; by epoll, 14k to 27k, its four workers each waiting on one.
 - On Linux, a file's chunk the page cache had only the start of came back short by the ring (five chunks of 100000 bytes gave 393213): the rest is read too.

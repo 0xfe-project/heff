@@ -541,12 +541,14 @@ static void bc_aged(BcPool *pl) {
 
 // (the behaviour made another's to take, at the back of this worker's
 // queue: where it is full, with those ready.  Readied by a body, the
-// queue's first, one more woken)
+// queue's first, one more woken -- its pool read before it is put, as
+// another may take it, run it and let go of it at once)
 static void bc_spill(BcBehaviour *b) {
+  BcPool *pl = b->pool;
   bc_movable(b);
   int first = bc_own_empty(bc_own);
   if (!bc_own_put(b)) bc_queued(b);
-  else if (first && bc_in_body) bc_wake_one(b->pool);
+  else if (first && bc_in_body) bc_wake_one(pl);
 }
 
 // (whether this worker is looking at its reactor: where an act's rest
