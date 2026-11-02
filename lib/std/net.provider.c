@@ -579,7 +579,7 @@ static V net_where(NetSock *s, int peer) {
 static void net_op_free(NetOp *o) {
   if (o->ais) freeaddrinfo(o->ais);
   if (o->lookup) net_lookup_let_go(o->lookup);
-  free(o->buf);
+  heff_big_free(o->buf, (size_t)o->n);
   if (o->held) heff_drop(o->held);
   free(o->address);
   free(o);
@@ -733,7 +733,7 @@ static V heff_provider_net(V p, V k) {
     NetOp *o = net_op(NET_READ, ms);
     o->address = heff_strdup(s->address);
     o->n = n > NET_READ_MAX ? NET_READ_MAX : n;
-    o->buf = heff_alloc((size_t)o->n);
+    o->buf = heff_big_alloc((size_t)o->n);
     o->held = p;
     o->w.fd = s->fd;
     o->w.step = net_read_step;
