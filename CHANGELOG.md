@@ -4,6 +4,7 @@
 
 ### Backends and performance
 
+- On Linux, a block of 64 KiB to 4 MiB given back -- a socket read's buffer, a file's chunk, a long string or array -- is kept by its thread for the next of its size (four of a size, 32 MiB in all), not given back to the system: a static (musl) build's malloc mapped and unmapped each one afresh, and a server's every read was a map and an unmap. Static build, in a container: `GET /` at 64 connections 126–130k requests a second to 137–139k, as glibc's; 2 GB read from the page cache in chunks, 313 ms to 24 ms. glibc builds as before.
 - A file's chunk read right after a seek is read as asked, straight into its bytes, not 64 KiB ahead: 4 KiB read here and there in a 16 GB file, cold, on Linux 6.12, by the ring, 23k reads a second to 63k (the disk's most) and a sixth of the CPU; by epoll, 14k to 27k, its four workers each waiting on one.
 - On Linux, a file's chunk the page cache had only the start of came back short by the ring (five chunks of 100000 bytes gave 393213): the rest is read too.
 - A file's chunk of 64 KiB or more is read straight into bytes of its own, the kernel's read into them -- the ring's too, on Linux, its buffer the chunk -- not into a buffer and copied. 16 files of 512 MB read at once, cold, in chunks of 1 MiB on Linux 6.12: the program's CPU 10.2–10.4 s to 4.85–4.96 s by the ring, 7.6–7.75 s to 4.41 s by epoll, its page faults halved; in chunks of 64 KiB, 15.3 s to 7.9 s and 11.2 s to 6.0 s.

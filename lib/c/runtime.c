@@ -56,6 +56,7 @@ extern char **environ;
 #endif
 #if defined(__linux__)
 #define HEFF_EPOLL 1
+#include <malloc.h>
 #include <sys/epoll.h>
 #if defined(__has_include)
 #if __has_include(<linux/io_uring.h>)
@@ -755,6 +756,85 @@ HEFF_FN void *heff_alloc(size_t n) {
   return p;
 }
 
+// Large blocks, kept (Linux).  A block of 64 KiB to 4 MiB -- a read's
+// buffer, a file's chunk, a long string or array -- given back is kept,
+// a few of each size, for the next of that size, not given back to the
+// system: a static build's malloc (musl's, zig's) maps and unmaps each
+// such block afresh, a system call each way and every page of it faulted
+// in again, where glibc's keeps them -- a server's every read of a
+// socket was a map and an unmap.  Sizes are rounded up, eight to each
+// power of two, so that what is kept fits what is asked; a block is kept
+// only where the system says it is as large as its size rounded
+// (`malloc_usable_size`), so that one grown in place (`realloc`) is kept
+// by what it is.  Each thread keeps its own, `HEFF_BIG_KEEP` of a size
+// and `HEFF_BIG_ROOM` bytes in all, given back as it ends.  Not where
+// objects are given back to the system at once (`SMALL_MAX` 0, for
+// AddressSanitizer); elsewhere, the system's malloc keeps them itself.
+// `heff_big_alloc` and `heff_big_free` are a provider's too, for a
+// buffer of its own, its size given back with it.
+#if defined(__linux__) && (!defined(SMALL_MAX) || SMALL_MAX != 0)
+#define HEFF_BLOCKS 1
+#define HEFF_BIG_SIZES 49
+#define HEFF_BIG_KEEP 4
+#define HEFF_BIG_ROOM ((size_t)32 << 20)
+HEFF_VAR(HEFF_TLS void *heff_big[HEFF_BIG_SIZES][HEFF_BIG_KEEP]);
+HEFF_VAR(HEFF_TLS uint8_t heff_nbig[HEFF_BIG_SIZES]);
+HEFF_VAR(HEFF_TLS size_t heff_big_kept);
+
+// (`n`'s size, rounded up -- `*r` -- as a kept block's: or -1, `n` kept
+// by none)
+static inline int heff_big_size(size_t n, size_t *r) {
+  if (n < ((size_t)1 << 16) || n > ((size_t)1 << 22)) return -1;
+  int k = 63 - __builtin_clzll((unsigned long long)n);
+  size_t step = (size_t)1 << (k - 3);
+  size_t q = (n + step - 1) / step;
+  if (q == 16) {
+    k++;
+    q = 8;
+    step <<= 1;
+  }
+  *r = q * step;
+  return (k - 16) * 8 + (int)(q - 8);
+}
+
+HEFF_FN void *heff_big_alloc(size_t n) {
+  size_t r;
+  int i = heff_big_size(n, &r);
+  if (i < 0) return heff_alloc(n);
+  if (heff_nbig[i]) {
+    heff_big_kept -= r;
+    return heff_big[i][--heff_nbig[i]];
+  }
+  return heff_alloc(r);
+}
+
+HEFF_FN void heff_big_free(void *p, size_t n) {
+  if (!p) return;
+  size_t r;
+  int i = heff_big_size(n, &r);
+  if (i >= 0 && heff_nbig[i] < HEFF_BIG_KEEP && heff_big_kept + r <= HEFF_BIG_ROOM && malloc_usable_size(p) >= r) {
+    heff_big[i][heff_nbig[i]++] = p;
+    heff_big_kept += r;
+    return;
+  }
+  free(p);
+}
+
+// (what this thread kept given back: as it ends)
+HEFF_FN void heff_big_end(void) {
+  for (int i = 0; i < HEFF_BIG_SIZES; i++) {
+    while (heff_nbig[i]) free(heff_big[i][--heff_nbig[i]]);
+  }
+  heff_big_kept = 0;
+}
+#else
+HEFF_FN void *heff_big_alloc(size_t n) { return heff_alloc(n); }
+HEFF_FN void heff_big_free(void *p, size_t n) {
+  (void)n;
+  free(p);
+}
+#endif
+
 // Objects are small and made and given back all the time (a
 // computation's continuations, its operations, a list's cells): those of
 // up to `SMALL_MAX` bytes are kept, for the next of their size, each
@@ -966,7 +1046,7 @@ HEFF_FN void *heff_page_alloc(size_t c);
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
   HEFF_COUNTED(c);
-  if (c > SMALL_MAX / 8) return heff_alloc(c * 8);
+  if (c > SMALL_MAX / 8) return heff_big_alloc(c * 8);
   HEFF_HEAP;
   HeffPage *pg = HEFF_AT[c];
   if (pg) {
@@ -979,7 +1059,7 @@ static inline void *heff_obj_alloc(size_t n) {
 
 static inline void heff_obj_free(void *p, size_t n) {
   size_t c = (n + 7) / 8;
-  if (c > SMALL_MAX / 8) { free(p); return; }
+  if (c > SMALL_MAX / 8) { heff_big_free(p, c * 8); return; }
   HeffPage *pg = HEFF_PAGE_OF(p);
   HEFF_HEAP;
 #ifdef HEFF_THREADS
@@ -5652,6 +5732,9 @@ HEFF_FN void heff_thread_end(void) {
   }
 #elif defined(HEFF_THREADS)
   heff_heap_end();
+#endif
+#ifdef HEFF_BLOCKS
+  heff_big_end();
 #endif
   free(heff_dead);
   heff_dead = NULL;

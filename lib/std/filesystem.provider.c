@@ -719,7 +719,7 @@ static void fs_op_free(FsOp *o) {
   if (o->result) heff_drop(o->result);
   if (o->held) heff_drop(o->held);
   free(o->owned);
-  free(o->rbuf);
+  heff_big_free(o->rbuf, o->rlen);
   if (o->rbytes) heff_drop(o->rbytes);
   fs_unref(o->h);
   free(o);
@@ -805,8 +805,8 @@ static ssize_t fs_ring_read(FsOp *o, uint8_t *dst, size_t n, V into) {
   uint8_t *to = dst;
   if (!into) {
     if (o->rlen < n) {
-      free(o->rbuf);
-      o->rbuf = heff_alloc(n);
+      heff_big_free(o->rbuf, o->rlen);
+      o->rbuf = heff_big_alloc(n);
       o->rlen = n;
     }
     to = o->rbuf;
