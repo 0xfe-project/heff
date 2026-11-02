@@ -1,20 +1,13 @@
 # heff
 
-heff is a functional language with a Haskell-like syntax and a phase
-distinction: types are computed at compile time, data at run time.
+heff is a functional language with a Haskell-like syntax and a phase distinction: types are computed at compile time, data at run time.
 
-- **Types at compile time.** Types, functions of types and records of
-  them (theories) are values the type checker computes with -- a
-  function takes its types as arguments, `{a : Type} -> ...` -- while
-  run-time data (numbers, strings, data types) never reaches a type.
-- **Algebraic effects** as a library: a computation names the effects it
-  needs as instance arguments, and is given them where it runs.
-- **Self-hosting**: the compiler is written in heff, and builds from a
-  seed of itself compiled to C.
-- **Two backends**: C (native programs, built by zig; the runtime is
-  part C, part Zig) and JavaScript (web pages, ES modules).
-- **Tools** in the one executable: a formatter, a language server, doc
-  tests and property tests, and packages fetched by git.
+- **Types at compile time.** Types, functions of types and records of them (theories) are values the type checker computes with -- a function takes its types as arguments, `{a : Type} -> ...` -- while run-time data (numbers, strings, data types) never reaches a type.
+- **Algebraic effects** as a library: a computation names the effects it needs as instance arguments, and is given them where it runs.
+- **Behaviour-Oriented Concurrency**: the main concurrency programming style, directly be supported by the runtime.
+- **Self-hosting**: the compiler is written in heff, and builds from a seed of itself compiled to C.
+- **Two backends**: C (native programs, built by zig; the runtime is part C, part Zig) and JavaScript (web pages, ES modules).
+- **Tools** in the one executable: a formatter, a language server, doc tests and property tests, and packages fetched by git.
 
 ```haskell
 module hello
@@ -36,13 +29,11 @@ main = do
     print $ "Hello, " ^ x ^ "!"
 ```
 
-`heff run hello.hf` prints the two greetings; `heff test hello.hf`
-checks the doc test of `map`.
+`heff run hello.hf` prints the two greetings; `heff test hello.hf` checks the doc test of `map`.
 
 ## Installing
 
-With [zig](https://ziglang.org/download/) and make (Node.js only for
-some of the tests):
+With [zig](https://ziglang.org/download/) and make (Node.js only for some of the tests):
 
 ```sh
 make install               # build .heff/out/heff, then install it into ~/.heff/bin/
@@ -67,11 +58,8 @@ heff dev                   # build and run; again at each change
 
 ## Editors
 
-- **VS Code**: [`editors/vscode`](editors/vscode/README.md), a client of
-  `heff lsp` -- diagnostics, hover, go to definition, completion,
-  formatting, renaming.  A release has it built (`heff-X.Y.Z.vsix`).
-- **bat** (and Sublime Text): [`editors/bat`](editors/bat/README.md), a
-  syntax for `.hf` files.
+- **VS Code**: [`editors/vscode`](editors/vscode/README.md), a client of `heff lsp` -- diagnostics, hover, go to definition, completion, formatting, renaming.  A release has it built (`heff-X.Y.Z.vsix`).
+- **bat** (and Sublime Text): [`editors/bat`](editors/bat/README.md), a syntax for `.hf` files.
 
 ## Documentation
 
@@ -85,13 +73,10 @@ make check   # all a change is held to: from the seed, every test, the layout
 make         # every target
 ```
 
-How the source is laid out, the seed and the test groups are in
-[DEVELOPING.md](DEVELOPING.md).
+How the source is laid out, the seed and the test groups are in [DEVELOPING.md](DEVELOPING.md).
 
 ## References
 
-- Lynch & Staton, *Hippogriff*, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728):
-  the core theory heff uses, and [its implementation](https://tangled.org/owenlynch.tngl.sh/hippogriff/),
-  which heff refers to.
-- Yang & Wu, POPL 2026, [arXiv:2511.05739](https://arxiv.org/abs/2511.05739):
-  the idea behind heff's effects library, `co`.
+- Lynch & Staton, *Hippogriff*, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728): the core theory heff uses, and [its implementation](https://tangled.org/owenlynch.tngl.sh/hippogriff/), which heff refers to.
+- Yang & Wu, POPL 2026, [arXiv:2511.05739](https://arxiv.org/abs/2511.05739): the idea behind heff's effects library, `co`.
+- Behaviour-Oriented Concurrency, [doi.org/10.1145/3622852](https://dl.acm.org/doi/10.1145/3622852): the main concurrency programming style supported in runtime.
