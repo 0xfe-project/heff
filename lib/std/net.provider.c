@@ -23,11 +23,13 @@
 // by a thread of its own, which says it is done by a descriptor written;
 // without one, it is resolved where the program is, not cut short.
 //
-// Where the reactor has a ring that does it (`heff_ring_can`), an
-// accept, a read and a write that cannot be done now are the ring's,
-// not waits for the socket to be ready and the call tried again: the
-// kernel accepts, reads into the op's buffer, writes from the bytes the
-// op holds, as it can, and the op is stepped with what it did.
+// Where the reactor has a ring that does it (`heff_ring_can`), a read
+// and a write that cannot be done now are the ring's, not waits for the
+// socket to be ready and the call tried again: the kernel reads into the
+// op's buffer, writes from the bytes the op holds, as it can, and the op
+// is stepped with what it did.  An accept is not: a listener is waited
+// on by the turn's poll alone (`loose`), so that the kernel never holds
+// it once the process is gone.
 
 #ifdef _WIN32
 
@@ -361,20 +363,6 @@ static int net_took(NetOp *o, int32_t *res) {
 
 static int net_accept_step(HeffWait *w) {
   NetOp *o = (NetOp *)w;
-  int32_t res;
-  if (net_took(o, &res)) {
-    if (res < 0) {
-      o->err = -res;
-      return HEFF_STEP_DONE;
-    }
-    if (net_ready_fd(res) < 0) {
-      o->err = errno;
-      close(res);
-      return HEFF_STEP_DONE;
-    }
-    o->n = res;
-    return HEFF_STEP_DONE;
-  }
   for (;;) {
     int c = accept(w->fd, NULL, NULL);
     if (c >= 0) {
@@ -389,10 +377,6 @@ static int net_accept_step(HeffWait *w) {
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       w->events = POLLIN;
-#ifdef SOCK_NONBLOCK
-      if (!o->unringed && heff_ring_op(w, HEFF_OP_ACCEPT, w->fd, NULL, 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC, NULL))
-        return HEFF_STEP_WAIT;
-#endif
       return HEFF_STEP_WAIT;
     }
     o->err = errno;
@@ -731,6 +715,7 @@ static V heff_provider_net(V p, V k) {
     o->address = heff_strdup(s->address);
     o->held = p;
     o->w.fd = s->fd;
+    o->w.loose = 1;
     o->w.step = net_accept_step;
     return net_go(o, f, k);
   }

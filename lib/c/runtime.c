@@ -5774,6 +5774,12 @@ struct HeffWait {
                                  //  its `fd` and `events` again)
   V (*answer)(HeffWait *);       // (its answer, made, the wait let go of)
   void (*cancel)(HeffWait *);    // (the wait let go of, undone)
+  int loose;                     // (whether its descriptor is to be the
+                                 //  kernel's only while a turn waits:
+                                 //  polled by the turn, where the reactor
+                                 //  has a ring -- a listener, which a poll
+                                 //  of the ring's would keep listening
+                                 //  once the process is gone)
   // (the reactor's)
   V f, k;
   int64_t group;
@@ -6121,6 +6127,69 @@ HEFF_FN int heff_ring_open(void) {
   return -1;
 }
 
+// The program's end and the rings.  What the kernel holds of a ring at
+// the end -- a poll, a read -- holds its descriptor's file: a connection
+// stays open until the kernel tears the ring down, after the process is
+// gone, which Linux 6.12 takes a tenth of a second for.  A listener so
+// held would stay listening, and a server started again on its port
+// meanwhile -- restarted, killed -- find it taken: so a listener is
+// never the ring's (`loose`), but polled by the turn, held by the kernel
+// only while the turn waits.  At the end (`exit`, a failure's
+// `quick_exit`) what each thread's ring has with the kernel is taken
+// back first, at once (IORING_REGISTER_SYNC_CANCEL, Linux 6.0 on;
+// before, nothing is), and what it held let go of with the process; one
+// killed -- SIGKILL, a signal not handled -- runs nothing, its
+// connections closed as the kernel tears its rings down.  The rings are
+// kept by their descriptors, plus one (0, none), so many at most; one
+// let go of is taken out first, under the same lock, so that its number
+// is never another's by then.
+#define HEFF_RINGS 1024
+HEFF_VAR(int heff_rings[HEFF_RINGS]);
+HEFF_VAR(int heff_rings_lock);
+HEFF_VAR(int heff_rings_ending);
+
+HEFF_FN void heff_rings_take(void) {
+  while (__atomic_exchange_n(&heff_rings_lock, 1, __ATOMIC_ACQUIRE))
+    ;
+}
+
+HEFF_FN void heff_rings_give(void) { __atomic_store_n(&heff_rings_lock, 0, __ATOMIC_RELEASE); }
+
+// (every ring's operations taken back, at the end)
+HEFF_FN void heff_rings_end(void) {
+#ifdef IORING_ASYNC_CANCEL_ANY
+  heff_rings_take();
+  for (int i = 0; i < HEFF_RINGS; i++) {
+    if (!heff_rings[i]) continue;
+    struct io_uring_sync_cancel_reg r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.flags = IORING_ASYNC_CANCEL_ANY;
+    r.timeout.tv_nsec = 100000000;
+    (void)syscall(__NR_io_uring_register, heff_rings[i] - 1, IORING_REGISTER_SYNC_CANCEL, &r, 1);
+  }
+  heff_rings_give();
+#endif
+}
+
+// (the ring `fd` kept, or, `on` 0, taken out; the end's taking back
+// asked for, the first time)
+HEFF_FN void heff_rings_keep(int fd, int on) {
+  heff_rings_take();
+  for (int i = 0; i < HEFF_RINGS; i++)
+    if (on ? !heff_rings[i] : heff_rings[i] == fd + 1) {
+      heff_rings[i] = on ? fd + 1 : 0;
+      break;
+    }
+  int first = on && !heff_rings_ending;
+  if (first) heff_rings_ending = 1;
+  heff_rings_give();
+  if (first) {
+    atexit(heff_rings_end);
+    at_quick_exit(heff_rings_end);
+  }
+}
+
 // (the ring let go of: its descriptor closed after, by the queue's)
 HEFF_FN void heff_ring_close(void) {
   munmap(heff_ring.sqes, heff_ring.sqes_len);
@@ -6361,6 +6430,12 @@ HEFF_FN void heff_evq_add(HeffWait *w) {
     heff_evq_polled(w);
     return;
   }
+#ifdef HEFF_URING
+  if (heff_ring_on && w->loose) {
+    heff_evq_polled(w);
+    return;
+  }
+#endif
   size_t at = (size_t)w->fd * 2 + (size_t)(way - 1);
   heff_evq_room(at);
   if (heff_evq_owner[at] || !heff_evq_tell(w->fd, way, 1)) {
@@ -6424,6 +6499,7 @@ HEFF_FN void heff_evq_open(void) {
   heff_evq = heff_ring_open();
   if (heff_evq >= 0) {
     heff_ring_on = heff_evq_made = 1;
+    heff_rings_keep(heff_evq, 1);
     return;
   }
 #endif
@@ -6438,7 +6514,10 @@ HEFF_FN void heff_evq_open(void) {
 HEFF_FN void heff_evq_close(void) {
   if (!heff_evq_made) return;
 #ifdef HEFF_URING
-  if (heff_ring_on) heff_ring_close();
+  if (heff_ring_on) {
+    heff_rings_keep(heff_evq, 0);
+    heff_ring_close();
+  }
 #endif
   close(heff_evq);
   heff_evq_made = 0;
