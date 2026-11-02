@@ -22,6 +22,12 @@
 // descriptor: under a scheduler, a host that is no address is resolved
 // by a thread of its own, which says it is done by a descriptor written;
 // without one, it is resolved where the program is, not cut short.
+//
+// Where the reactor has a ring that does it (`heff_ring_can`), an
+// accept, a read and a write that cannot be done now are the ring's,
+// not waits for the socket to be ready and the call tried again: the
+// kernel accepts, reads into the op's buffer, writes from the bytes the
+// op holds, as it can, and the op is stepped with what it did.
 
 #ifdef _WIN32
 
@@ -228,6 +234,7 @@ struct NetOp {
                        //  listener, else -1)
   int what;
   int err, gai;        // (why it failed: errno, getaddrinfo's code)
+  int unringed;        // (the ring's operation said it would wait: polled)
   // a connection made, a socket listening
   struct addrinfo *ais, *ai;
   int backlog;
@@ -342,8 +349,32 @@ static int net_listen_step(HeffWait *w) {
 }
 
 // (the listener's descriptor stepped on, and the socket made: in `o->n`)
+// (a step's ring operation come back, its result `res`, where it is
+// one: 1, the result to take; 0, none; -1, the ring's said it would
+// wait, the op polled from now on)
+static int net_took(NetOp *o, int32_t *res) {
+  if (!heff_ring_took(&o->w, res)) return 0;
+  if (*res != -EAGAIN && *res != -EINTR) return 1;
+  o->unringed = *res == -EAGAIN;
+  return 0;
+}
+
 static int net_accept_step(HeffWait *w) {
   NetOp *o = (NetOp *)w;
+  int32_t res;
+  if (net_took(o, &res)) {
+    if (res < 0) {
+      o->err = -res;
+      return HEFF_STEP_DONE;
+    }
+    if (net_ready_fd(res) < 0) {
+      o->err = errno;
+      close(res);
+      return HEFF_STEP_DONE;
+    }
+    o->n = res;
+    return HEFF_STEP_DONE;
+  }
   for (;;) {
     int c = accept(w->fd, NULL, NULL);
     if (c >= 0) {
@@ -358,6 +389,10 @@ static int net_accept_step(HeffWait *w) {
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       w->events = POLLIN;
+#ifdef SOCK_NONBLOCK
+      if (!o->unringed && heff_ring_op(w, HEFF_OP_ACCEPT, w->fd, NULL, 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC, NULL))
+        return HEFF_STEP_WAIT;
+#endif
       return HEFF_STEP_WAIT;
     }
     o->err = errno;
@@ -367,6 +402,12 @@ static int net_accept_step(HeffWait *w) {
 
 static int net_read_step(HeffWait *w) {
   NetOp *o = (NetOp *)w;
+  int32_t res;
+  if (net_took(o, &res)) {
+    if (res < 0) o->err = -res;
+    else o->done = res;
+    return HEFF_STEP_DONE;
+  }
   for (;;) {
     ssize_t r = recv(w->fd, o->buf, (size_t)o->n, 0);
     if (r >= 0) {
@@ -376,6 +417,8 @@ static int net_read_step(HeffWait *w) {
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       w->events = POLLIN;
+      if (!o->unringed && heff_ring_op(w, HEFF_OP_RECV, w->fd, o->buf, (uint64_t)o->n, 0, 0, NULL))
+        return HEFF_STEP_WAIT;
       return HEFF_STEP_WAIT;
     }
     o->err = errno;
@@ -385,6 +428,18 @@ static int net_read_step(HeffWait *w) {
 
 static int net_write_step(HeffWait *w) {
   NetOp *o = (NetOp *)w;
+  int32_t res;
+  if (net_took(o, &res)) {
+    if (res < 0) {
+      o->err = -res;
+      return HEFF_STEP_DONE;
+    }
+    o->done += res;
+    // (the rest, the ring's again at once: the socket was full)
+    if (o->done < o->n && heff_ring_op(w, HEFF_OP_SEND, w->fd, o->data + o->done, (uint64_t)(o->n - o->done), 0,
+                                       NET_SEND_FLAGS, NULL))
+      return HEFF_STEP_WAIT;
+  }
   while (o->done < o->n) {
     ssize_t r = send(w->fd, o->data + o->done, (size_t)(o->n - o->done), NET_SEND_FLAGS);
     if (r >= 0) {
@@ -394,6 +449,9 @@ static int net_write_step(HeffWait *w) {
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       w->events = POLLOUT;
+      if (!o->unringed && heff_ring_op(w, HEFF_OP_SEND, w->fd, o->data + o->done, (uint64_t)(o->n - o->done), 0,
+                                       NET_SEND_FLAGS, NULL))
+        return HEFF_STEP_WAIT;
       return HEFF_STEP_WAIT;
     }
     o->err = errno;
@@ -543,8 +601,15 @@ static void net_op_free(NetOp *o) {
   free(o);
 }
 
+// (a connection the ring accepted after the op ended: closed)
+static void net_ring_left(NetOp *o) {
+  int32_t res;
+  if (heff_ring_took(&o->w, &res) && o->what == NET_ACCEPT && res >= 0) close(res);
+}
+
 static V net_answer(HeffWait *w) {
   NetOp *o = (NetOp *)w;
+  net_ring_left(o);
   // (why waiting failed, where it did: the op's error)
   int err = w->err ? w->err : o->err;
   V r;
@@ -578,6 +643,7 @@ static V net_answer(HeffWait *w) {
 
 static void net_cancel(HeffWait *w) {
   NetOp *o = (NetOp *)w;
+  net_ring_left(o);
   // (a socket being connected, or listened on, is the op's own)
   if ((o->what == NET_CONNECT || o->what == NET_LISTEN) && !o->lookup && w->fd >= 0) close(w->fd);
   net_op_free(o);
