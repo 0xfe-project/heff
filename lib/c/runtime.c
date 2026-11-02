@@ -1842,16 +1842,32 @@ HEFF_FN V *heff_slots(V v, int64_t *n) {
 }
 
 // (a stack of objects, for a walk that is not a recursion: a long
-// list's spine never on the C stack)
-typedef struct { V *v; size_t n, cap; } HeffStack;
+// list's spine never on the C stack.  The first few are held in the
+// stack itself, so the walk of a small value -- a behaviour's body,
+// handed to another thread -- allocates nothing)
+typedef struct { V *v; size_t n, cap; V few[16]; } HeffStack;
 
 HEFF_FN void heff_stack_push(HeffStack *s, V v) {
   if (s->n == s->cap) {
-    s->cap = s->cap ? s->cap * 2 : 256;
-    s->v = realloc(s->v, s->cap * sizeof(V));
-    if (!s->v) heff_fail("out of memory");
+    if (!s->cap) {
+      s->v = s->few;
+      s->cap = sizeof s->few / sizeof(V);
+    } else if (s->v == s->few) {
+      s->v = malloc(s->cap * 2 * sizeof(V));
+      if (!s->v) heff_fail("out of memory");
+      memcpy(s->v, s->few, sizeof s->few);
+      s->cap *= 2;
+    } else {
+      s->cap *= 2;
+      s->v = realloc(s->v, s->cap * sizeof(V));
+      if (!s->v) heff_fail("out of memory");
+    }
   }
   s->v[s->n++] = v;
+}
+
+HEFF_FN void heff_stack_free(HeffStack *s) {
+  if (s->v != s->few) free(s->v);
 }
 
 // (each place of the object `v` holds a value in, given to `f`)
@@ -1912,7 +1928,7 @@ HEFF_FN void heff_freeze(V v) {
     V o = s.v[--s.n];
     HEFF_EACH_SLOT(o, heff_freeze_one, &s);
   }
-  free(s.v);
+  heff_stack_free(&s);
 }
 
 #ifdef HEFF_THREADS
@@ -1943,7 +1959,7 @@ HEFF_FN V heff_share(V v) {
     V o = s.v[--s.n];
     HEFF_EACH_SLOT(o, heff_share_one, &s);
   }
-  free(s.v);
+  heff_stack_free(&s);
   return v;
 }
 
@@ -1989,7 +2005,7 @@ HEFF_FN V heff_move(V v) {
     V o = s.v[--s.n];
     HEFF_EACH_SLOT(o, heff_move_one, &s);
   }
-  free(s.v);
+  heff_stack_free(&s);
   return v;
 }
 
@@ -2022,7 +2038,7 @@ HEFF_FN void heff_own_at(V *at) {
     V o = s.v[--s.n];
     HEFF_EACH_SLOT(o, heff_own_one, &s);
   }
-  free(s.v);
+  heff_stack_free(&s);
 }
 #else
 // (one thread: nothing is shared, nothing to do)
@@ -4169,7 +4185,7 @@ HEFF_FN int heff_own_found(HeffOwnLog *g, Arr *r) {
           k.from = o;
           HEFF_EACH_SLOT(o, heff_own_seek, &k);
         }
-        free(k.s.v);
+        heff_stack_free(&k.s);
         if (!k.at) continue;
         at = k.at;
         parent = k.parent;
