@@ -363,17 +363,15 @@ static V rpc_open_fn(V self, V *a) {
   return NTAG(TAG_MkUnit);
 }
 
-// (`c`, a computation of the world, run to its end, a failure caught --
-// an abandon, a case not provided for, the runtime's, a stack that
-// overflowed: `Right` its value, or `Left` why, said on stderr too.  By
-// the runtime's catch-all, the language server's alone: a fault of the
-// compiler's ends the request, not the server.  What it made before
-// failing is leaked, as `heff_try` leaves it; the depth of calls last is
-// put back)
+// (`c`, a computation of the world, run to its end, an abandon caught:
+// `Right` its value, or `Left` why, said on stderr too.  Any other
+// failure ends the server, as it ends every program.  What it made
+// before abandoning is leaked, as `heff_try` leaves it; the depth of
+// calls last is put back)
 static V rpc_attempt(V c) {
   long dep = heff_dep;
   V r;
-  const char *why = heff_lsp_try(c, heff_clo(heff_kept, 1, 0, NULL), &r);
+  const char *why = heff_try(c, heff_clo(heff_kept, 1, 0, NULL), &r);
   heff_dep = dep;
   if (!why) return heff_tag_n(TAG_Right, 1, &r);
   fprintf(stderr, "heff lsp: failed: %s\n", why);
