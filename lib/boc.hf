@@ -3,11 +3,15 @@
 -- behaviour, which later, once, with every cown of `c` its own at once,
 -- is given what they hold and gives back what they are to hold after
 -- it.  Behaviours whose cowns overlap run one after another, in the
--- order they were spawned; the others run at once, on as many threads
--- as the machine has cores.  A behaviour takes its cowns all at once,
--- never one and then another, so behaviours do not deadlock on them.
--- Import it by a name, `import boc as BOC`, and name `BOC.boc` in the
--- program's world.
+-- causal order of their spawns (Cheeseman et al., CONCUR 2026,
+-- Definition 7): one spawned before another by the same body or
+-- `main`, or by a body that body spawned, or by a body that held a cown
+-- the first was done on, runs first; two spawned by bodies with no such
+-- path between them are in no order, whichever was spawned first in
+-- time.  The others run at once, on as many threads as the machine has
+-- cores.  A behaviour takes its cowns all at once, never one and then
+-- another, so behaviours do not deadlock on them.  Import it by a name,
+-- `import boc as BOC`, and name `BOC.boc` in the program's world.
 --
 -- > [!CAUTION]
 -- > Unstable: concurrency in heff is not settled. What this module offers
@@ -66,9 +70,11 @@
 -- names it sets are written back, and the `with` comes to `()`.  A
 -- `with` of cowns with a condition, `with a := c once p do ...`, is a
 -- behaviour that, once it has its cowns, checks `p` of what they hold:
--- where it does not hold, the behaviour lets go of them, untouched, and
--- waits until a behaviour writes a cown whose name `p` reads; then it is
--- queued again on all of them, behind that one, and checks `p` again
+-- where it does not hold, the behaviour lets go of them, untouched --
+-- done, as far as the behaviours after it are concerned -- and waits
+-- until a behaviour writes a cown whose name `p` reads; that one, at
+-- its end, spawns it again on all of them, as its own last spawn: after
+-- itself, and after all it came after on them; and it checks `p` again
 -- (the paper's `whenever`).  One still waiting once every other
 -- behaviour of the program is done is dropped, its body never run.
 -- The same cown twice in one `when` or `with` -- two names bound to one
@@ -92,12 +98,20 @@
 -- later, once, on whichever thread takes it: what it needs that it
 -- cannot do in the world, it is given as a value.
 --
--- So a behaviour runs before every behaviour spawned after it on a cown
--- they share, wherever in the source it is.  There is no barrier, and
--- nothing waits for behaviours to come back with a value: a behaviour
--- that is to come after others on a cown is spawned after them on it,
--- and what they came to is given on, to the behaviours after them
--- (`parMap`'s `k`).
+-- So a behaviour runs before every behaviour spawned after it, in the
+-- causal order, on a cown they share, wherever in the source it is: the
+-- order is that of one body's (or `main`'s) statements, and passes from
+-- a spawn to the body it spawned, and from a behaviour done on a cown
+-- to the next to hold it -- what a body spawned before it ended, the
+-- next behaviour on any of its cowns comes after, and so do the
+-- behaviours that one spawns.  Two behaviours spawned by bodies between
+-- which there is no such path are in no order, even where one was
+-- spawned long before the other: a program that wants an order between
+-- them spawns the second from a body that comes after the first.  There
+-- is no barrier, and nothing waits for behaviours to come back with a
+-- value: a behaviour that is to come after others on a cown is spawned
+-- after them on it, and what they came to is given on, to the
+-- behaviours after them (`parMap`'s `k`).
 --
 -- The program is the scope: a program whose world has `boc` has one
 -- pool, of as many threads as the machine has cores, opened by its
@@ -118,8 +132,10 @@
 -- value.  With cowns bound before it (`with x := c` and `r := BOC.await
 -- act` under it; several cowns, a tuple of them to one name, `x := (c0,
 -- c1)`), it is a behaviour on them, spawned only then: no cown is held
--- while the act waits, and behaviours on a cown that await acts come in
--- the order their acts came to their values.  What an act fails at is
+-- while the act waits, and the behaviour comes after what the `with`
+-- awaiting the act came after -- the act's rest is the `with`'s own, in
+-- the causal order -- and in no order with what was spawned meanwhile
+-- by bodies that know nothing of it.  What an act fails at is
 -- its value, for the body to handle -- `Net.read`'s `Either NetError
 -- Bytes`, a time limit its own (`Net.read (timeout := 5000) c n`); an
 -- act that itself abandons is as a body that abandons: that is said,
@@ -176,15 +192,32 @@
 -- behaviour after it is never spawned.  What a caller is to handle is an
 -- `exception`'s throw, caught in the body (`attempt`), not a failure.
 
--- The runtime's side (boc.provider.c): each cown is a turnstile, the
--- last request queued at it, and the value it holds.  A behaviour is
+-- The runtime's side (boc.provider.c): each context that spawns -- a
+-- body, `main`, an act's rest -- knows, for each cown, the latest
+-- behaviour spawned on it before that point in the causal order (a few
+-- entries, each a behaviour at a cown); a spawn waits for those on
+-- each of its cowns not yet done, copies what the context knows into
+-- the behaviour for its body, and is known to the context from then
+-- on.  What a context knows passes along a body, is copied by each
+-- spawn for the body it spawns, and is left at each cown by the
+-- behaviour done on it for the next to hold it, which puts it with its
+-- own -- laid out only where the body spawns, or is on several cowns;
+-- a body on one cown that spawns nothing hands it on as it came.  A
+-- spawner that has spawned thousands while thousands wait to run is
+-- held back a little at each spawn, so that what waits stays as large
+-- as the caches.  Once every behaviour it waited for is done, the
+-- behaviour is queued at its cowns: each cown is a turnstile, the
+-- last request queued at it, and the value it holds; the behaviour is
 -- queued at each of its cowns' in two phases, by swaps, in the order of
 -- their addresses, then runs on a thread of the pool once it is first
--- at each, and lets the next through at each as it ends.  No lock but
--- the pool's own, around the behaviours ready.  A behaviour readied by
--- one a thread runs -- spawned, or handed a cown -- is kept by that
--- thread and run next there, nothing woken, until it has run 64 in a row
--- with others ready.  A cown's value is the cown's, read by the
+-- at each, and lets the next through at each as it ends -- first come
+-- first served at each cown, so none waits for ever.  Several released
+-- by one behaviour's end, in no order with one another, are queued in
+-- an order drawn at random, not the order they were spawned in time.
+-- No lock but the pool's own, around the behaviours ready.  A
+-- behaviour readied by one a thread runs -- spawned, or handed a cown
+-- -- is kept by that thread and run next there, nothing woken, until it
+-- has run 64 in a row with others ready.  A cown's value is the cown's, read by the
 -- behaviour holding it as its own (owned, not shared): an array a cown
 -- holds a body writes in place, and the runtime puts back what it wrote
 -- where the body abandons or does not write the cown.  The behaviours
@@ -221,12 +254,15 @@
 -- kept, until it ends; that is the program's to avoid.
 --
 -- JavaScript's (boc.provider.js): one thread, the behaviours run in
--- turns, each once it is first at every cown it is queued at, in the
--- order they were readied.  A body whose rest comes later (a sleep, an
--- operation of another provider that waits) holds its cowns until then.
--- An act awaited is a turn of its own, holding no cown; of two raced,
--- the other is not given up, nothing there undoing a wait, but runs on,
--- its rest doing nothing; nor is an act given up by a custodian.
+-- turns, each queued at its cowns once those it comes after are done,
+-- as in C, and run once it is first at every one.  A body whose rest
+-- comes later (a sleep, an operation of another provider that waits)
+-- holds its cowns until then; what that rest spawns, whose body it is
+-- cannot be told then, comes after every behaviour spawned before it
+-- on its cowns, as the clock has it -- the sound choice.  An act
+-- awaited is a turn of its own, holding no cown; of two raced, the
+-- other is not given up, nothing there undoing a wait, but runs on, its
+-- rest doing nothing; nor is an act given up by a custodian.
 
 module boc
   ( Cown
@@ -362,7 +398,10 @@ givingThen g (MkGiving tn v x) = MkGiving tn v (g x)
 -- | behaviour after it spawned -- its own rest; two acts raced, each
 -- | given the race as its turn, and asking it, once it has its value,
 -- | whether it is the first to (`Won`), the other given up where it is;
--- | how many threads the pool runs behaviours on (`Workers`).  The
+-- | an act's rest run as the act's (`After`): what the act's turn knows
+-- | of the behaviours before it is what the behaviours its rest spawns
+-- | come after; how many threads the pool runs behaviours on
+-- | (`Workers`).  The
 -- | computations are `m`'s, wrapped where the operation is, by the
 -- | handler in force there; what is of a type of its own is beside them,
 -- | not mapped.
@@ -374,6 +413,7 @@ data BocF (m : Type -> Type) x
   | Awaits (Turn -> m Unit) x
   | Races (Turn -> m Unit) (Turn -> m Unit) x
   | Won Turn (Bool -> x)
+  | After Turn (m Unit) x
   | Workers (Int -> x)
 
 -- | Behaviours on cowns, the runtime's: cowns made, behaviours queued on
@@ -389,6 +429,7 @@ boc =
       Awaits c x -> Awaits c (g x)
       Races l r x -> Races l r (g x)
       Won tn k -> Won tn (\b -> g (k b))
+      After tn c x -> After tn c (g x)
       Workers k -> Workers (\n -> g (k n))
   , hmap = \m n nt p -> case p of
       NewCown s -> NewCown s
@@ -398,6 +439,7 @@ boc =
       Awaits c x -> Awaits (\tn -> nt (c tn)) x
       Races l r x -> Races (\tn -> nt (l tn)) (\tn -> nt (r tn)) x
       Won tn k -> Won tn k
+      After tn c x -> After tn (nt c) x
       Workers k -> Workers k
   }
 
@@ -492,7 +534,9 @@ behaviour cs written body =
 
 -- | A behaviour on the cowns `cs`, one or a tuple of them, spawned;
 -- | this one goes on.  Its turn comes once every behaviour spawned
--- | before it on any of them is done; then `body` is given what they
+-- | before it, in the causal order, on any of them is done -- by this
+-- | body before it, or by a body this one came after on a cown, or by
+-- | one those spawned -- then `body` is given what they
 -- | hold, a tuple as `cs` is, and what it gives back is what they hold
 -- | after.  The body is a computation of this world, run later, on
 -- | whichever thread takes it.  The same cown twice is a failure, the
@@ -599,8 +643,8 @@ instanceHolderCownsMore =
 -- | A behaviour on a cown held by a `with` with a condition, `with a :=
 -- | c once p do ...`: once it has the cown, `p` checked of what it
 -- | holds; where it does not hold, the cown let go of, untouched, and
--- | the behaviour waits until a behaviour writes it, then is queued
--- | again, behind that one (the paper's `whenever`).
+-- | the behaviour waits until a behaviour writes it, which spawns it
+-- | again at its end, after itself (the paper's `whenever`).
 instance instanceWaiterCown : {e : HFunctor}
                             -> {a : Type}
                             -> {{bc : boc <: e}}
@@ -691,6 +735,12 @@ data Await (w : HFunctor) a
 await : {w : HFunctor} -> {a : Type} -> Co w a -> Await w a
 await act = MkAwait act
 
+-- (`c`, the rest of the act whose turn is `tn`, run as the act's: the
+-- behaviours it spawns come after those the act's `with` knew of, as
+-- the act's own `when` would -- the runtime runs it knowing the turn)
+after : {e : HFunctor} -> {{bc : boc <: e}} -> Turn -> Co e Unit -> Co e Unit
+after tn c = op (bc (After tn c MkUnit)) val
+
 -- (`c` run where the act of the race `tn` whose value this is came to
 -- it first: the other given up then)
 firstThen : {e : HFunctor}
@@ -699,7 +749,9 @@ firstThen : {e : HFunctor}
           -> Co e Unit
           -> Co e Unit
 firstThen tn c =
-  bind (op (bc (Won tn (\b -> b))) val) (\w -> if w then c else pure ())
+  bind
+    (op (bc (Won tn (\b -> b))) val)
+    (\w -> if w then after tn c else pure ())
 
 -- (the act awaited, and `k` given its value once it has come to it:
 -- both run outside every behaviour, `k`, as the act's rest, spawning
@@ -710,7 +762,8 @@ awaitedThen : {e : HFunctor}
             -> Await e a
             -> (a -> Co e Unit)
             -> Co e Unit
-awaitedThen (MkAwait act) k = op (bc (Awaits (\tn -> bind act k) MkUnit)) val
+awaitedThen (MkAwait act) k =
+  op (bc (Awaits (\tn -> bind act (\x -> after tn (k x))) MkUnit)) val
 awaitedThen (Raced l r) k =
   op
     (bc
@@ -772,8 +825,8 @@ instanceHolderAwait =
   }
 
 -- | ... and with cowns: once the act has come to its value, the body a
--- | behaviour on them, spawned then -- so behaviours on a cown that
--- | await acts are in the order their acts came to their values -- its
+-- | behaviour on them, spawned then -- after what the `with` awaiting
+-- | the act came after, as the act's rest is the `with`'s own -- its
 -- | names set what they hold after it, as a `with` of the cowns alone.
 instance instanceHolderCownsAwait : {e : HFunctor}
                                   -> {c a : Type}

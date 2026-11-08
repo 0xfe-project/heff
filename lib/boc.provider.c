@@ -3,20 +3,64 @@
 // once, so it says so:
 #define HEFF_THREADS 1
 // A cown is a foreign value: a turnstile (the last request queued at
-// it), the value it holds, and the behaviours waiting for it to be
-// written (`once`), each read and written by the one behaviour holding
-// it, once it is first at the turnstile.  A behaviour is queued and run
-// as the paper has it (Cheeseman et al., OOPSLA 2023, as Verona keeps
-// it): a request at each of its cowns, in the order of their addresses,
-// queued by swapping each in as the last, the one before it -- once
-// that one's behaviour is done queueing at all of its own -- told it is
-// next.  A behaviour on one cown is done queueing as it is swapped in,
-// so its request says so from the start, and the one behind it never
-// waits.  It runs once it is first at every one: a count of the cowns it
-// still waits at, and one more until its queueing is done.  Done, it
-// lets the next through at each, or, where none is behind it, takes its
-// request out as the last by a compare-and-swap -- or, one coming
-// meanwhile, waits for it to say so.  No mutex but the pool's, around
+// it), the value it holds, the behaviours waiting for it to be written
+// (`once`), and what the last behaviour on it knew of the others (its
+// causal context, below), each read and written by the one behaviour
+// holding it, once it is first at the turnstile.
+//
+// Which behaviour comes before which is the paper's causality
+// (Cheeseman et al., "When Behaviours Have to Happen: An Axiomatic
+// Model of Causality in BoC", CONCUR 2026, Definition 7): a behaviour
+// i is done before a behaviour j runs iff the two share a cown and i's
+// spawn comes before j's in the causal order -- the order within one
+// body or one `main` (program order), from a spawn to the body it
+// spawned (the body runs after its spawn), and from a behaviour done
+// on a cown to the next to hold that cown (the hand-over), these
+// three chained.  Behaviours spawned by bodies with no such path
+// between them are in no order, whichever was spawned first in time:
+// the order of the clock is not causality (the paper's Definition 9,
+// the operational semantics' `hb_os`, which Verona and this runtime
+// before it kept by queueing each behaviour at its cowns as it was
+// spawned, is more than the model asks for, and which of two unrelated
+// behaviours it put first turned on where in the source each `when`
+// stood).
+//
+// So a behaviour is not queued at its cowns as it is spawned, but once
+// every behaviour it is to come after is done.  Each context that
+// spawns -- a body running, `main`, the rest of an act awaited --
+// carries what it knows: for each cown, the behaviours spawned on it
+// before this point in the causal order and perhaps not done (`BcCtx`:
+// a base, laid flat, and a list of its own spawns since).  A spawn
+// looks up the latest the context knows of on each of the new
+// behaviour's cowns and waits for those not done (`pending`, the
+// behaviour on each one's list of dependents), captures what the
+// context knows, for its body, and puts itself in the context.  The
+// context passes along program order within the body, is captured by
+// the spawn for the body it spawns, and is left at each cown by the
+// behaviour done on it for the next holder, which merges it with its
+// own as it starts: the paper's three edges.  Only the latest on a
+// cown need be waited for: it waits for the earlier ones itself.  A
+// context is laid flat again, those done dropped, once its list has
+// grown past twice its base, so that `main`'s, which is never done,
+// stays as large as what is live.  Each behaviour is counted
+// (`refs`) by the contexts that know it, so one done is not reused
+// while one still asks whether it is.
+//
+// Once none is left to wait for, the behaviour is queued and run as
+// the OOPSLA 2023 paper has it (as Verona keeps it): a request at each
+// of its cowns, in the order of their addresses, queued by swapping
+// each in as the last, the one before it -- once that one's behaviour
+// is done queueing at all of its own -- told it is next.  A behaviour
+// on one cown is done queueing as it is swapped in, so its request
+// says so from the start, and the one behind it never waits.  It runs
+// once it is first at every one: a count of the cowns it still waits
+// at, and one more until its queueing is done.  Done, it lets the next
+// through at each, or, where none is behind it, takes its request out
+// as the last by a compare-and-swap -- or, one coming meanwhile, waits
+// for it to say so.  The turnstile takes the cowns all at once, so
+// behaviours do not deadlock on them, and is first come first served
+// at each: a behaviour queued is passed by none that comes to the cown
+// after it, so none waits for ever.  No mutex but the pool's, around
 // the behaviours ready to run that no thread of the pool readied --
 // main's -- and around sleeping on its condition.  A behaviour readied
 // by one a thread of the pool runs is kept in that thread's slot, the
@@ -47,11 +91,14 @@
 // the behaviour's `ws` says.  No operation of the program's for any of
 // it, and nothing built at run time between the body and the runtime.
 // A condition (`once`) is checked of the tuple first: where it does
-// not hold, the behaviour lets go of its cowns, untouched, and waits,
-// parked on those its `rs` says, until a body writes one; then it is
-// queued again, behind that one, on all of them.  One still waiting
-// once every other behaviour of its pool is done is dropped, its body
-// never run.
+// not hold, the behaviour lets go of its cowns, untouched, and is done
+// as far as those after it are concerned; it waits, parked on those
+// its `rs` says, until a body writes one.  That body, at its end,
+// spawns it again, as its own last spawn would be: after the writer,
+// and after all the writer knew of on the waiter's cowns, and in no
+// order with what others spawn after the writer not knowing of it.
+// One still waiting once every other behaviour of its pool is done is
+// dropped, its body never run.
 //
 // What a cown holds is the cown's: read by the behaviour holding it as
 // a thread's own, not shared, marked `OWNED` (`heff_own_at`) once a body
@@ -161,6 +208,48 @@ typedef struct BcWait BcWait;
 typedef struct BcPark BcPark;
 typedef struct BcAct BcAct;
 typedef struct BcOwn BcOwn;
+typedef struct BcDep BcDep;
+
+// (a behaviour waiting for another to be done: its place in that one's
+// list of them -- one of its own two, or the system's where it waits
+// for more; `BC_DONE` the list of one done)
+struct BcDep {
+  BcBehaviour *b;
+  BcDep *next;
+};
+
+#define BC_DONE ((BcDep *)1)
+
+// (a behaviour known on a cown: which, and the number it was spawned
+// with, so that the room reused for a later one is known not to be it;
+// and the context that spawned it and its number there, copied here so
+// that merging two contexts' knowledge reads no behaviour, only the
+// entries -- a behaviour another thread wrote is a cache line's trip.
+// No count is kept: a behaviour's room is never given back to the
+// system, so what is known may always be looked at, and one is spawned
+// again in a room only once every look that might have found its
+// former behaviour live is over -- see "Reclaiming")
+typedef struct {
+  BcCown *c;
+  BcBehaviour *b;
+  uint64_t serial, ctxid, seq;
+} BcKnown;
+
+#define BC_KNOWN 8
+#define BC_PEND 16
+
+// (a causal context: what it knows, a few entries of its own, more on
+// the heap; how many were left after it was last pruned; its identity,
+// and how many it has spawned -- each behaviour knows the context that
+// spawned it and its number there, so that of two a context spawned on
+// a cown, the later, which waited for the earlier, stands for it
+// wherever both are known)
+typedef struct {
+  BcKnown *e;
+  int n, cap, pruned;
+  uint64_t id, seq;
+  BcKnown few[BC_KNOWN];
+} BcCtx;
 
 typedef struct {
   _Atomic(BcBehaviour *) next;
@@ -190,25 +279,56 @@ struct BcPark {
 struct BcCown {
   _Atomic(BcRequest *) last;
   // (what the holder reads and writes on a line apart from `last`: each
-  // spawn on the cown swaps `last`, and each body run on it writes `v`)
+  // behaviour queued on the cown swaps `last`, and each body run on it
+  // writes `v`)
   _Alignas(BC_LINE) V v;  // the holder's
   BcPark *waiting;        // the holder's
+  // (what the last behaviour done on it knew, for the next to hold it:
+  // the hand-over's edge -- laid flat, `co`, and what the last few
+  // holders that spawned nothing were spawned knowing, as it came,
+  // `pend`, laid into `co` once there is no room for more)
+  BcCtx co;
+  int npend;
+  BcKnown pend[BC_PEND];
 };
 
 struct BcBehaviour {
-  atomic_int waits;
+  // (what is written as it is spawned and as it waits, on a line of its
+  // own: those it waits for to be done and one more until its spawn is
+  // done (queued at 0), those waiting for it to be done (`BC_DONE` once
+  // it is), and its places on the lists of those it waits for.  The
+  // spawner of the next behaviour on a cown writes to this line while
+  // the thread running this one reads the next)
+  atomic_int pending;
+  _Atomic(BcDep *) deps;
+  BcDep dep0[2];
+  // (what the thread running it reads and writes, on a line: the cowns
+  // it still waits at, what it runs and holds, and its place in a
+  // queue)
+  _Alignas(BC_LINE) atomic_int waits;
+  int n;
+  int moved;
+  BcBehaviour *after;
   BcPool *pool;
   V cs;      // the cowns, a cown or a tuple of them
   V body;    // Turn -> m Unit
   V cond;    // Nothing, or Just (t -> Bool)
   int64_t ws, rs;
-  BcBehaviour *after;
-  BcAct *act;  // an act awaited outside every worker: run by one
-  BcOwn *home;  // the worker's that made it, to be given back to; or none
-  int n;
-  int moved;
   BcRequest *req;  // `few`, where the cowns are as few
   BcRequest few[2];
+  // (the rest, read as it is spawned and as its body ends: its number,
+  // no two behaviours' the same, by which what knows it tells it from
+  // a later one in its room; the context that spawned it, and its
+  // number of that context's spawns; what that context knew, captured
+  // for its body, a few entries of its own; an act awaited outside
+  // every worker, run by one; and the worker's that made it, to be
+  // given back to, or none)
+  _Alignas(BC_LINE) uint64_t serial, ctxid, seq;
+  BcKnown *known;
+  int nknown;
+  BcAct *act;
+  BcOwn *home;
+  BcKnown kfew[4];
 };
 
 struct BcPool {
@@ -240,6 +360,8 @@ static void bc_wait_less(BcWait *w) {
   if (atomic_fetch_sub_explicit(&w->refs, 1, memory_order_acq_rel) == 1) free(w);
 }
 
+static void bc_ctx_free(BcCtx *h);
+
 // (a cown holding `v`, shared; `v` consumed)
 // (a cown on cache lines of its own: each spawn on it swaps `last`, and
 // a line two cowns shared would be written by the spawns on both)
@@ -249,6 +371,8 @@ static BcCown *bc_cown(V v) {
   atomic_init(&c->last, NULL);
   c->v = heff_share(v);
   c->waiting = NULL;
+  memset(&c->co, 0, sizeof c->co);
+  c->npend = 0;
   return c;
 }
 
@@ -261,6 +385,7 @@ static void bc_cown_let_go(void *x) {
     bc_wait_less(p->w);
     free(p);
   }
+  bc_ctx_free(&c->co);
   heff_drop(c->v);
   free(c);
 }
@@ -367,6 +492,474 @@ static void bc_movable(BcBehaviour *b) {
 }
 
 static void bc_thread_more(BcPool *pl);
+
+// Causality -------------------------------------------------------------------
+//
+// What a context knows (`BcCtx`) is a few entries, a behaviour at a
+// cown each (`BcKnown`): for each cown, the latest it knows of on it
+// -- as it spawns one on a cown, that one stands for every other it
+// knew of on the cown, having waited for them, so a context that
+// spawns keeps one entry a cown.  A spawn copies what the context
+// knows into the behaviour, for its body (a copy, not a share: the
+// entries are few, and nothing is counted).  A body begins by taking
+// what its spawn knew and what each of its cowns' last holder knew,
+// together, those done dropped, and of those one context spawned on a
+// cown only the latest; and leaves what it knows at each of its cowns
+// as it ends.  Entries point at behaviours without counting them, so
+// a behaviour's room is never given back to the system, and one is
+// spawned again in a room only once no thread may still take its
+// former behaviour for live: see "Reclaiming".  Entries that are dead
+// -- the behaviour done, or its room another's by now (its `serial`
+// changed) -- are dropped as a context is pruned, when it has grown to
+// twice what the last pruning left.
+
+static void bc_enqueue(BcBehaviour *b);
+static void bc_body_fill(void);
+
+// (whether the entry's behaviour is not yet done: its list of
+// dependents first -- `BC_DONE` once done, and empty again only once
+// the room is another's, whose number is then seen too, the number
+// written before the list is)
+static inline int bc_live(const BcKnown *k) {
+  if (atomic_load_explicit(&k->b->deps, memory_order_acquire) == BC_DONE) return 0;
+  return k->b->serial == k->serial;
+}
+
+static inline void bc_ctx_ready(BcCtx *h) {
+  if (!h->e) {
+    h->e = h->few;
+    h->cap = BC_KNOWN;
+  }
+}
+
+// (the context's heap given back; the context empty)
+static void bc_ctx_free(BcCtx *h) {
+  if (h->e && h->e != h->few) free(h->e);
+  h->e = NULL;
+  h->n = h->cap = h->pruned = 0;
+}
+
+static inline void bc_ctx_clear(BcCtx *h) {
+  h->n = 0;
+  h->pruned = 0;
+}
+
+// (by the cown, then by the context that spawned them, the later
+// spawn first, then by address)
+static int bc_by_known(const void *x, const void *y) {
+  const BcKnown *a = x, *b = y;
+  if (a->c != b->c) return (uintptr_t)a->c < (uintptr_t)b->c ? -1 : 1;
+  if (a->ctxid != b->ctxid) return a->ctxid < b->ctxid ? -1 : 1;
+  if (a->seq != b->seq) return a->seq > b->seq ? -1 : 1;
+  return a->b == b->b ? 0 : (uintptr_t)a->b < (uintptr_t)b->b ? -1 : 1;
+}
+
+// (what the context knows pruned: those dead dropped, and of those one
+// context spawned on a cown only the latest -- the entries sorted so,
+// and then each once)
+static void bc_ctx_prune(BcCtx *h) {
+  if (h->n > 1) qsort(h->e, (size_t)h->n, sizeof(BcKnown), bc_by_known);
+  int n = 0;
+  for (int i = 0; i < h->n; i++) {
+    if (!bc_live(&h->e[i])) continue;
+    if (n && h->e[n - 1].c == h->e[i].c && (h->e[n - 1].ctxid == h->e[i].ctxid || h->e[n - 1].b == h->e[i].b)) continue;
+    h->e[n++] = h->e[i];
+  }
+  h->n = n;
+  h->pruned = n > BC_KNOWN ? n : BC_KNOWN;
+}
+
+// (room for one more entry: pruned first where it has grown to twice
+// what the last pruning left, else the heap)
+static void bc_ctx_room(BcCtx *h) {
+  bc_ctx_ready(h);
+  if (h->n >= 2 * h->pruned && h->n >= BC_KNOWN) bc_ctx_prune(h);
+  if (h->n < h->cap) return;
+  BcKnown *e = heff_alloc(2 * (size_t)h->cap * sizeof *e);
+  memcpy(e, h->e, (size_t)h->n * sizeof *e);
+  if (h->e != h->few) free(h->e);
+  h->e = e;
+  h->cap *= 2;
+}
+
+// (a context's identity, no two the same: this thread's number, given
+// once, and a count of its own; and a behaviour's number the same way)
+static atomic_uint_fast32_t bc_threads;
+static HEFF_TLS uint64_t bc_thread_tag, bc_serials;
+
+static inline uint64_t bc_numbered(void) {
+  if (!bc_thread_tag) bc_thread_tag = (uint64_t)(atomic_fetch_add_explicit(&bc_threads, 1, memory_order_relaxed) + 1) << 40;
+  return bc_thread_tag | ++bc_serials;
+}
+
+static inline void bc_ctx_open(BcCtx *h) {
+  h->id = bc_numbered();
+  h->seq = 0;
+}
+
+// (`b`, spawned by the context on its cowns, known to it: the one
+// entry at each of them)
+static void bc_ctx_add(BcCtx *h, BcBehaviour *b) {
+  for (int i = 0; i < b->n; i++) {
+    BcCown *c = b->req[i].t;
+    int n = 0;
+    for (int j = 0; j < h->n; j++)
+      if (h->e[j].c != c) h->e[n++] = h->e[j];
+    h->n = n;
+    bc_ctx_room(h);
+    h->e[h->n].c = c;
+    h->e[h->n].b = b;
+    h->e[h->n].serial = b->serial;
+    h->e[h->n].ctxid = b->ctxid;
+    h->e[h->n].seq = b->seq;
+    h->n++;
+  }
+}
+
+// (the entries `e`, `n` of them, put in `h`: each once, and of those
+// one context spawned on a cown only the latest.  Nothing but the
+// entries is read; those dead are dropped as the context is pruned)
+// (room for `want` entries in all)
+static void bc_ctx_reserve(BcCtx *h, int want) {
+  bc_ctx_ready(h);
+  if (want <= h->cap) return;
+  int cap = h->cap;
+  while (cap < want) cap *= 2;
+  BcKnown *e = heff_alloc((size_t)cap * sizeof *e);
+  memcpy(e, h->e, (size_t)h->n * sizeof *e);
+  if (h->e != h->few) free(h->e);
+  h->e = e;
+  h->cap = cap;
+}
+
+#define BC_MANY 64
+
+static void bc_ctx_merge(BcCtx *h, const BcKnown *e, int n) {
+  if (!h->n) {
+    // (one context's knowledge, an entry a cown: copied)
+    bc_ctx_reserve(h, n);
+    if (n) memcpy(h->e, e, (size_t)n * sizeof *e);
+    h->n = n;
+    return;
+  }
+  if (h->n > BC_MANY) {
+    // (one that knows many: the entries put in as they are, each once
+    // and the latest only once it is pruned, which it is once it has
+    // doubled -- not looked for among the many each)
+    for (int i = 0; i < n; i++) {
+      bc_ctx_room(h);
+      h->e[h->n++] = e[i];
+    }
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    int keep = 1;
+    for (int j = 0; j < h->n; j++) {
+      BcKnown *k = &h->e[j];
+      if (k->c != e[i].c) continue;
+      if (k->b == e[i].b) {
+        keep = 0;
+        break;
+      }
+      if (k->ctxid == e[i].ctxid) {
+        if (k->seq < e[i].seq) *k = e[i];
+        keep = 0;
+        break;
+      }
+    }
+    if (!keep) continue;
+    bc_ctx_room(h);
+    h->e[h->n++] = e[i];
+  }
+}
+
+// (what `h` knows copied into `b`, for its body)
+static void bc_captured(BcBehaviour *b, BcCtx *h) {
+  int n = h->n;
+  b->nknown = n;
+  if (n <= (int)(sizeof b->kfew / sizeof b->kfew[0])) b->known = b->kfew;
+  else b->known = heff_alloc((size_t)n * sizeof(BcKnown));
+  if (n) memcpy(b->known, h->e, (size_t)n * sizeof(BcKnown));
+}
+
+// (what `src` knows copied into `dst`, which knew nothing)
+static void bc_ctx_copy(BcCtx *dst, const BcCtx *src) {
+  bc_ctx_ready(dst);
+  if (src->n > dst->cap) {
+    if (dst->e != dst->few) free(dst->e);
+    dst->e = heff_alloc((size_t)src->n * sizeof(BcKnown));
+    dst->cap = src->n;
+  }
+  if (src->n) memcpy(dst->e, src->e, (size_t)src->n * sizeof(BcKnown));
+  dst->n = src->n;
+  dst->pruned = src->pruned;
+}
+
+static inline void bc_capture_free(BcBehaviour *b) {
+  if (b->known && b->known != b->kfew) free(b->known);
+  b->known = NULL;
+  b->nknown = 0;
+}
+
+// (the context of what runs on this thread: `bc_outside`, main's, or a
+// worker's outside every body; `bc_body`, the body a worker runs; or an
+// act's turn's, while its rest runs -- `bc_now` which, NULL for
+// `bc_outside`)
+static HEFF_TLS BcCtx bc_outside, bc_body;
+static HEFF_TLS BcCtx *bc_now;
+
+// Reclaiming.  A behaviour's room is reused, never given back to the
+// system (but at the program's end): the entries of what contexts know
+// point at it without counting it, and look at it whenever they are
+// pruned or merged, to see whether its behaviour is done -- a dead
+// entry may be looked at long after.  Reusing a room is the one danger:
+// a thread that has just found a behaviour live, by its number, and is
+// about to wait for it must not find the room spawned again under it
+// (it would wait for the wrong one, perhaps for ever).  So a thread
+// looks at what is known only within a section, during which it says
+// which epoch it is in (`BcEpoch`, one a thread, `local`), and a room
+// let go of (`bc_retire`) is kept until every thread that was in a
+// section when it was let go of has left it: the epoch is advanced
+// once every thread in a section is in the current one, and the rooms
+// let go of two epochs ago are reused then -- by a look at every
+// thread's epoch every `BC_RETIRES`.  A thread that leaves a section
+// says it is in none, so one asleep holds nothing up.
+#define BC_RETIRES 128
+
+typedef struct BcEpoch BcEpoch;
+struct BcEpoch {
+  _Alignas(BC_LINE) atomic_uint_fast64_t local;  // 0: in no section; else the epoch, shifted, and 1
+  BcEpoch *next;
+  int depth;
+  BcBehaviour *retired[3];  // by the epoch they were let go of in, mod 3
+  uint64_t retired_in[3];   // which epoch each holds
+  int since;
+};
+
+static atomic_uint_fast64_t bc_epoch = 1;
+static pthread_mutex_t bc_epochs_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(BcEpoch *) bc_epochs;
+static HEFF_TLS BcEpoch *bc_mine;
+
+static BcEpoch *bc_epoch_mine(void) {
+  if (bc_mine) return bc_mine;
+  BcEpoch *m = aligned_alloc(BC_LINE, sizeof(BcEpoch));
+  if (!m) heff_fail("out of memory");
+  memset(m, 0, sizeof *m);
+  atomic_init(&m->local, 0);
+  pthread_mutex_lock(&bc_epochs_mu);
+  m->next = atomic_load_explicit(&bc_epochs, memory_order_relaxed);
+  atomic_store_explicit(&bc_epochs, m, memory_order_release);
+  pthread_mutex_unlock(&bc_epochs_mu);
+  return bc_mine = m;
+}
+
+// (a section begun: in the epoch of now, said before anything is
+// looked at)
+static void bc_enter(void) {
+  BcEpoch *m = bc_epoch_mine();
+  if (m->depth++) return;
+  uint64_t e = atomic_load_explicit(&bc_epoch, memory_order_relaxed);
+  atomic_store_explicit(&m->local, (e << 1) | 1, memory_order_seq_cst);
+  atomic_thread_fence(memory_order_seq_cst);
+}
+
+static void bc_exit(void) {
+  BcEpoch *m = bc_mine;
+  if (--m->depth) return;
+  atomic_store_explicit(&m->local, 0, memory_order_release);
+}
+
+static void bc_behaviour_free(BcBehaviour *b);
+
+// (the rooms of bucket `k` reused)
+static void bc_reused(BcEpoch *m, int k) {
+  for (BcBehaviour *b = m->retired[k], *next; b; b = next) {
+    next = b->after;
+    bc_behaviour_free(b);
+  }
+  m->retired[k] = NULL;
+}
+
+// (the rooms this thread let go of two epochs or more before `now`
+// reused: safe, every thread then in a section having left it since)
+static void bc_reclaimed(BcEpoch *m, uint64_t now) {
+  for (int k = 0; k < 3; k++)
+    if (m->retired[k] && m->retired_in[k] + 2 <= now) bc_reused(m, k);
+}
+
+// (the epoch advanced where every thread in a section is in it -- by
+// whichever thread looks first -- and what this thread may reuse by
+// now reused)
+static void bc_reclaim(BcEpoch *m) {
+  m->since = 0;
+  uint64_t e = atomic_load_explicit(&bc_epoch, memory_order_acquire);
+  int all = 1;
+  for (BcEpoch *r = atomic_load_explicit(&bc_epochs, memory_order_acquire); r && all; r = r->next) {
+    uint64_t l = atomic_load_explicit(&r->local, memory_order_acquire);
+    if ((l & 1) && (l >> 1) != e) all = 0;
+  }
+  if (all) atomic_compare_exchange_strong_explicit(&bc_epoch, &e, e + 1, memory_order_acq_rel, memory_order_acquire);
+  bc_reclaimed(m, atomic_load_explicit(&bc_epoch, memory_order_acquire));
+}
+
+// (`b`'s room let go of: kept until it is safe to reuse.  The bucket
+// of this epoch holds, if anything, rooms of three epochs back, safe
+// by now: reused first)
+static void bc_retire(BcBehaviour *b) {
+  BcEpoch *m = bc_epoch_mine();
+  uint64_t e = atomic_load_explicit(&bc_epoch, memory_order_acquire);
+  int k = (int)(e % 3);
+  if (m->retired[k] && m->retired_in[k] != e) bc_reused(m, k);
+  m->retired_in[k] = e;
+  b->after = m->retired[k];
+  m->retired[k] = b;
+  if (++m->since >= BC_RETIRES) bc_reclaim(m);
+}
+
+// (the rooms a thread ending has let go of, and those it kept, handed
+// to the program's end to free: under the epochs' mutex)
+static BcBehaviour *bc_orphans;
+
+// (`j` to wait for `i`, where `i` is not done and `j` does not already:
+// `j`'s place on `i`'s list of dependents, one of its own two where it
+// waits for two at most, and `j`'s pending one more.  `j` may then be
+// queued by another thread, so what it holds is made another's to
+// take.  Within a section: `i` found live is not spawned again under
+// it)
+static void bc_need(BcBehaviour *j, const BcKnown *k, BcBehaviour **seen, int *nseen, int *ndeps) {
+  BcBehaviour *i = k->b;
+  if (i == j) return;
+  for (int s = 0; s < *nseen; s++)
+    if (seen[s] == i) return;
+  if (*nseen < 16) seen[(*nseen)++] = i;
+  if (!bc_live(k)) return;
+  BcDep *old = atomic_load_explicit(&i->deps, memory_order_acquire);
+  if (old == BC_DONE) return;
+  if (!*ndeps) bc_movable(j);
+  BcDep *d = *ndeps < 2 ? &j->dep0[*ndeps] : heff_alloc(sizeof(BcDep));
+  d->b = j;
+  // (counted before it is on the list: `i`, done as soon as it is,
+  // takes one off, and `j` is not queued before its spawn is done, the
+  // spawn's own count still held)
+  atomic_fetch_add_explicit(&j->pending, 1, memory_order_relaxed);
+  for (;;) {
+    d->next = old;
+    if (atomic_compare_exchange_weak_explicit(&i->deps, &old, d, memory_order_release, memory_order_acquire)) break;
+    if (old == BC_DONE) {
+      if (d != &j->dep0[0] && d != &j->dep0[1]) free(d);
+      atomic_fetch_sub_explicit(&j->pending, 1, memory_order_relaxed);
+      return;
+    }
+  }
+  (*ndeps)++;
+}
+
+// (`j` to wait for what the context knows of on each of its cowns, and
+// for `also`, where one is given: those not done; whether it waits for
+// any)
+static int bc_needs(BcBehaviour *j, BcCtx *h, BcBehaviour *also) {
+  BcBehaviour *seen[16];
+  int nseen = 0, ndeps = 0;
+  if (also) {
+    BcKnown k = { NULL, also, also->serial, also->ctxid, also->seq };
+    bc_need(j, &k, seen, &nseen, &ndeps);
+  }
+  for (int i = 0; i < j->n; i++) {
+    BcCown *c = j->req[i].t;
+    for (int at = 0; at < h->n; at++)
+      if (h->e[at].c == c) bc_need(j, &h->e[at], seen, &nseen, &ndeps);
+  }
+  return ndeps > 0;
+}
+
+// (one it waited for done, or its spawn: queued at its cowns where none
+// is left)
+static inline void bc_resolve(BcBehaviour *j) {
+  if (atomic_fetch_sub_explicit(&j->pending, 1, memory_order_acq_rel) == 1) bc_enqueue(j);
+}
+
+// (a number of this thread's, the next: xorshift, seeded by the clock
+// and the thread)
+static HEFF_TLS uint64_t bc_seed;
+
+static inline uint64_t bc_random(void) {
+  uint64_t x = bc_seed;
+  if (!x) x = (uint64_t)heff_now_ms() * 0x9e3779b97f4a7c15ULL ^ (uintptr_t)&bc_seed ^ 0x2545f4914f6cdd1dULL;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  return bc_seed = x;
+}
+
+// (`b` done: those waiting for it told, each perhaps queued here.
+// Several told at once are in no order with one another -- that is
+// why they waited for `b` and not for each other -- and they are
+// queued in an order drawn at random, not the order they came to wait
+// or its reverse: either would put the ones a body spawned first
+// first, or last, at every cown, every time, an order of the clock's
+// the model does not have.  A place of the system's freed)
+static void bc_done(BcBehaviour *b) {
+  BcDep *d = atomic_exchange_explicit(&b->deps, BC_DONE, memory_order_acq_rel);
+  if (!d) return;
+  if (!d->next) {
+    BcBehaviour *j = d->b;
+    if (d < j->dep0 || d >= j->dep0 + 2) free(d);
+    bc_resolve(j);
+    return;
+  }
+  BcBehaviour *few[32], **js = few;
+  int n = 0, cap = 32;
+  for (BcDep *next; d; d = next) {
+    next = d->next;
+    BcBehaviour *j = d->b;
+    if (d < j->dep0 || d >= j->dep0 + 2) free(d);
+    if (n == cap) {
+      BcBehaviour **more = heff_alloc(2 * (size_t)cap * sizeof *more);
+      memcpy(more, js, (size_t)n * sizeof *more);
+      if (js != few) free(js);
+      js = more;
+      cap *= 2;
+    }
+    js[n++] = j;
+  }
+  for (int i = n - 1; i > 0; i--) {
+    int k = (int)(bc_random() % (uint64_t)(i + 1));
+    BcBehaviour *t = js[i];
+    js[i] = js[k];
+    js[k] = t;
+  }
+  for (int i = 0; i < n; i++) bc_resolve(js[i]);
+  if (js != few) free(js);
+}
+
+// (`b`, spawned by the context `h`: those it is to come after waited
+// for, what `h` knows copied for its body, `h` told of it; and, where
+// none is to be waited for, queued now.  Within a section)
+#define BC_AHEAD 8192
+#define BC_AHEAD_SPAWNS 4096
+#define BC_AHEAD_SPINS 1024
+static void bc_held_back(BcPool *pl);
+
+static void bc_spawned(BcBehaviour *b, BcCtx *h, BcBehaviour *also) {
+  bc_ctx_ready(h);
+  if (!h->id) bc_ctx_open(h);
+  b->ctxid = h->id;
+  b->seq = ++h->seq;
+  bc_enter();
+  int waiting = bc_needs(b, h, also);
+  bc_captured(b, h);
+  bc_ctx_add(h, b);
+  bc_exit();
+  // (its spawn done first -- queued now, or by the last it waits for --
+  // and only then the spawner held back: a behaviour whose spawn is not
+  // done cannot be queued, and would hold up the runner it is waiting
+  // on, which the spawner is waiting for)
+  BcPool *pl = b->pool;
+  bc_resolve(b);
+  if (waiting && h->seq > BC_AHEAD_SPAWNS && pl && atomic_load_explicit(&pl->live, memory_order_relaxed) > BC_AHEAD)
+    bc_held_back(pl);
+}
 
 // (the behaviour put behind those ready, a sleeping thread woken; where
 // none sleeps or waits in its reactor, more are ready than threads look
@@ -540,6 +1133,34 @@ static void bc_wake_one(BcPool *pl) {
   if (!one) atomic_store_explicit(&pl->waking, 0, memory_order_seq_cst);
 }
 
+// A spawner far ahead.  A body that spawns behaviours faster than
+// they are run -- each on a cown, behind the one before -- piles them
+// up: every one takes a room, the rooms stop fitting in the caches, and
+// the thread running them, which must fetch each from memory, falls
+// further behind, so that more pile up.  (The turnstile alone used to
+// hold such a spawner back by chance: each of its spawns swapped at a
+// line the runner wrote too.)  So a spawner whose behaviour must wait
+// for one not done, while the pool has more than `BC_AHEAD` behaviours
+// queued, pending or running, waits a little itself, up to
+// `BC_AHEAD_SPINS` rounds, until the pool has fewer: the pile stays as
+// large as the caches, and the runners stay fast.  Only a spawner that
+// has spawned many (`BC_AHEAD_SPAWNS`) is held back: a body that spawns
+// a few while many are queued -- a node of a tree of them -- is not the
+// cause, and waiting would not help.  A wait of time alone, on no
+// condition, so nothing is held up for good.
+
+static void bc_held_back(BcPool *pl) {
+  for (int i = 0; i < BC_AHEAD_SPINS; i++) {
+    // (what this body readied waits in this worker's queue, which the
+    // body, spinning here, will not run: put with those ready, which
+    // wakes a thread to take them)
+    if (bc_own)
+      for (BcBehaviour *x; (x = bc_own_take());) bc_queued(x);
+    for (int j = 0; j < 256; j++) bc_relax();
+    if (atomic_load_explicit(&pl->live, memory_order_relaxed) <= BC_AHEAD) return;
+  }
+}
+
 // (this worker's queue's front waited `BC_AGE`: one more woken to take
 // from it, and the wait counted from now)
 static void bc_aged(BcPool *pl) {
@@ -560,7 +1181,15 @@ static void bc_spill(BcBehaviour *b) {
   bc_movable(b);
   int first = bc_own_empty(bc_own);
   if (!bc_own_put(b)) bc_queued(b);
-  else if (first && bc_in_body) bc_wake_one(pl);
+  // (the first of the queue: one more woken to take it -- the slot is
+  // taken, so this worker has two to run, and a body readying it may
+  // run on for long.  Before behaviours were queued only once those
+  // they come after are done, most were readied by the body that
+  // spawned them, and taken from its queue by workers looking for one;
+  // now most are readied by a behaviour done on their cown, on the
+  // worker running that cown's chain, and a worker that comes to hold
+  // two cowns' chains would keep both while the others sleep)
+  else if (first) bc_wake_one(pl);
 }
 
 // (whether this worker is looking at its reactor: where an act's rest
@@ -573,7 +1202,7 @@ static HEFF_TLS int bc_polling;
 // any other thread queued with those ready)
 static void bc_ready(BcBehaviour *b) {
   if (bc_running != b->pool) bc_queued(b);
-  else if (!bc_slot) {
+  else if (!bc_slot && !bc_in_body) {
     bc_slot = b;
 #ifndef _WIN32
     if (bc_polling) heff_woken = 1;
@@ -585,24 +1214,40 @@ static void bc_through(BcBehaviour *b) {
   if (atomic_fetch_sub_explicit(&b->waits, 1, memory_order_acq_rel) == 1) bc_ready(b);
 }
 
-// (a behaviour's room: one this thread let go of, kept for the next, a
-// few hundred at most -- a chain of behaviours on one thread mallocs
-// none -- else one a worker made given back to it, else the system's.
-// A behaviour one worker makes and another runs is given back to the
-// worker that made it, its `home`: the one letting go of it keeps a run
-// of `BC_RUN` for each worker, and puts the run on the maker's `back`
-// at once, by one compare-and-swap; the maker takes all its `back` holds
-// where it has none kept.  So a spawner and a runner apart do not each
-// go to the system's malloc and free, the one never finding one kept,
-// the other keeping too many.  Where a worker has `BC_BACK` given back
-// and not taken -- it made a burst, and makes no more -- a run is the
-// system's again)
-#define BC_KEPT 256
+// (a behaviour's room: one this thread let go of, kept for the next --
+// a chain of behaviours on one thread mallocs none -- else one a worker
+// made given back to it, else one made by no worker given back by one
+// (`bc_rooms`), else the system's.  A behaviour one worker makes and
+// another runs is given back to the worker that made it, its `home`:
+// the one letting go of it keeps a run of `BC_RUN` for each worker, and
+// puts the run on the maker's `back` at once, by one compare-and-swap;
+// the maker takes all its `back` holds where it has none kept.  So a
+// spawner and a runner apart do not each go to the system's malloc and
+// free, the one never finding one kept, the other keeping too many.  No
+// room is the system's again before the program's end: what the
+// contexts know points at rooms (see "Causality"), so a room is kept,
+// and reused only once it is safe to (see "Reclaiming"))
 #define BC_RUN 32
-#define BC_BACK 4096
 static HEFF_TLS BcBehaviour *bc_spare;
 static HEFF_TLS int bc_nspare;
 typedef struct BcRun { BcBehaviour *first, *last; int n; } BcRun;
+
+// (the rooms of behaviours made by no worker -- main's -- let go of by
+// workers: a pool of the program's, under a mutex, which main takes
+// from a run at a time; a worker puts them there a run at a time too,
+// `bc_strays`, as it does a worker's)
+static pthread_mutex_t bc_rooms_mu = PTHREAD_MUTEX_INITIALIZER;
+static BcBehaviour *bc_rooms;
+static HEFF_TLS BcRun bc_strays;
+
+static void bc_strays_back(void) {
+  if (!bc_strays.n) return;
+  pthread_mutex_lock(&bc_rooms_mu);
+  bc_strays.last->after = bc_rooms;
+  bc_rooms = bc_strays.first;
+  pthread_mutex_unlock(&bc_rooms_mu);
+  bc_strays.n = 0;
+}
 
 static BcBehaviour *bc_behaviour_room(BcPool *pl) {
   BcBehaviour *b = bc_spare;
@@ -613,10 +1258,25 @@ static BcBehaviour *bc_behaviour_room(BcPool *pl) {
     atomic_store_explicit(&home->nback, 0, memory_order_relaxed);
     bc_nspare = 0;
   }
+  if (!b && !bc_own && bc_rooms) {
+    pthread_mutex_lock(&bc_rooms_mu);
+    b = bc_rooms;
+    BcBehaviour *last = b;
+    for (int i = 1; last && last->after && i < BC_RUN; i++) last = last->after;
+    if (last) {
+      bc_rooms = last->after;
+      last->after = NULL;
+    }
+    pthread_mutex_unlock(&bc_rooms_mu);
+    bc_nspare = 0;
+  }
   if (b) {
     bc_spare = b->after;
     if (bc_nspare > 0) bc_nspare--;
-  } else b = heff_alloc(sizeof(BcBehaviour));
+  } else {
+    b = aligned_alloc(BC_LINE, sizeof(BcBehaviour));
+    if (!b) heff_fail("out of memory");
+  }
   b->home = home;
   return b;
 }
@@ -625,13 +1285,6 @@ static BcBehaviour *bc_behaviour_room(BcPool *pl) {
 // taken, to the system)
 static void bc_run_back(BcOwn *home, BcRun *r) {
   if (!r->n) return;
-  if (atomic_load_explicit(&home->nback, memory_order_relaxed) >= BC_BACK) {
-    for (BcBehaviour *b = r->first, *next; r->n; b = next, r->n--) {
-      next = b->after;
-      free(b);
-    }
-    return;
-  }
   BcBehaviour *old = atomic_load_explicit(&home->back, memory_order_relaxed);
   do r->last->after = old;
   while (!atomic_compare_exchange_weak_explicit(&home->back, &old, r->first, memory_order_release,
@@ -642,13 +1295,18 @@ static void bc_run_back(BcOwn *home, BcRun *r) {
 
 // (all this worker's runs given back: before it waits, and as it ends)
 static void bc_runs_back(BcPool *pl) {
+  bc_strays_back();
   BcOwn *me = bc_own;
   if (!me || me->pool != pl) return;
   for (int k = 0; k < pl->n; k++) bc_run_back(&pl->own[k], &me->runs[k]);
 }
 
+// (the room of a behaviour, done and safe to reuse (see "Reclaiming"),
+// kept for the next: this thread's, or given back to the worker that
+// made it)
 static void bc_behaviour_free(BcBehaviour *b) {
   if (b->req != b->few) free(b->req);
+  b->req = NULL;
   BcOwn *home = b->home, *me = bc_own;
   if (home && home != me) {
     BcPool *pl = b->pool;
@@ -664,8 +1322,12 @@ static void bc_behaviour_free(BcBehaviour *b) {
     }
     return;
   }
-  if (bc_nspare >= BC_KEPT) {
-    free(b);
+  if (!home && me) {
+    // (made by no worker, let go of by one: the program's pool)
+    b->after = bc_strays.first;
+    bc_strays.first = b;
+    if (!bc_strays.n++) bc_strays.last = b;
+    if (bc_strays.n >= BC_RUN) bc_strays_back();
     return;
   }
   b->after = bc_spare;
@@ -673,12 +1335,15 @@ static void bc_behaviour_free(BcBehaviour *b) {
   bc_nspare++;
 }
 
-// (... and what it holds let go of, where it still holds it)
+// (... and what it holds let go of, where it still holds it: the
+// runtime's count of it given back, the room freed by the last to know
+// it)
 static void bc_behaviour_drop(BcBehaviour *b) {
   if (b->cs) heff_drop(b->cs);
   if (b->body) heff_drop(b->body);
   if (b->cond) heff_drop(b->cond);
-  bc_behaviour_free(b);
+  bc_capture_free(b);
+  bc_retire(b);
 }
 
 static int bc_by_address(const void *x, const void *y) {
@@ -687,7 +1352,8 @@ static int bc_by_address(const void *x, const void *y) {
 }
 
 // (the behaviour queued at its cowns, which it is now first at or
-// behind the last at each: counted one more of its pool's beforehand)
+// behind the last at each: counted one more of its pool's beforehand,
+// and every behaviour it was to come after done)
 static void bc_enqueue(BcBehaviour *b) {
   int n = b->n;
   for (int i = 0; i < n; i++) {
@@ -742,11 +1408,13 @@ static void bc_twice(BcPool *pl, V cs, BcCown *t) {
   bc_failed(pl, why);
 }
 
-// (`body` queued on the cowns `cs`, in the pool, `cond` what it waits
-// for, `ws` the cowns it writes back, `rs` those its condition reads;
-// all consumed.  The same cown twice is found here, as the cowns are
-// put in order: a failure, the behaviour never queued, the spawner
-// going on)
+static BcCtx *bc_ctx_here(void);
+
+// (`body` spawned on the cowns `cs`, in the pool, by the context of
+// here, `cond` what it waits for, `ws` the cowns it writes back, `rs`
+// those its condition reads; all consumed.  The same cown twice is
+// found here, as the cowns are put in order: a failure, the behaviour
+// never queued, the spawner going on)
 static void bc_behave(BcPool *pl, V cs, V body, V cond, int64_t ws, int64_t rs) {
   int n = bc_count(cs);
   if (n > 62 && (ws >= 0 || rs > 0)) heff_fail("boc: a behaviour on more than 62 cowns, some not written");
@@ -776,8 +1444,15 @@ static void bc_behave(BcPool *pl, V cs, V body, V cond, int64_t ws, int64_t rs) 
   b->rs = rs;
   b->act = NULL;
   b->moved = 0;
+  b->known = NULL;
+  b->nknown = 0;
+  // (its number before its list of dependents, which says it is live:
+  // a look that sees the list empty sees the number)
+  b->serial = bc_numbered();
+  atomic_init(&b->pending, 1);
+  atomic_store_explicit(&b->deps, NULL, memory_order_release);
   bc_pool_more(pl);
-  bc_enqueue(b);
+  bc_spawned(b, bc_ctx_here(), NULL);
   return;
 twice:
   bc_twice(pl, cs, b->req[i].t);
@@ -840,6 +1515,11 @@ static BcBehaviour *bc_again(BcBehaviour *b) {
   nb->rs = b->rs;
   nb->act = NULL;
   nb->moved = 1;
+  nb->known = NULL;
+  nb->nknown = 0;
+  nb->serial = bc_numbered();
+  atomic_init(&nb->pending, 1);
+  atomic_store_explicit(&nb->deps, NULL, memory_order_release);
   b->cs = b->body = b->cond = 0;
   return nb;
 }
@@ -867,10 +1547,12 @@ static void bc_unparked(BcPool *pl, BcWait *w) {
   if (w->next) w->next->prev = w->prev;
 }
 
-// (the behaviour parked queued again, behind the one writing a cown it
-// waits on, where it still waits: counted its pool's again before it
-// says it no longer waits, so that `drain` does not end meanwhile)
-static void bc_wake(BcWait *w) {
+// (the behaviour parked spawned again, where it still waits, by the
+// body `by`, which wrote a cown it waits on, as the body's last spawn:
+// after `by`, and after all `by` knew of on its cowns.  Counted its
+// pool's again before it says it no longer waits, so that `drain` does
+// not end meanwhile)
+static void bc_wake(BcWait *w, BcBehaviour *by) {
   int one = 1;
   if (!atomic_compare_exchange_strong_explicit(&w->state, &one, 2, memory_order_acq_rel, memory_order_acquire))
     return;
@@ -882,12 +1564,13 @@ static void bc_wake(BcWait *w) {
   pthread_mutex_unlock(&pl->mu);
   atomic_store_explicit(&w->state, 0, memory_order_release);
   bc_wait_less(w);
-  bc_enqueue(b);
+  bc_body_fill();
+  bc_spawned(b, &bc_body, by);
 }
 
-// (those waiting on the cowns written woken, the `i`th of the tuple
+// (those waiting on the cowns `by` wrote woken, the `i`th of the tuple
 // from `*i`: in the order they came to wait)
-static void bc_woken(V cs, int64_t ws, int *i) {
+static void bc_woken(V cs, BcBehaviour *by, int64_t ws, int *i) {
   if (bc_is_cown(cs)) {
     BcCown *c = BC_COWN(cs);
     if (bc_bit(ws, (*i)++) && c->waiting) {
@@ -901,7 +1584,7 @@ static void bc_woken(V cs, int64_t ws, int *i) {
       }
       while (order) {
         BcPark *next = order->next;
-        bc_wake(order->w);
+        bc_wake(order->w, by);
         bc_wait_less(order->w);
         free(order);
         order = next;
@@ -910,8 +1593,8 @@ static void bc_woken(V cs, int64_t ws, int *i) {
     return;
   }
   if (BC_NONE(cs)) return;
-  bc_woken(heff_field(cs, 0), ws, i);
-  bc_woken(heff_field(cs, 1), ws, i);
+  bc_woken(heff_field(cs, 0), by, ws, i);
+  bc_woken(heff_field(cs, 1), by, ws, i);
 }
 
 // What a cown holds, owned ----------------------------------------------------
@@ -1159,22 +1842,111 @@ static void bc_failed(BcPool *pl, const char *why) {
 
 // (an act awaited: its computation, of the program's, given the
 // custodian current at its await, as a body is; or, `race`, two of
-// them; and that custodian, its foreign value, or 0)
+// them; that custodian, its foreign value, or 0; and its turn)
 struct BcAct {
   BcAct *next;
   V arm[2];
   int race;
   V custody;
+  V turn;
 };
 
-// (a race's: whether one of its acts has come to its value first, and
-// their groups)
-typedef struct {
-  int won;
+// (an act's turn: what the context awaiting it knew of the behaviours
+// before it -- the context of its rest, which spawns the behaviour
+// after it (`After`), so that one comes after them -- and, of a race,
+// whether one of its acts has come to its value first, and their
+// groups (0: the worker's).  Each turn is among its worker's acts
+// begun and not ended, so that a behaviour an act's own computation
+// spawns -- which act is not known then -- comes after what any of
+// them knew; whether it is there, and whether the program has let go
+// of it: the last of the two frees it)
+typedef struct BcTurn BcTurn;
+struct BcTurn {
+  BcCtx ctx;
+  int race, won;
   int64_t g[2];
-} BcRace;
+  BcTurn *prev, *next;
+  atomic_int st;
+};
 
-static void bc_race_let_go(void *p) { free(p); }
+#define BC_TURN_LISTED 1
+#define BC_TURN_DROPPED 2
+
+static HEFF_TLS BcTurn *bc_turns;
+static HEFF_TLS int bc_nturns, bc_turns_swept;
+
+static void bc_turn_free(BcTurn *t) {
+  bc_ctx_free(&t->ctx);
+  free(t);
+}
+
+static void bc_turn_let_go(void *p) {
+  BcTurn *t = p;
+  int old = atomic_fetch_or_explicit(&t->st, BC_TURN_DROPPED, memory_order_acq_rel);
+  if (!(old & BC_TURN_LISTED)) bc_turn_free(t);
+}
+
+// (the turn among this worker's acts begun)
+static void bc_turn_listed(BcTurn *t) {
+  atomic_fetch_or_explicit(&t->st, BC_TURN_LISTED, memory_order_acq_rel);
+  t->prev = NULL;
+  t->next = bc_turns;
+  if (bc_turns) bc_turns->prev = t;
+  bc_turns = t;
+  bc_nturns++;
+}
+
+// (... no longer, where it is: the act ended, or given up)
+static void bc_turn_unlisted(BcTurn *t) {
+  int old = atomic_fetch_and_explicit(&t->st, ~BC_TURN_LISTED, memory_order_acq_rel);
+  if (!(old & BC_TURN_LISTED)) return;
+  if (t->prev) t->prev->next = t->next;
+  else bc_turns = t->next;
+  if (t->next) t->next->prev = t->prev;
+  bc_nturns--;
+  if (old & BC_TURN_DROPPED) bc_turn_free(t);
+}
+
+// (the acts given up, their groups closed, taken out of this worker's
+// begun: once there are twice as many as after the last sweep)
+static void bc_turns_sweep(void) {
+  if (bc_nturns <= BC_KNOWN || bc_nturns <= 2 * bc_turns_swept) return;
+  for (BcTurn *t = bc_turns, *next; t; t = next) {
+    next = t->next;
+    if (t->g[0] && !heff_group_of(t->g[0])) bc_turn_unlisted(t);
+  }
+  bc_turns_swept = bc_nturns;
+}
+
+// (the context of a spawn here: a body's, an act's rest's, main's --
+// or, on a worker outside every body and rest, an act's own
+// computation's, which act not known: what every act begun on this
+// worker knows, and what was spawned so before, laid flat together)
+static BcCtx *bc_ctx_here(void) {
+  if (bc_now == &bc_body) bc_body_fill();
+  if (bc_now) return bc_now;
+  if (!bc_running) return &bc_outside;
+  bc_turns_sweep();
+  bc_ctx_ready(&bc_outside);
+  bc_enter();
+  for (BcTurn *t = bc_turns; t; t = t->next) bc_ctx_merge(&bc_outside, t->ctx.e, t->ctx.n);
+  bc_exit();
+  return &bc_outside;
+}
+
+// (`c`, the rest of the act whose turn is `tn`, run now as the act's:
+// what it spawns comes after what the turn knows.  Run to its end
+// here: a rest that waits (none of boc's does) runs on as the act's
+// computation would)
+static void bc_after(V tn, V c) {
+  BcTurn *t = heff_foreign_ptr(tn);
+  BcCtx *was = bc_now;
+  bc_now = &t->ctx;
+  V r = heff_tr(heff_app1(c, heff_clo(heff_kept, 1, 0, NULL)));
+  bc_now = was;
+  if (r != HEFF_PENDING) heff_drop(r);
+  heff_drop(tn);
+}
 
 // (this worker's acts awaited, to be started, the first first; its
 // group, 0 before its first act; and whether it counts as one of its
@@ -1204,6 +1976,7 @@ static void bc_act_behaviour(BcPool *pl, BcAct *a) {
   a->arm[0] = heff_move(a->arm[0]);
   if (a->race) a->arm[1] = heff_move(a->arm[1]);
   if (a->custody) a->custody = heff_move(a->custody);
+  a->turn = heff_move(a->turn);
   BcBehaviour *b = bc_behaviour_room(pl);
   b->req = b->few;
   b->n = 0;
@@ -1214,13 +1987,18 @@ static void bc_act_behaviour(BcPool *pl, BcAct *a) {
   b->ws = b->rs = 0;
   b->act = a;
   b->moved = 1;
+  b->known = NULL;
+  b->nknown = 0;
+  b->serial = bc_numbered();
+  atomic_init(&b->pending, 0);
+  atomic_store_explicit(&b->deps, NULL, memory_order_release);
   bc_pool_more(pl);
   bc_enqueue(b);
 }
 
 // (an act awaited, `arm1` 0, or two raced: in the pool of here, given
-// this worker where it is one of that pool's, else a behaviour; the
-// arms consumed)
+// this worker where it is one of that pool's, else a behaviour; its
+// turn knowing what the context of here knows; the arms consumed)
 static void bc_await(BcPool *pl, V arm0, V arm1) {
   BcAct *a = heff_alloc(sizeof(BcAct));
   a->arm[0] = arm0;
@@ -1228,6 +2006,17 @@ static void bc_await(BcPool *pl, V arm0, V arm1) {
   a->race = arm1 != 0;
   V env = heff_custody_env;
   a->custody = env && heff_tag_of(env) == TAG_Just ? heff_dup(heff_field(env, 0)) : 0;
+  BcTurn *t = heff_alloc(sizeof(BcTurn));
+  BcCtx *h = bc_ctx_here();
+  memset(&t->ctx, 0, sizeof t->ctx);
+  bc_ctx_copy(&t->ctx, h);
+  bc_ctx_open(&t->ctx);
+  t->race = a->race;
+  t->won = 0;
+  t->g[0] = t->g[1] = 0;
+  t->prev = t->next = NULL;
+  atomic_init(&t->st, 0);
+  a->turn = heff_foreign(t, bc_turn_let_go);
   if (bc_running == pl) bc_inboxed(pl, a);
   else bc_act_behaviour(pl, a);
 }
@@ -1253,11 +2042,14 @@ static V bc_act_begun(V self, V *a) {
   return heff_tail(act, 2, args);
 }
 
-// (the end of an act in a group of its own: the group closed, given up
-// no more, before what gives it up, in the closure's room, is let go
-// of)
+// (the end of an act: its group closed where it has one of its own,
+// given up no more, before what gives it up, in the closure's room, is
+// let go of; and its turn no longer among those begun)
 static V bc_act_ended(V self, V *a) {
-  heff_reactor_close(INT_OF(heff_env(self)[0]));
+  V *e = heff_env(self);
+  int64_t g = INT_OF(e[0]);
+  if (g) heff_reactor_close(g);
+  bc_turn_unlisted(heff_foreign_ptr(e[2]));
   heff_drop(self);
   return a[0];
 }
@@ -1300,32 +2092,29 @@ static void bc_hold_update(BcPool *pl) {
 static void bc_start(BcAct *a) {
   if (!bc_group) bc_group = heff_reactor_open(heff_clo(bc_act_failed, 1, 0, NULL));
   int arms = a->race ? 2 : 1;
-  BcRace *rc = NULL;
-  V race = NTAG(TAG_MkUnit);
-  if (a->race) {
-    rc = heff_alloc(sizeof(BcRace));
-    rc->won = 0;
-    race = heff_foreign(rc, bc_race_let_go);
-  }
+  V race = a->turn;
+  BcTurn *t = heff_foreign_ptr(race);
+  bc_turns_sweep();
+  bc_turn_listed(t);
   int64_t gs[2];
   V ends[2];
   for (int i = 0; i < arms; i++) {
-    int64_t g = bc_group;
+    int64_t g = bc_group, own = 0;
+    V gv = NTAG(TAG_MkUnit);
     if (a->race || a->custody) {
-      g = heff_reactor_open_within(bc_group);
-      V gv = NTAG(TAG_MkUnit);
+      g = own = heff_reactor_open_within(bc_group);
       if (a->custody) {
         gv = heff_reactor_giving(g, NTAG(TAG_MkUnit));
         bc_owned_by(a->custody, gv);
       }
-      V e[2] = { heff_int(g), gv };
-      ends[i] = heff_clo(bc_act_ended, 1, 2, e);
-    } else ends[i] = heff_clo(heff_kept, 1, 0, NULL);
+    }
+    V e[3] = { heff_int(own), gv, heff_dup(race) };
+    ends[i] = heff_clo(bc_act_ended, 1, 3, e);
     gs[i] = g;
-    if (rc) rc->g[i] = g;
+    t->g[i] = g;
   }
   for (int i = 0; i < arms; i++) {
-    if (rc && rc->won) {
+    if (t->won) {
       heff_drop(a->arm[i]);
       heff_drop(ends[i]);
       continue;
@@ -1366,10 +2155,10 @@ static void bc_poll(BcPool *pl, int wait) {
 // first: where it is, the other's group closed, what of it is pending
 // let go of)
 static int bc_won(V tn) {
-  BcRace *rc = heff_foreign_ptr(tn);
-  if (rc->won) return 0;
-  rc->won = 1;
-  heff_reactor_close(rc->g[heff_group == rc->g[0] ? 1 : 0]);
+  BcTurn *t = heff_foreign_ptr(tn);
+  if (t->won) return 0;
+  t->won = 1;
+  heff_reactor_close(t->g[heff_group == t->g[0] ? 1 : 0]);
   return 1;
 }
 
@@ -1378,6 +2167,83 @@ static int bc_won(V tn) {
 // and what it gives back written back; then let go of -- or, its
 // condition not holding, parked.  One that is an act awaited where no
 // worker was: the act given this worker)
+// (the body's context begun: what the behaviour's spawn knew and what
+// the last on each of its cowns knew, laid flat as its base -- its
+// capture let go of)
+// (the body running, and whether what it knows has been laid out:
+// only once it spawns, or something is spawned as its own -- most
+// bodies spawn nothing, and what they knew is handed on as it came)
+static HEFF_TLS BcBehaviour *bc_body_of;
+static HEFF_TLS int bc_body_full;
+
+// (the body's context begun: nothing laid out yet)
+static void bc_body_begin(BcBehaviour *b) {
+  bc_ctx_ready(&bc_body);
+  bc_ctx_clear(&bc_body);
+  bc_body_of = b;
+  bc_body_full = 0;
+}
+
+// (what the body knows laid out, where not yet: what its spawn knew,
+// and what the last holder of each of its cowns knew -- laid flat, and
+// as it came)
+static void bc_body_fill(void) {
+  if (bc_body_full) return;
+  bc_body_full = 1;
+  BcBehaviour *b = bc_body_of;
+  bc_enter();
+  bc_ctx_merge(&bc_body, b->known, b->nknown);
+  for (int i = 0; i < b->n; i++) {
+    BcCown *c = b->req[i].t;
+    bc_ctx_merge(&bc_body, c->co.e, c->co.n);
+    bc_ctx_merge(&bc_body, c->pend, c->npend);
+  }
+  bc_exit();
+  bc_ctx_open(&bc_body);
+}
+
+// (what came to the cown as it was handed over, not yet laid flat,
+// laid into what it knows)
+static void bc_pend_flat(BcCown *c) {
+  if (!c->npend) return;
+  bc_enter();
+  bc_ctx_merge(&c->co, c->pend, c->npend);
+  bc_exit();
+  c->npend = 0;
+}
+
+// (... and ended: what the body knows left at each of its cowns, for
+// the next to hold it: laid out, where it was; else what its spawn
+// knew, as it came, laid flat with the rest once there is no room.  A
+// body on several cowns is laid out first: what came to it at one of
+// them, the next holder of another is to know -- the leap-frog of the
+// paper's Figure 7, where a behaviour on two cowns carries what the
+// one before it on the first knew to the one after it on the second)
+static void bc_body_end(BcBehaviour *b) {
+  if (b->n > 1) bc_body_fill();
+  for (int i = 0; i < b->n; i++) {
+    BcCown *c = b->req[i].t;
+    if (bc_body_full) {
+      bc_ctx_copy(&c->co, &bc_body);
+      c->npend = 0;
+      continue;
+    }
+    int n = b->nknown;
+    if (c->npend + n > BC_PEND) bc_pend_flat(c);
+    if (n > BC_PEND) {
+      bc_enter();
+      bc_ctx_merge(&c->co, b->known, n);
+      bc_exit();
+    } else if (n) {
+      memcpy(c->pend + c->npend, b->known, (size_t)n * sizeof(BcKnown));
+      c->npend += n;
+    }
+  }
+  bc_capture_free(b);
+  bc_ctx_clear(&bc_body);
+  bc_body_of = NULL;
+}
+
 static void bc_run_behaviour(BcBehaviour *b) {
   BcPool *pl = b->pool;
   if (b->act) {
@@ -1386,6 +2252,21 @@ static void bc_run_behaviour(BcBehaviour *b) {
     bc_behaviour_free(b);
     bc_pool_less(pl);
     return;
+  }
+  BcCtx *was = bc_now;
+  bc_body_begin(b);
+  bc_now = &bc_body;
+  // (the rooms of those waiting for this one fetched meanwhile: the
+  // next on its cowns, which this thread runs after it, were spawned
+  // long since where many are queued, and are cold)
+  {
+    int k = 0;
+    for (BcDep *d = atomic_load_explicit(&b->deps, memory_order_acquire); d && d != BC_DONE && k < 4; d = d->next, k++) {
+      const char *at = (const char *)d->b;
+      __builtin_prefetch(at, 1, 3);
+      __builtin_prefetch(at + 64, 1, 3);
+      __builtin_prefetch(at + 128, 0, 3);
+    }
   }
   bc_fuel = 0;
   bc_in_body = 1;
@@ -1434,10 +2315,13 @@ static void bc_run_behaviour(BcBehaviour *b) {
   else if (!holds) bc_park(bc_again(b));
   else if (b->ws) {
     int i = 0;
-    bc_woken(b->cs, b->ws, &i);
+    bc_woken(b->cs, b, b->ws, &i);
   }
   bc_in_body = 0;
+  bc_body_end(b);
+  bc_now = was;
   bc_behaved_all(b);
+  bc_done(b);
   bc_behaviour_drop(b);
   bc_pool_less(pl);
 }
@@ -1593,11 +2477,24 @@ static void *bc_worker(void *u) {
   free(bc_own->runs);
   bc_own->runs = NULL;
   bc_own->pool = NULL;
+  // (the rooms it kept, and those let go of not yet safe to reuse,
+  // handed to the program's end to free, once every thread is done)
+  pthread_mutex_lock(&bc_epochs_mu);
   while (bc_spare) {
     BcBehaviour *next = bc_spare->after;
-    free(bc_spare);
+    bc_spare->after = bc_orphans;
+    bc_orphans = bc_spare;
     bc_spare = next;
   }
+  if (bc_mine)
+    for (int k = 0; k < 3; k++)
+      while (bc_mine->retired[k]) {
+        BcBehaviour *b = bc_mine->retired[k];
+        bc_mine->retired[k] = b->after;
+        b->after = bc_orphans;
+        bc_orphans = b;
+      }
+  pthread_mutex_unlock(&bc_epochs_mu);
   bc_nspare = 0;
   heff_thread_end();
   return NULL;
@@ -1703,12 +2600,45 @@ static void bc_drain(BcPool *pl) {
   pthread_cond_destroy(&pl->work);
   pthread_cond_destroy(&pl->idle);
   free(pl->threads);
-  // (the behaviours given back to workers ended since)
+  // (the behaviours given back to workers ended since, those the
+  // threads handed over as they ended, and this thread's own: every
+  // thread is done, so none looks at them any more)
   for (int k = 0; k < pl->n; k++)
     for (BcBehaviour *b = pl->own[k].back, *next; b; b = next) {
       next = b->after;
+      if (b->req && b->req != b->few) free(b->req);
       free(b);
     }
+  pthread_mutex_lock(&bc_epochs_mu);
+  for (BcBehaviour *b = bc_orphans, *next; b; b = next) {
+    next = b->after;
+    if (b->req && b->req != b->few) free(b->req);
+    free(b);
+  }
+  bc_orphans = NULL;
+  pthread_mutex_unlock(&bc_epochs_mu);
+  pthread_mutex_lock(&bc_rooms_mu);
+  for (BcBehaviour *b = bc_rooms, *next; b; b = next) {
+    next = b->after;
+    if (b->req && b->req != b->few) free(b->req);
+    free(b);
+  }
+  bc_rooms = NULL;
+  pthread_mutex_unlock(&bc_rooms_mu);
+  while (bc_spare) {
+    BcBehaviour *next = bc_spare->after;
+    free(bc_spare);
+    bc_spare = next;
+  }
+  bc_nspare = 0;
+  if (bc_mine)
+    for (int k = 0; k < 3; k++)
+      while (bc_mine->retired[k]) {
+        BcBehaviour *b = bc_mine->retired[k];
+        bc_mine->retired[k] = b->after;
+        if (b->req && b->req != b->few) free(b->req);
+        free(b);
+      }
   free(pl->own);
   free(pl);
 }
@@ -1852,6 +2782,13 @@ static V heff_provider_boc(V p, V k) {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     x = heff_answer(f, NTAG(first ? TAG_True : TAG_False));
+    break;
+  }
+  case TAG_After: {
+    V tn = heff_dup(heff_field(p, 0)), c = heff_carried(heff_dup(heff_field(p, 1)));
+    x = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    bc_after(tn, c);
     break;
   }
   case TAG_Workers: {
