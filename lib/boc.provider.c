@@ -128,6 +128,7 @@
 
 #include <stdatomic.h>
 #include <sched.h>
+#include <time.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -1025,12 +1026,13 @@ static void bc_done(BcBehaviour *b) {
 // for, what `h` knows copied for its body, `h` told of it; and, where
 // none is to be waited for, queued now.  Within a section)
 #ifndef BC_AHEAD
-#define BC_AHEAD 65536
+#define BC_AHEAD 16384
 #endif
 #define BC_AHEAD_SPAWNS 4096
-#ifndef BC_AHEAD_SPINS
-#define BC_AHEAD_SPINS 1024
+#ifndef BC_AHEAD_NAPS
+#define BC_AHEAD_NAPS 200
 #endif
+#define BC_AHEAD_NAP_NS 50000
 static void bc_held_back(BcPool *pl);
 
 static void bc_spawned(BcBehaviour *b, BcCtx *h, BcBehaviour *also) {
@@ -1243,22 +1245,31 @@ static void bc_wake_one(BcPool *pl) {
 // hold such a spawner back by chance: each of its spawns swapped at a
 // line the runner wrote too.)  So a spawner whose behaviour must wait
 // for one not done, while the pool has more than `BC_AHEAD` behaviours
-// queued, pending or running, waits a little itself, up to
-// `BC_AHEAD_SPINS` rounds, until the pool has fewer: the pile stays as
-// large as the caches, and the runners stay fast.  Only a spawner that
-// has spawned many (`BC_AHEAD_SPAWNS`) is held back: a body that spawns
-// a few while many are queued -- a node of a tree of them -- is not the
-// cause, and waiting would not help.  A wait of time alone, on no
-// condition, so nothing is held up for good.
+// queued, pending or running, waits a little itself, asleep
+// `BC_AHEAD_NAP_NS` at a time, up to `BC_AHEAD_NAPS` times, until the
+// pool has fewer: the pile stays as large as the caches (16k rooms, some
+// 10 MB), and the runners stay fast.  Asleep, not spinning: on a machine
+// with more threads to run than cores free -- the runners' slower, the
+// spawners further ahead -- a spawner spinning holds the core a runner
+// lacks, and spinning a round of 256 `yield`s a thousand times was over
+// in a millisecond, before any runner had got through a quarter of the
+// pile, so the spawner was never held in fact (producer_consumer under
+// six busy processes: 96 MB of rooms, as many as the pile at 64k and
+// what waited to be reclaimed behind it; now 53 MB, and alone 1.3 s to
+// 1.2 s).  Only a spawner that has spawned many (`BC_AHEAD_SPAWNS`) is
+// held back: a body that spawns a few while many are queued -- a node
+// of a tree of them -- is not the cause, and waiting would not help.  A
+// wait of time alone, on no condition, so nothing is held up for good.
 
 static void bc_held_back(BcPool *pl) {
-  for (int i = 0; i < BC_AHEAD_SPINS; i++) {
+  for (int i = 0; i < BC_AHEAD_NAPS; i++) {
     // (what this body readied waits in this worker's queue, which the
-    // body, spinning here, will not run: put with those ready, which
+    // body, asleep here, will not run: put with those ready, which
     // wakes a thread to take them)
     if (bc_own)
       for (BcBehaviour *x; (x = bc_own_take());) bc_queued(x);
-    for (int j = 0; j < 256; j++) bc_relax();
+    struct timespec nap = { 0, BC_AHEAD_NAP_NS };
+    nanosleep(&nap, NULL);
     // (held until a quarter have run, not until one has: a spawner let
     // go at the line would be held again at its next spawn, and the
     // runners, which have just emptied their queues, would wait for it
