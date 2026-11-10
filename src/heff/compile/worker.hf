@@ -20,7 +20,9 @@
 -- start: what it comes to is the same whatever order the program is in);
 -- then what it could not see, functions round a cycle of calls giving
 -- one another their numbers, from hopes that fall where they must ("Hopes
--- on cycles of calls").
+-- on cycles of calls").  It is worked out a component of the program at
+-- a time, as the backend's cache keeps it ("Workers, a component at a
+-- time").
 --
 -- Only what a body says is evidence, never what a caller gives: a
 -- function called with an `Int64` at one call and a `Float64` at another
@@ -214,42 +216,6 @@ weighOne facts defs sg acc k = case OrdMap.lookup defs k of
 withChanges : Repr.Sigs -> List (Pair String Repr.Sig) -> Repr.Sigs
 withChanges sg cs = List.foldl (\m p -> OrdMap.insert m (fst p) (snd p)) sg cs
 
--- | what the next round weighs: the workers so far, and those whose
--- | callees' workers changed (and those changed themselves)
-type Next = { round : Round, dirty : List String }
-
-nextOf : OrdMap.OrdMap String (List String) -> Round -> Weighed -> Next
-nextOf callers r w =
-  { round = { sigs = withChanges r.sigs w.changed, imps = w.imps }
-  , dirty =
-      sortedOnce
-        (List.concatMap
-           (\p -> fst p :: fromMaybe Nil (OrdMap.lookup callers (fst p)))
-           w.changed)
-  }
-
--- (the rounds, `n` more at most, until no worker changes)
-rounds : Facts.Facts
-       -> OrdMap.OrdMap String IR.Def
-       -> OrdMap.OrdMap String (List String)
-       -> Int
-       -> Next
-       -> Round
-rounds facts defs callers n nx =
-  if n <= 0 || List.null nx.dirty then nx.round
-  else rounds
-      facts
-      defs
-      callers
-      (n - 1)
-      (nextOf
-         callers
-         nx.round
-         (List.foldl
-            (weighOne facts defs nx.round.sigs)
-            { changed = Nil, imps = nx.round.imps }
-            nx.dirty))
-
 -- Cycles of jumps
 --------------------------------------------------------------------------------
 
@@ -356,7 +322,7 @@ meetCycles js sg = List.foldl (meetAt js) sg (OrdMap.toList sg)
 -- Hopes on cycles of calls
 --------------------------------------------------------------------------------
 
--- The rounds above start from no workers and only unboxing, so functions
+-- The rounds start from no workers and only unboxing, so functions
 -- calling one another round a cycle, each giving back what the other
 -- gives (an accumulator), keep
 -- it a `V`: each sees the other give a `V`.  So the functions weighed
@@ -437,103 +403,29 @@ fallOne facts base imps sg acc k = case OrdMap.lookup imps k of
   Just md -> fallImp facts base sg acc k md
   Nothing -> acc
 
--- | what the falls go on with: the rounds' workers, their forms, the
--- | functions hoped for and those that mention each
-type Fall =
-  { facts : Facts.Facts
-  , base : Repr.Sigs
-  , imps : OrdMap.OrdMap String Imperative.Def
-  , hoped : Repr.Sigs
-  , callers : OrdMap.OrdMap String (List String)
-  }
-
--- (those hoped for whose callees changed, and those changed themselves)
-fallDirty : Fall -> List (Pair String Repr.Sig) -> List String
-fallDirty fl cs =
-  List.keepIf
-    (\k -> OrdMap.member fl.hoped k)
-    (sortedOnce
-       (List.concatMap
-          (\p -> fst p :: fromMaybe Nil (OrdMap.lookup fl.callers (fst p)))
-          cs))
-
--- (the hopes of `dirty` weighed against `sg`: those that fell)
-fallStep : Fall -> Repr.Sigs -> List String -> List (Pair String Repr.Sig)
-fallStep fl sg dirty =
-  List.foldl (fallOne fl.facts fl.base fl.imps sg) Nil dirty
-
--- (the falls `cs`, then `n` more at most, until no signature falls)
-falls : Fall -> Int -> Repr.Sigs -> List (Pair String Repr.Sig) -> Repr.Sigs
-falls fl n sg cs =
-  if n <= 0 || List.null cs then sg
-  else falls
-      fl
-      (n - 1)
-      (withChanges sg cs)
-      (fallStep fl (withChanges sg cs) (fallDirty fl cs))
-
--- (those that mention any hoped for, and those hoped for)
-fallDirtyAll : Fall -> List String
-fallDirtyAll fl =
-  sortedOnce
-    (List.concatMap
-       (\p -> fst p :: fromMaybe Nil (OrdMap.lookup fl.callers (fst p)))
-       (OrdMap.toList fl.hoped))
-
-roundSigs : Round -> Repr.Sigs
-roundSigs r = r.sigs
-
 -- (only those with a worker)
 workersOnly : Repr.Sigs -> Repr.Sigs
 workersOnly sg =
   List.foldl (\m p -> withSig m (fst p) (snd p)) sg (OrdMap.toList sg)
 
--- (the hopes, fallen as far as they fall)
-fallen : Fall -> Repr.Sigs
-fallen fl =
-  falls
-    fl
-    64
-    (withChanges fl.base (OrdMap.toList fl.hoped))
-    (fallStep
-       fl
-       (withChanges fl.base (OrdMap.toList fl.hoped))
-       (List.map fst (OrdMap.toList fl.hoped)))
-
-hopingWith : Facts.Facts -> OrdMap.OrdMap String IR.Def -> Fall -> Repr.Sigs
-hopingWith facts defs fl =
-  if OrdMap.size fl.hoped == 0 then fl.base
-  else roundSigs
-      (rounds
-         facts
-         defs
-         fl.callers
-         64
-         { round = { sigs = workersOnly (fallen fl), imps = fl.imps }
-         , dirty = fallDirtyAll fl
-         })
-
--- | the rounds' workers, hoped for on cycles of calls: those hoped for
--- | weighed against the hopes until none falls, then the rounds again
--- | for what calls them
-hoping : Facts.Facts
-       -> OrdMap.OrdMap String IR.Def
-       -> OrdMap.OrdMap String (List String)
-       -> Round
-       -> Repr.Sigs
-hoping facts defs callers r =
-  hopingWith
-    facts
-    defs
-    { facts = facts
-    , base = r.sigs
-    , imps = r.imps
-    , hoped = hopesOf facts r
-    , callers = callers
-    }
-
--- Workers
+-- Workers, a component at a time
 --------------------------------------------------------------------------------
+
+-- The fixpoint is the whole program's: rounds from no workers, the first
+-- weighing the functions with evidence of a number of their own, each
+-- after it those changed and those that mention one changed, each
+-- against the workers at its start, 64 at most; the functions weighed
+-- given their hopes, which fall step by step as the rounds go, 64 steps
+-- at most; the rounds again, from the workers among what fell, of those
+-- hoped for and those that mention one; then each cycle of jumps one
+-- signature.  What a function comes to at each step depends on its body
+-- and on what each global it mentions was at the step before, never on
+-- the rest of the program.  So it is worked out a component of the
+-- definitions at a time (those mentioning one another round a cycle),
+-- the components each mentions first, each given what was done with
+-- those step by step (a `Track`): each function is weighed at the very
+-- steps the whole program would weigh it, against the very workers, so
+-- it comes to what it would -- the caps and all.
 
 byKey : List IR.Def -> OrdMap.OrdMap String IR.Def
 byKey defs =
@@ -542,29 +434,342 @@ byKey defs =
     OrdMap.empty
     defs
 
--- | the functions with a worker, of the program's definitions as the C
--- | backend lowers them (in monadic form), what is known of them `facts`
--- | >>> OrdMap.size (workers (Facts.factsOf Nil) Nil)
+-- | what the fixpoint did with a function: its worker after each round
+-- | that changed it, of the rounds (`first`), of the falls of the hopes
+-- | (`falls`) and of the rounds after them (`again`), and its hope, if
+-- | it was hoped for
+type Track =
+  { first : List (Pair Int Repr.Sig)
+  , hope : Maybe Repr.Sig
+  , falls : List (Pair Int Repr.Sig)
+  , again : List (Pair Int Repr.Sig)
+  }
+
+withMaybe : Repr.Sigs -> String -> Maybe Repr.Sig -> Repr.Sigs
+withMaybe sg k (Just s) = OrdMap.insert sg k s
+withMaybe sg k Nothing = sg
+
+isSig : Maybe Repr.Sig -> Bool
+isSig (Just _) = True
+isSig Nothing = False
+
+hoped : Pair String Track -> Bool
+hoped p = isSig (snd p).hope
+
+-- | the changes made round by round: in order of the rounds, each
+-- | round's
+type Events = List (Pair Int (List (Pair String Repr.Sig)))
+
+eventOne : OrdMap.OrdMap Int (List (Pair String Repr.Sig))
+         -> String
+         -> Pair Int Repr.Sig
+         -> OrdMap.OrdMap Int (List (Pair String Repr.Sig))
+eventOne m k (MkPair i s) =
+  OrdMap.insert m i (MkPair k s :: fromMaybe Nil (OrdMap.lookup m i))
+
+-- (the changes `part` says of the tracks, by round)
+eventsOf : (Track -> List (Pair Int Repr.Sig))
+         -> List (Pair String Track)
+         -> Events
+eventsOf part ts =
+  OrdMap.toList
+    (List.foldl
+       (\m (p : Pair String Track) ->
+          List.foldl (\m2 c -> eventOne m2 (fst p) c) m (part (snd p)))
+       OrdMap.empty
+       ts)
+
+-- | a component: what is known, its definitions by key, each global by
+-- | those of them that mention it
+type Comp =
+  { facts : Facts.Facts
+  , defs : OrdMap.OrdMap String IR.Def
+  , callers : OrdMap.OrdMap String (List String)
+  }
+
+-- (of its definitions, those changed and those that mention one changed)
+touched : Comp -> List String -> List String
+touched c ks =
+  List.keepIf
+    (\k -> OrdMap.member c.defs k)
+    (sortedOnce
+       (List.concatMap
+          (\k -> k :: fromMaybe Nil (OrdMap.lookup c.callers k))
+          ks))
+
+-- | the rounds so far: the workers, of the component and of what it
+-- | mentions, the forms made, each change of the component's with its
+-- | round (the last first)
+type Sim =
+  { sigs : Repr.Sigs
+  , imps : OrdMap.OrdMap String Imperative.Def
+  , log : List (Pair String (Pair Int Repr.Sig))
+  }
+
+-- (the changes of what it mentions, made)
+simWith : Sim -> List (Pair String Repr.Sig) -> Sim
+simWith s cs = { sigs = withChanges s.sigs cs, imps = s.imps, log = s.log }
+
+-- (the round `i`'s changes, the component's `own` and those of what it
+-- mentions, made)
+simAt : Sim
+      -> Int
+      -> OrdMap.OrdMap String Imperative.Def
+      -> List (Pair String Repr.Sig)
+      -> List (Pair String Repr.Sig)
+      -> Sim
+simAt s i imps own cs =
+  { sigs = withChanges (withChanges s.sigs own) cs
+  , imps = imps
+  , log =
+      List.foldl
+        (\acc (p : Pair String Repr.Sig) ->
+           MkPair (fst p) (MkPair i (snd p)) :: acc)
+        s.log
+        own
+  }
+
+-- (the round `i`'s changes of what it mentions, and the later ones)
+eventsAt : Int -> Events -> Pair (List (Pair String Repr.Sig)) Events
+eventsAt i (MkPair j cs :: rest) =
+  if i == j then MkPair cs rest else MkPair Nil (MkPair j cs :: rest)
+eventsAt i [] = MkPair Nil Nil
+
+-- | how a phase goes on: from the round, the changes of what the
+-- | component mentions from it on, those it weighs in it
+type Go c = c -> Int -> Events -> List String -> Sim -> Sim
+
+roundsStep : Comp
+           -> Go Comp
+           -> Int
+           -> Sim
+           -> Weighed
+           -> Pair (List (Pair String Repr.Sig)) Events
+           -> Sim
+roundsStep c go i s w (MkPair cs rest) =
+  go
+    c
+    (i + 1)
+    rest
+    (touched c (List.append (List.map fst w.changed) (List.map fst cs)))
+    (simAt s i w.imps w.changed cs)
+
+-- (none of it weighed: on to the next round that changes what it
+-- mentions)
+roundsIdle : Comp -> Go Comp -> Events -> Sim -> Sim
+roundsIdle c go [] s = s
+roundsIdle c go (MkPair j cs :: rest) s =
+  go c (j + 1) rest (touched c (List.map fst cs)) (simWith s cs)
+
+-- (the rounds from the `i`th on, `dirty` weighed in it, to the 64th)
+roundsIn : Comp -> Int -> Events -> List String -> Sim -> Sim
+roundsIn c i evs dirty s =
+  if i > 64 then simWith s (List.concatMap snd evs)
+  else if List.null dirty then roundsIdle c roundsIn evs s
+  else roundsStep
+      c
+      roundsIn
+      i
+      s
+      (List.foldl
+         (weighOne c.facts c.defs s.sigs)
+         { changed = Nil, imps = s.imps }
+         dirty)
+      (eventsAt i evs)
+
+-- | the falls of a component: it, the rounds' workers, its hopes
+type FallC = { comp : Comp, base : Repr.Sigs, hoped : Repr.Sigs }
+
+hopedIn : FallC -> List String -> List String
+hopedIn fc ks = List.keepIf (\k -> OrdMap.member fc.hoped k) ks
+
+fallsStep : FallC
+          -> Go FallC
+          -> Int
+          -> Sim
+          -> List (Pair String Repr.Sig)
+          -> Pair (List (Pair String Repr.Sig)) Events
+          -> Sim
+fallsStep fc go j s own (MkPair cs rest) =
+  go
+    fc
+    (j + 1)
+    rest
+    (hopedIn
+       fc
+       (touched fc.comp (List.append (List.map fst own) (List.map fst cs))))
+    (simAt s j s.imps own cs)
+
+fallsIdle : FallC -> Go FallC -> Events -> Sim -> Sim
+fallsIdle fc go [] s = s
+fallsIdle fc go (MkPair j cs :: rest) s =
+  go
+    fc
+    (j + 1)
+    rest
+    (hopedIn fc (touched fc.comp (List.map fst cs)))
+    (simWith s cs)
+
+-- (the falls from the `j`th on, `dirty` weighed in it: the 0th to the
+-- 63rd, the 0th weighing all those hoped for)
+fallsIn : FallC -> Int -> Events -> List String -> Sim -> Sim
+fallsIn fc j evs dirty s =
+  if j > 63 then simWith s (List.concatMap snd evs)
+  else if List.null dirty then fallsIdle fc fallsIn evs s
+  else fallsStep
+      fc
+      fallsIn
+      j
+      s
+      (List.foldl (fallOne fc.comp.facts fc.base s.imps s.sigs) Nil dirty)
+      (eventsAt j evs)
+
+-- (each change of the log, by function, in order)
+logged : List (Pair String (Pair Int Repr.Sig))
+       -> OrdMap.OrdMap String (List (Pair Int Repr.Sig))
+logged log =
+  List.foldl
+    (\m (p : Pair String (Pair Int Repr.Sig)) ->
+       OrdMap.insert
+         m
+         (fst p)
+         (snd p :: fromMaybe Nil (OrdMap.lookup m (fst p))))
+    OrdMap.empty
+    log
+
+loggedOf : OrdMap.OrdMap String (List (Pair Int Repr.Sig))
+         -> String
+         -> List (Pair Int Repr.Sig)
+loggedOf m k = fromMaybe Nil (OrdMap.lookup m k)
+
+-- | what is worked out of a component: each function's track, and the
+-- | workers
+type Worked = { tracks : List (Pair String Track), sigs : Repr.Sigs }
+
+-- (only the component's)
+ownSigs : List IR.Def -> Repr.Sigs -> Repr.Sigs
+ownSigs defs sg =
+  List.foldl
+    (\m (d : IR.Def) -> withMaybe m d.key (Repr.sigIn sg d.key))
+    OrdMap.empty
+    defs
+
+trackOf : OrdMap.OrdMap String (List (Pair Int Repr.Sig))
+        -> Repr.Sigs
+        -> OrdMap.OrdMap String (List (Pair Int Repr.Sig))
+        -> OrdMap.OrdMap String (List (Pair Int Repr.Sig))
+        -> String
+        -> Track
+trackOf l1 hs l2 l3 k =
+  { first = loggedOf l1 k
+  , hope = Repr.sigIn hs k
+  , falls = loggedOf l2 k
+  , again = loggedOf l3 k
+  }
+
+-- (... after the rounds again, `s3`: each cycle of jumps one signature)
+workedAgain : Comp -> List IR.Def -> Repr.Sigs -> Sim -> Sim -> Sim -> Worked
+workedAgain c defs hs s1 s2 s3 =
+  { tracks =
+      List.map
+        (\(d : IR.Def) ->
+           MkPair
+             d.key
+             (trackOf (logged s1.log) hs (logged s2.log) (logged s3.log) d.key))
+        defs
+  , sigs = meetCycles (jumpsAll c.facts.arity defs) (ownSigs defs s3.sigs)
+  }
+
+-- (... after the falls, `s2`: the rounds again, from the workers among
+-- what fell, of those hoped for and those that mention one)
+workedFallen : Comp
+             -> List IR.Def
+             -> List (Pair String Track)
+             -> Repr.Sigs
+             -> Sim
+             -> Sim
+             -> Worked
+workedFallen c defs known hs s1 s2 =
+  workedAgain
+    c
+    defs
+    hs
+    s1
+    s2
+    (roundsIn
+       c
+       1
+       (eventsOf (\(tr : Track) -> tr.again) known)
+       (touched
+          c
+          (List.append
+             (List.map fst (OrdMap.toList hs))
+             (List.map fst (List.keepIf hoped known))))
+       { sigs = workersOnly s2.sigs, imps = s2.imps, log = Nil })
+
+-- (the falls' start: the rounds' workers, the hopes over them)
+hopedSigs : Repr.Sigs -> Repr.Sigs -> List (Pair String Track) -> Repr.Sigs
+hopedSigs base hs known =
+  List.foldl
+    (\m (p : Pair String Track) -> withMaybe m (fst p) (snd p).hope)
+    (withChanges base (OrdMap.toList hs))
+    known
+
+-- (... after the rounds, `s1`: its functions hoped for (`hs`), fallen)
+workedHoped : Comp
+            -> List IR.Def
+            -> List (Pair String Track)
+            -> Sim
+            -> Repr.Sigs
+            -> Worked
+workedHoped c defs known s1 hs =
+  workedFallen
+    c
+    defs
+    known
+    hs
+    s1
+    (fallsIn
+       { comp = c, base = s1.sigs, hoped = hs }
+       0
+       (eventsOf (\(tr : Track) -> tr.falls) known)
+       (List.map fst (OrdMap.toList hs))
+       { sigs = hopedSigs s1.sigs hs known, imps = s1.imps, log = Nil })
+
+workedFrom : Comp -> List IR.Def -> List (Pair String Track) -> Sim -> Worked
+workedFrom c defs known s1 =
+  workedHoped
+    c
+    defs
+    known
+    s1
+    (hopesOf c.facts { sigs = s1.sigs, imps = s1.imps })
+
+compOf : Facts.Facts -> List IR.Def -> Comp
+compOf facts defs =
+  { facts = facts, defs = byKey defs, callers = callersOf defs }
+
+-- | the workers of a component's definitions `defs`, given the tracks of
+-- | those they mention outside it (`known`): each function's track, and
+-- | the workers -- as the whole program's, the rounds, the hopes and
+-- | their falls, the rounds again, then each cycle of jumps one signature
+-- | >>> OrdMap.size (componentWorkers (Facts.factsOf Nil) Nil Nil).sigs
 -- | 0
-workers : Facts.Facts -> List IR.Def -> Repr.Sigs
-workers facts defs =
-  meetCycles
-    (jumpsAll facts.arity defs)
-    (hoping
-       facts
-       (byKey defs)
-       (callersOf defs)
-       (rounds
-          facts
-          (byKey defs)
-          (callersOf defs)
-          64
-          { round = { sigs = OrdMap.empty, imps = OrdMap.empty }
-          , dirty =
-              sortedOnce
-                (List.map
-                   (\(d : IR.Def) -> d.key)
-                   (List.keepIf
-                      (\(d : IR.Def) -> isFunction d && numeric d)
-                      defs))
-          }))
+componentWorkers : Facts.Facts
+                 -> List (Pair String Track)
+                 -> List IR.Def
+                 -> Worked
+componentWorkers facts known defs =
+  workedFrom
+    (compOf facts defs)
+    defs
+    known
+    (roundsIn
+       (compOf facts defs)
+       1
+       (eventsOf (\(tr : Track) -> tr.first) known)
+       (sortedOnce
+          (List.map
+             (\(d : IR.Def) -> d.key)
+             (List.keepIf (\(d : IR.Def) -> isFunction d && numeric d) defs)))
+       { sigs = OrdMap.empty, imps = OrdMap.empty, log = Nil })
