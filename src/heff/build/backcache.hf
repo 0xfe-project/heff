@@ -10,7 +10,10 @@
 --   version each was made at, what it is known by and the copies that
 --   calls, and what it was made to, with the copies asked for as it was;
 -- - each of its definitions' C (heff.compile.emitc), and each one's
---   JavaScript (heff.compile.emit), by a hash of what it was made of.
+--   JavaScript (heff.compile.emit), by a hash of what it was made of;
+-- - the workers and what is lent of each component of the definitions
+--   whose first is its (heff.compile.components), by a hash of what it
+--   was worked out from.
 --
 -- A file is of one compiler: the hash of the program that wrote it (its
 -- own executable), which a file of another is not believed by -- a
@@ -22,17 +25,20 @@
 module heff.build.backcache
 
 import heff.build.decoder
+import heff.compile.components as Components
 import heff.compile.emit as Emit
 import heff.compile.emitc as EmitC
+import heff.elab.fixed as Fixed
 import heff.compile.ir as IR
 import heff.compile.irtext as IRText
 import heff.compile.lower as Lower
+import heff.compile.repr as Repr
 import heff.compile.simplify as Simplify
 import heff.compile.spec as Spec
 import std.ordmap as OrdMap
 
 version : String
-version = "heff-backend/14"
+version = "heff-backend/16"
 
 -- | the directory under `.heff/` the files are in
 backDir : String
@@ -119,6 +125,49 @@ jsText key k =
     (IRText.tok key
      :: IRText.tok k.ver
      :: strsT k.lines (strsT k.params (strsT k.refs (strsT k.prims Nil))))
+
+sigT : Repr.Sig -> List String -> List String
+sigT s rest =
+  strsT
+    (List.map Repr.reprName s.params)
+    (IRText.tok (Repr.reprName s.result) :: rest)
+
+changesT : List (Pair Int Repr.Sig) -> List String -> List String
+changesT cs rest =
+  debug (List.length cs)
+  :: List.foldr
+    (\(c : Pair Int Repr.Sig) acc -> debug (fst c) :: sigT (snd c) acc)
+    rest
+    cs
+
+maybeSigT : Maybe Repr.Sig -> List String -> List String
+maybeSigT (Just s) rest = "j" :: sigT s rest
+maybeSigT Nothing rest = "n" :: rest
+
+lentT : Maybe (List Int) -> List String -> List String
+lentT (Just is) rest =
+  "j" :: debug (List.length is) :: List.append (List.map debug is) rest
+lentT Nothing rest = "n" :: rest
+
+memberT : Components.Member -> List String -> List String
+memberT m rest =
+  IRText.tok m.key
+  :: changesT
+    m.track.first
+    (maybeSigT
+       m.track.hope
+       (changesT
+          m.track.falls
+          (changesT m.track.again (maybeSigT m.sig (lentT m.lent rest)))))
+
+workText : String -> Components.Kept -> String
+workText key k =
+  joinWith
+    " "
+    (IRText.tok key
+     :: IRText.tok k.ver
+     :: debug (List.length k.members)
+     :: List.foldr memberT Nil k.members)
 
 -- Reading
 --------------------------------------------------------------------------------
@@ -254,16 +303,79 @@ jsD = do
          , prims = prims
          })
 
+fixedRepr : Maybe Fixed.Fixed -> Dec Repr.Repr
+fixedRepr (Just w) = pure (RepFix w)
+fixedRepr Nothing = fail
+
+reprOf : String -> Dec Repr.Repr
+reprOf "_" = pure RepV
+reprOf "Float64" = pure RepF64
+reprOf "Int" = pure RepInt
+reprOf x = fixedRepr (Fixed.fixedOfName x)
+
+reprD : Dec Repr.Repr
+reprD = bind str reprOf
+
+sigD : Dec Repr.Sig
+sigD = do
+  params <- many reprD
+  result <- reprD
+  pure { params = params, result = result }
+
+changeD : Dec (Pair Int Repr.Sig)
+changeD = do
+  i <- int
+  s <- sigD
+  pure (MkPair i s)
+
+maybeSigOf : String -> Dec (Maybe Repr.Sig)
+maybeSigOf "j" = do
+  s <- sigD
+  pure (Just s)
+maybeSigOf "n" = pure Nothing
+maybeSigOf _ = fail
+
+lentFrom : String -> Dec (Maybe (List Int))
+lentFrom "j" = do
+  is <- many int
+  pure (Just is)
+lentFrom "n" = pure Nothing
+lentFrom _ = fail
+
+memberD : Dec Components.Member
+memberD = do
+  key <- str
+  first <- many changeD
+  hope <- bind word maybeSigOf
+  falls <- many changeD
+  again <- many changeD
+  sig <- bind word maybeSigOf
+  lent <- bind word lentFrom
+  pure
+      { key = key
+      , track = { first = first, hope = hope, falls = falls, again = again }
+      , sig = sig
+      , lent = lent
+      }
+
+workD : Dec (Pair String Components.Kept)
+workD = do
+  key <- str
+  ver <- str
+  members <- many memberD
+  pure (MkPair key { ver = ver, members = members })
+
 -- | what a file keeps, each entry with its text
 type Back =
   { groups : List (Pair GroupIn String)
   , copies : List (Pair (Pair String Simplify.KeptCopy) String)
   , emits : List (Pair (Pair String EmitC.EmitKept) String)
   , jss : List (Pair (Pair String Emit.JsKept) String)
+  , works : List (Pair (Pair String Components.Kept) String)
   }
 
 noBack : Back
-noBack = { groups = Nil, copies = Nil, emits = Nil, jss = Nil }
+noBack = { groups = Nil, copies = Nil, emits = Nil, jss = Nil, works = Nil }
 
 backD : String -> Dec Back
 backD id = do
@@ -273,8 +385,15 @@ backD id = do
   copies <- many (withRaw copyD)
   emits <- many (withRaw emitD)
   jss <- many (withRaw jsD)
+  works <- many (withRaw workD)
   expect "end"
-  pure { groups = groups, copies = copies, emits = emits, jss = jss }
+  pure
+      { groups = groups
+      , copies = copies
+      , emits = emits
+      , jss = jss
+      , works = works
+      }
 
 -- | a file, believed if it is of this compiler (`id`) and decodes whole
 readBack : String -> String -> Back
@@ -307,6 +426,15 @@ keepsOf bs =
              (\m2 c -> OrdMap.insert m2 (fst (fst c)) (snd (fst c)))
              m
              b.copies)
+        OrdMap.empty
+        bs
+  , works =
+      List.foldl
+        (\m (b : Back) ->
+           List.foldl
+             (\m2 w -> OrdMap.insert m2 (fst (fst w)) (snd (fst w)))
+             m
+             b.works)
         OrdMap.empty
         bs
   }
@@ -356,6 +484,7 @@ type Entries =
   , copies : OrdMap.OrdMap String String
   , emits : OrdMap.OrdMap String String
   , jss : OrdMap.OrdMap String String
+  , works : OrdMap.OrdMap String String
   }
 
 entriesOf : Back -> Entries
@@ -380,6 +509,11 @@ entriesOf b =
         (\m e -> OrdMap.insert m (fst (fst e)) (snd e))
         OrdMap.empty
         b.jss
+  , works =
+      List.foldl
+        (\m w -> OrdMap.insert m (fst (fst w)) (snd w))
+        OrdMap.empty
+        b.works
   }
 
 withGroup : String -> String -> Entries -> Entries
@@ -388,6 +522,7 @@ withGroup k t es =
   , copies = es.copies
   , emits = es.emits
   , jss = es.jss
+  , works = es.works
   }
 
 withCopy : String -> String -> Entries -> Entries
@@ -396,6 +531,7 @@ withCopy k t es =
   , copies = OrdMap.insert es.copies k t
   , emits = es.emits
   , jss = es.jss
+  , works = es.works
   }
 
 withEmit : String -> String -> Entries -> Entries
@@ -404,6 +540,7 @@ withEmit k t es =
   , copies = es.copies
   , emits = OrdMap.insert es.emits k t
   , jss = es.jss
+  , works = es.works
   }
 
 withJs : String -> String -> Entries -> Entries
@@ -412,6 +549,16 @@ withJs k t es =
   , copies = es.copies
   , emits = es.emits
   , jss = OrdMap.insert es.jss k t
+  , works = es.works
+  }
+
+withWork : String -> String -> Entries -> Entries
+withWork k t es =
+  { groups = es.groups
+  , copies = es.copies
+  , emits = es.emits
+  , jss = es.jss
+  , works = OrdMap.insert es.works k t
   }
 
 backOf : OrdMap.OrdMap String Back -> String -> Back
@@ -469,6 +616,7 @@ type Given =
   , copies : List Simplify.CopyDone
   , emits : List (Pair String EmitC.EmitKept)
   , jss : List (Pair String Emit.JsKept)
+  , works : List (Pair String Components.Kept)
   }
 
 -- | where the files are: the modules, and what each kept
@@ -543,6 +691,19 @@ addJs fs m (MkPair k e) =
        (jsText k e)
        (entriesAt fs.olds m (moduleIn fs.mods (Spec.rootOf k))))
 
+addWork : Files
+        -> OrdMap.OrdMap String Entries
+        -> Pair String Components.Kept
+        -> OrdMap.OrdMap String Entries
+addWork fs m (MkPair k w) =
+  OrdMap.insert
+    m
+    (moduleIn fs.mods (Spec.rootOf k))
+    (withWork
+       k
+       (workText k w)
+       (entriesAt fs.olds m (moduleIn fs.mods (Spec.rootOf k))))
+
 -- | a module's file, its entries in order of their keys
 backText : String -> Entries -> String
 backText id es =
@@ -561,7 +722,10 @@ backText id es =
                 (debug (OrdMap.size es.jss)
                  :: List.append
                    (List.map snd (OrdMap.toList es.jss))
-                   [IRText.tok "end"])))))
+                   (debug (OrdMap.size es.works)
+                    :: List.append
+                      (List.map snd (OrdMap.toList es.works))
+                      [IRText.tok "end"]))))))
 
 -- | the files with something made anew in them, each by its module, as
 -- | they are to be: what they kept, what was made in place of the
@@ -572,12 +736,15 @@ backTexts id fs gv =
     (\p -> MkPair (fst p) (backText id (snd p)))
     (OrdMap.toList
        (List.foldl
-          (addJs fs)
+          (addWork fs)
           (List.foldl
-             (addEmit fs)
+             (addJs fs)
              (List.foldl
-                (addCopy fs)
-                (List.foldl (addGroup fs) OrdMap.empty gv.groups)
-                gv.copies)
-             gv.emits)
-          gv.jss))
+                (addEmit fs)
+                (List.foldl
+                   (addCopy fs)
+                   (List.foldl (addGroup fs) OrdMap.empty gv.groups)
+                   gv.copies)
+                gv.emits)
+             gv.jss)
+          gv.works))

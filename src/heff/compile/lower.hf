@@ -43,10 +43,10 @@
 module heff.compile.lower
 
 import heff.compile.arrayloops as ArrayLoops
-import heff.compile.borrow as Borrow
 import heff.compile.bounds as Bounds
 import heff.compile.cpr as CPR
 import heff.compile.callarity as CallArity
+import heff.compile.components as Components
 import heff.compile.captures as Captures
 import heff.compile.cycles as Cycles
 import heff.compile.defun as Defun
@@ -79,14 +79,20 @@ import heff.compile.tokens as Tokens
 import heff.compile.simplify as Simplify
 import heff.compile.tested as Tested
 import heff.compile.trmc as TRMC
-import heff.compile.worker as Worker
 import heff.compile.worlds as Worlds
 import heff.elab.effect as Effect
 import std.ordmap as OrdMap
 
 -- | the definitions, what is known of them (heff.compile.facts), and
--- | what could not be lowered, said by key: as a backend is given them
-type Lowered = { defs : List IR.Def, facts : Facts.Facts, errors : List String }
+-- | what could not be lowered, said by key: as a backend is given them;
+-- | the components worked out anew (heff.compile.components), the C
+-- | backend's, as the cache is to keep them
+type Lowered =
+  { defs : List IR.Def
+  , facts : Facts.Facts
+  , errors : List String
+  , works : List (Pair String Components.Kept)
+  }
 
 -- | what a backend lowers on to, from what is reached of what is fused:
 -- | given the roots, where fresh names go on from, the definitions, and
@@ -186,6 +192,7 @@ sharedLowered errors t =
   { defs = t.defs
   , facts = Facts.withTuples t.tuples (Facts.factsOf t.defs)
   , errors = errors
+  , works = Nil
   }
 
 -- (a string's rune and its width read once, heff.compile.runes; where
@@ -471,70 +478,100 @@ entryBody : EntryCustody -> Maybe Effect.Effect -> String -> Int -> IR.Expr
 entryBody Reading w key n = entryReading w key n
 entryBody NoCustody w key n = entryCps w key n
 
--- (... its workers, of what else is known)
-withWorkersOf : List IR.Def -> Facts.Facts -> Facts.Facts
-withWorkersOf defs facts = Facts.withWorkers (Worker.workers facts defs) facts
-
--- (the C backend's: what each function is lent, too, the tags' fields
--- that may be flat, and its worker)
-cFacts : List IR.Def -> Facts.Facts -> Facts.Facts
-cFacts defs facts =
-  withWorkersOf
-    defs
-    (Facts.withSureRecs
-       (Facts.sureRecords defs)
-       (Facts.withFlat (Facts.flatTags defs) (Facts.sureTags defs) facts))
-
 -- (what each function is lent: not a copy's cell, which it is given,
 -- heff.compile.tokens)
-lentOf : Facts.Tokens -> List IR.Def -> OrdMap.OrdMap String (List Int)
-lentOf tk defs =
+lentOf : Facts.Tokens
+       -> OrdMap.OrdMap String (List Int)
+       -> OrdMap.OrdMap String (List Int)
+lentOf tk bor =
   OrdMap.fromList
     (List.map
        (\p ->
           if OrdMap.member tk.cells (fst p)
           then MkPair (fst p) (List.keepIf (\i -> i /= 0) (snd p))
           else p)
-       (OrdMap.toList (Borrow.borrowing defs)))
+       (OrdMap.toList bor))
 
+-- (... its workers and what each function is lent, worked out a
+-- component at a time, heff.compile.components)
+cWorked : List String
+        -> Facts.Tokens
+        -> List IR.Def
+        -> Facts.Facts
+        -> Components.Walked
+        -> Lowered
+cWorked errors tk defs facts w =
+  { defs = defs
+  , facts = Facts.withWorkers w.sigs (Facts.withLent (lentOf tk w.lent) facts)
+  , errors = errors
+  , works = w.fresh
+  }
+
+-- (... what is known but its workers and what each function is lent:
+-- the tags' fields that may be flat, the definitions' hashes)
+cKnown : List String
+       -> OrdMap.OrdMap String Components.Kept
+       -> Facts.Tokens
+       -> List IR.Def
+       -> Facts.Facts
+       -> Lowered
+cKnown errors works tk defs facts =
+  cWorked errors tk defs facts (Components.worked works facts defs)
+
+-- (the C backend's: what each function is lent, too, the tags' fields
+-- that may be flat, and its worker -- what the cache keeps of its
+-- components taken as it keeps it, `works`)
 cLowered : List String
          -> OrdMap.OrdMap String Int
          -> Facts.Tokens
+         -> OrdMap.OrdMap String Components.Kept
          -> Ranges.Ranged
          -> Lowered
-cLowered errors tuples tk r =
-  { defs = r.defs
-  , facts =
-      cFacts
-        r.defs
-        (Facts.withWords
-           r.words
-           (Facts.withTuples
-              tuples
-              (Facts.withLent
-                 (lentOf tk r.defs)
-                 (Facts.withTokens tk (Facts.factsOf r.defs)))))
-  , errors = errors
-  }
+cLowered errors tuples tk works r =
+  cKnown
+    errors
+    works
+    tk
+    r.defs
+    (Facts.withSureRecs
+       (Facts.sureRecords r.defs)
+       (Facts.withFlat
+          (Facts.flatTags r.defs)
+          (Facts.sureTags r.defs)
+          (Facts.withWords
+             r.words
+             (Facts.withTuples
+                tuples
+                (Facts.withTokens
+                   tk
+                   (Facts.withHashes
+                      (Components.bodyHashes r.defs)
+                      (Facts.factsOf r.defs)))))))
 
 -- (in monadic form, a rune and its width read once, its `Int`s known
 -- words done on words: heff.compile.ranges)
-cTokened : List String -> OrdMap.OrdMap String Int -> Tokens.Tokened -> Lowered
-cTokened errors tuples t =
+cTokened : List String
+         -> OrdMap.OrdMap String Int
+         -> OrdMap.OrdMap String Components.Kept
+         -> Tokens.Tokened
+         -> Lowered
+cTokened errors tuples works t =
   cLowered
     errors
     tuples
     t.tokens
+    works
     (Ranges.rangeProgram
        (fst (runesRead (Monadic.monadicFrom t.supply t.defs))))
 
 -- (functions copied to be given a cell, heff.compile.tokens)
 cRematched : List String
            -> OrdMap.OrdMap String Int
+           -> OrdMap.OrdMap String Components.Kept
            -> Pair (List IR.Def) Int
            -> Lowered
-cRematched errors tuples (MkPair defs n) =
-  cTokened errors tuples (Tokens.tokensProgram tuples n defs)
+cRematched errors tuples works (MkPair defs n) =
+  cTokened errors tuples works (Tokens.tokensProgram tuples n defs)
 
 -- (a record read only field by field read where it is bound,
 -- heff.compile.fields)
@@ -542,29 +579,35 @@ fieldsRead : Pair (List IR.Def) Int -> Pair (List IR.Def) Int
 fieldsRead (MkPair defs n) = Fields.fieldsProgram n defs
 
 -- (a tag matched again where its arms part, heff.compile.rematch)
-cShared : List String -> CPR.Cprd -> Lowered
-cShared errors t =
+cShared : List String
+        -> OrdMap.OrdMap String Components.Kept
+        -> CPR.Cprd
+        -> Lowered
+cShared errors works t =
   cRematched
     errors
     t.tuples
+    works
     (fieldsRead (Rematch.rematchProgram t.supply t.defs))
 
 -- (... each `generate` of a lambda worth a loop made one first,
 -- heff.compile.arrayloops)
 cLooped : Bool
+        -> OrdMap.OrdMap String Components.Kept
         -> List String
         -> List String
         -> Pair (List IR.Def) Int
         -> Lowered
-cLooped fuel roots errors (MkPair defs n) =
-  cShared errors (shared fuel roots n defs)
+cLooped fuel works roots errors (MkPair defs n) =
+  cShared errors works (shared fuel roots n defs)
 
 -- (as both backends have it, in monadic form: names from where the
--- simplifier's ended)
-cKept : Bool -> List String -> Rest
-cKept fuel direct roots supply kept errors =
+-- simplifier's ended; what the cache keeps of its components, `works`)
+cKept : Bool -> List String -> OrdMap.OrdMap String Components.Kept -> Rest
+cKept fuel direct works roots supply kept errors =
   cLooped
     fuel
+    works
     roots
     errors
     (Direct.directProgram direct (ArrayLoops.loopsProgram supply kept))
@@ -581,7 +624,8 @@ directLeaves False (Just w) =
 -- | what is reached from `roots`, lowered as `lower` does, then in
 -- | monadic form
 lowerC : Globals.Globals -> List String -> Lowered
-lowerC g roots = erasedWith (cKept False Nil) roots (Erase.eraseProgram g)
+lowerC g roots =
+  erasedWith (cKept False Nil OrdMap.empty) roots (Erase.eraseProgram g)
 
 -- (a definition made imperative, its variables kept unboxed where they
 -- may be (heff.compile.repr), its references counted (heff.compile.refcount),
@@ -635,15 +679,17 @@ type KeptUnit = { def : Simplify.KeptDef, refs : List String }
 
 -- | what the cache keeps: for each definition of the core, by its key,
 -- | the version it keeps it at and the definitions lifted from it, in
--- | order; the copies, by name
+-- | order; the copies, by name; the C backend's components
+-- | (heff.compile.components), by the key of the first definition of each
 type Keeps =
   { units : OrdMap.OrdMap String (Pair String (List KeptUnit))
   , copies : OrdMap.OrdMap String Simplify.KeptCopy
+  , works : OrdMap.OrdMap String Components.Kept
   }
 
 -- | the cache keeping nothing: each definition erased and simplified here
 noKeeps : Keeps
-noKeeps = { units = OrdMap.empty, copies = OrdMap.empty }
+noKeeps = { units = OrdMap.empty, copies = OrdMap.empty, works = OrdMap.empty }
 
 -- | a definition lifted from one of the core, simplified here, as the
 -- | cache is to keep it
@@ -676,12 +722,17 @@ type LoweredKept =
 
 -- | ... lowered on for the C backend, then in monadic form
 -- | (heff.compile.monadic): what it emits, a binding for each value
--- | computed (where, with Perceus, references are taken and dropped)
-cKeptOf : Bool -> Maybe Effect.Effect -> SimplifiedKept -> LoweredKept
-cKeptOf fuel w sk =
+-- | computed (where, with Perceus, references are taken and dropped) --
+-- | what the cache keeps of its components, `works`, taken as it keeps it
+cKeptOf : Bool
+        -> Maybe Effect.Effect
+        -> OrdMap.OrdMap String Components.Kept
+        -> SimplifiedKept
+        -> LoweredKept
+cKeptOf fuel w works sk =
   { lowered =
       simplifiedWith
-        (cKept fuel (directLeaves fuel w))
+        (cKept fuel (directLeaves fuel w) works)
         [entryKey]
         sk.errors
         sk.simplified

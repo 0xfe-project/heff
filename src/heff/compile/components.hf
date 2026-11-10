@@ -1,0 +1,349 @@
+-- Workers and borrowing, for the C backend, a component at a time: the
+-- definitions mentioning one another round a cycle, the components each
+-- mentions first, each worked out given what was worked out of those
+-- (heff.compile.worker's "A component at a time", heff.compile.borrow's
+-- `borrowingIn`) -- the same as the whole program at once.  So the
+-- backend's cache (heff.build.backcache) keeps what is worked out of a
+-- component, by a hash of what it is worked out from: its definitions'
+-- bodies, each hashed once (`bodyHashes`, which a definition's C is kept
+-- by too), what is known of each, and what was worked out of each
+-- definition it mentions outside it.  A component changed is worked out
+-- again; one mentioning it, only where what was worked out of it
+-- changed.
+
+module heff.compile.components
+
+import heff.compile.borrow as Borrow
+import heff.compile.cycles as Cycles
+import heff.compile.facts as Facts
+import heff.compile.ir as IR
+import heff.compile.irtext as IRText
+import heff.compile.repr as Repr
+import heff.compile.worker as Worker
+import std.ordmap as OrdMap
+
+-- | each definition's body, its variables named again from 0, hashed
+bodyHashes : List IR.Def -> OrdMap.OrdMap String String
+bodyHashes defs =
+  List.foldl
+    (\m (d : IR.Def) ->
+       OrdMap.insert
+         m
+         d.key
+         (IRText.hashOf [HE (fst (IR.freshen 0 d.body))]))
+    OrdMap.empty
+    defs
+
+-- | a definition of a component, as the cache keeps it: its key, what
+-- | the workers' fixpoint did with it, its worker, what it is lent (a
+-- | function's)
+type Member =
+  { key : String
+  , track : Worker.Track
+  , sig : Maybe Repr.Sig
+  , lent : Maybe (List Int)
+  }
+
+-- | a component, as the cache keeps it, by the key of its first
+-- | definition: the hash of what it was worked out from, its definitions
+-- | in order of their keys
+type Kept = { ver : String, members : List Member }
+
+-- Hashes
+--------------------------------------------------------------------------------
+
+sigH : Repr.Sig -> List IRText.HItem -> List IRText.HItem
+sigH s rest = HS (Repr.sigName s) :: rest
+
+changesH : List (Pair Int Repr.Sig) -> List IRText.HItem -> List IRText.HItem
+changesH cs rest =
+  HN (List.length cs)
+  :: List.foldr
+    (\(c : Pair Int Repr.Sig) acc -> HN (fst c) :: sigH (snd c) acc)
+    rest
+    cs
+
+maybeSigH : Maybe Repr.Sig -> List IRText.HItem -> List IRText.HItem
+maybeSigH (Just s) rest = HN 1 :: sigH s rest
+maybeSigH Nothing rest = HN 0 :: rest
+
+lentH : Maybe (List Int) -> List IRText.HItem -> List IRText.HItem
+lentH (Just is) rest =
+  HN (List.length is + 1) :: List.foldr (\i acc -> HN i :: acc) rest is
+lentH Nothing rest = HN 0 :: rest
+
+trackH : Worker.Track -> List IRText.HItem -> List IRText.HItem
+trackH tr rest =
+  changesH
+    tr.first
+    (maybeSigH tr.hope (changesH tr.falls (changesH tr.again rest)))
+
+-- (what a definition mentioning it is worked out from: what was worked
+-- out of it)
+sumOf : Member -> String
+sumOf m = IRText.hashOf (trackH m.track (lentH m.lent Nil))
+
+-- (the tags' fields that may be flat, which every worker is weighed
+-- knowing)
+flatH : Facts.Facts -> String
+flatH facts =
+  IRText.hashOf
+    (List.foldr
+       (\(p : Pair String (List Int)) acc ->
+          HS (fst p) :: lentH (Just (snd p)) acc)
+       Nil
+       (OrdMap.toList facts.flat))
+
+hashOr : IR.Expr -> Maybe String -> String
+hashOr b (Just h) = h
+hashOr b Nothing = IRText.hashOf [HE (fst (IR.freshen 0 b))]
+
+-- (what is known of a definition of the component: its body, its
+-- arity, whether a call of it may give back a bounce)
+memberH : Facts.Facts -> IR.Def -> List IRText.HItem -> List IRText.HItem
+memberH facts d rest =
+  HS d.key
+  :: HS d.name
+  :: HS (hashOr d.body (OrdMap.lookup facts.hashes d.key))
+  :: HN (fromMaybe (0 - 1) (OrdMap.lookup facts.arity d.key) + 1)
+  :: HN (if OrdMap.member facts.bounce d.key then 1 else 0)
+  :: rest
+
+-- Components
+--------------------------------------------------------------------------------
+
+-- (each definition by the definitions it mentions)
+refsOf : OrdMap.OrdMap String IR.Def
+       -> List IR.Def
+       -> OrdMap.OrdMap String (List String)
+refsOf byKey defs =
+  List.foldl
+    (\m (d : IR.Def) ->
+       OrdMap.insert
+         m
+         d.key
+         (List.keepIf (\g -> OrdMap.member byKey g) (IR.globalsIn d.body)))
+    OrdMap.empty
+    defs
+
+componentsBy : OrdMap.OrdMap String (List String)
+             -> List IR.Def
+             -> List (List String)
+componentsBy refs defs =
+  List.reverse
+    (Cycles.foundOf
+       (List.foldl
+          (\(w : Cycles.Walk) (d : IR.Def) ->
+             if OrdMap.member w.index d.key then w
+             else Cycles.strong refs w d.key)
+          Cycles.startWalk
+          defs))
+
+-- | the components of the definitions, those mentioning one another
+-- | round a cycle, each after those it mentions
+componentsOf : List IR.Def -> List (List String)
+componentsOf defs = componentsBy (refsOf (Worker.byKey defs) defs) defs
+
+-- | what is worked out so far: of each definition, what the workers'
+-- | fixpoint did with it, its worker, what it is lent, what one
+-- | mentioning it is worked out from; the components worked out here,
+-- | as the cache is to keep them
+type Walked =
+  { tracks : OrdMap.OrdMap String Worker.Track
+  , sigs : Repr.Sigs
+  , lent : OrdMap.OrdMap String (List Int)
+  , sums : OrdMap.OrdMap String String
+  , fresh : List (Pair String Kept)
+  }
+
+withSig : Repr.Sigs -> String -> Maybe Repr.Sig -> Repr.Sigs
+withSig m k (Just s) = OrdMap.insert m k s
+withSig m k Nothing = m
+
+withLent : OrdMap.OrdMap String (List Int)
+         -> String
+         -> Maybe (List Int)
+         -> OrdMap.OrdMap String (List Int)
+withLent m k (Just is) = OrdMap.insert m k is
+withLent m k Nothing = m
+
+-- (a component's definitions, worked out)
+walkedWith : Walked -> List Member -> List (Pair String Kept) -> Walked
+walkedWith w ms fresh =
+  { tracks =
+      List.foldl (\m (x : Member) -> OrdMap.insert m x.key x.track) w.tracks ms
+  , sigs = List.foldl (\m (x : Member) -> withSig m x.key x.sig) w.sigs ms
+  , lent = List.foldl (\m (x : Member) -> withLent m x.key x.lent) w.lent ms
+  , sums =
+      List.foldl (\m (x : Member) -> OrdMap.insert m x.key (sumOf x)) w.sums ms
+  , fresh = fresh
+  }
+
+-- (what the component's definitions mention outside it: definitions
+-- worked out before)
+outside : Walked -> OrdMap.OrdMap String Unit -> List IR.Def -> List String
+outside w own defs =
+  Worker.sortedOnce
+    (List.keepIf
+       (\g -> OrdMap.member w.sums g && not (OrdMap.member own g))
+       (List.concatMap (\(d : IR.Def) -> IR.globalsIn d.body) defs))
+
+keySet : List String -> OrdMap.OrdMap String Unit
+keySet ks = List.foldl (\m k -> OrdMap.insert m k MkUnit) OrdMap.empty ks
+
+-- (what a component is worked out from, hashed)
+verOf : Facts.Facts -> String -> Walked -> List IR.Def -> List String -> String
+verOf facts fl w defs out =
+  IRText.hashOf
+    (HS fl
+     :: List.foldr
+       (memberH facts)
+       (List.foldr
+          (\g acc -> HS g :: HS (fromMaybe "" (OrdMap.lookup w.sums g)) :: acc)
+          Nil
+          out)
+       defs)
+
+trackIn : Walked -> String -> Pair String Worker.Track
+trackIn w g =
+  MkPair
+    g
+    (fromMaybe
+       { first = Nil, hope = Nothing, falls = Nil, again = Nil }
+       (OrdMap.lookup w.tracks g))
+
+lentKnown : Walked -> List String -> OrdMap.OrdMap String (List Int)
+lentKnown w out =
+  List.foldl (\m g -> withLent m g (OrdMap.lookup w.lent g)) OrdMap.empty out
+
+memberOf : Worker.Worked
+         -> OrdMap.OrdMap String (List Int)
+         -> Pair String Worker.Track
+         -> Member
+memberOf wk bor (MkPair k tr) =
+  { key = k
+  , track = tr
+  , sig = Repr.sigIn wk.sigs k
+  , lent = OrdMap.lookup bor k
+  }
+
+-- (the component worked out here)
+membersOf : Worker.Worked -> OrdMap.OrdMap String (List Int) -> List Member
+membersOf wk bor = List.map (memberOf wk bor) wk.tracks
+
+-- (... and kept anew, under the key of its first definition)
+keptAnew : Walked -> List String -> String -> List Member -> Walked
+keptAnew w ks ver ms =
+  walkedWith
+    w
+    ms
+    (MkPair (fromMaybe "" (List.head ks)) { ver = ver, members = ms }
+     :: w.fresh)
+
+-- (... worked out here)
+computed : Facts.Facts
+         -> Walked
+         -> List String
+         -> List IR.Def
+         -> List String
+         -> String
+         -> Walked
+computed facts w ks defs out ver =
+  keptAnew
+    w
+    ks
+    ver
+    (membersOf
+       (Worker.componentWorkers facts (List.map (trackIn w) out) defs)
+       (Borrow.borrowingIn (lentKnown w out) defs))
+
+-- (the members, if kept at the version `ver`, of the keys `ks`)
+keptAt : String -> List String -> Maybe Kept -> Maybe (List Member)
+keptAt ver ks (Just k) =
+  if strEq k.ver ver
+     && List.length ks == List.length k.members
+     && List.all
+       (\p -> strEq (fst p) (snd p))
+       (List.zip ks (List.map (\(m : Member) -> m.key) k.members))
+  then Just k.members
+  else Nothing
+keptAt ver ks Nothing = Nothing
+
+takenOr : Facts.Facts
+        -> Walked
+        -> List String
+        -> List IR.Def
+        -> List String
+        -> String
+        -> Maybe (List Member)
+        -> Walked
+takenOr facts w ks defs out ver (Just ms) = walkedWith w ms w.fresh
+takenOr facts w ks defs out ver Nothing = computed facts w ks defs out ver
+
+-- (a component, of the keys `ks` in order, its definitions `defs`, what
+-- it is worked out from hashed `ver`)
+componentAt : OrdMap.OrdMap String Kept
+            -> Facts.Facts
+            -> Walked
+            -> List String
+            -> List IR.Def
+            -> List String
+            -> String
+            -> Walked
+componentAt kept facts w ks defs out ver =
+  takenOr
+    facts
+    w
+    ks
+    defs
+    out
+    ver
+    (keptAt ver ks (OrdMap.lookup kept (fromMaybe "" (List.head ks))))
+
+componentDefs : OrdMap.OrdMap String Kept
+              -> Facts.Facts
+              -> String
+              -> Walked
+              -> List String
+              -> List IR.Def
+              -> List String
+              -> Walked
+componentDefs kept facts fl w ks defs out =
+  componentAt kept facts w ks defs out (verOf facts fl w defs out)
+
+componentOne : OrdMap.OrdMap String Kept
+             -> Facts.Facts
+             -> String
+             -> OrdMap.OrdMap String IR.Def
+             -> Walked
+             -> List String
+             -> Walked
+componentOne kept facts fl byKey w ks =
+  componentDefs
+    kept
+    facts
+    fl
+    w
+    (Worker.sortedOnce ks)
+    (List.mapMaybe (\k -> OrdMap.lookup byKey k) (Worker.sortedOnce ks))
+    (outside w (keySet ks) (List.mapMaybe (\k -> OrdMap.lookup byKey k) ks))
+
+-- | what is worked out of the program's definitions (as the C backend
+-- | lowers them, `facts` known of them, their hashes among it): the
+-- | workers, the parameters each function is lent, and the components
+-- | worked out here, each by the key of its first definition -- those
+-- | the cache keeps (`kept`) at what they are worked out from taken as
+-- | it keeps them
+-- | >>> OrdMap.size (worked OrdMap.empty (Facts.factsOf Nil) Nil).sigs
+-- | 0
+worked : OrdMap.OrdMap String Kept -> Facts.Facts -> List IR.Def -> Walked
+worked kept facts defs =
+  List.foldl
+    (componentOne kept facts (flatH facts) (Worker.byKey defs))
+    { tracks = OrdMap.empty
+    , sigs = OrdMap.empty
+    , lent = OrdMap.empty
+    , sums = OrdMap.empty
+    , fresh = Nil
+    }
+    (componentsOf defs)
