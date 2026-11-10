@@ -2807,48 +2807,38 @@ declOf ce k = case OrdMap.lookup ce.facts.arity k of
     else funDecl ce k n
   Nothing -> ["V " ^ cGlobal k ^ "_get(void);"]
 
--- (what was made for each definition -- its strings, its lambdas --
--- by the definition it was made for)
-byOwner : List (Pair String String) -> OrdMap.OrdMap String (List String)
-byOwner ps =
-  List.foldl
-    (\m p ->
-       OrdMap.insert
-         m
-         (fst p)
-         (snd p :: fromMaybe Nil (OrdMap.lookup m (fst p))))
-    OrdMap.empty
-    ps
+-- | a definition's C, as the cache keeps it (`emitVer` its version)
+type EmitKept =
+  { ver : String
+  , protos : List String
+  , code : List String
+  , strs : List String
+  , lprotos : List String
+  , lams : List String
+  , shapes : List String
+  , prims : List String
+  }
 
-linesOf : OrdMap.OrdMap String (List String) -> String -> List String
-linesOf m o = fromMaybe Nil (OrdMap.lookup m o)
-
--- (a definition, as its part has it)
-ownLines : CS
-         -> OrdMap.OrdMap String (List String)
-         -> OrdMap.OrdMap String (List String)
-         -> OrdMap.OrdMap String (List String)
-         -> Pair IR.Def Emitted1
-         -> List String
-ownLines s strs protos lams (MkPair d e) =
+-- (a definition, as its part has it: what was made for it -- its
+-- strings, its lambdas -- with its own code)
+ownLines : EmitKept -> List String
+ownLines k =
   List.append
-    (linesOf strs (cGlobal d.key))
+    k.strs
     (List.append
-       (List.map pubLine (linesOf protos (cGlobal d.key)))
+       (List.map pubLine k.lprotos)
        (List.append
           (List.map
              (\l -> strSlice l 7 (strLength l))
-             (List.keepIf isCloDef e.protos))
-          (List.append
-             (List.map pubLine e.code)
-             (List.map pubLine (linesOf lams (cGlobal d.key))))))
+             (List.keepIf isCloDef k.protos))
+          (List.append (List.map pubLine k.code) (List.map pubLine k.lams))))
 
-pairKey : Pair IR.Def Emitted1 -> String
+pairKey : Pair IR.Def EmitKept -> String
 pairKey (MkPair d _) = d.key
 
 -- (the definitions, by module, each module's in order)
-byModule : List (Pair IR.Def Emitted1)
-         -> OrdMap.OrdMap String (List (Pair IR.Def Emitted1))
+byModule : List (Pair IR.Def EmitKept)
+         -> OrdMap.OrdMap String (List (Pair IR.Def EmitKept))
 byModule ps =
   List.foldl
     (\m p ->
@@ -2862,8 +2852,8 @@ byModule ps =
     OrdMap.empty
     (List.reverse ps)
 
-zipDE : List IR.Def -> List Emitted1 -> List (Pair IR.Def Emitted1)
-zipDE (d :: ds) (e :: es) = MkPair d e :: zipDE ds es
+zipDE : List IR.Def -> List EmitKept -> List (Pair IR.Def EmitKept)
+zipDE (d :: ds) (k :: ks) = MkPair d k :: zipDE ds ks
 zipDE _ _ = Nil
 
 -- (the definitions it mentions, and their copies given a cell, which
@@ -2880,50 +2870,180 @@ withCopies ce gs =
 
 -- (what a definition uses: the definitions it calls or mentions, and
 -- itself)
-usesOf : CE -> Pair IR.Def Emitted1 -> List String
+usesOf : CE -> Pair IR.Def EmitKept -> List String
 usesOf ce (MkPair d _) = d.key :: withCopies ce (IR.globalsIn d.body)
 
--- (what the owners of a part use, each once: shapes, primitives)
-usedBy : OrdMap.OrdMap String (List String)
-       -> List (Pair IR.Def Emitted1)
-       -> List String
-usedBy m ps =
-  sortedOnce (List.concatMap (\p -> linesOf m (cGlobal (pairKey p))) ps)
+-- A module's part, kept: its text is its definitions' C, each as the
+-- cache keeps it at its version, and what it is told of the program --
+-- the numbers of the tags and labels it uses, the definitions it
+-- declares.  Which tags, labels and definitions those are is its
+-- definitions' versions' too; their numbers and declarations are the
+-- program's, kept hashed.  A part whose definitions and hash are as
+-- kept is as it was written: its file, of the bytes and the time kept,
+-- is not made again, read nor written.
+
+-- | what a module's part is made of, as the cache keeps it: its file's
+-- | name, its module; its definitions in order, each by its key, its
+-- | version and its bytes in the part; the tags and labels it numbers,
+-- | the definitions it declares, a hash of their numbers and
+-- | declarations; and the bytes and the time of its file as last
+-- | written (0 where not yet)
+type PartMemo =
+  { name : String
+  , home : String
+  , keys : List String
+  , vers : List String
+  , sizes : List Int
+  , tags : List String
+  , lbls : List String
+  , decls : List String
+  , glob : String
+  , bytes : Int
+  , modified : Int
+  }
+
+-- | a part to be written: its name, what it is made of (a module's
+-- | part's), and whether the cache is sure of it -- that its file, if
+-- | of the bytes and the time kept, is as it would be written
+type PartPlan = { name : String, memo : Maybe PartMemo, sure : Bool }
+
+-- | ... the memo of a part, its file written: of these bytes, at this
+-- | time
+writtenAs : Int -> Int -> PartMemo -> PartMemo
+writtenAs bytes modified m =
+  { name = m.name
+  , home = m.home
+  , keys = m.keys
+  , vers = m.vers
+  , sizes = m.sizes
+  , tags = m.tags
+  , lbls = m.lbls
+  , decls = m.decls
+  , glob = m.glob
+  , bytes = bytes
+  , modified = modified
+  }
+
+-- (what a part is told of the program, hashed: the numbers of its tags
+-- and labels, its declarations)
+globOf : CE -> List String -> List String -> List String -> String
+globOf ce tags lbls decls =
+  IRText.hashOf
+    (List.map
+       HS
+       (List.append
+          (numbersOf ce (MkPair tags lbls))
+          (List.concatMap (declOf ce) decls)))
+
+-- (its definitions as the memo's: the same keys at the same versions)
+sameMembers : List String
+            -> List String
+            -> List (Pair IR.Def EmitKept)
+            -> Bool
+sameMembers (k :: ks) (v :: vs) (MkPair d e :: ps) =
+  strEq k d.key && strEq v e.ver && sameMembers ks vs ps
+sameMembers [] [] [] = True
+sameMembers _ _ _ = False
+
+-- (whether the memo kept of a part is of these definitions, told what
+-- it was told)
+sureOf : CE -> List (Pair IR.Def EmitKept) -> PartMemo -> Bool
+sureOf ce ps m =
+  sameMembers m.keys m.vers ps && strEq m.glob (globOf ce m.tags m.lbls m.decls)
+
+-- (a part's memo, of the tags, labels and definitions it is told of)
+memoNamed : CE
+          -> String
+          -> String
+          -> List (Pair IR.Def EmitKept)
+          -> List Int
+          -> List String
+          -> List String
+          -> List String
+          -> PartMemo
+memoNamed ce name home ps sizes tags lbls decls =
+  { name = name
+  , home = home
+  , keys = List.map pairKey ps
+  , vers = List.map (\(p : Pair IR.Def EmitKept) -> (snd p).ver) ps
+  , sizes = sizes
+  , tags = tags
+  , lbls = lbls
+  , decls = decls
+  , glob = globOf ce tags lbls decls
+  , bytes = 0
+  , modified = 0
+  }
+
+-- (... of the tags and labels its definitions use, each once)
+memoUsing : CE
+          -> String
+          -> String
+          -> List (Pair IR.Def EmitKept)
+          -> List Int
+          -> Pair (List String) (List String)
+          -> PartMemo
+memoUsing ce name home ps sizes (MkPair ts ls) =
+  memoNamed
+    ce
+    name
+    home
+    ps
+    sizes
+    (List.keepIf (\t -> not (elemS t knownTags)) (sortedOnce ts))
+    (sortedOnce ls)
+    (sortedOnce (List.concatMap (usesOf ce) ps))
+
+-- (a part's memo, made anew)
+memoOf : CE
+       -> String
+       -> String
+       -> List (Pair IR.Def EmitKept)
+       -> List Int
+       -> PartMemo
+memoOf ce name home ps sizes =
+  memoUsing
+    ce
+    name
+    home
+    ps
+    sizes
+    (namesIn
+       tagsLbls
+       (List.map (\(p : Pair IR.Def EmitKept) -> (fst p).body) ps))
 
 -- (a module's part: heff.h, then what it uses declared -- the shapes and
 -- primitives its definitions use, and the definitions -- then its own)
-modulePart : List String
-           -> CE
-           -> CS
-           -> OrdMap.OrdMap String (List String)
-           -> OrdMap.OrdMap String (List String)
-           -> OrdMap.OrdMap String (List String)
-           -> OrdMap.OrdMap String (List String)
-           -> OrdMap.OrdMap String (List String)
-           -> Pair String (List (Pair IR.Def Emitted1))
-           -> Pair String String
-modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
-  MkPair
-    (m ^ ".c")
-    (joinWith
-       "\n"
+modulePart : CE -> PartMemo -> List (Pair IR.Def EmitKept) -> String
+modulePart ce m ps =
+  joinWith
+    "\n"
+    (List.append
+       [ "// Generated from Hippogriff; do not edit."
+       , "#define HEFF_PART"
+       , "#include \"heff.h\""
+       ]
        (List.append
-          head
+          (numbersOf ce (MkPair m.tags m.lbls))
           (List.append
-             (numbersOf
-                ce
-                (namesIn
-                   tagsLbls
-                   (List.map (\(p : Pair IR.Def Emitted1) -> (fst p).body) ps)))
+             (List.map
+                shapeDef
+                (sortedOnce
+                   (List.concatMap
+                      (\(p : Pair IR.Def EmitKept) -> (snd p).shapes)
+                      ps)))
              (List.append
-                (List.map shapeDef (usedBy shapes ps))
-                (List.append
-                   (List.concatMap primCloDef (usedBy prims ps))
-                   (List.append
+                (List.concatMap
+                   primCloDef
+                   (sortedOnce
                       (List.concatMap
-                         (declOf ce)
-                         (sortedOnce (List.concatMap (usesOf ce) ps)))
-                      (List.concatMap (ownLines s strs protos lams) ps)))))))
+                         (\(p : Pair IR.Def EmitKept) -> (snd p).prims)
+                         ps)))
+                (List.append
+                   (List.concatMap (declOf ce) m.decls)
+                   (List.concatMap
+                      (\(p : Pair IR.Def EmitKept) -> ownLines (snd p))
+                      ps))))))
 
 -- Parts bounded in size (#38): a module's definitions are put in as many
 -- parts as keep each to about `partBytes` of C -- a power of two of them,
@@ -2958,7 +3078,7 @@ partCount bytes b =
 linesBytes : List String -> Int
 linesBytes ls = List.foldl (\n l -> n + strLength l + 1) 0 ls
 
-inPart : Int -> Int -> Pair IR.Def Emitted1 -> Bool
+inPart : Int -> Int -> Pair IR.Def EmitKept -> Bool
 inPart b k p = keyHash (pairKey p) % b == k
 
 consPart : {a : Type}
@@ -2971,9 +3091,9 @@ consPart n qs rest = MkPair n qs :: rest
 
 partsFrom : String
           -> Int
-          -> List (Pair IR.Def Emitted1)
+          -> List (Pair IR.Def EmitKept)
           -> Int
-          -> List (Pair String (List (Pair IR.Def Emitted1)))
+          -> List (Pair String (List (Pair IR.Def EmitKept)))
 partsFrom m b ps k =
   if k >= b then Nil
   else consPart
@@ -2982,16 +3102,16 @@ partsFrom m b ps k =
       (partsFrom m b ps (k + 1))
 
 partsOfCount : String
-             -> List (Pair IR.Def Emitted1)
+             -> List (Pair IR.Def EmitKept)
              -> Int
-             -> List (Pair String (List (Pair IR.Def Emitted1)))
+             -> List (Pair String (List (Pair IR.Def EmitKept)))
 partsOfCount m ps b = if b == 1 then [MkPair m ps] else partsFrom m b ps 0
 
 -- (a module's definitions, as its parts: one, named as the module, where
 -- it is small; else `MODULE.K`, K the part a definition's key hashes to)
-moduleParts : (Pair IR.Def Emitted1 -> Int)
-            -> Pair String (List (Pair IR.Def Emitted1))
-            -> List (Pair String (List (Pair IR.Def Emitted1)))
+moduleParts : (Pair IR.Def EmitKept -> Int)
+            -> Pair String (List (Pair IR.Def EmitKept))
+            -> List (Pair String (List (Pair IR.Def EmitKept)))
 moduleParts size (MkPair m ps) =
   partsOfCount m ps (partCount (List.foldl (\n p -> n + size p) 0 ps) 1)
 
@@ -3001,66 +3121,126 @@ moduleParts size (MkPair m ps) =
 entryPart : String
 entryPart = "run$main.c"
 
--- (every module's parts, each bounded in size)
-modulesParts : CE
-             -> CS
-             -> OrdMap.OrdMap String (List String)
-             -> OrdMap.OrdMap String (List String)
-             -> OrdMap.OrdMap String (List String)
-             -> List IR.Def
-             -> List Emitted1
-             -> List (Pair String String)
-modulesParts ce s strs protos lams defs ems =
-  List.map
-    (modulePart
-       [ "// Generated from Hippogriff; do not edit."
-       , "#define HEFF_PART"
-       , "#include \"heff.h\""
-       ]
-       ce
-       s
-       (byOwner s.shapes)
-       (byOwner s.prims)
-       strs
-       protos
-       lams)
-    (List.concatMap
-       (moduleParts
-          (\(p : Pair IR.Def Emitted1) ->
-             linesBytes (ownLines s strs protos lams p)))
-       (OrdMap.toList (byModule (zipDE defs ems))))
+-- (the bytes each definition has in its part, as the memos keep them:
+-- by its key, with its version)
+memoSizes : List PartMemo -> OrdMap.OrdMap String (Pair String Int)
+memoSizes ms =
+  List.foldl
+    (\acc (m : PartMemo) ->
+       List.foldl
+         (\a p -> OrdMap.insert a (fst p) (snd p))
+         acc
+         (List.zip m.keys (List.zip m.vers m.sizes)))
+    OrdMap.empty
+    ms
 
+-- (a definition's bytes in its part: as kept at its version, else
+-- counted)
+sizeAt : EmitKept -> Maybe (Pair String Int) -> Int
+sizeAt k (Just (MkPair v n)) =
+  if strEq v k.ver then n else linesBytes (ownLines k)
+sizeAt k Nothing = linesBytes (ownLines k)
+
+sizeIn : OrdMap.OrdMap String (Pair String Int) -> Pair IR.Def EmitKept -> Int
+sizeIn known (MkPair d k) = sizeAt k (OrdMap.lookup known d.key)
+
+-- | a part written as it is, the cache keeping nothing of it
+plainPart : String -> (Unit -> String) -> Pair PartPlan (Unit -> String)
+plainPart name text = MkPair { name = name, memo = Nothing, sure = False } text
+
+-- (a module's part, as its memo says, and its text when it is to be
+-- written)
+planOf : CE
+       -> Bool
+       -> PartMemo
+       -> List (Pair IR.Def EmitKept)
+       -> Pair PartPlan (Unit -> String)
+planOf ce sure m ps =
+  MkPair
+    { name = m.name, memo = Just m, sure = sure }
+    (\u -> modulePart ce m ps)
+
+-- (... its memo made anew)
+planAnew : CE
+         -> OrdMap.OrdMap String (Pair String Int)
+         -> String
+         -> String
+         -> List (Pair IR.Def EmitKept)
+         -> Pair PartPlan (Unit -> String)
+planAnew ce known home n ps =
+  planOf ce False (memoOf ce n home ps (List.map (sizeIn known) ps)) ps
+
+-- (... as the memo kept of it, if it is sure of it)
+planWith : CE
+         -> OrdMap.OrdMap String (Pair String Int)
+         -> String
+         -> String
+         -> List (Pair IR.Def EmitKept)
+         -> Maybe PartMemo
+         -> Pair PartPlan (Unit -> String)
+planWith ce known home n ps (Just m) =
+  if sureOf ce ps m then planOf ce True m ps
+  else planAnew ce known home n ps
+planWith ce known home n ps Nothing = planAnew ce known home n ps
+
+-- (a module's parts, each bounded in size)
+homeParts : CE
+          -> OrdMap.OrdMap String PartMemo
+          -> OrdMap.OrdMap String (Pair String Int)
+          -> Pair String (List (Pair IR.Def EmitKept))
+          -> List (Pair PartPlan (Unit -> String))
+homeParts ce memos known (MkPair m ps) =
+  List.map
+    (\(q : Pair String (List (Pair IR.Def EmitKept))) ->
+       planWith
+         ce
+         known
+         m
+         (fst q ^ ".c")
+         (snd q)
+         (OrdMap.lookup memos (fst q ^ ".c")))
+    (moduleParts (sizeIn known) (MkPair m ps))
+
+-- (every module's parts)
+modulesParts : CE
+             -> OrdMap.OrdMap String PartMemo
+             -> List IR.Def
+             -> List EmitKept
+             -> List (Pair PartPlan (Unit -> String))
+modulesParts ce memos defs ks =
+  List.concatMap
+    (homeParts ce memos (memoSizes (OrdMap.values memos)))
+    (OrdMap.toList (byModule (zipDE defs ks)))
+
+-- | the program as parts: heff.h, `entryPart`, then each module's --
+-- | each with its text, made when it is to be written; a module's as
+-- | its memo (`memos`, by its name) says, where it is sure of it
 partsWith : String
           -> List Emit.Provider
           -> Ending
           -> List IR.Def
           -> CE
-          -> Pair (List Emitted1) CS
-          -> List (Pair String String)
-partsWith runtime provs ending defs ce (MkPair ems s) =
-  MkPair "heff.h" (joinWith "\n" (partHead runtime ending))
-  :: MkPair
+          -> OrdMap.OrdMap String PartMemo
+          -> List EmitKept
+          -> List (Pair PartPlan (Unit -> String))
+partsWith runtime provs ending defs ce memos ks =
+  plainPart "heff.h" (\u -> joinWith "\n" (partHead runtime ending))
+  :: plainPart
     entryPart
-    (joinWith
-       "\n"
-       ("#include \"heff.h\""
-        :: List.append
-          (numbersOf
-             ce
-             (MkPair (namedBy "TAG_" provs) (namedBy "LBL_" provs)))
-          (List.append
-             (declOf ce Lower.entryKey)
-             (List.append
-                (List.map (\(p : Emit.Provider) -> p.text) provs)
-                (List.map pubLine (ending.end ce))))))
-  :: modulesParts
-    ce
-    s
-    (byOwner s.strs)
-    (byOwner s.protos)
-    (byOwner s.lams)
-    defs
-    ems
+    (\u ->
+       joinWith
+         "\n"
+         ("#include \"heff.h\""
+          :: List.append
+            (numbersOf
+               ce
+               (MkPair (namedBy "TAG_" provs) (namedBy "LBL_" provs)))
+            (List.append
+               (declOf ce Lower.entryKey)
+               (List.append
+                  (List.map (\(p : Emit.Provider) -> p.text) provs)
+                  (List.map pubLine (ending.end ce))))))
+  :: modulesParts ce memos defs ks
 
 -- The backend's cache: a definition's C as it keeps it
 --------------------------------------------------------------------------------
@@ -3072,19 +3252,8 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
 -- which of its parameters are lent, its worker's signature.  The cache
 -- (heff.build.backcache) keeps it by a hash of those (`emitVer`), with
 -- what was made for it on the way: its strings and lambdas, the shapes
--- and primitives it uses, each in the order made.
-
--- | a definition's C, as the cache keeps it
-type EmitKept =
-  { ver : String
-  , protos : List String
-  , code : List String
-  , strs : List String
-  , lprotos : List String
-  , lams : List String
-  , shapes : List String
-  , prims : List String
-  }
+-- and primitives it uses, each in the order made (`EmitKept`, with the
+-- parts, which are made of it).
 
 -- (what is known of a global: its arity, whether it bounces, what it is
 -- lent, its worker, the parameters every call gives a word, the sizes of
@@ -3215,42 +3384,18 @@ keptOf v e s =
   , prims = madeLines s.prims
   }
 
-pushOwn : String
-        -> List String
-        -> List (Pair String String)
-        -> List (Pair String String)
-pushOwn o [] acc = acc
-pushOwn o (l :: ls) acc = pushOwn o ls (MkPair o l :: acc)
-
--- (what the definition `o` made, as if made after what `s` holds)
-mergeKept : String -> EmitKept -> CS -> CS
-mergeKept o k s =
-  { owner = s.owner
-  , nlam = s.nlam
-  , lams = pushOwn o k.lams s.lams
-  , protos = pushOwn o k.lprotos s.protos
-  , nstr = s.nstr
-  , strs = pushOwn o k.strs s.strs
-  , shapes = pushOwn o k.shapes s.shapes
-  , prims = pushOwn o k.prims s.prims
-  }
-
-type EmitAcc =
-  { ems : List Emitted1, s : CS, fresh : List (Pair String EmitKept) }
+-- | what is emitted: each definition's C, as the cache keeps it, in
+-- | order (last first), and those made here
+type EmitAcc = { ks : List EmitKept, fresh : List (Pair String EmitKept) }
 
 keptHit : EmitAcc -> String -> EmitKept -> EmitAcc
-keptHit acc key k =
-  { ems = { protos = k.protos, code = k.code } :: acc.ems
-  , s = mergeKept (cGlobal key) k acc.s
-  , fresh = acc.fresh
-  }
+keptHit acc key k = { ks = k :: acc.ks, fresh = acc.fresh }
+
+freshKept : EmitAcc -> String -> EmitKept -> EmitAcc
+freshKept acc key k = { ks = k :: acc.ks, fresh = MkPair key k :: acc.fresh }
 
 freshEmitted : EmitAcc -> String -> String -> Pair Emitted1 CS -> EmitAcc
-freshEmitted acc key v (MkPair e s1) =
-  { ems = e :: acc.ems
-  , s = mergeKept (cGlobal key) (keptOf v e s1) acc.s
-  , fresh = MkPair key (keptOf v e s1) :: acc.fresh
-  }
+freshEmitted acc key v (MkPair e s1) = freshKept acc key (keptOf v e s1)
 
 keptAtVer : String -> Maybe EmitKept -> Maybe EmitKept
 keptAtVer v (Just k) = if strEq k.ver v then Just k else Nothing
@@ -3293,7 +3438,7 @@ emitOne ce kept acc d = emitWith ce kept acc d (IR.freshen 0 d.body)
 -- | where it keeps it at its version -- and those emitted here
 defsKept : CE -> OrdMap.OrdMap String EmitKept -> List IR.Def -> EmitAcc
 defsKept ce kept defs =
-  List.foldl (emitOne ce kept) { ems = Nil, s = emptyCS, fresh = Nil } defs
+  List.foldl (emitOne ce kept) { ks = Nil, fresh = Nil } defs
 
 -- | the program, its runtime and its providers before it
 programC : String
@@ -3377,7 +3522,7 @@ compileProgramC fuel runtime provs g key eff =
 -- | wrong with it, and what the cache is to keep anew -- definitions of
 -- | the core simplified, copies, definitions' C
 type PartsKept =
-  { parts : List (Pair String String)
+  { parts : List (Pair PartPlan (Unit -> String))
   , errors : List String
   , groups : List Lower.GroupOut
   , copies : List Simplify.CopyDone
@@ -3389,9 +3534,10 @@ keptPartsAcc : String
              -> Ending
              -> Lower.LoweredKept
              -> CE
+             -> OrdMap.OrdMap String PartMemo
              -> EmitAcc
              -> PartsKept
-keptPartsAcc runtime provs ending lk ce acc =
+keptPartsAcc runtime provs ending lk ce memos acc =
   { parts =
       partsWith
         runtime
@@ -3399,7 +3545,8 @@ keptPartsAcc runtime provs ending lk ce acc =
         ending
         lk.lowered.defs
         ce
-        (MkPair (List.reverse acc.ems) acc.s)
+        memos
+        (List.reverse acc.ks)
   , errors = lk.lowered.errors
   , groups = lk.groups
   , copies = lk.copies
@@ -3410,24 +3557,34 @@ keptPartsCE : String
             -> List Emit.Provider
             -> Ending
             -> OrdMap.OrdMap String EmitKept
+            -> OrdMap.OrdMap String PartMemo
             -> Lower.LoweredKept
             -> CE
             -> PartsKept
-keptPartsCE runtime provs ending kept lk ce =
-  keptPartsAcc runtime provs ending lk ce (defsKept ce kept lk.lowered.defs)
+keptPartsCE runtime provs ending kept memos lk ce =
+  keptPartsAcc
+    runtime
+    provs
+    ending
+    lk
+    ce
+    memos
+    (defsKept ce kept lk.lowered.defs)
 
 keptParts : String
           -> List Emit.Provider
           -> Effect.Effect
           -> OrdMap.OrdMap String EmitKept
+          -> OrdMap.OrdMap String PartMemo
           -> Lower.LoweredKept
           -> PartsKept
-keptParts runtime provs eff kept lk =
+keptParts runtime provs eff kept memos lk =
   keptPartsCE
     runtime
     provs
     { prefix = runPrefix provs, end = runEnd eff }
     kept
+    memos
     lk
     (ceOf
        provs
@@ -3438,7 +3595,8 @@ keptParts runtime provs eff kept lk =
 -- | run$main.c (`entryPart`), then a part for each module -- made
 -- | through the backend's cache (heff.build.backcache): each definition of the core taken as
 -- | it keeps it at its version (`vers`, `ks`, heff.compile.lower), each
--- | definition's C as it keeps it at what it is made of (`kept`)
+-- | definition's C as it keeps it at what it is made of (`kept`), each
+-- | module's part as it keeps what it is made of (`memos`)
 compileProgramPartsKept : Bool
                         -> String
                         -> List Emit.Provider
@@ -3448,13 +3606,15 @@ compileProgramPartsKept : Bool
                         -> OrdMap.OrdMap String String
                         -> Lower.Keeps
                         -> OrdMap.OrdMap String EmitKept
+                        -> OrdMap.OrdMap String PartMemo
                         -> PartsKept
-compileProgramPartsKept fuel runtime provs g key eff vers ks kept =
+compileProgramPartsKept fuel runtime provs g key eff vers ks kept memos =
   keptParts
     runtime
     provs
     eff
     kept
+    memos
     (Lower.cKeptOf
        fuel
        (Just eff)

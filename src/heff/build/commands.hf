@@ -759,20 +759,78 @@ writeChanged path text (Just was) =
   if strEq was text then pure True else Files.writeFile path text
 writeChanged path text Nothing = Files.writeFile path text
 
--- (the parts of a C program, each `DIR/NAME`, written where changed)
+-- (whether a part's file is as the cache kept it: of the bytes, and of
+-- the time, it was last written at)
+asKept : Maybe EmitC.PartMemo -> Either FileError Status -> Bool
+asKept (Just m) (Right st) = st.size == m.bytes && st.modified == m.modified
+asKept _ _ = False
+
+-- (... where the cache is sure of what the part is made of)
+keptOnDisk : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> EmitC.PartPlan
+           -> Co e Bool
+keptOnDisk path p =
+  if p.sure then bind (Files.pathStatus path) (\r -> pure (asKept p.memo r))
+  else pure False
+
+-- | what the cache is to keep of a directory's parts, as written:
+-- | whether any was written anew, and each module's part's memo
+type Written = { changed : Bool, memos : List EmitC.PartMemo }
+
+-- (a part's file left as it was: its memo as kept)
+leftAs : Maybe EmitC.PartMemo -> Written -> Written
+leftAs (Just m) w = { changed = w.changed, memos = m :: w.memos }
+leftAs Nothing w = w
+
+-- (a part's file written: its memo, of the file's bytes and time now)
+memoWritten : Maybe EmitC.PartMemo
+            -> Either FileError Status
+            -> Written
+            -> Written
+memoWritten (Just m) (Right st) w =
+  { changed = True
+  , memos = EmitC.writtenAs st.size st.modified m :: w.memos
+  }
+memoWritten (Just m) (Left _) w = { changed = True, memos = w.memos }
+memoWritten Nothing st w = w
+
+-- (a part written, where it changed: what the cache is to keep of it)
+writePart : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> EmitC.PartPlan
+          -> String
+          -> Written
+          -> Co e (Maybe Written)
+writePart path p text w = do
+  was <- Files.readFile path
+  ok <- writeChanged path text was
+  st <- Files.pathStatus path
+  pure (if ok then Just (memoWritten p.memo st w) else Nothing)
+
+-- (the parts of a C program, each `DIR/NAME`: as the cache kept it, left
+-- as it is; else made, and written where changed -- what the cache is to
+-- keep of them, or nothing where one could not be written)
 writePartsGo : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
              -> {{disk : filesystem <: e}}
              -> String
-             -> List (Pair String String)
-             -> Co e Bool
-writePartsGo dir [] = pure True
-writePartsGo dir (MkPair name text :: rest) = do
+             -> Written
+             -> List (Pair EmitC.PartPlan (Unit -> String))
+             -> Co e (Maybe Written)
+writePartsGo dir w [] = pure (Just w)
+writePartsGo dir w (MkPair p text :: rest) = do
   st <- styleNow
-  was <- Files.readFile (HostPath.join st dir name)
-  ok <- writeChanged (HostPath.join st dir name) text was
-  if ok then writePartsGo dir rest else pure False
+  kept <- keptOnDisk (HostPath.join st dir p.name) p
+  if kept then writePartsGo dir (leftAs p.memo w) rest
+  else do
+    done <- writePart (HostPath.join st dir p.name) p (text MkUnit) w
+    case done of
+      Just more -> writePartsGo dir more rest
+      Nothing -> pure Nothing
 
 -- (what is in `dir` and is no part of the program -- a module no longer
 -- in it -- gone, so that it is not built)
@@ -781,26 +839,28 @@ removeStale : {e : HFunctor}
             -> {{sys : process <: e}}
             -> {{disk : filesystem <: e}}
             -> String
-            -> List (Pair String String)
+            -> List String
             -> List String
             -> Co e Unit
 removeStale dir parts [] = pure MkUnit
 removeStale dir parts (n :: rest) = do
   st <- styleNow
   gone <-
-    if List.any (\p -> strEq (fst p) n) parts then pure True
+    if List.any (\p -> strEq p n) parts then pure True
     else Files.remove (HostPath.join st dir n)
   removeStale dir parts rest
 
 -- | a C program as parts, in the directory `dir`: each part written
--- | only if it changed, and what is no part of it gone
+-- | only if it changed (one the cache is sure of, only if its file is
+-- | not as last written), and what is no part of it gone; then `done`,
+-- | given what the cache is to keep of the parts written
 writeParts : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
            -> String
-           -> Co e Unit
-           -> Pair (List (Pair String String)) (List String)
+           -> (Written -> Co e Unit)
+           -> Pair (List (Pair EmitC.PartPlan (Unit -> String))) (List String)
            -> Co e Unit
 writeParts dir done (MkPair parts errors) = do
   emitErrs errors
@@ -808,12 +868,19 @@ writeParts dir done (MkPair parts errors) = do
   then do
     made <- Files.makeDirectory dir
     names <- Files.readDirectory dir
-    u <- removeStale dir parts (fromMaybe Nil names)
-    ok <- writePartsGo dir parts
-    if ok then done
-    else do
-      printErr ("cannot write " ^ dir)
-      exit 1
+    u <-
+      removeStale
+        dir
+        (List.map
+           (\(p : Pair EmitC.PartPlan (Unit -> String)) -> (fst p).name)
+           parts)
+        (fromMaybe Nil names)
+    written <- writePartsGo dir { changed = False, memos = Nil } parts
+    case written of
+      Just w -> done w
+      Nothing -> do
+        printErr ("cannot write " ^ dir)
+        exit 1
   else exit 1
 
 -- The backend's cache (heff.build.backcache), `.heff/<backDir>/`
@@ -943,6 +1010,72 @@ backsOf id ps =
 modsOf : List String -> OrdMap.OrdMap String Unit
 modsOf ms = List.foldl (\m k -> OrdMap.insert m k MkUnit) OrdMap.empty ms
 
+-- (where the cache keeps what a directory of parts holds: by a hash of
+-- its path, as the system resolves it)
+stampPath : Load.Paths -> Path.Style -> Path.Path -> String
+stampPath ps st real =
+  Load.under
+    ps
+    (backDirOf ps)
+    (Cache.strHash (Path.render (os := st) real) ^ ".parts")
+
+stampRead : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> Load.Paths
+          -> String
+          -> Path.Style
+          -> Either FileError Path.Path
+          -> Co e (OrdMap.OrdMap String EmitC.PartMemo)
+stampRead ps id st (Right real) = do
+  t <- Files.readFile (stampPath ps st real)
+  pure (BackCache.readStamp id (fromMaybe "" t))
+stampRead ps id st (Left _) = pure OrdMap.empty
+
+-- (what the directory `dir` holds, as the compiler `id` wrote it there:
+-- each module's part, by its name)
+stampOf : {e : HFunctor}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Load.Paths
+        -> String
+        -> String
+        -> Co e (OrdMap.OrdMap String EmitC.PartMemo)
+stampOf ps id dir =
+  if strEq id "" then pure OrdMap.empty
+  else do
+    st <- styleNow
+    bind (Files.realPath dir) (stampRead ps id st)
+
+stampWrite : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> Load.Paths
+           -> String
+           -> List EmitC.PartMemo
+           -> Path.Style
+           -> Either FileError Path.Path
+           -> Co e Unit
+stampWrite ps id memos st (Right real) = do
+  ok <- writeWhole (stampPath ps st real) (BackCache.stampText id memos)
+  pure MkUnit
+stampWrite ps id memos st (Left _) = pure MkUnit
+
+-- (... kept anew, where a part was written: after every part is, so
+-- that a part left half written is not taken for written)
+stampWritten : {e : HFunctor}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> Load.Paths
+             -> String
+             -> String
+             -> Written
+             -> Co e Unit
+stampWritten ps id dir w =
+  if w.changed
+  then do
+    st <- styleNow
+    bind (Files.realPath dir) (stampWrite ps id (List.reverse w.memos) st)
+  else pure MkUnit
+
 -- (the parts written, then what the cache is to keep anew -- `texts`,
 -- the files as they were, `backs`, what they kept -- then `done`)
 keptWritten : {e : HFunctor}
@@ -961,22 +1094,24 @@ keptWritten : {e : HFunctor}
 keptWritten bi dir zig id texts backs done out =
   writeParts
     dir
-    (if strEq id "" then done
-     else do
-       made <- Files.makeDirectory (backDirOf bi.paths)
-       writeBacks
-           bi.paths
-           (textsMap texts)
-           (BackCache.backTexts
-              id
-              { mods = modsOf ("_" :: bi.modules), olds = backs }
-              { groups = out.groups
-              , copies = out.copies
-              , emits = out.emits
-              , jss = Nil
-              })
-       done)
-    (MkPair (MkPair "heff.zig" zig :: out.parts) out.errors)
+    (\w ->
+       if strEq id "" then done
+       else do
+         made <- Files.makeDirectory (backDirOf bi.paths)
+         writeBacks
+             bi.paths
+             (textsMap texts)
+             (BackCache.backTexts
+                id
+                { mods = modsOf ("_" :: bi.modules), olds = backs }
+                { groups = out.groups
+                , copies = out.copies
+                , emits = out.emits
+                , jss = Nil
+                })
+         stampWritten bi.paths id dir w
+         done)
+    (MkPair (EmitC.plainPart "heff.zig" (\u -> zig) :: out.parts) out.errors)
 
 keptWith : {e : HFunctor}
          -> {{io : stdio <: e}}
@@ -992,8 +1127,9 @@ keptWith : {e : HFunctor}
          -> String
          -> List (Pair String String)
          -> OrdMap.OrdMap String BackCache.Back
+         -> OrdMap.OrdMap String EmitC.PartMemo
          -> Co e Unit
-keptWith bi dir rt done c available r id texts backs =
+keptWith bi dir rt done c available r id texts backs memos =
   keptWritten
     bi
     dir
@@ -1011,7 +1147,8 @@ keptWith bi dir rt done c available r id texts backs =
        r.effect
        bi.hashes
        (BackCache.keepsOf (List.map snd (OrdMap.toList backs)))
-       (BackCache.emitsOf (List.map snd (OrdMap.toList backs))))
+       (BackCache.emitsOf (List.map snd (OrdMap.toList backs)))
+       memos)
 
 -- (the parts of the program running `r`, made through the cache)
 keptParts : {e : HFunctor}
@@ -1030,7 +1167,8 @@ keptParts bi dir rt done c available r = do
   id <- selfHash bi.paths
   texts <-
     if strEq id "" then pure Nil else readBacks bi.paths ("_" :: bi.modules)
-  keptWith bi dir rt done c available r id texts (backsOf id texts)
+  memos <- stampOf bi.paths id dir
+  keptWith bi dir rt done c available r id texts (backsOf id texts) memos
 
 -- (the JavaScript of the program running `r`, written -- then what the
 -- cache is to keep anew, `texts` the files as they were, `backs` what
