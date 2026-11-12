@@ -55,7 +55,8 @@ firstLong ws = run do
 - `for p in e do ...` runs once for each element of `e`, matched by `p`.
 - `break` leaves the innermost loop; `continue` starts its next turn.
 - `return e` ends the whole block with `e`.
-- An `if` among the statements may have no `else`. The arms of an `if`
+- An `if` among the statements may have no `else`, an `if let p = e`
+  too ([expressions](definitions.md#expressions)). The arms of an `if`
   or `case` among the statements are statements too.
 - `let p = e else s` binds `p`'s names for the statements after it when
   `e` matches `p`, and runs `s` otherwise. `s`, a statement or the
