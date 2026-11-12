@@ -41,6 +41,10 @@
 - bytes' `indexOf needle b from` and `split sep b`, as a string's are: where some bytes are first, from an index on, searched by the runtime (memchr, then a compare) and not a byte at a time; and the pieces between a separator's, each a `slice`. A `\r\n` or a multipart boundary found without a loop of `index`.
 - std.net's `writeNow c b`: as many of the bytes as the system takes now, never waiting -- how many, 0 where it takes none -- so a behaviour of boc's may write itself, only the rest left to a `write` an act awaits. std.http.bocserver writes what a stream's or a socket's senders queue so: the server's behaviour on the connection writes it at once, and only what the socket does not take goes to an awaited write, with `pending`, the time limit, order and `gone` as before.
 
+### Compiler and tools
+
+- `heff init NAME` makes its module `src/NAME.hf`, the module `NAME`, not `src/NAME/greeting.hf`; the program and the test import `NAME`.
+
 ## 0.6.1
 
 Released 2026-10-31.
