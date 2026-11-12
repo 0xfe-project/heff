@@ -88,6 +88,22 @@ quadruple n = double (double n)
   double : Int -> Int
   double k = k * 2
 
+-- | >>> lastOr [1, 2, 3]
+-- | 3
+lastOr : List Int -> Int
+lastOr xs =
+  if let Just m = List.last xs
+  then m
+  else 0
+
+-- | >>> firstOf Nothing (Just 2)
+-- | 2
+firstOf : Maybe Int -> Maybe Int -> Int
+firstOf a b =
+  if let Just x = a then x
+  else if let Just y = b then y
+  else 0
+
 -- | >>> List.map (\x -> x + 1) [1, 2]
 -- | [2, 3]
 increments : List Int
@@ -96,6 +112,10 @@ increments = List.map (\x -> x + 1) [1, 2]
 
 - `case e of` matches `e` against patterns, one arm a line.
 - `if c then a else b` is `a` where `c` is `True`.
+- `if let p = e then a else b` is `a` where `e` matches `p`, `p`'s names
+  bound in `a`, and `b` where it does not; `b` sees none of them. `p`
+  may fail to match; a `p` that cannot is let be, its `else` never
+  taken. `else if let` goes on a chain as `else if` does.
 - `let x = e in body` names `e` in `body`. A `let` does not generalise:
   what it binds has one type for every use. `let p = e in body` takes
   `e` apart by the pattern `p`: `let (a, b) = pair in a + b`.
@@ -120,7 +140,8 @@ a `do` block's `p <- e` and `with e as p`, must match every value of
 its type: names, `_`, tuples and units of them, and a tag that is its
 type's only one, such as `MkPair a b`. A pattern that can fail, `Just
 x` or a literal, is non-exhaustive (E0317), as a `case` that leaves a
-value out is. Write a `case`, or in a `do` block `let p = e else s`
+value out is. Write a `case`, `if let p = e then a else b`, or in a
+`do` block `let p = e else s`
 ([do](do.md#statements)), which says what happens when it does not
 match.
 
@@ -167,7 +188,7 @@ pick 1 = 1          -- W0359: never used
 ```
 
 Only arms the source writes in a `case` are warned of, and equations:
-not those of an `if`, of `&&` and `||`, of a `do` block's
+not those of an `if` (an `if let` too), of `&&` and `||`, of a `do` block's
 `let p = e else s`, nor the ones the compiler adds; nor an arm inside
 one already warned of. An equation of names after equations of every
 tag is not warned of, nor such an arm of a `case` of nested patterns:
