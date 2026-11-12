@@ -33,7 +33,7 @@ This makes a project with one module, one program, and one test:
 | File | What it is |
 |---|---|
 | `package.hf` | the package: its name and the heff it is for |
-| `src/hello/greeting.hf` | a module, `hello.greeting` |
+| `src/hello.hf` | a module, `hello` |
 | `app/hello/main.hf` | a program |
 | `app/hello/build.hf` | how that program is built |
 | `test/greeting.hf` | a test |
@@ -47,10 +47,10 @@ Hello, world!
 
 ## The module
 
-Open `src/hello/greeting.hf`:
+Open `src/hello.hf`:
 
 ```haskell
-module hello.greeting
+module hello
 
 -- | a greeting, of `name`
 -- | >>> greeting "heff"
@@ -75,7 +75,7 @@ Open `app/hello/main.hf`:
 module app.hello.main
 
 import co
-import hello.greeting
+import hello
 import std.io
 
 main : Co stdio Unit
@@ -83,7 +83,7 @@ main = do
   print (greeting "world")
 ```
 
-`import hello.greeting` brings in the module above. A module's name is
+`import hello` brings in the module above. A module's name is
 its path under `src/`.
 
 `main`'s type says what it does: it is a computation (`Co stdio Unit`)
@@ -95,7 +95,7 @@ and computations that run in any world that has what they need.
 
 ```sh
 $ heff test
-ok    src/hello/greeting.hf  1/1
+ok    src/hello.hf  1/1
   ok    greeting
 ok    test/greeting.hf  0/0, tests 1/1
 1/1 expectations hold, 1/1 tests hold, 2/2 files check as they should
