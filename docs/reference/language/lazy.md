@@ -98,3 +98,18 @@ seven = ~(3 + 4)     -- not `seven = 3 + 4`
 
 A `Lazy`'s tag is the language's own: a `Lazy` is made by `~e`, and
 taken apart by forcing it.
+
+## Lazy lists
+
+A list whose rest is a `Lazy` is computed a cell at a time, as it is
+wanted, and may go on without end: the library's `seq`, `Seq a` a
+`~(Node a)`, with `Node a = End | Cons a ~(Node a)`.
+
+```haskell
+import seq as Seq
+
+-- | >>> Seq.toList (Seq.take 5 threes)
+-- | [3, 10, 17, 24, 31]
+threes : Seq.Seq Int
+threes = Seq.keepIf (\(x : Int) -> x % 7 == 3) (Seq.from 1)
+```

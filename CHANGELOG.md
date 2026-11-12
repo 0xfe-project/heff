@@ -21,6 +21,7 @@
 
 ### Standard library
 
+- seq: lazy lists, `Seq a` a `~(Node a)`, each cell computed only as it is wanted, and once, so a `Seq` may go on without end: made by `empty`, `cons`, `singleton`, `fromList`, `from`, `iterate`, `repeat`, `replicate`, `cycle` and `unfold`; looked at by `uncons`, `null`, `head` and `index`; changed by `map`, `keepIf`, `mapMaybe`, `append`, `concat`, `concatMap`, `zipWith`, `zip`, `indexed`, `interleave`, `scanl`, `take`, `drop`, `takeWhile` and `dropWhile`, none computing a cell before it is wanted; and gone through by `foldl`, `length`, `find`, `toList`, a `for` (`Iterate`), and `foldr`, whose function is given the rest of the fold delayed (`a -> ~b -> b`), so `any` and `all` stop at the first value that settles them, of a `Seq` without end too.
 - std.entropy: the system's randomness, `bytes n` (`getentropy`; `rand_s` on Windows; `crypto.getRandomValues` in a page), and std.random's `fromEntropy`, a generator seeded by 32 bytes of it, for draws no two runs share.
 - A failure ends the process by `quick_exit`, so no C library's own cleanup runs while other threads may still be inside it. std.terminal, std.process and std.progress register what they put back with `at_quick_exit` too: the terminal's mode, the commands started (ended), the status line.
 - std.net's TCP connections, accepted or connected, have `TCP_NODELAY`: a write is sent as it is written, not held back for the peer's acknowledgement of the one before.

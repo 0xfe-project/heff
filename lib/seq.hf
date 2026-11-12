@@ -1,0 +1,421 @@
+-- Lazy lists: a list whose cells are computed only as they are wanted, so
+-- it may go on without end.  Import it by a name, `import seq as Seq`, as
+-- it has a `map`, a `take` and a `zip`, the prelude's lists' names too.
+--
+-- ```haskell
+-- import seq as Seq
+--
+-- -- | the first five squares that are even
+-- -- | >>> Seq.toList (evenSquares 5)
+-- -- | [4, 16, 36, 64, 100]
+-- evenSquares : Int -> Seq.Seq Int
+-- evenSquares n =
+--   Seq.take n (Seq.keepIf (\(x : Int) -> x % 2 == 0) (Seq.map (\(x : Int) -> x * x) (Seq.from 1)))
+-- ```
+--
+-- A `Seq a` is a `~(Node a)`: a node not yet computed, which is the end or
+-- a value and the rest, another `Seq a`.  Nothing of it is computed until
+-- it is forced -- by `uncons`, a fold, `toList`, a `for` -- and then only
+-- as far as is wanted: `take 3 (from 1)` makes three cells.  A cell's
+-- value is computed with the cell.
+--
+-- A cell forced is kept, as every `~e` is: a `Seq` gone through twice is
+-- computed once.  So what holds the start of a long `Seq` holds every cell
+-- made after it; what holds only the rest lets go of the cells before.
+--
+-- Where a source's next value takes an effect, `stream`'s `Source` is the
+-- one to use.
+
+module seq
+  ( Node(..)
+  , Seq
+  , empty
+  , cons
+  , singleton
+  , fromList
+  , from
+  , iterate
+  , repeat
+  , replicate
+  , cycle
+  , unfold
+  , uncons
+  , null
+  , head
+  , index
+  , map
+  , keepIf
+  , mapMaybe
+  , append
+  , concat
+  , concatMap
+  , zipWith
+  , zip
+  , indexed
+  , interleave
+  , scanl
+  , take
+  , drop
+  , takeWhile
+  , dropWhile
+  , foldl
+  , foldr
+  , length
+  , find
+  , any
+  , all
+  , toList
+  , instanceIterateSeq
+  )
+
+-- | What a `Seq` comes to, forced: the end, or a value and the rest.
+data Node a = End | Cons a ~(Node a)
+
+-- | A list computed a cell at a time, as it is wanted.
+type Seq a = ~(Node a)
+
+-- | Each cell made into a list, in order: a `Seq` without end never
+-- | comes to one.
+-- | >>> toList ~(Cons 1 ~(Cons 2 ~End))
+-- | [1, 2]
+toList : {a : Type} -> Seq a -> List a
+toList s = List.reverse (gather Nil s)
+  where
+  gather : List a -> Node a -> List a
+  gather acc End = acc
+  gather acc (Cons x rest) = gather (x :: acc) rest
+
+-- | None.
+-- | >>> toList (empty : Seq Int)
+-- | []
+empty : {a : Type} -> Seq a
+empty = ~End
+
+-- | `x`, then `s`.
+-- | >>> toList (cons 1 (cons 2 empty))
+-- | [1, 2]
+cons : {a : Type} -> a -> Seq a -> Seq a
+cons x s = ~(Cons x s)
+
+-- | `x` alone.
+-- | >>> toList (singleton 7)
+-- | [7]
+singleton : {a : Type} -> a -> Seq a
+singleton x = ~(Cons x ~End)
+
+-- | A list's elements, each cell made as it is wanted.
+-- | >>> toList (fromList [1, 2, 3])
+-- | [1, 2, 3]
+fromList : {a : Type} -> List a -> Seq a
+fromList xs = ~(node xs)
+  where
+  node : List a -> Node a
+  node [] = End
+  node (y :: ys) = Cons y ~(node ys)
+
+-- | The first `n` cells, and no more of `s` computed.
+-- | >>> toList (take 2 (fromList [1, 2, 3]))
+-- | [1, 2]
+take : {a : Type} -> Int -> Seq a -> Seq a
+take n s = if n <= 0 then ~End else ~(node s)
+  where
+  node : Node a -> Node a
+  node End = End
+  node (Cons x rest) = Cons x (take (n - 1) rest)
+
+-- | The integers from `n` on, without end.
+-- | >>> toList (take 4 (from 0))
+-- | [0, 1, 2, 3]
+from : Int -> Seq Int
+from n = ~(node n)
+  where
+  node : Int -> Node Int
+  node i = Cons i ~(node (i + 1))
+
+-- | `x`, `f x`, `f (f x)`, and on without end: each `f` applied only as
+-- | its cell is wanted.
+-- | >>> toList (take 5 (iterate (\(x : Int) -> x * 2) 1))
+-- | [1, 2, 4, 8, 16]
+iterate : {a : Type} -> (a -> a) -> a -> Seq a
+iterate f x = ~(node x)
+  where
+  node : a -> Node a
+  node y = Cons y ~(node (f y))
+
+-- | `x` without end.
+-- | >>> toList (take 3 (repeat 9))
+-- | [9, 9, 9]
+repeat : {a : Type} -> a -> Seq a
+repeat x = ~(Cons x (repeat x))
+
+-- | `x`, `n` times.
+-- | >>> toList (replicate 2 5)
+-- | [5, 5]
+replicate : {a : Type} -> Int -> a -> Seq a
+replicate n x = take n (repeat x)
+
+-- | A list's elements over and over, without end; none, for none.
+-- | >>> toList (take 5 (cycle [1, 2]))
+-- | [1, 2, 1, 2, 1]
+-- | >>> toList (cycle (Nil : List Int))
+-- | []
+cycle : {a : Type} -> List a -> Seq a
+cycle xs = if List.null xs then ~End else ~(node xs)
+  where
+  node : List a -> Node a
+  node [] = node xs
+  node (y :: ys) = Cons y ~(node ys)
+
+-- | From a seed, a value and the next seed at a time, until `f` gives
+-- | `Nothing`.
+-- | >>> toList (unfold (\(n : Int) -> if n > 3 then Nothing else Just (MkPair (n * 10) (n + 1))) 1)
+-- | [10, 20, 30]
+unfold : {a b : Type} -> (b -> Maybe (Pair a b)) -> b -> Seq a
+unfold f seed = ~(node (f seed))
+  where
+  node : Maybe (Pair a b) -> Node a
+  node Nothing = End
+  node (Just (MkPair x next)) = Cons x ~(node (f next))
+
+-- | The first cell and the rest, or `Nothing` at the end: one cell
+-- | computed.
+-- | >>> maybe Nil (\(p : Pair Int (Seq Int)) -> fst p :: toList (snd p)) (uncons (fromList [4, 5]))
+-- | [4, 5]
+uncons : {a : Type} -> Seq a -> Maybe (Pair a (Seq a))
+uncons s = node s
+  where
+  node : Node a -> Maybe (Pair a (Seq a))
+  node End = Nothing
+  node (Cons x rest) = Just (MkPair x rest)
+
+-- | Is it at its end?
+-- | >>> null (from 1)
+-- | False
+null : {a : Type} -> Seq a -> Bool
+null s = node s
+  where
+  node : Node a -> Bool
+  node End = True
+  node (Cons x rest) = False
+
+-- | The first cell, if any.
+-- | >>> head (from 3)
+-- | Just 3
+head : {a : Type} -> Seq a -> Maybe a
+head s = node s
+  where
+  node : Node a -> Maybe a
+  node End = Nothing
+  node (Cons x rest) = Just x
+
+-- | The cell at `i` (from 0), if there is one: the cells before it
+-- | computed too.
+-- | >>> index (from 0) 100
+-- | Just 100
+index : {a : Type} -> Seq a -> Int -> Maybe a
+index s i = node i s
+  where
+  node : Int -> Node a -> Maybe a
+  node j End = Nothing
+  node j (Cons x rest) = if j <= 0 then Just x else node (j - 1) rest
+
+-- | Each value mapped by `f`, as its cell is wanted.
+-- | >>> toList (take 3 (map (\(x : Int) -> x * 10) (from 1)))
+-- | [10, 20, 30]
+map : {a b : Type} -> (a -> b) -> Seq a -> Seq b
+map f s = ~(node s)
+  where
+  node : Node a -> Node b
+  node End = End
+  node (Cons x rest) = Cons (f x) ~(node rest)
+
+-- | The values `p` holds of.  A cell wanted goes on through `s` until
+-- | it finds one: past the last there is, a `Seq` without end never
+-- | comes back.
+-- | >>> toList (take 3 (keepIf (\(x : Int) -> x % 3 == 0) (from 1)))
+-- | [3, 6, 9]
+keepIf : {a : Type} -> (a -> Bool) -> Seq a -> Seq a
+keepIf p s = ~(node s)
+  where
+  node : Node a -> Node a
+  node End = End
+  node (Cons x rest) = if p x then Cons x ~(node rest) else node rest
+
+-- | The values `f` gives a `Just` of, as `keepIf` goes on.
+-- | >>> toList (mapMaybe (\(x : Int) -> if x > 1 then Just (x * 2) else Nothing) (fromList [1, 2, 3]))
+-- | [4, 6]
+mapMaybe : {a b : Type} -> (a -> Maybe b) -> Seq a -> Seq b
+mapMaybe f s = ~(node s)
+  where
+  node : Node a -> Node b
+  node End = End
+  node (Cons x rest) = case f x of
+    Nothing -> node rest
+    Just y -> Cons y ~(node rest)
+
+-- | `xs`, then `ys`: `ys` computed only once `xs` has come to its end.
+-- | >>> toList (append (fromList [1, 2]) (fromList [3]))
+-- | [1, 2, 3]
+append : {a : Type} -> Seq a -> Seq a -> Seq a
+append xs ys = ~(node xs)
+  where
+  node : Node a -> Node a
+  node End = ys
+  node (Cons x rest) = Cons x ~(node rest)
+
+-- | Each `Seq` of `ss`, one after another.
+-- | >>> toList (concat (fromList [fromList [1], empty, fromList [2, 3]]))
+-- | [1, 2, 3]
+concat : {a : Type} -> Seq (Seq a) -> Seq a
+concat ss = ~(node ss)
+  where
+  node : Node (Seq a) -> Node a
+  node End = End
+  node (Cons s rest) = append s ~(node rest)
+
+-- | The `Seq`s `f` gives, one after another.
+-- | >>> toList (take 5 (concatMap (\(x : Int) -> fromList [x, x]) (from 1)))
+-- | [1, 1, 2, 2, 3]
+concatMap : {a b : Type} -> (a -> Seq b) -> Seq a -> Seq b
+concatMap f s = concat (map f s)
+
+-- | A value of each, given to `f`, until either ends: `ys`'s cell
+-- | computed only where `xs` has one.
+-- | >>> toList (zipWith (\(x : Int) (y : Int) -> x + y) (from 1) (fromList [10, 20]))
+-- | [11, 22]
+zipWith : {a b c : Type} -> (a -> b -> c) -> Seq a -> Seq b -> Seq c
+zipWith f xs ys = ~(node xs ys)
+  where
+  other : a -> Seq a -> Node b -> Node c
+  other x xrest End = End
+  other x xrest (Cons y yrest) = Cons (f x y) (zipWith f xrest yrest)
+
+  node : Node a -> Seq b -> Node c
+  node End ys' = End
+  node (Cons x xrest) ys' = other x xrest ys'
+
+-- | A value of each, a pair at a time, until either ends.
+-- | >>> toList (zip (fromList [1, 2, 3]) (from 7))
+-- | [MkPair 1 7, MkPair 2 8, MkPair 3 9]
+zip : {a b : Type} -> Seq a -> Seq b -> Seq (Pair a b)
+zip xs ys = zipWith (\(x : a) (y : b) -> MkPair x y) xs ys
+
+-- | Each value with its index, from 0.
+-- | >>> toList (indexed (fromList [7, 8]))
+-- | [MkPair 0 7, MkPair 1 8]
+indexed : {a : Type} -> Seq a -> Seq (Pair Int a)
+indexed s = zip (from 0) s
+
+-- | A value of `xs`, then one of `ys`, in turn; once one ends, the rest
+-- | of the other.
+-- | >>> toList (take 6 (interleave (from 0) (repeat 9)))
+-- | [0, 9, 1, 9, 2, 9]
+-- | >>> toList (interleave (fromList [1, 2, 3]) (fromList [10]))
+-- | [1, 10, 2, 3]
+interleave : {a : Type} -> Seq a -> Seq a -> Seq a
+interleave xs ys = ~(node xs)
+  where
+  node : Node a -> Node a
+  node End = ys
+  node (Cons x rest) = Cons x (interleave ys rest)
+
+-- | `z`, and each value folded into what came before, a cell each.
+-- | >>> toList (take 5 (scanl (\(acc : Int) (x : Int) -> acc + x) 0 (from 1)))
+-- | [0, 1, 3, 6, 10]
+scanl : {a b : Type} -> (b -> a -> b) -> b -> Seq a -> Seq b
+scanl f z s = ~(Cons z ~(node s))
+  where
+  node : Node a -> Node b
+  node End = End
+  node (Cons x rest) = force (scanl f (f z x) rest)
+
+-- | `s` without its first `n` cells: they are computed once the rest is
+-- | wanted.
+-- | >>> toList (take 3 (drop 5 (from 0)))
+-- | [5, 6, 7]
+drop : {a : Type} -> Int -> Seq a -> Seq a
+drop n s = ~(node n s)
+  where
+  node : Int -> Node a -> Node a
+  node i End = End
+  node i (Cons x rest) = if i <= 0 then Cons x rest else node (i - 1) rest
+
+-- | The values before the first `p` does not hold of.
+-- | >>> toList (takeWhile (\(x : Int) -> x < 4) (from 1))
+-- | [1, 2, 3]
+takeWhile : {a : Type} -> (a -> Bool) -> Seq a -> Seq a
+takeWhile p s = ~(node s)
+  where
+  node : Node a -> Node a
+  node End = End
+  node (Cons x rest) = if p x then Cons x ~(node rest) else End
+
+-- | `s` from the first value `p` does not hold of.
+-- | >>> toList (take 2 (dropWhile (\(x : Int) -> x < 4) (from 1)))
+-- | [4, 5]
+dropWhile : {a : Type} -> (a -> Bool) -> Seq a -> Seq a
+dropWhile p s = ~(node s)
+  where
+  node : Node a -> Node a
+  node End = End
+  node (Cons x rest) = if p x then node rest else Cons x rest
+
+-- | Each value folded in, from `z`, the first first: through the whole
+-- | of `s`, so never for a `Seq` without end.
+-- | >>> foldl (\(acc : Int) (x : Int) -> acc * 10 + x) 0 (fromList [1, 2, 3])
+-- | 123
+foldl : {a b : Type} -> (b -> a -> b) -> b -> Seq a -> b
+foldl f z s = node z s
+  where
+  node : b -> Node a -> b
+  node acc End = acc
+  node acc (Cons x rest) = node (f acc x) rest
+
+-- | Each value folded into what the rest comes to, the rest not computed
+-- | until `f` forces it: so `f` may stop early, as `any` does, and a
+-- | `Seq` without end is folded as far as `f` wants.
+-- | >>> foldr (\(x : Int) (more : ~Bool) -> if x > 2 then True else force more) ~False (from 1)
+-- | True
+foldr : {a b : Type} -> (a -> ~b -> b) -> ~b -> Seq a -> b
+foldr f z s = node s
+  where
+  node : Node a -> b
+  node End = force z
+  node (Cons x rest) = f x ~(node rest)
+
+-- | How many cells: through the whole of `s`.
+-- | >>> length (take 4 (from 1))
+-- | 4
+length : {a : Type} -> Seq a -> Int
+length s = foldl (\(n : Int) (x : a) -> n + 1) 0 s
+
+-- | The first value `p` holds of: as far into `s` as that.
+-- | >>> find (\(x : Int) -> x * x > 50) (from 1)
+-- | Just 8
+find : {a : Type} -> (a -> Bool) -> Seq a -> Maybe a
+find p s = node s
+  where
+  node : Node a -> Maybe a
+  node End = Nothing
+  node (Cons x rest) = if p x then Just x else node rest
+
+-- | Does `p` hold of some value?  It stops at the first.
+-- | >>> any (\(x : Int) -> x > 1000) (from 1)
+-- | True
+any : {a : Type} -> (a -> Bool) -> Seq a -> Bool
+any p s =
+  foldr (\(x : a) (more : ~Bool) -> if p x then True else force more) ~False s
+
+-- | Does `p` hold of every value?  It stops at the first it does not.
+-- | >>> all (\(x : Int) -> x < 10) (from 1)
+-- | False
+all : {a : Type} -> (a -> Bool) -> Seq a -> Bool
+all p s =
+  foldr (\(x : a) (more : ~Bool) -> if p x then force more else False) ~True s
+
+-- | A `Seq`, as `for` goes through it: a cell forced a step.
+instance instanceIterateSeq : {a : Type} -> Iterate (Seq a)
+instanceIterateSeq = { Elem = a, Cursor = Seq a, start = begin, next = uncons }
+  where
+  begin : Seq a -> Seq a
+  begin s = s
