@@ -59,6 +59,7 @@ heff dev                   # build and run; again at each change
 ## Editors
 
 - **VS Code**: [`editors/vscode`](editors/vscode/README.md), a client of `heff lsp` -- diagnostics, hover, go to definition, completion, formatting, renaming.  A release has it built (`heff-X.Y.Z.vsix`).
+- **Zed**: [`editors/zed`](editors/zed/README.md), highlighting (a tree-sitter grammar, [`editors/tree-sitter-heff`](editors/tree-sitter-heff)), an outline, and a client of `heff lsp`.
 - **bat** (and Sublime Text): [`editors/bat`](editors/bat/README.md), a syntax for `.hf` files.
 
 ## Documentation

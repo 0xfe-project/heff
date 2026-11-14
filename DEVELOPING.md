@@ -213,3 +213,12 @@ repository); `make vsix` packages it.  `editors/bat` is its grammar for
 bat, made from the VS Code grammar ([its README](editors/bat/README.md)):
 `make bat` makes it again, and `make bat-check` fails where it is not
 made from the grammar as it is.
+
+`editors/zed` is a Zed extension: a client of the language server and
+queries over `editors/tree-sitter-heff`, a tree-sitter grammar written
+for it ([its README](editors/zed/README.md)).  The grammar is lines of
+tokens, as the VS Code grammar sees them; after changing `grammar.js`,
+`make zed-grammar` makes `src/parser.c` again (Zed reads it from git, at
+the commit `extension.toml` names), and `make zed-grammar-check` fails
+where it is not made from `grammar.js`, or where a `.hf` file here does
+not read.
