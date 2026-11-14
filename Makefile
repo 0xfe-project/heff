@@ -35,7 +35,7 @@ BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 .NOTPARALLEL:
 .PHONY: help build build-seed boot native release test test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
-  fmt-check aliases aliases-check api bat bat-check vsix install install-all bench clean
+  fmt-check aliases aliases-check api bat bat-check zed-grammar zed-grammar-check vsix install install-all bench clean
 
 help: ## this list
 	@echo "make TARGET [VARIABLE=VALUE...]"
@@ -129,6 +129,14 @@ bat: ## editors/bat/heff.sublime-syntax, made from the VS Code grammar
 
 bat-check: ## is bat's syntax made from the grammar as it is?
 	$(NODE) editors/bat/build.mjs --check
+
+zed-grammar: ## editors/tree-sitter-heff/src/parser.c, Zed's grammar, made from its grammar.js (tree-sitter)
+	cd editors/tree-sitter-heff && tree-sitter generate
+
+zed-grammar-check: zed-grammar ## is the parser made from grammar.js as it is, and does it read every .hf here?
+	git diff --exit-code -- editors/tree-sitter-heff/src
+	cd editors/tree-sitter-heff && find ../../lib ../../src ../../examples ../../app -name '*.hf' -not -path '*/.heff/*' \
+	  | tree-sitter parse --quiet --stat --paths /dev/stdin
 
 # (npm ci where the packages are not installed, or the lock changed:
 # npm keeps its own lock, of what it installed, in node_modules/)
