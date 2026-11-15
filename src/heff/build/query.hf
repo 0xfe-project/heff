@@ -176,7 +176,8 @@ lastDot s i =
   else if byteAt s i == 46 then Just i
   else lastDot s (i - 1)
 
-type Completion = { label : String, detail : String }
+-- | a name that may be written, its type, and whether it is a local's
+type Completion = { label : String, detail : String, local : Bool }
 
 -- (what a completion says of the name `x`: its type; where more than
 -- one definition has it, which they are)
@@ -194,6 +195,7 @@ completionOf c typed qualifier x =
   then Just
       { label = fromMaybe x (stripPrefixS qualifier x)
       , detail = completionDetail c x
+      , local = False
       }
   else Nothing
 
@@ -225,6 +227,7 @@ keywordCompletions typed =
   if startsWith typed "abandon"
   then [ { label = "abandon"
          , detail = "a hole: checks at any small type, abandons the run"
+         , local = False
          }
        ]
   else Nil
@@ -243,26 +246,64 @@ statementCompletions src from typed =
   if startsStatement src from 0 && startsWith typed "with"
   then [ { label = "with"
          , detail = "a statement: `with e as x do`, the block the `with`'s body"
+         , local = False
          }
        ]
   else Nil
 
+keyless : Environment.Info -> Bool
+keyless { key = Nothing } = True
+keyless _ = False
+
+-- (a local's type: what elaboration noted at a use of it, where it
+-- elaborated one -- not at its binder, nor in a definition that does not
+-- check)
+localDetail : Driver.Checked -> Locals.Locals -> Locals.Binder -> String
+localDetail c ls b = case List.find
+    (\(i : Environment.Info) ->
+       keyless i
+       && List.any
+         (\(l : Locals.Local) ->
+            sameSpan l.binder b.span && List.any (\u -> sameSpan u i.span) l.uses)
+         ls.locals)
+    c.top.infos of
+  Just i -> i.ty MkUnit
+  Nothing -> ""
+
+-- | the locals in scope where the name being typed is, that start as it
+-- | does (none after `M.`)
+localCompletions : Driver.Checked -> Int -> String -> List Completion
+localCompletions c offset typed =
+  if contains "." typed then Nil
+  else let ls = Locals.locals c.decls
+  in List.map
+      (\(b : Locals.Binder) ->
+         { label = b.name, detail = localDetail c ls b, local = True })
+      (List.keepIf
+         (\(b : Locals.Binder) -> startsWith typed b.name)
+         (Locals.inScopeAt c.decls offset))
+
 -- | What may be written where the name being typed ends, at `offset`:
--- | the names in scope that start as it does, the primitives and
--- | `abandon` too, each with its type; `with` where a statement starts.  After `M.`, the definitions of the module imported as
--- | `M`, without the `M.`.
+-- | the locals in scope and the names in scope that start as it does
+-- | (a global a local shadows not), the primitives and `abandon` too,
+-- | each with its type; `with` where a statement starts.  After `M.`,
+-- | the definitions of the module imported as `M`, without the `M.`.
 completionsAt : Driver.Checked -> Int -> List Completion
 completionsAt c offset =
-  List.sortOn
+  let locals = localCompletions c offset (typedAt c offset)
+  in List.sortOn
     (\(a : Completion) -> a.label)
     (List.append
        (List.append
-          (keywordCompletions (typedAt c offset))
+          (List.append locals (keywordCompletions (typedAt c offset)))
           (statementCompletions
              c.source
              (typedFrom c.source offset)
              (typedAt c offset)))
-       (catMaybesQ
+       (List.keepIf
+        (\(g : Completion) ->
+           not (List.any (\(l : Completion) -> strEq l.label g.label) locals))
+        (catMaybesQ
           (List.map
              (\x ->
                 completionOf
@@ -277,7 +318,7 @@ completionsAt c offset =
                       (OrdMap.keys c.top.globals.aliases)
                       (List.append
                          (OrdMap.keys c.top.globals.ambiguous)
-                         (primitivesIn c.top.globals))))))))
+                         (primitivesIn c.top.globals)))))))))
 
 -- References
 --------------------------------------------------------------------------------

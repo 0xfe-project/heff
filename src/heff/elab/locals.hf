@@ -32,21 +32,25 @@ type Binder = { name : String, span : Params.Span, field : Bool }
 
 type Use = { binder : Binder, use : Params.Span }
 
-type Found = { binders : List Binder, uses : List Use }
+-- | a name written, and the binders in scope there, the innermost first
+type Scope = { span : Params.Span, env : List Binder }
+
+type Found = { binders : List Binder, uses : List Use, scopes : List Scope }
 
 type Locals = { locals : List Local, fields : List FieldUse }
 
 none : Found
-none = { binders = Nil, uses = Nil }
+none = { binders = Nil, uses = Nil, scopes = Nil }
 
 both : Found -> Found -> Found
 both a b =
   { binders = List.append a.binders b.binders
   , uses = List.append a.uses b.uses
+  , scopes = List.append a.scopes b.scopes
   }
 
 bound : List Binder -> Found
-bound bs = { binders = bs, uses = Nil }
+bound bs = { binders = bs, uses = Nil, scopes = Nil }
 
 binder : String -> Params.Span -> Binder
 binder name span = { name = name, span = span, field = False }
@@ -145,7 +149,7 @@ headUse : List Binder
         -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
         -> Found
 headUse env (At (MkEquation f fsp _ _) _) = case findBinder f env of
-  Just b -> { binders = Nil, uses = [{ binder = b, use = fsp }] }
+  Just b -> { binders = Nil, uses = [{ binder = b, use = fsp }], scopes = Nil }
   Nothing -> none
 
 -- | a local definition: its signature, then its equations under the
@@ -179,7 +183,7 @@ localsF w env (d :: ds) body =
 -- | a name, a use where something binds it
 useOf : List Binder -> String -> Params.Span -> Found
 useOf env x sp = case findBinder x env of
-  Just b -> { binders = Nil, uses = [{ binder = b, use = sp }] }
+  Just b -> { binders = Nil, uses = [{ binder = b, use = sp }], scopes = Nil }
   Nothing -> none
 
 paramWalk : Walk
@@ -235,7 +239,10 @@ catchF w env (MkCatchArm b ss) =
   both (bound (lamBinders b)) (w.doBlock (scope (lamBinders b) env) ss)
 
 walkF : Walk -> List Binder -> Presyntax.Expr -> Found
-walkF w env n@(At (EVar x) _) = useOf env x (Params.spanOf n)
+walkF w env n@(At (EVar x) _) =
+  both
+    (useOf env x (Params.spanOf n))
+    { binders = Nil, uses = Nil, scopes = [{ span = Params.spanOf n, env = env }] }
 -- a lambda with its binder annotated, `\(x : T) -> e`: `T` is outside
 walkF w env (At (ELam (LamAnn x sp a) r) _) =
   both (w.walk env a) (under w env [binder x sp] r)
@@ -441,3 +448,22 @@ localsOf found =
 locals : List Presyntax.Decl -> Locals
 locals decls =
   localsOf (List.foldl (\acc d -> both acc (declaration d)) none decls)
+
+unshadowed : List Binder -> List Binder -> List Binder
+unshadowed [] seen = List.reverse seen
+unshadowed (b :: rest) seen =
+  if List.any (\(o : Binder) -> strEq o.name b.name) seen then unshadowed rest seen
+  else unshadowed rest (b :: seen)
+
+-- | the locals in scope where a name is written, at `offset` (within it
+-- | or at its end): the innermost of a name first, none shadowed
+inScopeAt : List Presyntax.Decl -> Int -> List Binder
+inScopeAt decls offset =
+  case List.head
+    (List.sortOn
+       (\(a : Scope) -> a.span.end - a.span.start)
+       (List.keepIf
+          (\(a : Scope) -> a.span.start <= offset && offset <= a.span.end)
+          (List.foldl (\acc d -> both acc (declaration d)) none decls).scopes)) of
+  Just a -> unshadowed a.env Nil
+  Nothing -> Nil
