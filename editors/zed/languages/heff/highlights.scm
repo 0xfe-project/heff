@@ -38,6 +38,7 @@
 (doc_comment) @comment.doc
 
 (operator) @operator
+(infix_name) @operator
 ":" @operator
 
 ["," ";"] @punctuation.delimiter

@@ -511,10 +511,84 @@ applyOp op l r =
   else if strEq op.text "||" then shortcut op l (At (ETag "True") (spanT op)) r
   else Presyntax.app (At (EVar op.text) (spanT op)) [l, r]
 
+-- Names in backticks, `` a `f` b ``: `f a b`, the name as it is written
+-- alone
+
+-- (the name in a tick's backticks, from `a` to `b` of its text: a token
+-- of `kind`, where it is in the file)
+tickPart : CST.T -> String -> Int -> Int -> Int -> CST.T
+tickPart t kind from a b =
+  { kind = kind
+  , text = strSlice t.text a b
+  , raw = strSlice t.text from b
+  , start = t.start + 1 + from
+  , end = t.start + 1 + b
+  , col = t.col + 1 + from
+  , first = False
+  , ix = t.ix
+  , blank = False
+  }
+
+-- (where the first `.` of a name is, from `j`; none, its end)
+firstDot : String -> Int -> Int
+firstDot x j =
+  if j >= strLength x || byteAt x j == 46 then j else firstDot x (j + 1)
+
+-- (the fields of a qualified name, `.f` each, from the `.` at `j`)
+tickFields : CST.T -> CST.E -> Int -> CST.E
+tickFields t e j =
+  if j >= strLength t.text then e
+  else tickFields
+      t
+      (EField
+         e
+         (tickPart t "field" j (j + 1) (firstDot t.text (j + 1))))
+      (firstDot t.text (j + 1))
+
+-- | the name in a tick's backticks, as written without them: `f`,
+-- | `Cons`, `M.f` (an alias and a field)
+tickE : CST.T -> CST.E
+tickE t =
+  tickFields
+    t
+    (Atom
+       (tickPart
+          t
+          (Lex.nameKind
+             (strSlice t.text 0 (firstDot t.text 0))
+             (byteAt t.text 0))
+          0
+          0
+          (firstDot t.text 0)))
+    (firstDot t.text 0)
+
+-- | where the name of a tick is, its backticks not
+tickSpan : CST.T -> Params.Span
+tickSpan t = mkSpan (t.start + 1) (t.end - 1)
+
+-- | the names in backticks of a chain, each lowered as it is alone: by
+-- | where each is
+headAt : List (Pair Int Presyntax.Expr) -> Int -> Maybe Presyntax.Expr
+headAt [] k = Nothing
+headAt (MkPair j h :: rest) k = if j == k then Just h else headAt rest k
+
+-- | an operator applied; a name in backticks is applied as it is, the
+-- | name lowered, `heads`
+applyWith : List (Pair Int Presyntax.Expr)
+          -> CST.T
+          -> Presyntax.Expr
+          -> Presyntax.Expr
+          -> Presyntax.Expr
+applyWith heads op l r = case headAt heads op.start of
+  Just h -> Presyntax.app h [l, r]
+  Nothing -> applyOp op l r
+
 -- | in a pattern, an operator is applied as a tag is: its operands are
--- | its arguments
+-- | its arguments; a name in backticks, `` x `Cons` xs ``, is the tag
 applyPatOp : CST.T -> Presyntax.Pat -> Presyntax.Pat -> Presyntax.Pat
-applyPatOp op l r = Presyntax.patOp op.text (spanT op) [l, r]
+applyPatOp op l r =
+  if strEq op.kind "tick" then Presyntax.patTag op.text (tickSpan op) [l, r]
+  else Presyntax.patOp op.text (spanT op) [l, r]
 
 -- (stacks newest first: push is `Cons`)
 reduceS : {a : Type} -> (CST.T -> a -> a -> a) -> Shunt a -> Shunt a
@@ -594,7 +668,7 @@ pushAll apply fix lenient st (r :: rest) = do
 
 checkFixOf : {a : Type} -> Fixity.Fixities -> Bool -> List (Operand a) -> P Unit
 checkFixOf fix lenient [] = pure MkUnit
-checkFixOf fix lenient (r :: rest) = case Fixity.groupOf fix r.op.text of
+checkFixOf fix lenient (r :: rest) = case Fixity.groupOrName fix r.op.text of
   Just _ -> checkFixOf fix lenient rest
   Nothing ->
     if lenient then checkFixOf fix lenient rest
@@ -2307,6 +2381,17 @@ conditionL r (Just (MkPair w c)) = do
   c' <- r.e c
   pure (Just c')
 
+-- (an operator's right side: the name in its backticks, lowered, by
+-- where it is, if it is a tick)
+tickHeadL : Lw -> CST.E -> P (List (Pair Int Presyntax.Expr))
+tickHeadL r (OpRhs op e) =
+  if strEq op.kind "tick"
+  then do
+    h <- r.e (tickE op)
+    pure [MkPair op.start h]
+  else pure Nil
+tickHeadL r e = pure Nil
+
 exprL : Lw -> CST.E -> P Presyntax.Expr
 exprL r (Atom t) =
   if strEq t.kind "con" then conAtom t Nil
@@ -2377,7 +2462,8 @@ exprL r (Op a op b) = opL r a op b
 exprL r (Ops a rest) = do
   a' <- r.e a
   rest' <- traverseS (\m -> operandL r m) rest
-  resolve applyOp a' rest'
+  heads <- traverseS (\m -> tickHeadL r m) rest
+  resolve (applyWith (concatMapS (\h -> h) heads)) a' rest'
 exprL r (Ann e cc ty) = do
   e' <- r.e e
   ty' <- r.e ty
@@ -3182,7 +3268,8 @@ restOfDecl ts j acc = case Array.index ts j of
 
 takeSyms : List Lex.Tok -> List Lex.Tok
 takeSyms [] = Nil
-takeSyms (u :: rest) = if strEq u.kind "sym" then u :: takeSyms rest else Nil
+takeSyms (u :: rest) =
+  if strEq u.kind "sym" || strEq u.kind "tick" then u :: takeSyms rest else Nil
 
 dropN : {a : Type} -> Int -> List a -> List a
 dropN n [] = Nil
@@ -3425,20 +3512,31 @@ fixDiagsOf scope all d =
                (spanOf u)
                ("`"
                 ^ u.text
-                ^ "` has no fixity to be above or below: declare it first"))
+                ^ "` is qualified: a module declares the fixities of its own names"))
           (List.keepIf
-             (\(u : Lex.Tok) -> noGroup scope u)
-             (appendS d.above d.below)))
+             (\(u : Lex.Tok) -> strEq u.kind "tick" && contains "." u.text)
+             d.ops))
        (appendS
-          (catMaybesS (List.map (\u -> belowLoosest scope d u) d.below))
+          (List.map
+             (\(u : Lex.Tok) ->
+                diag
+                  (spanOf u)
+                  ("`"
+                   ^ u.text
+                   ^ "` has no fixity to be above or below: declare it first"))
+             (List.keepIf
+                (\(u : Lex.Tok) -> noGroup scope u)
+                (appendS d.above d.below)))
           (appendS
-             (if List.length d.ops == 0
-              then [ diag
-                     d.span
-                     "a fixity declaration names its operators: `infixl + -`"
-                   ]
-              else Nil)
-             (appendS d.errors (cycleDiag all d)))))
+             (catMaybesS (List.map (\u -> belowLoosest scope d u) d.below))
+             (appendS
+                (if List.length d.ops == 0
+                 then [ diag
+                        d.span
+                        "a fixity declaration names its operators: `infixl + -`"
+                      ]
+                 else Nil)
+                (appendS d.errors (cycleDiag all d))))))
 
 type FixRead = { fixities : Fixity.Fixities, diags : List Diag }
 

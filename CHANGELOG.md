@@ -5,6 +5,7 @@
 ### Language
 
 - `if let p = e then a else b`, an expression: `a` where `e` matches `p`, `p`'s names bound in `a` alone, `b` where it does not (`lastOr xs = if let Just m = List.last xs then m else 0`). It is a `case` on `e`, `p` and `_` its arms. `p` may fail to match; one that cannot is let be, its `else` never taken, as a `do` block's `let p = e else s`'s. `else if let` goes on a chain, and in a `do` block an `if let`, a statement, may have no `else`, as an `if` may. `if let x = e in c` is still an `if` on a `let ... in`.
+- A name in backticks is applied as an operator: `` a `f` b `` is `f a b`, the name a variable, a tag or a definition through an import's alias (`` xs `List.append` ys ``, `` x `Cons` xs ``, in a pattern too), application binding tighter. Its fixity is declared as an operator's (`` infixl `union` above ++ ``) and named in another's `above` and `below`, and it comes with the module, under an alias too (`` `M.union` ``). With none, the name goes with no operator but the loosest (`` f $ a `g` b ``) and does not associate: `` a `g` b + c `` and `` a `g` b `g` c `` want parentheses. The formatter lays it out as an operator; the language server takes it as the name; VS Code's, bat's and Zed's grammars colour it as an operator.
 
 ### Backends and performance
 

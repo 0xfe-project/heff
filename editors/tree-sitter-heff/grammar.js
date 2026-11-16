@@ -108,7 +108,7 @@ module.exports = grammar({
         ":",
         ",",
         ";",
-        "`",
+        $.infix_name,
         $.parens,
         $.brackets,
         $.binary,
@@ -127,6 +127,10 @@ module.exports = grammar({
 
     name: (_) => SYMBOL_NAME,
     constructor: (_) => /[A-Z][A-Za-z0-9_']*(\/[A-Za-z][A-Za-z0-9_']*)*/,
+    // a name in backticks, applied as an operator: `a \`f\` b`,
+    // `m \`Map.union\` n`
+    infix_name: (_) =>
+      token(/`[A-Za-z][A-Za-z0-9_']*(\/[A-Za-z][A-Za-z0-9_']*)*(\.[A-Za-z][A-Za-z0-9_']*(\/[A-Za-z][A-Za-z0-9_']*)*)*`/),
     // a field: right after what it projects (`r.x`, `List.map`)
     field: (_) => /\.[A-Za-z][A-Za-z0-9_']*/,
 

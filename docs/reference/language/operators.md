@@ -27,6 +27,48 @@ parentheses.
 
 `below` with nothing after it is below every other operator.
 
+## Names in backticks
+
+```haskell
+infixl `plus` above + below *
+
+-- | >>> 1 `plus` 2 * 3
+-- | 7
+-- | >>> (0 `Cons` [1] : List Int)
+-- | [0, 1]
+-- | >>> [1] `List.append` [2]
+-- | [1, 2]
+plus : Int -> Int -> Int
+plus a b = a + b
+```
+
+A name in backticks is applied as an operator: `` a `f` b `` is
+`f a b`. Any name will do: a variable, a tag (`` x `Cons` xs ``, in a
+pattern too), or a definition reached through an import's alias
+(`` xs `List.append` ys ``). Nothing is written inside the backticks but
+the name.
+
+Application binds tighter than any of them, as it does than any
+operator: `` f x `g` h y `` is `g (f x) (h y)`.
+
+A name's fixity is declared as an operator's, and it can be named in
+another declaration's `above` and `below`. A module's fixities of its
+names come with it when it is imported, under an alias too: imported as
+`M`, its `` `f` `` is written `` `M.f` ``.
+
+A name with no fixity is not related to any operator but the loosest,
+nor does it associate:
+
+```haskell
+-- | >>> larger 2 3
+-- | 4
+larger : Int -> Int -> Int
+larger a b = id $ (a `max` b) + 1
+```
+
+`` id $ a `max` b `` needs no parentheses, but `` a `max` b + 1 `` and
+`` a `max` b `max` c `` do.
+
 ## The prelude's
 
 The prelude's operators, `+`, `==`, `&&`, `::`, `++`, `^`, `$` and the
