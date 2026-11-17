@@ -47,11 +47,11 @@ lists : Test
 lists =
   group
     "lists"
-    [ unit "append" (([1] ++ [2] : List Int) `assertEqual` [1, 2])
-    , property "reversed twice" (do
+    [ unit "append" $ ([1] ++ [2] : List Int) `assertEqual` [1, 2]
+    , property "reversed twice" $ do
         xs <- forAll (Generator.list 0 20 (Generator.int 0 99))
         label (if List.null xs then "empty" else "not empty")
-        List.reverse (List.reverse xs) `assertEqual` xs)
+        List.reverse (List.reverse xs) `assertEqual` xs
     ]
 ```
 
@@ -91,13 +91,13 @@ tool : Test
 tool =
   group
     "tool"
-    [ integration "writes its output where it is run" (do
+    [ integration "writes its output where it is run" $ do
         r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
         out <- readFile "out.txt"
-        out `assertEqual` "hi\n")
-    , withinTime 5000 (integration "answers quickly" (do
+        out `assertEqual` "hi\n"
+    , withinTime 5000 $ integration "answers quickly" $ do
         r <- run { command = "true" }
-        assert "it ended well" (succeeded r)))
+        assert "it ended well" (succeeded r)
     ]
 ```
 
@@ -128,16 +128,16 @@ each : {e : HFunctor}
      -> Co e Unit
 each [] = pure MkUnit
 each (n :: rest) = do
-  subtest n (do
+  subtest n $ do
     text <- readFile ("inputs/" ^ n)
-    golden n text)
+    golden n text
   each rest
 
 inputs : Test
 inputs =
-  integration "files" (do
+  integration "files" $ do
     paths <- readDirectory "inputs"
-    each (List.sort (List.map basename paths)))
+    each (List.sort (List.map basename paths))
 ```
 
 `subtest NAME body`, as Go's `t.Run`, makes a test while an integration
@@ -153,7 +153,7 @@ with no `/`.
 
 ```haskell
 pretty : Test
-pretty = unit "laid out" (golden "list.txt" (debug ([1, 2] : List Int)))
+pretty = unit "laid out" $ golden "list.txt" (debug ([1, 2] : List Int))
 ```
 
 `golden NAME text` holds `text` to the file `NAME` in the directory
