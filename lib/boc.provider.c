@@ -2621,6 +2621,18 @@ static void *bc_worker(void *u) {
         // emptied and filled again too often for its front to age)
         if (bc_slot && !bc_own_empty(bc_own)) bc_wake_one(pl);
         bc_aged(pl);
+        // (the acts it awaited started, and those pending looked at
+        // every `BC_POLL_EVERY`, between two of the slot's as between
+        // any two: a chain each readying the next keeps the slot full
+        // for as long as it counts, and an act's rest, readied behind
+        // it into this worker's queue, is taken by the one woken for
+        // it -- else it waits for the whole chain, the acts' reactor
+        // this worker's alone)
+        if (bc_inbox) bc_start_all(pl);
+        if (bc_holding && since >= BC_POLL_EVERY) {
+          since = 0;
+          bc_poll(pl, 0);
+        }
         continue;
       }
     }
