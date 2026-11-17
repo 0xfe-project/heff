@@ -343,11 +343,19 @@ opensBlock (EFor kw p i c d body) = True
 opensBlock (App h args) = endsInDo args
 opensBlock e = False
 
+isOps : CST.E -> Bool
+isOps (Ops a rest) = True
+isOps e = False
+
 -- | an item of a list or tuple, a block in it (or at its end) indented
 -- | past the commas, as a record's field is: else the items of a `case`
--- | would be under the commas, and a comma would end the last one
+-- | would be under the commas, and a comma would end the last one; a
+-- | chain broken under its first operand
 elemDoc : (CST.E -> Doc) -> CST.E -> Doc
-elemDoc one e = if hangs e || hangsLast e then nest 4 (one e) else one e
+elemDoc one e =
+  if isOps e then align (one e)
+  else if hangs e || hangsLast e then nest 4 (one e)
+  else one e
 
 -- (nothing, but a group around it breaks, as one around a hard line
 -- break does: a group takes the first side of a union to be flat)
@@ -365,6 +373,39 @@ blockLast hang h one init2 block =
   <> Union
     (flatten (h <> nest 2 (argLines one init2)) <+> nest hang block)
     (h <> nest 2 (argLines one init2 <+> nest 2 block))
+
+-- A chain's last operand a block (`f x $ do`, `case`, a lambda, `with
+-- ... do`): it stays at the end of the line, with its operator, when
+-- what comes before fits there; its items are indented past the
+-- chain's first operand, or, right of `=` (`<-`, `->`), as a block
+-- right there is.
+
+blockOperand : CST.E -> Bool
+blockOperand (Lam bs binders arrow body) = True
+blockOperand (Case kw scrut of2 alts) = True
+blockOperand (Do kw stmts) = True
+blockOperand (EWith kw e a x d body) = True
+blockOperand (EWithBound kw bs w d body) = True
+blockOperand (App h args) = endsInDo args
+blockOperand e = False
+
+blockRhs : CST.E -> Bool
+blockRhs (OpRhs op e) = blockOperand e
+blockRhs e = False
+
+-- | the operators and operands before the last, if it is a block
+blockSplit : Maybe (Pair (List CST.E) CST.E) -> Maybe (List CST.E)
+blockSplit (Just (MkPair init2 r)) = if blockRhs r then Just init2 else Nothing
+blockSplit Nothing = Nothing
+
+-- | what comes before a chain's last operand, if that is a block (`f x
+-- | $ do`)
+blockInit : CST.E -> Maybe (List CST.E)
+blockInit (Ops a rest) = blockSplit (unsnocE rest)
+blockInit e = Nothing
+
+lastOf : List CST.E -> CST.E -> CST.E
+lastOf rest e = fromMaybe e (List.last rest)
 
 theory Lay where
   pE : Tokens.Env -> CST.E -> Doc
@@ -393,8 +434,16 @@ theory Lay where
   binderDoc : Tokens.Env -> CST.E -> Doc
   opRhsDoc : Tokens.Env -> List CST.E -> CST.E -> Doc
   opsRhsDoc : Tokens.Env -> CST.E -> Doc
+  opsLaid : Tokens.Env -> CST.E -> List CST.E -> Doc
   opsChainDoc : Tokens.Env -> CST.E -> List CST.E -> Doc
-  opsCut : Tokens.Env -> String -> CST.E -> List CST.E -> List CST.E -> Doc
+  opsPiece : Tokens.Env -> Bool -> CST.E -> List CST.E -> Doc
+  opsCut : Tokens.Env
+         -> String
+         -> Bool
+         -> CST.E
+         -> List CST.E
+         -> List CST.E
+         -> Doc
   altDoc : Tokens.Env -> CST.E -> Doc
   stmtDoc : Tokens.Env -> CST.E -> Doc
   rhsField : Tokens.Env -> CST.E -> Doc
@@ -635,9 +684,22 @@ lay =
         <> nest
           2
           (items env CST.firstE CST.lastE (\e s -> lay.stmtDoc e s) body)
+  -- (a chain ending in a block, `f x $ do`, stays on the line while what
+  -- is before the block fits, its items indented as a block's here)
   , rhsOf = \env e ->
         if opensBlock e then text " " <> lay.pE env e
-        else group (line <> lay.hungOn env e)
+        else (case e of
+              Ops a rest ->
+                (case blockInit e of
+                 Just init2 ->
+                   breaksGroup
+                   <> Union
+                     (text " "
+                      <> flatten (lay.opsLaid env a init2)
+                      <+> lay.pE env (lastOf rest e))
+                     (line <> lay.pE env e)
+                 Nothing -> group (line <> lay.hungOn env e))
+              _ -> group (line <> lay.hungOn env e))
   , letHead = \env kw p ann eq e ->
         tok env kw <+> pP env p
         <> (case ann of
@@ -735,12 +797,16 @@ lay =
   , opRhsDoc = \env rest r -> case r of
       OpRhs op e -> tok env op <+> lay.chainOperand env rest e
       _ -> lay.pE env r
+  -- (an operand after its operator; a block's items indented past the
+  -- chain's first operand)
   , opsRhsDoc = \env r -> case r of
-      OpRhs op e -> tok env op <+> lay.pE env e
+      OpRhs op e ->
+        tok env op
+        <+> (if blockOperand e then nest 2 (lay.pE env e) else lay.pE env e)
       _ -> lay.pE env r
   -- (a chain of declared operators: flat when one tightness, or one not
   -- declared; else cut at the loosest, each piece a chain again)
-  , opsChainDoc = \env first rest -> case loosest env.fix rest of
+  , opsLaid = \env first rest -> case loosest env.fix rest of
       Just m ->
         if List.all (isSameIn env.fix m) rest
         then group
@@ -749,7 +815,7 @@ lay =
                (List.map
                   (\r -> breakIf (brokenAt r) line <> lay.opsRhsDoc env r)
                   rest))
-        else group (lay.opsCut env m first Nil rest)
+        else group (lay.opsCut env m False first Nil rest)
       Nothing ->
         group
           (lay.pE env first
@@ -757,17 +823,35 @@ lay =
              (List.map
                 (\r -> breakIf (brokenAt r) line <> lay.opsRhsDoc env r)
                 rest))
-  , opsCut = \env m f acc rs -> case rs of
-      [] -> lay.opsChainDoc env f (List.reverse acc)
+  -- (a block last, `f x $ do`, stays on the line while what is before
+  -- it fits, its items indented past the chain's first operand)
+  , opsChainDoc = \env first rest -> case blockSplit (unsnocE rest) of
+      Just init2 ->
+        breaksGroup
+        <> Union
+          (align
+             (flatten (lay.opsLaid env first init2)
+              <+> lay.opsRhsDoc env (lastOf rest first)))
+          (lay.opsLaid env first rest)
+      Nothing -> lay.opsLaid env first rest
+  -- (a piece after a loosest operator, `inner`, a chain broken under
+  -- its own first operand; one operand as any operand)
+  , opsPiece = \env inner f acc ->
+        if not inner then lay.opsChainDoc env f acc
+        else if List.null acc
+        then (if blockOperand f then nest 2 (lay.pE env f) else lay.pE env f)
+        else align (lay.opsChainDoc env f acc)
+  , opsCut = \env m inner f acc rs -> case rs of
+      [] -> lay.opsPiece env inner f (List.reverse acc)
       r :: rest2 ->
         (case r of
          OpRhs op e ->
            if sameAs env.fix m op.text
-           then lay.opsChainDoc env f (List.reverse acc)
+           then lay.opsPiece env inner f (List.reverse acc)
              <> breakIf (brokenAt r) line
-             <> tok env op <+> lay.opsCut env m e Nil rest2
-           else lay.opsCut env m f (r :: acc) rest2
-         _ -> lay.opsCut env m f (r :: acc) rest2)
+             <> tok env op <+> lay.opsCut env m True e Nil rest2
+           else lay.opsCut env m inner f (r :: acc) rest2
+         _ -> lay.opsCut env m inner f (r :: acc) rest2)
   , altDoc = \env a -> case a of
       EAlt p arrow body -> pP env p <+> tok env arrow <> lay.rhsOf env body
       _ -> lay.pE env a

@@ -50,6 +50,7 @@
 ### Compiler and tools
 
 - `heff init NAME` makes its module `src/NAME.hf`, the module `NAME`, not `src/NAME/greeting.hf`; the program and the test import `NAME`.
+- `heff fmt` lays a broken chain of operators out by its fixities all through: a tighter piece after a looser operator stays on one line while it fits, else it breaks under its own first operand (`f` / `$ f` / `$ 1 + 2 + ...`, not every `$` and `+` a line); in a list or tuple a chain's operators are under its first operand, not under the comma; and a block last, `unit "n" $ do`, `$ case`, `$ \x ->`, stays at the end of the line with its operator while what comes before fits, its items indented past the chain's first operand, or, right of `=`, `<-` or `->`, as a block right there is. A `$ do` in a list was refused before (it would have changed what the file means).
 
 ## 0.6.1
 
