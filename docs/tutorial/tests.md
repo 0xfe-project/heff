@@ -59,14 +59,13 @@ uses.
 
 ```haskell
 moves : Test
-moves =
-  property "a move keeps the list" $ do
-    x <- forAll (Generator.int 0 99)
-    xs <- forAll (Generator.list 0 10 (Generator.int 0 99))
-    z <- pure { before = [], focus = x, after = xs }
-    case nextZ z of
-      Just z2 -> toList z2 `assertEqual` toList z
-      Nothing -> label "at the end"
+moves = property "a move keeps the list" $ do
+  x <- forAll (Generator.int 0 99)
+  xs <- forAll (Generator.list 0 10 (Generator.int 0 99))
+  z <- pure { before = [], focus = x, after = xs }
+  case nextZ z of
+    Just z2 -> toList z2 `assertEqual` toList z
+    Nothing -> label "at the end"
 ```
 
 A property checks something of many values. `forAll` draws one from a

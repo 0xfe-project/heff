@@ -119,6 +119,8 @@ not hear fails it, saying the program or the path it was of.
 ### Subtests
 
 ```haskell
+import exception
+
 -- (a subtest for each file, its text held to its golden text)
 each : {e : HFunctor}
      -> {{chk : check <: e}}
@@ -134,10 +136,9 @@ each (n :: rest) = do
   each rest
 
 inputs : Test
-inputs =
-  integration "files" $ do
-    paths <- readDirectory "inputs"
-    each (List.sort (List.map basename paths))
+inputs = integration "files" $ do
+  paths <- readDirectory "inputs"
+  each (List.sort (List.map basename paths))
 ```
 
 `subtest NAME body`, as Go's `t.Run`, makes a test while an integration
