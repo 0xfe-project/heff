@@ -53,8 +53,9 @@ operator: `` f x `g` h y `` is `g (f x) (h y)`.
 
 A name's fixity is declared as an operator's, and it can be named in
 another declaration's `above` and `below`. A module's fixities of its
-names come with it when it is imported, under an alias too: imported as
-`M`, its `` `f` `` is written `` `M.f` ``.
+names come with it when it is imported unqualified. Through an alias
+the name has none: imported as `M`, its `` `M.f` `` goes as a name with
+no fixity does, below.
 
 A name with no fixity is not related to any operator but the loosest,
 nor does it associate:
