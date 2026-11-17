@@ -47,11 +47,11 @@ lists : Test
 lists =
   group
     "lists"
-    [ unit "append" (assertEqual ([1] ++ [2] : List Int) [1, 2])
+    [ unit "append" (([1] ++ [2] : List Int) `assertEqual` [1, 2])
     , property "reversed twice" (do
         xs <- forAll (Generator.list 0 20 (Generator.int 0 99))
         label (if List.null xs then "empty" else "not empty")
-        assertEqual (List.reverse (List.reverse xs)) xs)
+        List.reverse (List.reverse xs) `assertEqual` xs)
     ]
 ```
 
@@ -94,7 +94,7 @@ tool =
     [ integration "writes its output where it is run" (do
         r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
         out <- readFile "out.txt"
-        assertEqual out "hi\n")
+        out `assertEqual` "hi\n")
     , withinTime 5000 (integration "answers quickly" (do
         r <- run { command = "true" }
         assert "it ended well" (succeeded r)))

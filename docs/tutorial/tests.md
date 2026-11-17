@@ -45,14 +45,12 @@ cursorTests =
     "cursor"
     [ unit
       "the second marked done"
-      (assertEqual
-         (shown (runCursor markSecond three))
-         ["[ ] write", "[x] read", "[ ] test"])
+      (shown (runCursor markSecond three)
+       `assertEqual` ["[ ] write", "[x] read", "[ ] test"])
     , unit
       "no previous at the start"
-      (assertEqual
-         (shown (runCursor previous three))
-         ["[ ] write", "[ ] read", "[ ] test"])
+      (shown (runCursor previous three)
+       `assertEqual` ["[ ] write", "[ ] read", "[ ] test"])
     ]
 ```
 
@@ -71,7 +69,7 @@ moves =
   xs <- forAll (Generator.list 0 10 (Generator.int 0 99))
   z <- pure { before = [], focus = x, after = xs }
   case nextZ z of
-    Just z2 -> assertEqual (toList z2) (toList z)
+    Just z2 -> toList z2 `assertEqual` toList z
     Nothing -> label "at the end")
 ```
 
@@ -87,17 +85,13 @@ screen : Test
 screen =
   unit
     "a todo marked done, on the screen"
-    (assertEqual
-       (Widget.shownAfter
-          Main.app
-          { columns = 30, rows = 5 }
-          [ArrowDown, Char ' '])
-       [ "[ ] write the tutorial"
-       , "[x] read the reference"
-       , "[ ] test the examples"
-       , ""
-       , "↑↓ move  space done  q quit   "
-       ])
+    (Widget.shownAfter Main.app { columns = 30, rows = 5 } [ArrowDown, Char ' ']
+     `assertEqual` [ "[ ] write the tutorial"
+                   , "[x] read the reference"
+                   , "[ ] test the examples"
+                   , ""
+                   , "↑↓ move  space done  q quit   "
+                   ])
 ```
 
 `Widget.shownAfter` runs the app on the keys given, and gives the rows
