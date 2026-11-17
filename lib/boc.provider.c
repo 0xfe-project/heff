@@ -1384,9 +1384,13 @@ static void bc_rooms_push(BcRooms *r, BcBehaviour *b) {
 
 // (the rooms of behaviours made by no worker -- main's -- let go of by
 // workers: a pool of the program's, blocks under a mutex, which main
-// takes from a block at a time)
+// takes from a block at a time.  Changed only under the mutex, but
+// main looks at it first without it, to take the mutex only where
+// there is a block to take: an atomic, all its uses relaxed -- the
+// look only a hint, and the mutex, taken then, what orders a block's
+// rooms with the worker that gave it)
 static pthread_mutex_t bc_rooms_mu = PTHREAD_MUTEX_INITIALIZER;
-static BcBlock *bc_rooms;
+static _Atomic(BcBlock *) bc_rooms;
 
 // (the block `*at` given to the list `to`, or to the program's pool
 // where `to` is NULL)
@@ -1396,8 +1400,8 @@ static void bc_block_back(BcBlock **at, _Atomic(BcBlock *) *to) {
   *at = NULL;
   if (!to) {
     pthread_mutex_lock(&bc_rooms_mu);
-    blk->next = bc_rooms;
-    bc_rooms = blk;
+    blk->next = atomic_load_explicit(&bc_rooms, memory_order_relaxed);
+    atomic_store_explicit(&bc_rooms, blk, memory_order_relaxed);
     pthread_mutex_unlock(&bc_rooms_mu);
     return;
   }
@@ -1439,10 +1443,10 @@ static BcBehaviour *bc_behaviour_room(BcPool *pl) {
   if (home && home->pool != pl) home = NULL;
   if (!bc_spares.n && home && atomic_load_explicit(&home->back, memory_order_relaxed))
     bc_blocks_taken(atomic_exchange_explicit(&home->back, NULL, memory_order_acquire));
-  if (!bc_spares.n && !bc_own && bc_rooms) {
+  if (!bc_spares.n && !bc_own && atomic_load_explicit(&bc_rooms, memory_order_relaxed)) {
     pthread_mutex_lock(&bc_rooms_mu);
-    BcBlock *blk = bc_rooms;
-    if (blk) bc_rooms = blk->next;
+    BcBlock *blk = atomic_load_explicit(&bc_rooms, memory_order_relaxed);
+    if (blk) atomic_store_explicit(&bc_rooms, blk->next, memory_order_relaxed);
     pthread_mutex_unlock(&bc_rooms_mu);
     if (blk) {
       blk->next = NULL;
@@ -2883,7 +2887,7 @@ static void bc_drain(BcPool *pl) {
   pthread_mutex_unlock(&bc_epochs_mu);
   bc_block_back(&bc_strays, NULL);
   pthread_mutex_lock(&bc_rooms_mu);
-  for (BcBlock *blk = bc_rooms, *next; blk; blk = next) {
+  for (BcBlock *blk = atomic_load_explicit(&bc_rooms, memory_order_relaxed), *next; blk; blk = next) {
     next = blk->next;
     for (int i = 0; i < blk->n; i++) {
       BcBehaviour *b = blk->b[i];
@@ -2892,7 +2896,7 @@ static void bc_drain(BcPool *pl) {
     }
     free(blk);
   }
-  bc_rooms = NULL;
+  atomic_store_explicit(&bc_rooms, NULL, memory_order_relaxed);
   pthread_mutex_unlock(&bc_rooms_mu);
   while (bc_spares.n) {
     BcBehaviour *b = bc_spares.b[--bc_spares.n];
