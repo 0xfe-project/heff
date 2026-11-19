@@ -6,7 +6,7 @@ heff is a functional language with a Haskell-like syntax and a phase distinction
 - **Algebraic effects** as a library: a computation names the effects it needs as instance arguments, and is given them where it runs.
 - **Behaviour-Oriented Concurrency**: the main concurrency programming style, directly be supported by the runtime.
 - **Self-hosting**: the compiler is written in heff, and builds from a seed of itself compiled to C.
-- **Two backends**: C (native programs, built by zig; the runtime is part C, part Zig) and JavaScript (web pages, ES modules).
+- **Two backends**: C (native programs, built by zig) and JavaScript (web pages, ES modules).
 - **Tools** in the one executable: a formatter, a language server, doc tests and property tests, and packages fetched by git.
 
 ```haskell

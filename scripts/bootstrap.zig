@@ -55,40 +55,6 @@ fn unwind(windows: bool) []const []const u8 {
     return noUnwind[0..unwound(windows)];
 }
 
-/// The flags C is built with, as zig builds the runtime's Zig with them:
-/// the same target and processor, the mode of the level (`-O2`
-/// ReleaseFast), and no unwind tables where C has none.
-fn zigFlags(arena: Allocator, compile: []const []const u8) ![]const []const u8 {
-    var flagged: std.ArrayList([]const u8) = .empty;
-    var unwinds = true;
-    var k: usize = 0;
-    while (k < compile.len) : (k += 1) {
-        const flag = compile[k];
-        if (std.mem.eql(u8, flag, "-target") and k + 1 < compile.len) {
-            try flagged.appendSlice(arena, &.{ flag, compile[k + 1] });
-            k += 1;
-        } else if (std.mem.startsWith(u8, flag, "-mcpu=")) {
-            try flagged.append(arena, flag);
-        } else if (modeOf(flag)) |mode| {
-            try flagged.appendSlice(arena, &.{ "-O", mode });
-        } else if (std.mem.eql(u8, flag, "-fno-unwind-tables")) {
-            unwinds = false;
-        }
-    }
-    if (!unwinds) try flagged.append(arena, "-fno-unwind-tables");
-    return flagged.items;
-}
-
-/// zig's mode for a C compiler's level, as heff builds the runtime's Zig.
-fn modeOf(level: []const u8) ?[]const u8 {
-    const modes = [_]struct { []const u8, []const u8 }{
-        .{ "-O0", "Debug" },       .{ "-O1", "ReleaseSafe" },  .{ "-O2", "ReleaseFast" },
-        .{ "-O3", "ReleaseFast" }, .{ "-Os", "ReleaseSmall" },
-    };
-    for (modes) |m| if (std.mem.eql(u8, level, m[0])) return m[1];
-    return null;
-}
-
 // (what the sources of the compiler are: a heff newer than every one of
 // them, and than the seed, is up to date)
 const sourceDirectories = [_][]const u8{ "app", "src", "lib" };
@@ -179,7 +145,7 @@ const Bootstrap = struct {
 
     fn isSource(name: []const u8) bool {
         return std.mem.endsWith(u8, name, ".hf") or std.mem.endsWith(u8, name, ".js") or
-            std.mem.endsWith(u8, name, ".c") or std.mem.endsWith(u8, name, ".zig");
+            std.mem.endsWith(u8, name, ".c");
     }
 
     /// The files of a directory whose names end so, sorted.
@@ -216,10 +182,9 @@ const Bootstrap = struct {
     }
 
     /// The parts in `directory` built by zig into `to`: each part an
-    /// object -- a C file's by `zig cc`, the runtime's Zig by `zig
-    /// build-obj` -- kept in `into` and named by what it is made of (the
-    /// zig and the machine it builds for, the flags, and the part; a C
-    /// part's heff.h too), so that a part as it was is not built again,
+    /// object, by `zig cc`, kept in `into` and named by what it is made
+    /// of (the zig and the machine it builds for, the flags, heff.h and
+    /// the part), so that a part as it was is not built again,
     /// wherever it is and whichever stage it is of; as many at once as
     /// there are cores, then the objects linked.  (zig's own cache knows
     /// a C file by its path, time and inode, not by what is in it, so it
@@ -227,17 +192,12 @@ const Bootstrap = struct {
     /// checkout or its cache restored.)
     fn cc(b: *const Bootstrap, who: []const u8, into: []const u8, directory: []const u8, to: []const u8, compile: []const []const u8, link: []const []const u8) bool {
         const files = b.filesOf(directory, &.{".c"}) orelse return false;
-        const zigs = b.filesOf(directory, &.{".zig"}) orelse return false;
-        const zigCompile = zigFlags(b.arena, compile) catch return false;
         b.root.createDirPath(b.io, into) catch return false;
         var madeOf = std.crypto.hash.sha2.Sha256.init(.{});
         madeOf.update(b.zigIs);
         madeOf.update(std.mem.join(b.arena, " ", compile) catch return false);
         madeOf.update(b.read(b.concat(&.{ directory, "/heff.h" })) orelse "");
-        var zigMadeOf = std.crypto.hash.sha2.Sha256.init(.{});
-        zigMadeOf.update(b.zigIs);
-        zigMadeOf.update(std.mem.join(b.arena, " ", zigCompile) catch return false);
-        const objects = b.arena.alloc([]const u8, files.len + zigs.len) catch return false;
+        const objects = b.arena.alloc([]const u8, files.len) catch return false;
         var anew: std.ArrayList(Job) = .empty;
         for (files, 0..) |file, k| {
             const object = b.objectOf(into, madeOf, directory, file, file[0 .. file.len - 2]) orelse return false;
@@ -247,17 +207,6 @@ const Bootstrap = struct {
                 &.{ b.zig, "cc" },
                 compile,
                 &.{ "-c", b.concat(&.{ directory, "/", file }), "-o", b.concat(&.{ object, ".part" }) },
-            }) catch return false;
-            anew.append(b.arena, .{ .argv = argv, .object = object }) catch return false;
-        }
-        for (zigs, files.len..) |file, k| {
-            const object = b.objectOf(into, zigMadeOf, directory, file, file) orelse return false;
-            objects[k] = object;
-            if (b.modified(object) != null) continue;
-            const argv = std.mem.concat(b.arena, []const u8, &.{
-                &.{ b.zig, "build-obj", b.concat(&.{ directory, "/", file }) },
-                zigCompile,
-                &.{b.concat(&.{ "-femit-bin=", object, ".part" })},
             }) catch return false;
             anew.append(b.arena, .{ .argv = argv, .object = object }) catch return false;
         }
@@ -430,7 +379,7 @@ const Bootstrap = struct {
             b.complain("heff fixpoint: the compiler refused its own source", .{});
             return false;
         }
-        const endings = [_][]const u8{ ".c", ".h", ".zig" };
+        const endings = [_][]const u8{ ".c", ".h" };
         const built = b.filesOf(parts, &endings) orelse return false;
         const child = b.filesOf(gen, &endings) orelse return false;
         if (built.len != child.len) return b.otherFiles(built, child);

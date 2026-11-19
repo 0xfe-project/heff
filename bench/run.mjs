@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The benchmarks: each program here compiled to C, built by `zig cc
-// -O2` (its runtime's Zig by `zig build-obj`), and run, the compiler
+// -O2`, and run, the compiler
 // checking itself (elaboration only: the
 // code the compiler emits, measured apart from what its simplifier
 // does), and compiling itself to C (its cache warm, then cold), each
@@ -56,9 +56,7 @@ for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")
   if (!wanted(name)) continue;
   const cOut = join(work, name + ".c"), bin = join(work, name);
   const cc = spawnSync(heff, ["compile", join("bench", f), cOut, "--name", "main", "--backend=c"], { cwd: root, encoding: "utf8" });
-  // (the runtime's Zig, written beside the C, built into an object of its own)
-  const rt = cc.status === 0 ? spawnSync("zig", ["build-obj", join(work, name + ".zig"), "-O", "ReleaseFast", `-femit-bin=${bin}-runtime.o`], { encoding: "utf8" }) : cc;
-  const z = rt.status === 0 ? spawnSync("zig", ["cc", "-O2", "-w", cOut, `${bin}-runtime.o`, "-o", bin, "-lm"], { encoding: "utf8" }) : rt;
+  const z = cc.status === 0 ? spawnSync("zig", ["cc", "-O2", "-w", cOut, "-o", bin, "-lm"], { encoding: "utf8" }) : cc;
   if (z.status !== 0) { console.log(`${name.padEnd(16)} did not compile to C\n${z.stdout}${z.stderr}`); continue; }
   best(`${name} (c)`, () => timed([bin]));
 }
