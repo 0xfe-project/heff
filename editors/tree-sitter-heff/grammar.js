@@ -16,7 +16,7 @@
 const SYMBOL_NAME = /[a-z_][A-Za-z0-9_']*(\/[A-Za-z][A-Za-z0-9_']*)*/;
 const KEYWORDS = [
   "data", "type", "theory", "primitive", "instance", "mutual", "import", "as",
-  "case", "of", "if", "then", "else", "do", "where", "once", "let", "mut", "in",
+  "case", "of", "if", "then", "else", "do", "where", "deriving", "once", "let", "mut", "in",
   "while", "for", "break", "continue", "return", "try", "catch", "with", "test",
   "abandon", "infixl", "infixr", "infix",
 ];

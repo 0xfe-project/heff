@@ -39,6 +39,30 @@ function it is given to, `paint Red` where `paint : Ink -> String`; or
 the tag itself, `(Red : Ink)`. A tag with nothing to say its type, as
 in `let x = Red`, will cause an error.
 
+### Deriving
+
+```haskell
+data Tree a = Leaf | Node (Tree a) a (Tree a)
+  deriving (Equality, Order, Debug, Show)
+
+-- | >>> compare (Node Leaf 1 Leaf : Tree Int) (Node Leaf 2 Leaf)
+-- | LT
+-- | >>> debug (Node Leaf "a" Leaf : Tree String)
+-- | "Node (Leaf) (\"a\") (Leaf)"
+```
+
+`deriving` after the tags writes the type's instances of the prelude's
+theories, as the prelude writes its own: `Equality` (the same tag, each
+field equal), `Order` (tags in the order they are declared, then the
+fields, first to last), `Debug` (`C (x) (y)`, each field's `debug`) and
+`Show` (the same text). They are named `instanceEqualityTree`, and so
+on, and each parameter asks for the same theory of its type, as in
+`{a : Type} -> {{eqA : Equality a}} -> Equality (Tree a)` (`Show`
+asks for `Debug`). `Order` needs `Equality` in the same list. A field
+may be the type itself, `Tree a`, but not hold it inside another type,
+as `List (Tree a)` does; such a type, and one whose parameters are
+written `(x : T)`, writes its instances by hand.
+
 ## Unit and pairs
 
 ```haskell

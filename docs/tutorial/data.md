@@ -19,6 +19,15 @@ data Status = Open | Done
 A data type lists its constructors. A `Status` is either `Open` or
 `Done`.
 
+```haskell
+data Priority = Low | High
+  deriving (Equality, Order, Debug)
+```
+
+`deriving` writes the instances for you, so `==`, `<` and `debug`
+work on a `Priority`: `Low` comes before `High`, and `debug High` is
+`"High"`.
+
 ## Records
 
 ```haskell

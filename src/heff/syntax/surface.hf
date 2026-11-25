@@ -2795,6 +2795,625 @@ dataParamL r e = case atomOf e of
          (spanT x))
   Nothing -> dataParamOf r e
 
+-- Deriving
+--------------------------------------------------------------------------------
+
+-- | a theory `deriving` makes an instance of
+data Derived = DerivedEquality | DerivedOrder | DerivedDebug | DerivedShow
+
+derivedOf : String -> Maybe Derived
+derivedOf "Equality" = Just DerivedEquality
+derivedOf "Order" = Just DerivedOrder
+derivedOf "Debug" = Just DerivedDebug
+derivedOf "Show" = Just DerivedShow
+derivedOf _ = Nothing
+
+-- | the order the instances are made in, each after those it uses
+derivedRank : Derived -> Int
+derivedRank DerivedEquality = 0
+derivedRank DerivedOrder = 1
+derivedRank DerivedDebug = 2
+derivedRank DerivedShow = 3
+
+-- | a constructor, its tag and whether each field is the type itself
+type DerivedCon = { tag : String, own : List Bool }
+
+-- | the type an instance is made for, its parameters and constructors
+type Deriver = { name : String, params : List String, cons : List DerivedCon }
+
+-- | a field taken apart, from the one value (`x`) and from the other (`y`)
+type DerivedField = { own : Bool, x : String, y : String }
+
+derivedFieldsFrom : Int -> List Bool -> List DerivedField
+derivedFieldsFrom i [] = Nil
+derivedFieldsFrom i (own :: rest) =
+  { own = own, x = "x#" ^ debug i, y = "y#" ^ debug i }
+  :: derivedFieldsFrom (i + 1) rest
+
+derivedFields : DerivedCon -> List DerivedField
+derivedFields c = derivedFieldsFrom 1 c.own
+
+fieldX : DerivedField -> String
+fieldX f = f.x
+
+fieldY : DerivedField -> String
+fieldY f = f.y
+
+upperAt : String -> Maybe Int -> String
+upperAt c (Just i) = strSlice "ABCDEFGHIJKLMNOPQRSTUVWXYZ" i (i + 1)
+upperAt c Nothing = c
+
+capitalised : String -> String
+capitalised x =
+  upperAt
+    (strSlice x 0 1)
+    (indexOf (strSlice x 0 1) "abcdefghijklmnopqrstuvwxyz" 0)
+  ^ strSlice x 1 (strLength x)
+
+dVar : Params.Span -> String -> Presyntax.Expr
+dVar sp x = At (EVar x) sp
+
+dLib : Params.Span -> String -> Presyntax.Expr
+dLib sp k = At (ENotationVar k sp ("`deriving` needs `" ^ k ^ "`")) sp
+
+dTag : Params.Span -> String -> Presyntax.Expr
+dTag sp t = At (ETag t) sp
+
+dStr : Params.Span -> String -> Presyntax.Expr
+dStr sp s = At (EString s) sp
+
+dPat : Params.Span -> String -> List String -> Presyntax.Pat
+dPat sp t xs = Presyntax.patTag t sp (List.map (\x -> At (PatVar x) sp) xs)
+
+dArrow : Params.Span -> Presyntax.Expr -> Presyntax.Expr -> Presyntax.Expr
+dArrow sp a b = At (EPi (PiAnon a) b) sp
+
+dSelf : Params.Span -> Deriver -> Presyntax.Expr
+dSelf sp d = Presyntax.app (dVar sp d.name) (List.map (dVar sp) d.params)
+
+dEqn : Params.Span
+     -> String
+     -> List Presyntax.Pat
+     -> Presyntax.Expr
+     -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+dEqn sp f ps body = At (MkEquation f sp ps body) sp
+
+dLocal : Params.Span
+       -> String
+       -> Presyntax.Expr
+       -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+       -> Presyntax.Decl
+dLocal sp f ty eqns = At (DeclEquations f sp AsDefinition ty eqns) sp
+
+typeParamsOver : Params.Span -> List String -> Presyntax.Expr -> Presyntax.Expr
+typeParamsOver sp [] e = e
+typeParamsOver sp (p :: ps) e =
+  At
+    (EPi
+       (PiImplicit p sp sp (At (EWord TypeWord) sp) Nothing)
+       (typeParamsOver sp ps e))
+    sp
+
+instanceArgsOver : Params.Span
+                 -> String
+                 -> String
+                 -> List String
+                 -> Presyntax.Expr
+                 -> Presyntax.Expr
+instanceArgsOver sp k pre [] e = e
+instanceArgsOver sp k pre (p :: ps) e =
+  At
+    (EPi
+       (PiInstance
+          (pre ^ capitalised p)
+          sp
+          sp
+          (Presyntax.app (dLib sp k) [dVar sp p]))
+       (instanceArgsOver sp k pre ps e))
+    sp
+
+-- | `{a : Type} -> {{eqA : Equality a}} -> Equality (T a)`: the theory's
+-- | key, and the key and name prefix of what each parameter needs
+instanceTypeOf : Params.Span
+               -> Deriver
+               -> String
+               -> String
+               -> String
+               -> Presyntax.Expr
+instanceTypeOf sp d k argK pre =
+  typeParamsOver
+    sp
+    d.params
+    (instanceArgsOver
+       sp
+       argK
+       pre
+       d.params
+       (Presyntax.app (dLib sp k) [dSelf sp d]))
+
+-- | the instance's signature and its one equation
+instanceItems : Params.Span
+              -> String
+              -> Presyntax.Expr
+              -> Presyntax.Expr
+              -> List Item
+instanceItems sp f ty body =
+  [Sig AsInstance f sp ty sp, Eqn f (dEqn sp f Nil body) sp]
+
+-- | `{ field = local } where local ...`
+recordWhere : Params.Span
+            -> String
+            -> String
+            -> List Presyntax.Decl
+            -> Presyntax.Expr
+recordWhere sp field local decls =
+  At
+    (ELocal (At (EStruct [At (SetField field sp (dVar sp local)) sp]) sp) decls)
+    sp
+
+moreThanOne : {a : Type} -> List a -> Bool
+moreThanOne (x :: y :: rest) = True
+moreThanOne _ = False
+
+-- | the equation of what is left: none where one constructor is all
+otherwiseEqn : {a : Type}
+             -> List a
+             -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+             -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+otherwiseEqn cons e = if moreThanOne cons then [e] else Nil
+
+equalLocal : String
+equalLocal = "equal#deriving"
+
+equalField : Params.Span -> DerivedField -> Presyntax.Expr
+equalField sp f =
+  Presyntax.app
+    (if f.own then dVar sp equalLocal else dLib sp "prelude.equal")
+    [dVar sp f.x, dVar sp f.y]
+
+allEqual : Params.Span -> List DerivedField -> Presyntax.Expr
+allEqual sp [] = dTag sp "True"
+allEqual sp [f] = equalField sp f
+allEqual sp (f :: rest) =
+  Presyntax.matchOf
+    sp
+    (Presyntax.ann (equalField sp f) (dVar sp "builtin.Bool"))
+    [ Presyntax.alt (Presyntax.patTag "True" sp Nil) (allEqual sp rest)
+    , Presyntax.alt (Presyntax.patTag "False" sp Nil) (dTag sp "False")
+    ]
+
+equalEqn : Params.Span
+         -> DerivedCon
+         -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+equalEqn sp c =
+  dEqn
+    sp
+    equalLocal
+    [ dPat sp c.tag (List.map fieldX (derivedFields c))
+    , dPat sp c.tag (List.map fieldY (derivedFields c))
+    ]
+    (allEqual sp (derivedFields c))
+
+-- | `instance instanceEqualityT`: the same constructor, and each field equal
+equalityItems : Deriver -> Params.Span -> List Item
+equalityItems d sp =
+  instanceItems
+    sp
+    ("instanceEquality" ^ d.name)
+    (instanceTypeOf sp d "prelude.Equality" "prelude.Equality" "eq")
+    (recordWhere
+       sp
+       "equal"
+       equalLocal
+       [ dLocal
+         sp
+         equalLocal
+         (dArrow
+            sp
+            (dSelf sp d)
+            (dArrow sp (dSelf sp d) (dVar sp "builtin.Bool")))
+         (appendS
+            (List.map (equalEqn sp) d.cons)
+            (otherwiseEqn
+               d.cons
+               (dEqn
+                  sp
+                  equalLocal
+                  [At (PatVar "_") sp, At (PatVar "_") sp]
+                  (dTag sp "False"))))
+       ])
+
+compareLocal : String
+compareLocal = "compare#deriving"
+
+rankLocal : String
+rankLocal = "rank#deriving"
+
+compareField : Params.Span -> DerivedField -> Presyntax.Expr
+compareField sp f =
+  Presyntax.app
+    (if f.own then dVar sp compareLocal else dLib sp "prelude.compare")
+    [dVar sp f.x, dVar sp f.y]
+
+lexically : Params.Span -> List DerivedField -> Presyntax.Expr
+lexically sp [] = dTag sp "EQ"
+lexically sp [f] = compareField sp f
+lexically sp (f :: rest) =
+  Presyntax.matchOf
+    sp
+    (Presyntax.ann (compareField sp f) (dLib sp "prelude.Ordering"))
+    [ Presyntax.alt (Presyntax.patTag "EQ" sp Nil) (lexically sp rest)
+    , Presyntax.alt (At (PatVar "o#deriving") sp) (dVar sp "o#deriving")
+    ]
+
+compareEqn : Params.Span
+           -> DerivedCon
+           -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+compareEqn sp c =
+  dEqn
+    sp
+    compareLocal
+    [ dPat sp c.tag (List.map fieldX (derivedFields c))
+    , dPat sp c.tag (List.map fieldY (derivedFields c))
+    ]
+    (lexically sp (derivedFields c))
+
+rankEqns : Params.Span
+         -> Int
+         -> List DerivedCon
+         -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+rankEqns sp i [] = Nil
+rankEqns sp i (c :: rest) =
+  dEqn
+    sp
+    rankLocal
+    [dPat sp c.tag (List.map (\f -> "_") c.own)]
+    (At (EInt i) sp)
+  :: rankEqns sp (i + 1) rest
+
+rankDecls : Deriver -> Params.Span -> List Presyntax.Decl
+rankDecls d sp =
+  if moreThanOne d.cons
+  then [ dLocal
+         sp
+         rankLocal
+         (dArrow sp (dSelf sp d) (At (EWord IntWord) sp))
+         (rankEqns sp 0 d.cons)
+       ]
+  else Nil
+
+byRank : Params.Span -> Presyntax.Expr
+byRank sp =
+  Presyntax.app
+    (dLib sp "prelude.compareInt")
+    [ Presyntax.app (dVar sp rankLocal) [dVar sp "x#0"]
+    , Presyntax.app (dVar sp rankLocal) [dVar sp "y#0"]
+    ]
+
+-- | `(eqA := ordA.eq)`, the equality of a parameter its order's
+equalityOfOrder : Params.Span -> String -> Presyntax.Expr
+equalityOfOrder sp p =
+  At
+    (ENamed
+       ("eq" ^ capitalised p)
+       (Presyntax.app
+          (dVar sp ("ord" ^ capitalised p))
+          [At (EProject "eq") sp]))
+    sp
+
+-- | `instance instanceOrderT`: constructors in the order they are
+-- | declared, then their fields, first to last
+orderItems : Deriver -> Params.Span -> List Item
+orderItems d sp =
+  instanceItems
+    sp
+    ("instanceOrder" ^ d.name)
+    (instanceTypeOf sp d "prelude.Order" "prelude.Order" "ord")
+    (At
+       (ELocal
+          (Presyntax.app
+             (dLib sp "prelude.orderByCompare")
+             [ At
+               (ENamed
+                  "eq"
+                  (Presyntax.app
+                     (dVar sp ("instanceEquality" ^ d.name))
+                     (List.map (equalityOfOrder sp) d.params)))
+               sp
+             , dVar sp compareLocal
+             ])
+          (appendS
+             (rankDecls d sp)
+             [ dLocal
+               sp
+               compareLocal
+               (dArrow
+                  sp
+                  (dSelf sp d)
+                  (dArrow sp (dSelf sp d) (dLib sp "prelude.Ordering")))
+               (appendS
+                  (List.map (compareEqn sp) d.cons)
+                  (otherwiseEqn
+                     d.cons
+                     (dEqn
+                        sp
+                        compareLocal
+                        [At (PatVar "x#0") sp, At (PatVar "y#0") sp]
+                        (byRank sp))))
+             ]))
+       sp)
+
+dAppend : Params.Span -> Presyntax.Expr -> Presyntax.Expr -> Presyntax.Expr
+dAppend sp a b = Presyntax.app (dLib sp "prelude.^") [a, b]
+
+writtenField : Params.Span -> String -> DerivedField -> Presyntax.Expr
+writtenField sp local f =
+  Presyntax.app
+    (if f.own then dVar sp local else dLib sp "prelude.debug")
+    [dVar sp f.x]
+
+writtenRest : Params.Span
+            -> String
+            -> Presyntax.Expr
+            -> List DerivedField
+            -> Presyntax.Expr
+writtenRest sp local acc [] = dAppend sp acc (dStr sp ")")
+writtenRest sp local acc (f :: rest) =
+  writtenRest
+    sp
+    local
+    (dAppend sp (dAppend sp acc (dStr sp ") (")) (writtenField sp local f))
+    rest
+
+-- | `C`, or `C (x) (y)`, each field as its `debug` writes it
+writtenOf : Params.Span
+          -> String
+          -> String
+          -> List DerivedField
+          -> Presyntax.Expr
+writtenOf sp local tag [] = dStr sp tag
+writtenOf sp local tag (f :: rest) =
+  writtenRest
+    sp
+    local
+    (dAppend sp (dStr sp (tag ^ " (")) (writtenField sp local f))
+    rest
+
+writtenEqn : Params.Span
+           -> String
+           -> DerivedCon
+           -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+writtenEqn sp local c =
+  dEqn
+    sp
+    local
+    [dPat sp c.tag (List.map fieldX (derivedFields c))]
+    (writtenOf sp local c.tag (derivedFields c))
+
+-- | `instance instanceDebugT`, or `instanceShowT` (`field`: `debug`,
+-- | `show`), the value as the source writes it, by its fields' `debug`
+writtenItems : Deriver -> Params.Span -> String -> String -> List Item
+writtenItems d sp th field =
+  instanceItems
+    sp
+    ("instance" ^ th ^ d.name)
+    (instanceTypeOf sp d ("prelude." ^ th) "prelude.Debug" "shows")
+    (recordWhere
+       sp
+       field
+       (field ^ "#deriving")
+       [ dLocal
+         sp
+         (field ^ "#deriving")
+         (dArrow sp (dSelf sp d) (At (EWord StringWord) sp))
+         (List.map (writtenEqn sp (field ^ "#deriving")) d.cons)
+       ])
+
+derivedItems : Deriver -> Pair Derived CST.T -> List Item
+derivedItems d (MkPair DerivedEquality t) = equalityItems d (spanT t)
+derivedItems d (MkPair DerivedOrder t) = orderItems d (spanT t)
+derivedItems d (MkPair DerivedDebug t) =
+  writtenItems d (spanT t) "Debug" "debug"
+derivedItems d (MkPair DerivedShow t) = writtenItems d (spanT t) "Show" "show"
+
+derivingList : CST.E -> List CST.E
+derivingList (Tup o items commas c) =
+  if strEq o.text "(" then items else [Tup o items commas c]
+derivingList (EParen o e c) = [e]
+derivingList e = [e]
+
+conOf : CST.E -> Maybe CST.T
+conOf (Atom t) = if strEq t.kind "con" then Just t else Nothing
+conOf _ = Nothing
+
+derivedOrRefused : CST.T -> Maybe Derived -> P (Pair Derived CST.T)
+derivedOrRefused t (Just k) = pure (MkPair k t)
+derivedOrRefused t Nothing =
+  throwP
+    (diag
+       (spanT t)
+       ("`"
+        ^ t.text
+        ^ "` cannot be derived: `deriving` makes `Equality`, `Order`, `Debug` and `Show`"))
+
+derivingTheoryOf : CST.E -> Maybe CST.T -> P (Pair Derived CST.T)
+derivingTheoryOf e (Just t) = derivedOrRefused t (derivedOf t.text)
+derivingTheoryOf e Nothing =
+  throwP
+    (diag
+       (spanTT (CST.firstE e) (CST.lastE e))
+       "`deriving` names theories: `deriving Equality`, `deriving (Equality, Debug)`")
+
+derivingTheory : CST.E -> P (Pair Derived CST.T)
+derivingTheory e = derivingTheoryOf e (conOf e)
+
+sameDerived : Pair Derived CST.T -> Pair Derived CST.T -> Bool
+sameDerived (MkPair a _) (MkPair b _) = derivedRank a == derivedRank b
+
+-- | a theory named twice, at the second
+derivedTwice : List (Pair Derived CST.T) -> List (Pair Derived CST.T) -> P Unit
+derivedTwice seen [] = pure MkUnit
+derivedTwice seen (k :: rest) =
+  if List.any (sameDerived k) seen
+  then throwP
+      (diag (spanT (snd k)) ("`" ^ (snd k).text ^ "` is derived twice"))
+  else derivedTwice (k :: seen) rest
+
+hasDerived : Derived -> List (Pair Derived CST.T) -> Bool
+hasDerived k ks = List.any (\p -> derivedRank (fst p) == derivedRank k) ks
+
+-- | `Order` uses the `Equality` made with it
+orderNeedsEquality : List (Pair Derived CST.T)
+                   -> List (Pair Derived CST.T)
+                   -> P Unit
+orderNeedsEquality ks0 [] = pure MkUnit
+orderNeedsEquality ks0 (MkPair DerivedOrder t :: rest) =
+  if hasDerived DerivedEquality ks0 then pure MkUnit
+  else throwP
+      (diag
+         (spanT t)
+         "deriving `Order` needs `Equality` derived with it: `deriving (Equality, Order)`")
+orderNeedsEquality ks0 (_ :: rest) = orderNeedsEquality ks0 rest
+
+ofRank : Int -> List (Pair Derived CST.T) -> List (Pair Derived CST.T)
+ofRank i [] = Nil
+ofRank i (p :: rest) =
+  if derivedRank (fst p) == i then p :: ofRank i rest else ofRank i rest
+
+inDerivedOrder : List (Pair Derived CST.T) -> List (Pair Derived CST.T)
+inDerivedOrder ks = concatMapS (\i -> ofRank i ks) [0, 1, 2, 3]
+
+derivingParamOf : CST.E -> Maybe CST.T -> P String
+derivingParamOf e (Just t) = pure t.text
+derivingParamOf e Nothing =
+  throwP
+    (diag
+       (spanTT (CST.firstE e) (CST.lastE e))
+       "a type with a parameter `(x : T)` or `{x : T}` cannot derive: write its instances by hand")
+
+derivingParam : CST.E -> P String
+derivingParam e = derivingParamOf e (atomOf e)
+
+derivingUniverse : Maybe (Pair CST.T CST.E) -> P Unit
+derivingUniverse Nothing = pure MkUnit
+derivingUniverse (Just (MkPair cc u)) =
+  throwP
+    (diag
+       (spanTT cc (CST.lastE u))
+       "a type given its universe cannot derive: write its instances by hand")
+
+derivingAlts : CST.T -> List CST.E -> P Unit
+derivingAlts dkw [] =
+  throwP
+    (diag
+       (spanT dkw)
+       "`deriving` needs the type's constructors: `data T = A | B Int deriving Equality`")
+derivingAlts dkw _ = pure MkUnit
+
+unparen : CST.E -> CST.E
+unparen (EParen o e c) = unparen e
+unparen e = e
+
+namedAtom : String -> CST.E -> Bool
+namedAtom x (Atom t) = strEq t.text x
+namedAtom x _ = False
+
+argsNamed : List String -> List CST.E -> Bool
+argsNamed [] [] = True
+argsNamed (p :: ps) (e :: es) = namedAtom p e && argsNamed ps es
+argsNamed _ _ = False
+
+-- | the type itself, its parameters in order: `T a b`
+ownType : String -> List String -> CST.E -> Bool
+ownType name [] (Atom t) = strEq t.text name
+ownType name ps (App h args) = namedAtom name h && argsNamed ps args
+ownType name ps _ = False
+
+tokNamed : String -> Maybe CST.T -> Bool
+tokNamed name (Just t) = strEq t.kind "con" && strEq t.text name
+tokNamed name Nothing = False
+
+mentionsFrom : Array CST.T -> String -> Int -> Int -> Bool
+mentionsFrom ts name i j =
+  i <= j && (tokNamed name (Array.index ts i) || mentionsFrom ts name (i + 1) j)
+
+-- | whether the field is the type itself; one that holds it otherwise
+-- | is refused, at `deriving`
+fieldOwn : Array CST.T
+         -> String
+         -> List String
+         -> CST.T
+         -> CST.T
+         -> Int
+         -> CST.E
+         -> P Bool
+fieldOwn ts name ps dkw c i e =
+  if ownType name ps (unparen e) then pure True
+  else if mentionsFrom ts name (CST.firstE e).ix (CST.lastE e).ix
+  then throwP
+      (diag
+         (spanT dkw)
+         ("`deriving` cannot reach the `"
+          ^ name
+          ^ "` inside field "
+          ^ debug i
+          ^ " of `"
+          ^ c.text
+          ^ "`: a derived instance calls itself only on a field that is `"
+          ^ joinWith " " (name :: ps)
+          ^ "`; write the instances of `"
+          ^ name
+          ^ "` by hand"))
+  else pure False
+
+fieldsOwn : Array CST.T
+          -> String
+          -> List String
+          -> CST.T
+          -> CST.T
+          -> Int
+          -> List CST.E
+          -> P (List Bool)
+fieldsOwn ts name ps dkw c i [] = pure Nil
+fieldsOwn ts name ps dkw c i (e :: es) = do
+  own <- fieldOwn ts name ps dkw c i e
+  rest <- fieldsOwn ts name ps dkw c (i + 1) es
+  pure (own :: rest)
+
+derivedCon : Array CST.T
+           -> String
+           -> List String
+           -> CST.T
+           -> CST.E
+           -> P (List DerivedCon)
+derivedCon ts name ps dkw (ECon c args) = do
+  own <- fieldsOwn ts name ps dkw c 1 args
+  pure [{ tag = c.text, own = own }]
+derivedCon ts name ps dkw _ = pure Nil
+
+-- | `deriving` and the theories: their instances, each after the type
+derivingL : CST.T
+          -> List CST.E
+          -> Maybe (Pair CST.T CST.E)
+          -> Maybe CST.DAlts
+          -> Maybe (Pair CST.T CST.E)
+          -> P (List Item)
+derivingL name params universe alts Nothing = pure Nil
+derivingL name params universe alts (Just (MkPair dkw what)) = do
+  ks <- traverseS derivingTheory (derivingList what)
+  derivedTwice Nil ks
+  orderNeedsEquality ks ks
+  derivingAlts dkw (CST.altsOf alts)
+  derivingUniverse universe
+  ps <- traverseS derivingParam params
+  ts <- pGets (\s -> s.toks)
+  cons <- traverseS (derivedCon ts name.text ps dkw) (CST.altsOf alts)
+  pure
+      (concatMapS
+         (derivedItems
+            { name = name.text, params = ps, cons = concatMapS (\c -> c) cons })
+         (inDerivedOrder ks))
+
 -- | `data T a = C x y | D`, and `data T : U = ...`
 dataL : Lw
       -> CST.D
@@ -2803,25 +3422,27 @@ dataL : Lw
       -> List CST.E
       -> Maybe (Pair CST.T CST.E)
       -> Maybe CST.DAlts
+      -> Maybe (Pair CST.T CST.E)
       -> P (List Item)
-dataL r d kw name params universe alts = do
+dataL r d kw name params universe alts derived = do
   params' <- traverseS (\m -> dataParamL r m) params
+  instances <- derivingL name params universe alts derived
   withScope (List.map paramName params') (do
     universe' <- case universe of
       Just (MkPair cc u) -> r.e u
       Nothing -> pure (At (EWord TypeWord) (spanT name))
     alts' <- traverseS (\a -> variantL r a) (CST.altsOf alts)
     pure
-        [ Whole
-          (At
-             (DeclDefine
-                name.text
-                (spanT name)
-                params'
-                universe'
-                (At (ESum alts') (spanTE kw (CST.lastD d).end)))
-             (spanTE kw (CST.lastD d).end))
-        ])
+        (Whole
+           (At
+              (DeclDefine
+                 name.text
+                 (spanT name)
+                 params'
+                 universe'
+                 (At (ESum alts') (spanTE kw (CST.lastD d).end)))
+              (spanTE kw (CST.lastD d).end))
+         :: instances))
 
 -- | `type T a = ...`
 typeL : Lw -> CST.T -> CST.T -> List CST.E -> CST.E -> P (List Item)
@@ -3175,8 +3796,8 @@ declL r (DSig names commas cc ty) =
   sigL r AsDefinition (firstStart (headOr Nil names)) names ty
 declL r (DInstance kw names cc ty) = sigL r AsInstance kw.start [names] ty
 declL r (DEqn names pats eq rhs w) = eqnL r names pats rhs w
-declL r d@(DData kw name params universe alts) =
-  dataL r d kw name params universe alts
+declL r d@(DData kw name params universe alts derived) =
+  dataL r d kw name params universe alts derived
 declL r (DType kw name params eq body) = typeL r kw name params body
 declL r d@(DTheory kw name params w fields) = theoryL r d kw name params fields
 declL r (DMutual kw ds) = mutualL r kw ds
