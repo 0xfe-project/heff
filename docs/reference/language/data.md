@@ -55,13 +55,17 @@ data Tree a = Leaf | Node (Tree a) a (Tree a)
 theories, as the prelude writes its own: `Equality` (the same tag, each
 field equal), `Order` (tags in the order they are declared, then the
 fields, first to last), `Debug` (`C (x) (y)`, each field's `debug`) and
-`Show` (the same text). They are named `instanceEqualityTree`, and so
+`Show` (the same text). A record type derives them too, after its
+body (`type Point = { x : Int, y : Int } deriving (Equality, Debug)`):
+its fields compared in the order they are declared, and written as
+the source writes the record, `{ x = 1, y = 2 }`. They are named `instanceEqualityTree`, and so
 on, and each parameter asks for the same theory of its type, as in
 `{a : Type} -> {{eqA : Equality a}} -> Equality (Tree a)` (`Show`
 asks for `Debug`). `Order` needs `Equality` in the same list. A field
 may be the type itself, `Tree a`, but not hold it inside another type,
-as `List (Tree a)` does; such a type, and one whose parameters are
-written `(x : T)`, writes its instances by hand.
+as `List (Tree a)` does; such a type, one whose parameters are
+written `(x : T)`, and a `type` that is no record type write their
+instances by hand.
 
 ## Unit and pairs
 

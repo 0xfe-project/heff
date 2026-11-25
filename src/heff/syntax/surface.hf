@@ -2818,26 +2818,19 @@ derivedRank DerivedShow = 3
 -- | a constructor, its tag and whether each field is the type itself
 type DerivedCon = { tag : String, own : List Bool }
 
--- | the type an instance is made for, its parameters and constructors
-type Deriver = { name : String, params : List String, cons : List DerivedCon }
+-- | what the type is: a `data`'s constructors, or a record's fields
+data DerivedShape = OfData (List DerivedCon) | OfRecord (List String)
 
--- | a field taken apart, from the one value (`x`) and from the other (`y`)
-type DerivedField = { own : Bool, x : String, y : String }
+-- | the type an instance is made for, its parameters and its shape
+type Deriver = { name : String, params : List String, shape : DerivedShape }
 
-derivedFieldsFrom : Int -> List Bool -> List DerivedField
-derivedFieldsFrom i [] = Nil
-derivedFieldsFrom i (own :: rest) =
-  { own = own, x = "x#" ^ debug i, y = "y#" ^ debug i }
-  :: derivedFieldsFrom (i + 1) rest
+-- | a field, of the one value (`x`) and of the other (`y`)
+type DerivedField = { own : Bool, x : Presyntax.Expr, y : Presyntax.Expr }
 
-derivedFields : DerivedCon -> List DerivedField
-derivedFields c = derivedFieldsFrom 1 c.own
-
-fieldX : DerivedField -> String
-fieldX f = f.x
-
-fieldY : DerivedField -> String
-fieldY f = f.y
+fieldNamesFrom : String -> Int -> List Bool -> List String
+fieldNamesFrom pre i [] = Nil
+fieldNamesFrom pre i (own :: rest) =
+  (pre ^ debug i) :: fieldNamesFrom pre (i + 1) rest
 
 upperAt : String -> Maybe Int -> String
 upperAt c (Just i) = strSlice "ABCDEFGHIJKLMNOPQRSTUVWXYZ" i (i + 1)
@@ -2855,6 +2848,28 @@ dVar sp x = At (EVar x) sp
 
 dLib : Params.Span -> String -> Presyntax.Expr
 dLib sp k = At (ENotationVar k sp ("`deriving` needs `" ^ k ^ "`")) sp
+
+derivedFieldsFrom : Params.Span -> Int -> List Bool -> List DerivedField
+derivedFieldsFrom sp i [] = Nil
+derivedFieldsFrom sp i (own :: rest) =
+  { own = own, x = dVar sp ("x#" ^ debug i), y = dVar sp ("y#" ^ debug i) }
+  :: derivedFieldsFrom sp (i + 1) rest
+
+derivedFields : Params.Span -> DerivedCon -> List DerivedField
+derivedFields sp c = derivedFieldsFrom sp 1 c.own
+
+-- | `r.x`
+dProj : Params.Span -> String -> String -> Presyntax.Expr
+dProj sp r x = Presyntax.app (dVar sp r) [At (EProject x) sp]
+
+recordField : Params.Span -> String -> DerivedField
+recordField sp x = { own = False, x = dProj sp "x#0" x, y = dProj sp "y#0" x }
+
+recordFields : Params.Span -> List String -> List DerivedField
+recordFields sp xs = List.map (recordField sp) xs
+
+dBoth : Params.Span -> List Presyntax.Pat
+dBoth sp = [At (PatVar "x#0") sp, At (PatVar "y#0") sp]
 
 dTag : Params.Span -> String -> Presyntax.Expr
 dTag sp t = At (ETag t) sp
@@ -2969,7 +2984,7 @@ equalField : Params.Span -> DerivedField -> Presyntax.Expr
 equalField sp f =
   Presyntax.app
     (if f.own then dVar sp equalLocal else dLib sp "prelude.equal")
-    [dVar sp f.x, dVar sp f.y]
+    [f.x, f.y]
 
 allEqual : Params.Span -> List DerivedField -> Presyntax.Expr
 allEqual sp [] = dTag sp "True"
@@ -2989,10 +3004,26 @@ equalEqn sp c =
   dEqn
     sp
     equalLocal
-    [ dPat sp c.tag (List.map fieldX (derivedFields c))
-    , dPat sp c.tag (List.map fieldY (derivedFields c))
+    [ dPat sp c.tag (fieldNamesFrom "x#" 1 c.own)
+    , dPat sp c.tag (fieldNamesFrom "y#" 1 c.own)
     ]
-    (allEqual sp (derivedFields c))
+    (allEqual sp (derivedFields sp c))
+
+equalEqns : Params.Span
+          -> DerivedShape
+          -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+equalEqns sp (OfData cons) =
+  appendS
+    (List.map (equalEqn sp) cons)
+    (otherwiseEqn
+       cons
+       (dEqn
+          sp
+          equalLocal
+          [At (PatVar "_") sp, At (PatVar "_") sp]
+          (dTag sp "False")))
+equalEqns sp (OfRecord xs) =
+  [dEqn sp equalLocal (dBoth sp) (allEqual sp (recordFields sp xs))]
 
 -- | `instance instanceEqualityT`: the same constructor, and each field equal
 equalityItems : Deriver -> Params.Span -> List Item
@@ -3012,15 +3043,7 @@ equalityItems d sp =
             sp
             (dSelf sp d)
             (dArrow sp (dSelf sp d) (dVar sp "builtin.Bool")))
-         (appendS
-            (List.map (equalEqn sp) d.cons)
-            (otherwiseEqn
-               d.cons
-               (dEqn
-                  sp
-                  equalLocal
-                  [At (PatVar "_") sp, At (PatVar "_") sp]
-                  (dTag sp "False"))))
+         (equalEqns sp d.shape)
        ])
 
 compareLocal : String
@@ -3033,7 +3056,7 @@ compareField : Params.Span -> DerivedField -> Presyntax.Expr
 compareField sp f =
   Presyntax.app
     (if f.own then dVar sp compareLocal else dLib sp "prelude.compare")
-    [dVar sp f.x, dVar sp f.y]
+    [f.x, f.y]
 
 lexically : Params.Span -> List DerivedField -> Presyntax.Expr
 lexically sp [] = dTag sp "EQ"
@@ -3053,10 +3076,10 @@ compareEqn sp c =
   dEqn
     sp
     compareLocal
-    [ dPat sp c.tag (List.map fieldX (derivedFields c))
-    , dPat sp c.tag (List.map fieldY (derivedFields c))
+    [ dPat sp c.tag (fieldNamesFrom "x#" 1 c.own)
+    , dPat sp c.tag (fieldNamesFrom "y#" 1 c.own)
     ]
-    (lexically sp (derivedFields c))
+    (lexically sp (derivedFields sp c))
 
 rankEqns : Params.Span
          -> Int
@@ -3071,16 +3094,17 @@ rankEqns sp i (c :: rest) =
     (At (EInt i) sp)
   :: rankEqns sp (i + 1) rest
 
-rankDecls : Deriver -> Params.Span -> List Presyntax.Decl
-rankDecls d sp =
-  if moreThanOne d.cons
+rankDecls : Deriver -> Params.Span -> DerivedShape -> List Presyntax.Decl
+rankDecls d sp (OfData cons) =
+  if moreThanOne cons
   then [ dLocal
          sp
          rankLocal
          (dArrow sp (dSelf sp d) (At (EWord IntWord) sp))
-         (rankEqns sp 0 d.cons)
+         (rankEqns sp 0 cons)
        ]
   else Nil
+rankDecls d sp (OfRecord xs) = Nil
 
 byRank : Params.Span -> Presyntax.Expr
 byRank sp =
@@ -3089,6 +3113,16 @@ byRank sp =
     [ Presyntax.app (dVar sp rankLocal) [dVar sp "x#0"]
     , Presyntax.app (dVar sp rankLocal) [dVar sp "y#0"]
     ]
+
+compareEqns : Params.Span
+            -> DerivedShape
+            -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+compareEqns sp (OfData cons) =
+  appendS
+    (List.map (compareEqn sp) cons)
+    (otherwiseEqn cons (dEqn sp compareLocal (dBoth sp) (byRank sp)))
+compareEqns sp (OfRecord xs) =
+  [dEqn sp compareLocal (dBoth sp) (lexically sp (recordFields sp xs))]
 
 -- | `(eqA := ordA.eq)`, the equality of a parameter its order's
 equalityOfOrder : Params.Span -> String -> Presyntax.Expr
@@ -3123,7 +3157,7 @@ orderItems d sp =
              , dVar sp compareLocal
              ])
           (appendS
-             (rankDecls d sp)
+             (rankDecls d sp d.shape)
              [ dLocal
                sp
                compareLocal
@@ -3131,15 +3165,7 @@ orderItems d sp =
                   sp
                   (dSelf sp d)
                   (dArrow sp (dSelf sp d) (dLib sp "prelude.Ordering")))
-               (appendS
-                  (List.map (compareEqn sp) d.cons)
-                  (otherwiseEqn
-                     d.cons
-                     (dEqn
-                        sp
-                        compareLocal
-                        [At (PatVar "x#0") sp, At (PatVar "y#0") sp]
-                        (byRank sp))))
+               (compareEqns sp d.shape)
              ]))
        sp)
 
@@ -3150,7 +3176,7 @@ writtenField : Params.Span -> String -> DerivedField -> Presyntax.Expr
 writtenField sp local f =
   Presyntax.app
     (if f.own then dVar sp local else dLib sp "prelude.debug")
-    [dVar sp f.x]
+    [f.x]
 
 writtenRest : Params.Span
             -> String
@@ -3187,8 +3213,39 @@ writtenEqn sp local c =
   dEqn
     sp
     local
-    [dPat sp c.tag (List.map fieldX (derivedFields c))]
-    (writtenOf sp local c.tag (derivedFields c))
+    [dPat sp c.tag (fieldNamesFrom "x#" 1 c.own)]
+    (writtenOf sp local c.tag (derivedFields sp c))
+
+recordRest : Params.Span -> Presyntax.Expr -> List String -> Presyntax.Expr
+recordRest sp acc [] = dAppend sp acc (dStr sp " }")
+recordRest sp acc (x :: rest) =
+  recordRest
+    sp
+    (dAppend
+       sp
+       (dAppend sp acc (dStr sp (", " ^ x ^ " = ")))
+       (writtenField sp "" (recordField sp x)))
+    rest
+
+-- | `{ x = 1, y = 2 }`, each field as its `debug` writes it
+recordText : Params.Span -> List String -> Presyntax.Expr
+recordText sp [] = dStr sp "{}"
+recordText sp (x :: rest) =
+  recordRest
+    sp
+    (dAppend
+       sp
+       (dStr sp ("{ " ^ x ^ " = "))
+       (writtenField sp "" (recordField sp x)))
+    rest
+
+writtenEqns : Params.Span
+            -> String
+            -> DerivedShape
+            -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+writtenEqns sp local (OfData cons) = List.map (writtenEqn sp local) cons
+writtenEqns sp local (OfRecord xs) =
+  [dEqn sp local [At (PatVar "x#0") sp] (recordText sp xs)]
 
 -- | `instance instanceDebugT`, or `instanceShowT` (`field`: `debug`,
 -- | `show`), the value as the source writes it, by its fields' `debug`
@@ -3206,7 +3263,7 @@ writtenItems d sp th field =
          sp
          (field ^ "#deriving")
          (dArrow sp (dSelf sp d) (At (EWord StringWord) sp))
-         (List.map (writtenEqn sp (field ^ "#deriving")) d.cons)
+         (writtenEqns sp (field ^ "#deriving") d.shape)
        ])
 
 derivedItems : Deriver -> Pair Derived CST.T -> List Item
@@ -3282,6 +3339,14 @@ ofRank i (p :: rest) =
 
 inDerivedOrder : List (Pair Derived CST.T) -> List (Pair Derived CST.T)
 inDerivedOrder ks = concatMapS (\i -> ofRank i ks) [0, 1, 2, 3]
+
+-- | the theories `deriving` names, each once, `Order` with `Equality`
+derivedTheories : CST.E -> P (List (Pair Derived CST.T))
+derivedTheories what = do
+  ks <- traverseS derivingTheory (derivingList what)
+  derivedTwice Nil ks
+  orderNeedsEquality ks ks
+  pure ks
 
 derivingParamOf : CST.E -> Maybe CST.T -> P String
 derivingParamOf e (Just t) = pure t.text
@@ -3400,9 +3465,7 @@ derivingL : CST.T
           -> P (List Item)
 derivingL name params universe alts Nothing = pure Nil
 derivingL name params universe alts (Just (MkPair dkw what)) = do
-  ks <- traverseS derivingTheory (derivingList what)
-  derivedTwice Nil ks
-  orderNeedsEquality ks ks
+  ks <- derivedTheories what
   derivingAlts dkw (CST.altsOf alts)
   derivingUniverse universe
   ps <- traverseS derivingParam params
@@ -3411,7 +3474,66 @@ derivingL name params universe alts (Just (MkPair dkw what)) = do
   pure
       (concatMapS
          (derivedItems
-            { name = name.text, params = ps, cons = concatMapS (\c -> c) cons })
+            { name = name.text
+            , params = ps
+            , shape = OfData (concatMapS (\c -> c) cons)
+            })
+         (inDerivedOrder ks))
+
+fieldDeclName : Params.Spanned
+                (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
+              -> List String
+fieldDeclName (At (DeclareField x _ _ _) _) = [x]
+fieldDeclName (At (BadFieldDecl _) _) = Nil
+
+-- | the fields of a record type; another type cannot derive
+recordNames : CST.T -> Presyntax.Expr -> P (List String)
+recordNames dkw (At (ESig fs) _) = pure (concatMapS fieldDeclName fs)
+recordNames dkw _ =
+  throwP
+    (diag
+       (spanT dkw)
+       "a `type` derives only as a record type, `{ x : A, ... }`: write this type's instances by hand")
+
+-- | a field of a record type that holds the type, refused at `deriving`
+recordFieldOwn : Array CST.T -> String -> CST.T -> CST.E -> P Unit
+recordFieldOwn ts name dkw e =
+  if mentionsFrom ts name (CST.firstE e).ix (CST.lastE e).ix
+  then throwP
+      (diag
+         (spanT dkw)
+         ("`deriving` cannot reach the `"
+          ^ name
+          ^ "` in field `"
+          ^ (CST.firstE e).text
+          ^ "`: write the instances of `"
+          ^ name
+          ^ "` by hand"))
+  else pure MkUnit
+
+recordOwn : Array CST.T -> String -> CST.T -> CST.E -> P Unit
+recordOwn ts name dkw (Braces o fs commas c) = do
+  done <- traverseS (recordFieldOwn ts name dkw) fs
+  pure MkUnit
+recordOwn ts name dkw e = pure MkUnit
+
+-- | a `type`'s `deriving` (`body'`, its record type lowered)
+derivingTypeL : CST.T
+              -> List CST.E
+              -> CST.E
+              -> Presyntax.Expr
+              -> Maybe (Pair CST.T CST.E)
+              -> P (List Item)
+derivingTypeL name params body body' Nothing = pure Nil
+derivingTypeL name params body body' (Just (MkPair dkw what)) = do
+  ks <- derivedTheories what
+  xs <- recordNames dkw body'
+  ps <- traverseS derivingParam params
+  ts <- pGets (\s -> s.toks)
+  recordOwn ts name.text dkw (unparen body)
+  pure
+      (concatMapS
+         (derivedItems { name = name.text, params = ps, shape = OfRecord xs })
          (inDerivedOrder ks))
 
 -- | `data T a = C x y | D`, and `data T : U = ...`
@@ -3445,22 +3567,29 @@ dataL r d kw name params universe alts derived = do
          :: instances))
 
 -- | `type T a = ...`
-typeL : Lw -> CST.T -> CST.T -> List CST.E -> CST.E -> P (List Item)
-typeL r kw name params body = do
+typeL : Lw
+      -> CST.T
+      -> CST.T
+      -> List CST.E
+      -> CST.E
+      -> Maybe (Pair CST.T CST.E)
+      -> P (List Item)
+typeL r kw name params body derived = do
   params' <- traverseS (\m -> dataParamL r m) params
   withScope (List.map paramName params') (do
     body' <- r.e body
+    instances <- derivingTypeL name params body body' derived
     pure
-        [ Whole
-          (At
-             (DeclDefine
-                name.text
-                (spanT name)
-                params'
-                (At (EWord TypeWord) (spanTE kw (CST.lastE body).end))
-                body')
-             (spanTE kw (CST.lastE body).end))
-        ])
+        (Whole
+           (At
+              (DeclDefine
+                 name.text
+                 (spanT name)
+                 params'
+                 (At (EWord TypeWord) (spanTE kw (CST.lastE body).end))
+                 body')
+              (spanTE kw (CST.lastE body).end))
+         :: instances))
 
 -- (a theory's field's default, if it has one)
 defaultL : Lw -> Maybe (Pair CST.T CST.E) -> P (Maybe Presyntax.Expr)
@@ -3798,7 +3927,8 @@ declL r (DInstance kw names cc ty) = sigL r AsInstance kw.start [names] ty
 declL r (DEqn names pats eq rhs w) = eqnL r names pats rhs w
 declL r d@(DData kw name params universe alts derived) =
   dataL r d kw name params universe alts derived
-declL r (DType kw name params eq body) = typeL r kw name params body
+declL r (DType kw name params eq body derived) =
+  typeL r kw name params body derived
 declL r d@(DTheory kw name params w fields) = theoryL r d kw name params fields
 declL r (DMutual kw ds) = mutualL r kw ds
 declL r (DPrimitive kw x cc ty) = primitiveL r kw x ty
