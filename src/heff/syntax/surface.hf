@@ -2799,11 +2799,17 @@ dataParamL r e = case atomOf e of
 --------------------------------------------------------------------------------
 
 -- | a theory `deriving` makes an instance of
-data Derived = DerivedEquality | DerivedOrder | DerivedDebug | DerivedShow
+data Derived
+  = DerivedEquality
+  | DerivedOrder
+  | DerivedHash
+  | DerivedDebug
+  | DerivedShow
 
 derivedOf : String -> Maybe Derived
 derivedOf "Equality" = Just DerivedEquality
 derivedOf "Order" = Just DerivedOrder
+derivedOf "Hash" = Just DerivedHash
 derivedOf "Debug" = Just DerivedDebug
 derivedOf "Show" = Just DerivedShow
 derivedOf _ = Nothing
@@ -2812,8 +2818,9 @@ derivedOf _ = Nothing
 derivedRank : Derived -> Int
 derivedRank DerivedEquality = 0
 derivedRank DerivedOrder = 1
-derivedRank DerivedDebug = 2
-derivedRank DerivedShow = 3
+derivedRank DerivedHash = 2
+derivedRank DerivedDebug = 3
+derivedRank DerivedShow = 4
 
 -- | a constructor, its tag and whether each field is the type itself
 type DerivedCon = { tag : String, own : List Bool }
@@ -2910,41 +2917,36 @@ typeParamsOver sp (p :: ps) e =
     sp
 
 instanceArgsOver : Params.Span
-                 -> String
+                 -> Presyntax.Expr
                  -> String
                  -> List String
                  -> Presyntax.Expr
                  -> Presyntax.Expr
-instanceArgsOver sp k pre [] e = e
-instanceArgsOver sp k pre (p :: ps) e =
+instanceArgsOver sp arg pre [] e = e
+instanceArgsOver sp arg pre (p :: ps) e =
   At
     (EPi
        (PiInstance
           (pre ^ capitalised p)
           sp
           sp
-          (Presyntax.app (dLib sp k) [dVar sp p]))
-       (instanceArgsOver sp k pre ps e))
+          (Presyntax.app arg [dVar sp p]))
+       (instanceArgsOver sp arg pre ps e))
     sp
 
--- | `{a : Type} -> {{eqA : Equality a}} -> Equality (T a)`: the theory's
--- | key, and the key and name prefix of what each parameter needs
+-- | `{a : Type} -> {{eqA : Equality a}} -> Equality (T a)`: the theory,
+-- | and the theory and name prefix of what each parameter needs
 instanceTypeOf : Params.Span
                -> Deriver
-               -> String
-               -> String
+               -> Presyntax.Expr
+               -> Presyntax.Expr
                -> String
                -> Presyntax.Expr
-instanceTypeOf sp d k argK pre =
+instanceTypeOf sp d th arg pre =
   typeParamsOver
     sp
     d.params
-    (instanceArgsOver
-       sp
-       argK
-       pre
-       d.params
-       (Presyntax.app (dLib sp k) [dSelf sp d]))
+    (instanceArgsOver sp arg pre d.params (Presyntax.app th [dSelf sp d]))
 
 -- | the instance's signature and its one equation
 instanceItems : Params.Span
@@ -3031,7 +3033,12 @@ equalityItems d sp =
   instanceItems
     sp
     ("instanceEquality" ^ d.name)
-    (instanceTypeOf sp d "prelude.Equality" "prelude.Equality" "eq")
+    (instanceTypeOf
+       sp
+       d
+       (dLib sp "prelude.Equality")
+       (dLib sp "prelude.Equality")
+       "eq")
     (recordWhere
        sp
        "equal"
@@ -3142,7 +3149,12 @@ orderItems d sp =
   instanceItems
     sp
     ("instanceOrder" ^ d.name)
-    (instanceTypeOf sp d "prelude.Order" "prelude.Order" "ord")
+    (instanceTypeOf
+       sp
+       d
+       (dLib sp "prelude.Order")
+       (dLib sp "prelude.Order")
+       "ord")
     (At
        (ELocal
           (Presyntax.app
@@ -3168,6 +3180,91 @@ orderItems d sp =
                (compareEqns sp d.shape)
              ]))
        sp)
+
+hashLocal : String
+hashLocal = "hash#deriving"
+
+dHashing : Params.Span -> String -> Presyntax.Expr
+dHashing sp k =
+  At
+    (ENotationVar
+       k
+       sp
+       "deriving `Hash` needs std.hashmap's `Hash`: `import std.hashmap`")
+    sp
+
+hashField : Params.Span -> DerivedField -> Presyntax.Expr
+hashField sp f =
+  Presyntax.app
+    (if f.own then dVar sp hashLocal else dHashing sp "std.hashmap.hash")
+    [f.x]
+
+-- | each field's hash `combine`d onto `acc`, first to last
+combined : Params.Span -> Presyntax.Expr -> List DerivedField -> Presyntax.Expr
+combined sp acc [] = acc
+combined sp acc (f :: rest) =
+  combined
+    sp
+    (Presyntax.app (dHashing sp "std.hashmap.combine") [acc, hashField sp f])
+    rest
+
+-- | a constructor declared `i`th: as `Nothing` hashes, `hash i`, with no
+-- | field; else from `i`, its fields `combine`d
+conHash : Params.Span -> Int -> DerivedCon -> List Bool -> Presyntax.Expr
+conHash sp i c [] =
+  Presyntax.app
+    (dHashing sp "std.hashmap.hash")
+    [Presyntax.ann (At (EInt i) sp) (At (EWord IntWord) sp)]
+conHash sp i c _ = combined sp (At (EInt i) sp) (derivedFields sp c)
+
+hashConEqns : Params.Span
+            -> Int
+            -> List DerivedCon
+            -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+hashConEqns sp i [] = Nil
+hashConEqns sp i (c :: rest) =
+  dEqn
+    sp
+    hashLocal
+    [dPat sp c.tag (fieldNamesFrom "x#" 1 c.own)]
+    (conHash sp i c c.own)
+  :: hashConEqns sp (i + 1) rest
+
+hashEqns : Params.Span
+         -> DerivedShape
+         -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+hashEqns sp (OfData cons) = hashConEqns sp 0 cons
+hashEqns sp (OfRecord xs) =
+  [ dEqn
+    sp
+    hashLocal
+    [At (PatVar "x#0") sp]
+    (combined sp (At (EInt 0) sp) (recordFields sp xs))
+  ]
+
+-- | `instance instanceHashT`, std.hashmap's: a constructor's index, then
+-- | its fields `combine`d in order; a record's fields from 0
+hashItems : Deriver -> Params.Span -> List Item
+hashItems d sp =
+  instanceItems
+    sp
+    ("instanceHash" ^ d.name)
+    (instanceTypeOf
+       sp
+       d
+       (dHashing sp "std.hashmap.Hash")
+       (dHashing sp "std.hashmap.Hash")
+       "hash")
+    (recordWhere
+       sp
+       "hash"
+       hashLocal
+       [ dLocal
+         sp
+         hashLocal
+         (dArrow sp (dSelf sp d) (At (EWord IntWord) sp))
+         (hashEqns sp d.shape)
+       ])
 
 dAppend : Params.Span -> Presyntax.Expr -> Presyntax.Expr -> Presyntax.Expr
 dAppend sp a b = Presyntax.app (dLib sp "prelude.^") [a, b]
@@ -3254,7 +3351,12 @@ writtenItems d sp th field =
   instanceItems
     sp
     ("instance" ^ th ^ d.name)
-    (instanceTypeOf sp d ("prelude." ^ th) "prelude.Debug" "shows")
+    (instanceTypeOf
+       sp
+       d
+       (dLib sp ("prelude." ^ th))
+       (dLib sp "prelude.Debug")
+       "shows")
     (recordWhere
        sp
        field
@@ -3269,6 +3371,7 @@ writtenItems d sp th field =
 derivedItems : Deriver -> Pair Derived CST.T -> List Item
 derivedItems d (MkPair DerivedEquality t) = equalityItems d (spanT t)
 derivedItems d (MkPair DerivedOrder t) = orderItems d (spanT t)
+derivedItems d (MkPair DerivedHash t) = hashItems d (spanT t)
 derivedItems d (MkPair DerivedDebug t) =
   writtenItems d (spanT t) "Debug" "debug"
 derivedItems d (MkPair DerivedShow t) = writtenItems d (spanT t) "Show" "show"
@@ -3291,7 +3394,7 @@ derivedOrRefused t Nothing =
        (spanT t)
        ("`"
         ^ t.text
-        ^ "` cannot be derived: `deriving` makes `Equality`, `Order`, `Debug` and `Show`"))
+        ^ "` cannot be derived: `deriving` makes `Equality`, `Order`, `Hash`, `Debug` and `Show`"))
 
 derivingTheoryOf : CST.E -> Maybe CST.T -> P (Pair Derived CST.T)
 derivingTheoryOf e (Just t) = derivedOrRefused t (derivedOf t.text)
@@ -3338,7 +3441,7 @@ ofRank i (p :: rest) =
   if derivedRank (fst p) == i then p :: ofRank i rest else ofRank i rest
 
 inDerivedOrder : List (Pair Derived CST.T) -> List (Pair Derived CST.T)
-inDerivedOrder ks = concatMapS (\i -> ofRank i ks) [0, 1, 2, 3]
+inDerivedOrder ks = concatMapS (\i -> ofRank i ks) [0, 1, 2, 3, 4]
 
 -- | the theories `deriving` names, each once, `Order` with `Equality`
 derivedTheories : CST.E -> P (List (Pair Derived CST.T))
